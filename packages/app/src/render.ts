@@ -41,20 +41,38 @@ const norm = (a: Px): Px => {
 };
 const perp = (a: Px): Px => [-a[1], a[0]];
 
+const DOT_SPACING = 0.55; // grid units between dots
+/** Dots only exist where current flows (Falstad convention). 1 µA is the
+ * floor of "a branch is conducting" — bias strings and op-amp feedback
+ * networks live at tens of µA and must animate. */
+const DOT_MIN_AMPS = 1e-6;
+/** Dot speed limits, grid units/sec. The upper bound also keeps the dots
+ * below the strobe threshold: DOT_SPACING/2 per frame at 60 fps is
+ * 16.5 grid/sec, so 6 never aliases. */
+const DOT_SPEED_MIN = 0.35;
+const DOT_SPEED_MAX = 6;
+
+/** Dot travel speed in grid units/sec for a branch current, log-compressed
+ * over the ~7 decades a real circuit spans: 1 µA crawls at 0.6, 50 µA at
+ * 1.45, 6 mA at 2.49, 100 mA at 3.1. Linear speed would make anything
+ * below a milliamp look dead. Sign carries the direction. */
+export function dotSpeed(current: number): number {
+  const a = Math.abs(current);
+  if (a < DOT_MIN_AMPS) return 0;
+  const v = 0.6 + 0.5 * Math.log10(a / DOT_MIN_AMPS);
+  return Math.sign(current) * Math.min(DOT_SPEED_MAX, Math.max(DOT_SPEED_MIN, v));
+}
+
 /** Animated dot phase per element, advanced by simulated current. */
 export class DotFlow {
   private phase = new Map<number, number>();
 
   advance(id: number, current: number, dtSec: number): number {
-    const p = (this.phase.get(id) ?? 0) + current * dtSec * 6;
+    const p = (this.phase.get(id) ?? 0) + dotSpeed(current) * dtSec;
     this.phase.set(id, p);
     return p;
   }
 }
-
-const DOT_SPACING = 0.55; // grid units between dots
-/** Dots only exist where current flows (Falstad convention). */
-const DOT_MIN_AMPS = 1e-4;
 
 export function drawDots(
   ctx: CanvasRenderingContext2D,
@@ -74,6 +92,24 @@ export function drawDots(
     ctx.beginPath();
     ctx.arc(x, y, Math.max(2, cam.scale * 0.055), 0, Math.PI * 2);
     ctx.fill();
+  }
+}
+
+/** Dots along a multi-segment lead, phase continuing across the corners. */
+function drawDotsPath(
+  ctx: CanvasRenderingContext2D,
+  cam: Camera,
+  pts: Px[],
+  phase: number,
+  current: number,
+) {
+  if (Math.abs(current) < DOT_MIN_AMPS) return;
+  let ph = phase;
+  for (let k = 0; k + 1 < pts.length; k++) {
+    const a = pts[k]!;
+    const b = pts[k + 1]!;
+    drawDots(ctx, cam, a, b, ph, current);
+    ph -= mag(sub(b, a)) / cam.scale;
   }
 }
 
@@ -506,100 +542,177 @@ export function drawElement(d: DrawCtx, e: ElementSpec) {
     }
     case 'Npn':
     case 'Pnp': {
+      // Textbook BJT: base lead perpendicular into a straight base bar,
+      // collector/emitter legs leaving the bar at ~50° and routing to their
+      // pins. Everything derives from the three pin positions, so the
+      // symbol is correct at any orientation.
       const [Bp, Cp, Ep] = [P[0]!, P[1]!, P[2]!];
-      const ceMid = lerp(Cp, Ep, 0.5);
-      const ub = norm(sub(ceMid, Bp)); // base -> body
-      const barC = add(ceMid, ub, -s * 0.28);
-      const barN = perp(ub);
-      const halfBar = s * 0.4;
-      // leads
+      const axis = sub(lerp(Cp, Ep, 0.5), Bp);
+      const ub = norm(axis); // base lead: base pin -> bar
+      const bn0 = perp(ub);
+      // Bar normal points from the collector side toward the emitter side.
+      const bn: Px = dot(bn0, sub(Ep, Cp)) < 0 ? [-bn0[0], -bn0[1]] : bn0;
+      const axLen = Math.max(mag(axis), s * 0.5);
+      const barC = add(Bp, ub, axLen * 0.42); // bar center
+      const att = s * 0.28; // leg attachment offset along the bar
+      const legOf = (Q: Px): { att: Px; knee: Px } => {
+        const dp = dot(sub(Q, barC), bn); // perpendicular offset of the pin
+        const da = Math.max(dot(sub(Q, barC), ub), s * 0.1); // axial distance
+        const sg = dp >= 0 ? 1 : -1;
+        const a0 = add(barC, bn, sg * att);
+        // tan(50°) ≈ 1.19 axial units per unit of perpendicular climb
+        const run = Math.min(da, Math.abs(dp - sg * att) * 1.19);
+        return { att: a0, knee: add(add(barC, bn, dp), ub, run) };
+      };
+      const cl = legOf(Cp);
+      const el = legOf(Ep);
+      const cPath: Px[] = [Cp, cl.knee, cl.att];
+      const ePath: Px[] = [el.att, el.knee, Ep];
       stroke(ctx, voltageColor(v(0)), [Bp, barC]);
-      const sC = Math.sign(dot(sub(Cp, barC), barN)) || 1;
-      const cAtt = add(barC, barN, sC * halfBar * 0.7);
-      const eAtt = add(barC, barN, -sC * halfBar * 0.7);
-      stroke(ctx, voltageColor(v(1)), [Cp, cAtt]);
-      stroke(ctx, voltageColor(v(2)), [Ep, eAtt]);
-      // base bar
-      stroke(ctx, '#c9c9d4', [add(barC, barN, halfBar), add(barC, barN, -halfBar)]);
-      // emitter arrow: out for NPN, in for PNP
-      const eDir = norm(sub(Ep, eAtt));
-      const eColor = voltageColor(v(2));
-      if (e.kind.t === 'Npn') {
-        arrowHead(ctx, lerp(eAtt, Ep, 0.6), eDir, s * 0.22, eColor);
-      } else {
-        arrowHead(ctx, lerp(Ep, eAtt, 0.6), norm(sub(eAtt, Ep)), s * 0.22, eColor);
-      }
-      // dots along collector->emitter through the device
+      stroke(ctx, voltageColor(v(1)), cPath);
+      stroke(ctx, voltageColor(v(2)), ePath);
+      stroke(ctx, '#c9c9d4', [add(barC, bn, s * 0.5), add(barC, bn, -s * 0.5)]);
+      // Emitter arrow, on the emitter leg only: away from the bar for NPN
+      // (conventional current out of the emitter), toward it for PNP.
+      const slant = sub(el.knee, el.att);
+      const away = norm(slant);
+      const npn = e.kind.t === 'Npn';
+      const asize = Math.min(s * 0.24, Math.max(s * 0.1, mag(slant) * 0.55));
+      arrowHead(
+        ctx,
+        lerp(el.att, el.knee, npn ? 0.72 : 0.3),
+        npn ? away : [-away[0], -away[1]],
+        asize,
+        voltageColor(v(2)),
+      );
+      // Dots on all three leads (base current is honest information).
       const ic = iPin(1);
-      drawDots(ctx, cam, Cp, Ep, d.dots.advance(e.id, ic, d.dtSec), ic);
+      const ie = -iPin(2);
+      const ib = iPin(0);
+      drawDotsPath(ctx, cam, [Bp, barC], d.dots.advance(e.id, ib, d.dtSec), ib);
+      drawDotsPath(ctx, cam, cPath, d.dots.advance(e.id + 1_000_000, ic, d.dtSec), ic);
+      drawDotsPath(ctx, cam, ePath, d.dots.advance(e.id + 2_000_000, ie, d.dtSec), ie);
       break;
     }
     case 'Nmos':
     case 'Pmos': {
+      // Enhancement MOSFET with legs: gate lead -> gate plate, air gap,
+      // broken channel plate, and drain/source legs that step off the
+      // channel perpendicular before running to their pins.
       const [Gp, Dp, Sp] = [P[0]!, P[1]!, P[2]!];
-      const dsMid = lerp(Dp, Sp, 0.5);
-      const toG = norm(sub(Gp, dsMid));
-      // channel bar on the D-S line, gate bar offset toward the gate pin
-      const chA = lerp(Dp, Sp, 0.22);
-      const chB = lerp(Dp, Sp, 0.78);
-      stroke(ctx, voltageColor(v(1)), [Dp, chA]);
-      stroke(ctx, voltageColor(v(2)), [Sp, chB]);
-      stroke(ctx, '#c9c9d4', [chA, chB]);
-      const gA = add(lerp(Dp, Sp, 0.28), toG, s * 0.18);
-      const gB = add(lerp(Dp, Sp, 0.72), toG, s * 0.18);
-      stroke(ctx, '#c9c9d4', [gA, gB]);
-      stroke(ctx, voltageColor(v(0)), [Gp, lerp(gA, gB, 0.5)]);
-      // arrow into (NMOS) / out of (PMOS) the channel at the source end
-      const sDir = norm(sub(chB, Sp));
-      if (e.kind.t === 'Nmos') {
-        arrowHead(ctx, lerp(Sp, chB, 0.7), sDir, s * 0.2, voltageColor(v(2)));
-      } else {
-        arrowHead(ctx, lerp(chB, Sp, 0.7), norm(sub(Sp, chB)), s * 0.2, voltageColor(v(2)));
+      const axis = sub(lerp(Dp, Sp, 0.5), Gp);
+      const ug = norm(axis); // gate pin -> plates
+      const bn0 = perp(ug);
+      // Plate normal points from the drain side toward the source side.
+      const bn: Px = dot(bn0, sub(Sp, Dp)) < 0 ? [-bn0[0], -bn0[1]] : bn0;
+      const axLen = Math.max(mag(axis), s * 0.5);
+      const gateC = add(Gp, ug, axLen * 0.4); // gate plate center
+      const chC = add(gateC, ug, s * 0.17); // channel plate center (after gap)
+      const halfCh = s * 0.55;
+      stroke(ctx, voltageColor(v(0)), [Gp, gateC]);
+      stroke(ctx, '#c9c9d4', [add(gateC, bn, s * 0.42), add(gateC, bn, -s * 0.42)]);
+      for (const [k0, k1] of [[-1, -0.4], [-0.22, 0.22], [0.4, 1]] as const) {
+        stroke(ctx, '#c9c9d4', [add(chC, bn, halfCh * k0), add(chC, bn, halfCh * k1)]);
       }
+      // Legs: channel end -> perpendicular stub -> across -> pin.
+      const legOf = (Q: Px, end: number): { pts: Px[]; stub: [Px, Px] } => {
+        const dp = dot(sub(Q, chC), bn);
+        const da = Math.max(dot(sub(Q, chC), ug), s * 0.2);
+        const root = add(chC, bn, end * halfCh);
+        const run = Math.min(s * 0.5, da * 0.6);
+        const k1 = add(root, ug, run);
+        const k2 = add(add(chC, bn, dp), ug, run);
+        return { pts: [root, k1, k2, Q], stub: [root, k1] };
+      };
+      const dl = legOf(Dp, -1);
+      const sl = legOf(Sp, 1);
+      stroke(ctx, voltageColor(v(1)), dl.pts);
+      stroke(ctx, voltageColor(v(2)), sl.pts);
+      // Source-leg arrow: into the channel for NMOS, out of it for PMOS.
+      const nmos = e.kind.t === 'Nmos';
+      const stubLen = mag(sub(sl.stub[1], sl.stub[0]));
+      const asize = Math.min(s * 0.22, Math.max(s * 0.09, stubLen * 0.6));
+      arrowHead(
+        ctx,
+        lerp(sl.stub[0], sl.stub[1], nmos ? 0.12 : 0.9),
+        nmos ? [-ug[0], -ug[1]] : ug,
+        asize,
+        voltageColor(v(2)),
+      );
+      // The gate draws no current, so only the conducting legs get dots.
       const idd = iPin(1);
-      drawDots(ctx, cam, Dp, Sp, d.dots.advance(e.id, idd, d.dtSec), idd);
+      drawDotsPath(ctx, cam, [...dl.pts].reverse(), d.dots.advance(e.id, idd, d.dtSec), idd);
+      drawDotsPath(ctx, cam, sl.pts, d.dots.advance(e.id + 1_000_000, idd, d.dtSec), idd);
       break;
     }
     case 'OpAmp':
     case 'Ota': {
+      // Classic proportions: back-edge height comes from the input-pin
+      // spacing (2 grid units -> 2.3 units tall) and the length is 1.3x the
+      // height. Anything left over becomes the output lead.
       const [Pp, Mp, Op] = [P[0]!, P[1]!, P[2]!];
       const back = lerp(Pp, Mp, 0.5);
-      const pmDir = norm(sub(Pp, Mp));
-      const half = Math.max(s * 0.9, mag(sub(Pp, Mp)) * 0.75);
+      const inSpan = mag(sub(Pp, Mp));
+      const pmDir = inSpan > 1e-6 ? norm(sub(Pp, Mp)) : perp(norm(sub(Op, back)));
+      const axVec = sub(Op, back);
+      const axDist = mag(axVec);
+      const uo = axDist > 1e-6 ? norm(axVec) : perp(pmDir);
+      // Height from the input spacing, but never so tall that the 1.3:1
+      // body would overshoot the output pin.
+      const half = Math.max(s * 0.45, Math.min(inSpan * 0.575, axDist / 2.6));
+      const triLen = Math.max(s * 0.5, Math.min(axDist, half * 2.6));
+      const apex = add(back, uo, triLen);
       const v1 = add(back, pmDir, half);
       const v2 = add(back, pmDir, -half);
+      // Input leads, for placements whose pins sit outside the back edge.
+      for (const [k, Q] of [[0, Pp], [1, Mp]] as const) {
+        const dp = dot(sub(Q, back), pmDir);
+        const edge = add(back, pmDir, Math.max(-half * 0.8, Math.min(half * 0.8, dp)));
+        if (mag(sub(edge, Q)) > s * 0.05) stroke(ctx, voltageColor(v(k)), [Q, edge]);
+      }
+      // Output lead for the axial slack the triangle does not use.
+      const io = -iPin(2); // current leaving the output pin
+      if (axDist - triLen > s * 0.02) {
+        stroke(ctx, voltageColor(v(2)), [apex, Op]);
+        drawDots(ctx, cam, apex, Op, d.dots.advance(e.id, io, d.dtSec), io);
+      } else {
+        d.dots.advance(e.id, io, d.dtSec);
+      }
       ctx.fillStyle = '#181820';
       ctx.strokeStyle = '#c9c9d4';
       ctx.beginPath();
       ctx.moveTo(...v1);
       ctx.lineTo(...v2);
-      ctx.lineTo(...Op);
+      ctx.lineTo(...apex);
       ctx.closePath();
       ctx.fill();
       ctx.stroke();
+      // +/- inside the triangle, next to their inputs.
+      ctx.save();
       ctx.fillStyle = '#c9c9d4';
-      ctx.font = `${Math.round(s * 0.32)}px ui-monospace`;
-      const inset = add(back, norm(sub(Op, back)), s * 0.22);
-      ctx.fillText('+', inset[0] + (Pp[0] - back[0]) * 0.55 - s * 0.1, inset[1] + (Pp[1] - back[1]) * 0.55 + s * 0.1);
-      ctx.fillText('−', inset[0] + (Mp[0] - back[0]) * 0.55 - s * 0.1, inset[1] + (Mp[1] - back[1]) * 0.55 + s * 0.1);
+      ctx.font = `${Math.round(Math.min(s * 0.3, half * 0.42))}px ui-monospace`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      const inset = add(back, uo, Math.min(s * 0.34, triLen * 0.2));
+      const lab = Math.min(half * 0.55, s * 0.62);
+      ctx.fillText('+', ...add(inset, pmDir, lab));
+      ctx.fillText('−', ...add(inset, pmDir, -lab));
+      ctx.restore();
       if (e.kind.t === 'Ota' && P[3]) {
         // Bias lead into the triangle's belly; a double bar marks the
         // current-output nature.
-        const center = lerp(back, Op, 0.45);
-        stroke(ctx, voltageColor(v(3)), [P[3]!, center]);
-        const uo = norm(sub(Op, back));
+        stroke(ctx, voltageColor(v(3)), [P[3]!, lerp(back, apex, 0.45)]);
         const no = perp(uo);
         ctx.strokeStyle = '#c9c9d4';
         for (const k of [0.62, 0.74]) {
-          const c = lerp(back, Op, k);
+          const c = lerp(back, apex, k);
+          const h = half * (1 - k) * 0.8;
           ctx.beginPath();
-          ctx.moveTo(...add(c, no, s * 0.16));
-          ctx.lineTo(...add(c, no, -s * 0.16));
+          ctx.moveTo(...add(c, no, h));
+          ctx.lineTo(...add(c, no, -h));
           ctx.stroke();
         }
       }
-      const io = iPin(2);
-      drawDots(ctx, cam, Op, add(Op, norm(sub(Op, back)), s * 0.01), d.dots.advance(e.id, io, d.dtSec), 0);
       break;
     }
   }
