@@ -59,6 +59,91 @@
         border-radius: 4px; padding: 4px 0; font: inherit; cursor: pointer;
       }
       #props button:hover { background: #2e2e3c; color: #fff; }
+
+      /* ---- control panels: floating instrument windows (panel.ts) ---- */
+      #panels { position: fixed; inset: 0; pointer-events: none; }
+      .pwin {
+        position: absolute; pointer-events: auto; width: 300px; color: #c9d6de;
+        font: 12px/1.5 ui-monospace, monospace;
+        background: linear-gradient(#232830, #171b21);
+        border: 1px solid #3c4653; border-radius: 8px;
+        box-shadow: 0 10px 28px #000a, inset 0 1px 0 #ffffff14;
+      }
+      .pwin-hd {
+        display: flex; align-items: center; gap: 6px; padding: 5px 6px 5px 8px;
+        cursor: move; border-bottom: 1px solid #2c343d;
+        background: linear-gradient(#2b323c, #212730);
+        border-radius: 7px 7px 0 0;
+      }
+      .pwin-grab { color: #5d6b78; cursor: move; }
+      .pwin-title {
+        flex: 1; min-width: 0; background: transparent; border: 1px solid transparent;
+        border-radius: 3px; color: #dff0f8; font: 600 12px ui-monospace, monospace;
+        letter-spacing: 0.08em; text-transform: uppercase; padding: 1px 4px; outline: none;
+      }
+      .pwin-title:hover { border-color: #3c4653; }
+      .pwin-title:focus { border-color: #4ad4ff; background: #10151a; text-transform: none; }
+      .pwin-x {
+        background: none; border: none; color: #6f8290; font: 15px/1 ui-monospace, monospace;
+        cursor: pointer; padding: 0 3px;
+      }
+      .pwin-x:hover { color: #ff8f8f; }
+      .pwin-body { padding: 4px 0; }
+      .pwin-hint { display: none; padding: 6px 10px 9px; color: #6d7d89; font-size: 11px; }
+      .prow {
+        display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+        padding: 4px 8px 4px 4px; border-bottom: 1px solid #232a32;
+      }
+      .prow:last-child { border-bottom: none; }
+      .prow.dragging { background: #2b3a44; }
+      .prow-grip { color: #4e5c68; cursor: grab; padding: 0 2px; touch-action: none; }
+      .prow-grip:hover { color: #8fa2b0; }
+      .prow-label { flex: 0 0 82px; color: #8ea3b1; font-size: 11px; letter-spacing: 0.04em; }
+      .prow-ctl { flex: 1 1 110px; display: flex; align-items: center; gap: 6px; min-width: 0; }
+      .prow-val {
+        flex: 0 0 auto; min-width: 76px; text-align: right; color: #cfe3ee;
+        font-variant-numeric: tabular-nums;
+      }
+      .pslider { flex: 1 1 auto; min-width: 60px; accent-color: #4ad4ff; }
+      .pnum {
+        width: 62px; background: #0f1419; color: #e8f2f8; border: 1px solid #3c4653;
+        border-radius: 3px; padding: 1px 4px; font: inherit; outline: none;
+      }
+      .pnum:focus { border-color: #4ad4ff; }
+      .ptog {
+        background: #262e37; color: #93a6b3; border: 1px solid #3c4653; border-radius: 3px;
+        font: 10px ui-monospace, monospace; padding: 2px 5px; cursor: pointer; white-space: nowrap;
+      }
+      .ptog:hover { background: #313b46; color: #e6f4fb; }
+      .pknob {
+        position: relative; width: 34px; height: 34px; border-radius: 50%;
+        background: radial-gradient(circle at 35% 30%, #47525f, #1d232a 70%);
+        border: 1px solid #55626f; box-shadow: inset 0 1px 0 #ffffff1c, 0 2px 5px #0008;
+        cursor: ns-resize; touch-action: none; flex: 0 0 auto;
+      }
+      .pknob i {
+        position: absolute; left: 50%; top: 3px; width: 2px; height: 13px; margin-left: -1px;
+        background: #4ad4ff; border-radius: 1px; transform-origin: 50% 14px;
+        box-shadow: 0 0 6px #4ad4ff;
+      }
+      .pswitch {
+        min-width: 52px; background: #262e37; color: #93a6b3; border: 1px solid #3c4653;
+        border-radius: 4px; font: 600 11px ui-monospace, monospace; letter-spacing: 0.1em;
+        padding: 4px 8px; cursor: pointer;
+      }
+      .pswitch:hover { background: #313b46; }
+      .pswitch.on {
+        background: #14463a; color: #7dffb0; border-color: #2f7f63;
+        box-shadow: inset 0 0 10px #7dffb033;
+      }
+      .pdot {
+        width: 16px; height: 16px; border-radius: 50%; background: #ffd66b;
+        border: 1px solid #00000055; flex: 0 0 auto;
+      }
+      .pseg {
+        font: 700 15px/1.1 ui-monospace, monospace; letter-spacing: 0.06em;
+        font-variant-numeric: tabular-nums; text-shadow: 0 0 9px currentColor;
+      }
     </style>
   </head>
   <body>
@@ -67,6 +152,7 @@
     <div id="tip"></div>
     <div id="scope"><canvas id="scopecv"></canvas></div>
     <div id="props"></div>
+    <div id="panels"></div>
     <button id="pbtn">+ part&nbsp;&nbsp;(/)</button>
     <div id="palette">
       <input id="psearch" placeholder="search parts…" autocomplete="off" />

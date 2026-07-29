@@ -16,6 +16,8 @@
 //   1 / 2                 voltage probe / current clamp at hover
 //   0                     set selected V-probe's reference (differential)
 //   O                     drop an in-place oscilloscope;  X delete;  / palette
+//   J                     drag a control-panel region around some parts
+//                         (its floating instrument window follows)
 //   wheel zoom (over a scope: timebase) · middle/right/space drag pan
 
 import init, { Sim } from './wasm/sim_wasm';
@@ -32,6 +34,16 @@ import {
 } from './circuit';
 import { CATALOG, makePins, searchParts, type PartDef } from './catalog';
 import { connect } from './net';
+import {
+  applyPanelOp,
+  drawPanelGhost,
+  drawPanelRegions,
+  normPanelRect,
+  PanelHost,
+  panelZoneAt,
+  type Panel,
+  type PanelOp,
+} from './panel';
 import { DotFlow, drawElement, hitTest, type Camera } from './render';
 import { probeColor, renderScope, renderScopeInto, TraceStore, type Probe } from './scope';
 
@@ -73,6 +85,9 @@ let myId = -1;
 const cursors = new Map<number, { x: number; y: number; seen: number }>();
 
 let probes: Probe[] = [];
+/** Shared control-panel regions (room-scoped, like probes). */
+let panels: Panel[] = [];
+let localPlidCounter = 1;
 const traces = new TraceStore();
 let localPidCounter = 1;
 let scopeTimebase = 5; // docked panel, seconds across
@@ -133,11 +148,12 @@ const newId = () => (myId > 0 ? myId : 999) * 1_000_000 + idCounter++;
 
 let firstHello = true;
 const net = connect({
-  onHello(you, serverElements, serverProbes) {
+  onHello(you, serverElements, serverProbes, serverPanels) {
     online = true;
     myId = you;
     elements = serverElements;
     probes = serverProbes;
+    panels = serverPanels;
     live = new Map();
     if (firstHello) {
       firstHello = false;
@@ -171,6 +187,9 @@ const net = connect({
     traces.prune(alive);
     if (selectedProbe !== null && !alive.has(selectedProbe)) selectedProbe = null;
     for (const s of floatScopes) if (s.pids) s.pids = s.pids.filter((pid) => alive.has(pid));
+  },
+  onPanels(list) {
+    panels = list;
   },
   onSamples(t0, dts, s) {
     for (const [pid, samples] of Object.entries(s)) {
@@ -223,6 +242,31 @@ function setProbeRef(pid: number, elem: number, pin: number) {
   if (!p) return;
   p.r = p.r && p.r[0] === elem && p.r[1] === pin ? null : [elem, pin];
 }
+
+/** Panels are room state: online the server owns the list (its broadcast is
+ * the truth), offline we apply the same rules locally. */
+function panelOp(op: PanelOp) {
+  if (online) {
+    net.sendPanel(op);
+    return;
+  }
+  panels = applyPanelOp(panels, op, () => {
+    // Never reuse a plid a restored/server panel already holds.
+    for (const p of panels) localPlidCounter = Math.max(localPlidCounter, p.plid + 1);
+    return localPlidCounter++;
+  });
+}
+
+/** The floating instrument windows. panel.ts owns all DOM and widget logic;
+ * we only hand it the shared list, the document, the live frame and the
+ * interact path. */
+const panelHost = new PanelHost({
+  elements: () => elements,
+  live: () => live,
+  probes: () => probes,
+  interact: (e, op) => interact(e, op),
+  op: panelOp,
+});
 
 function nearestPin(e: ElementSpec, x: number, y: number): number {
   let best = 0;
@@ -621,6 +665,18 @@ let moveDrag: {
 } | null = null;
 let scopeDrag: { s: FloatScope; dx: number; dy: number } | null = null;
 let scopeResize: { s: FloatScope } | null = null;
+/** J tool: dragging out a new control-panel region. */
+let panelTool = false;
+let panelDrag: { a: Point; b: Point } | null = null;
+/** Dragging an existing region by its name tab. */
+let panelMove: {
+  plid: number;
+  dx: number;
+  dy: number;
+  w: number;
+  h: number;
+  lastSent: number;
+} | null = null;
 let spaceHeld = false;
 let lastCursorSent = 0;
 
@@ -645,6 +701,11 @@ canvas.addEventListener('pointerdown', (ev) => {
     panDrag = { x: ev.clientX, y: ev.clientY, ox: cam.ox, oy: cam.oy };
     return;
   }
+  if (panelTool) {
+    const p = snap(ev.clientX, ev.clientY);
+    panelDrag = { a: p, b: p };
+    return;
+  }
   if (pasting) {
     commitPaste(snap(ev.clientX, ev.clientY));
     return;
@@ -667,6 +728,24 @@ canvas.addEventListener('pointerdown', (ev) => {
       scopeDrag = { s: z.s, dx: gx - z.s.x, dy: gy - z.s.y };
     } else if (z.zone === 'resize') {
       scopeResize = { s: z.s };
+    }
+    return;
+  }
+  // Panel name tabs: × deletes the region, the tab itself drags it.
+  const pz = panelZoneAt(cam, panels, ev.clientX, ev.clientY);
+  if (pz) {
+    if (pz.zone === 'close') {
+      panelOp({ t: 'remove', plid: pz.panel.plid });
+    } else {
+      const [gx, gy] = toGrid(ev.clientX, ev.clientY);
+      panelMove = {
+        plid: pz.panel.plid,
+        dx: gx - pz.panel.x0,
+        dy: gy - pz.panel.y0,
+        w: pz.panel.x1 - pz.panel.x0,
+        h: pz.panel.y1 - pz.panel.y0,
+        lastSent: 0,
+      };
     }
     return;
   }
@@ -761,6 +840,23 @@ canvas.addEventListener('pointermove', (ev) => {
     scopeResize.s.h = Math.max(4, Math.round(gy - scopeResize.s.y));
     return;
   }
+  if (panelDrag) {
+    panelDrag.b = snap(ev.clientX, ev.clientY);
+    return;
+  }
+  if (panelMove) {
+    const [gx, gy] = toGrid(ev.clientX, ev.clientY);
+    const x0 = Math.round(gx - panelMove.dx);
+    const y0 = Math.round(gy - panelMove.dy);
+    const rect = { x0, y0, x1: x0 + panelMove.w, y1: y0 + panelMove.h };
+    const p = panels.find((q) => q.plid === panelMove!.plid);
+    if (p) Object.assign(p, rect); // optimistic; the broadcast confirms
+    if (now - panelMove.lastSent > 60) {
+      panelMove.lastSent = now;
+      panelOp({ t: 'rect', plid: panelMove.plid, ...rect });
+    }
+    return;
+  }
   if (marquee) {
     marquee.x1 = ev.clientX;
     marquee.y1 = ev.clientY;
@@ -810,7 +906,7 @@ canvas.addEventListener('pointermove', (ev) => {
   }
   const z = scopeZoneAt(ev.clientX, ev.clientY);
   const over = z ? undefined : elementAt(ev.clientX, ev.clientY);
-  canvas.style.cursor = placing || pasting
+  canvas.style.cursor = placing || pasting || panelTool
     ? 'crosshair'
     : z
       ? z.zone === 'title'
@@ -834,6 +930,23 @@ canvas.addEventListener('pointerup', (ev) => {
   if (scopeDrag || scopeResize) {
     scopeDrag = null;
     scopeResize = null;
+    return;
+  }
+  if (panelDrag) {
+    const r = normPanelRect(panelDrag.a, panelDrag.b);
+    panelDrag = null;
+    if (r) {
+      // One region per arming; a stray click leaves the tool armed.
+      panelTool = false;
+      canvas.style.cursor = 'default';
+      panelOp({ t: 'add', x0: r[0], y0: r[1], x1: r[2], y1: r[3] });
+    }
+    return;
+  }
+  if (panelMove) {
+    const p = panels.find((q) => q.plid === panelMove!.plid);
+    if (p) panelOp({ t: 'rect', plid: p.plid, x0: p.x0, y0: p.y0, x1: p.x1, y1: p.y1 });
+    panelMove = null;
     return;
   }
   if (marquee) {
@@ -899,6 +1012,7 @@ canvas.addEventListener('pointerleave', () => (mouse = null));
 
 window.addEventListener('keydown', (ev) => {
   if (ev.target === psearch || (ev.target instanceof Node && propsDiv.contains(ev.target))) return;
+  if (panelHost.owns(ev.target)) return; // typing in a panel window
 
   // Clipboard first: ⌘/Ctrl+C copies, ⌘/Ctrl+V arms pasting at the cursor.
   if (ev.metaKey || ev.ctrlKey) {
@@ -930,10 +1044,21 @@ window.addEventListener('keydown', (ev) => {
   if (ev.key === 'Escape') {
     placing = null;
     pasting = null;
+    panelTool = false;
+    panelDrag = null;
     selectedIds.clear();
     selectedProbe = null;
     closePalette();
     canvas.style.cursor = 'default';
+    return;
+  }
+  if (ev.key === 'j' || ev.key === 'J') {
+    // Arm the panel tool: drag a region around the parts you want on a
+    // control panel. Its window appears as soon as the region exists.
+    panelTool = true;
+    placing = null;
+    pasting = null;
+    canvas.style.cursor = 'crosshair';
     return;
   }
   if (ev.key === 'Delete' || ev.key === 'Backspace' || ev.key === 'x') {
@@ -1260,6 +1385,11 @@ function frame(now: number) {
     }
   }
 
+  // Panel regions sit under the schematic: they frame parts, never hide them.
+  const pzHover = mouse ? panelZoneAt(cam, panels, mouse.x, mouse.y) : null;
+  drawPanelRegions(ctx, cam, panels, pzHover?.panel.plid ?? panelMove?.plid ?? null);
+  if (panelDrag) drawPanelGhost(ctx, cam, panelDrag.a, panelDrag.b);
+
   for (const e of elements) {
     drawElement({ ctx, cam, live: live.get(e.id), dots, dtSec: wallDt }, e);
   }
@@ -1267,7 +1397,7 @@ function frame(now: number) {
   // Hover highlight (blue element + pin dots), Falstad-style.
   const zHover = mouse ? scopeZoneAt(mouse.x, mouse.y) : null;
   const hover =
-    mouse && !valueDrag && !moveDrag && !placing && !pasting && !zHover
+    mouse && !valueDrag && !moveDrag && !placing && !pasting && !panelTool && !zHover
       ? elementAt(mouse.x, mouse.y)
       : valueDrag?.e;
   if (hover) drawHighlight(hover, true);
@@ -1331,6 +1461,9 @@ function frame(now: number) {
   drawFloatScopes();
   drawCursors(now);
   syncPropsPanel();
+  // Panel windows are HTML overlays: re-derive members and refresh every
+  // widget from this frame's solver values.
+  panelHost.tick(panels);
 
   if (probes.length > 0) {
     scopeDiv.style.display = 'block';
@@ -1356,18 +1489,20 @@ function frame(now: number) {
     tip.style.display = 'none';
   }
 
-  const mode = pasting
-    ? `pasting ${pasting.length} parts (Q rotates, click places, Esc cancels)`
-    : placing
-      ? `placing: ${placing.name} (click or drag, Q rotates, Esc exits)`
-      : selectedIds.size > 1
-        ? `${selectedIds.size} selected (drag moves, Q rotates, ⌘C copies, X deletes)`
-        : '';
+  const mode = panelTool
+    ? 'control panel: drag a region around the parts you want on it (Esc cancels)'
+    : pasting
+      ? `pasting ${pasting.length} parts (Q rotates, click places, Esc cancels)`
+      : placing
+        ? `placing: ${placing.name} (click or drag, Q rotates, Esc exits)`
+        : selectedIds.size > 1
+          ? `${selectedIds.size} selected (drag moves, Q rotates, ⌘C copies, X deletes)`
+          : '';
   hud.textContent =
     `EE Game   sim t = ${simTime.toFixed(2)} s   ` +
     (online ? `● ONLINE — ${population} player${population === 1 ? '' : 's'}` : '○ offline (local sim)') +
     (mode ? `   ${mode}` : '') +
-    `\nparts: R C L W G V D N P M A U S B T Z E F I · Q rotate · drag pin = wire · drag empty = select · ⌘C/⌘V copy/paste · 1/2 probe · 0 ref · O scope · X delete · / search`;
+    `\nparts: R C L W G V D N P M A U S B T Z E F I · Q rotate · drag pin = wire · drag empty = select · ⌘C/⌘V copy/paste · 1/2 probe · 0 ref · O scope · J panel · X delete · / search`;
 
   requestAnimationFrame(frame);
 }
