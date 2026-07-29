@@ -2,6 +2,7 @@
 // server answers, main.ts falls back to the local WASM sim.
 
 import type { DocOp, ElementSpec, InteractOp } from './circuit';
+import type { Panel, PanelOp } from './panel';
 import type { Probe } from './scope';
 
 export interface ServerFrame {
@@ -11,11 +12,12 @@ export interface ServerFrame {
 }
 
 export interface NetHandlers {
-  onHello(you: number, elements: ElementSpec[], probes: Probe[]): void;
+  onHello(you: number, elements: ElementSpec[], probes: Probe[], panels: Panel[]): void;
   onFrame(f: ServerFrame): void;
   onOp(id: number, op: InteractOp): void;
   onDoc(op: DocOp): void;
   onProbes(list: Probe[]): void;
+  onPanels(list: Panel[]): void;
   onSamples(t0: number, dts: number, s: Record<string, number[]>): void;
   onPresence(n: number): void;
   onCursor(who: number, x: number, y: number): void;
@@ -27,6 +29,7 @@ export interface Net {
   sendEdit(op: DocOp): void;
   sendProbe(elem: number, pin: number, kind: 'v' | 'i'): void;
   sendProbeRef(pid: number, elem: number, pin: number): void;
+  sendPanel(op: PanelOp): void;
   sendCursor(x: number, y: number): void;
 }
 
@@ -55,7 +58,7 @@ export function connect(h: NetHandlers): Net {
     const m = JSON.parse(ev.data as string);
     switch (m.t) {
       case 'hello':
-        h.onHello(m.you, m.elements, m.probes ?? []);
+        h.onHello(m.you, m.elements, m.probes ?? [], m.panels ?? []);
         break;
       case 'frame':
         h.onFrame(m);
@@ -68,6 +71,9 @@ export function connect(h: NetHandlers): Net {
         break;
       case 'probes':
         h.onProbes(m.list);
+        break;
+      case 'panels':
+        h.onPanels(m.list ?? []);
         break;
       case 'samples':
         h.onSamples(m.t0, m.dts, m.s);
@@ -91,6 +97,7 @@ export function connect(h: NetHandlers): Net {
     sendEdit: (op) => send({ t: 'edit', op }),
     sendProbe: (elem, pin, kind) => send({ t: 'probe', elem, pin, kind }),
     sendProbeRef: (pid, elem, pin) => send({ t: 'proberef', pid, elem, pin }),
+    sendPanel: (op) => send({ t: 'panel', op }),
     sendCursor: (x, y) => send({ t: 'cursor', x, y }),
   };
 }
