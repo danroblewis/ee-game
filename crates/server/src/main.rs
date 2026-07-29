@@ -597,7 +597,8 @@ fn apply_to_specs(room: &Room, id: u32, op: InteractOp) {
         (InteractOp::SetSwitch { closed }, K::Switch { closed: c })
         | (InteractOp::SetSwitch { closed }, K::Button { closed: c }) => *c = closed,
         (InteractOp::SetValue { value }, K::Resistor { ohms })
-        | (InteractOp::SetValue { value }, K::Lamp { ohms, .. }) => *ohms = value.max(1e-6),
+        | (InteractOp::SetValue { value }, K::Lamp { ohms, .. })
+        | (InteractOp::SetValue { value }, K::Speaker { ohms }) => *ohms = value.max(1e-6),
         (InteractOp::SetValue { value }, K::Capacitor { farads }) => *farads = value.max(1e-15),
         (InteractOp::SetValue { value }, K::Inductor { henries }) => *henries = value.max(1e-12),
         (InteractOp::SetValue { value }, K::VoltageSource { dc, .. }) => *dc = value,

@@ -27,6 +27,14 @@ pub enum ElementKind {
         ohms: f64,
         rated_watts: f64,
     },
+    /// A loudspeaker: electrically just its voice-coil resistance, so it is
+    /// stamped exactly like a `Resistor`. `ohms` is the nominal impedance
+    /// (8 Ω typical). Nothing here makes sound — the client's "listen"
+    /// probe plays the solver's own node waveform through WebAudio, so what
+    /// you hear is the simulation, not a sound effect.
+    Speaker {
+        ohms: f64,
+    },
     Capacitor {
         farads: f64,
     },
