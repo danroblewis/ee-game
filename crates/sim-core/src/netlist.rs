@@ -174,9 +174,22 @@ impl ElementSpec {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(tag = "t"))]
 pub enum DocOp {
-    Add { spec: ElementSpec },
-    Remove { id: u32 },
-    Move { id: u32, pins: Vec<Point> },
+    Add {
+        spec: ElementSpec,
+    },
+    Remove {
+        id: u32,
+    },
+    Move {
+        id: u32,
+        pins: Vec<Point>,
+    },
+    /// Reconfigure a part's parameters (the properties-panel path). The
+    /// new kind must keep the same pin count.
+    SetKind {
+        id: u32,
+        kind: ElementKind,
+    },
 }
 
 /// Interactions that mutate a live element without a recompile-worthy edit.

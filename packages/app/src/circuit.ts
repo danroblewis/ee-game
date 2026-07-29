@@ -35,7 +35,8 @@ export type InteractOp =
 export type DocOp =
   | { t: 'Add'; spec: ElementSpec }
   | { t: 'Remove'; id: number }
-  | { t: 'Move'; id: number; pins: Point[] };
+  | { t: 'Move'; id: number; pins: Point[] }
+  | { t: 'SetKind'; id: number; kind: ElementKind };
 
 /** Pin labels for tooltips, by kind. */
 export function pinLabels(kind: ElementKind): string[] {

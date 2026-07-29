@@ -4,3 +4,5 @@ dist/
 *.wasm.d.ts
 packages/app/src/wasm/
 .DS_Store
+
+room-save.json

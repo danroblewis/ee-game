@@ -26,14 +26,32 @@ export interface Net {
   sendInteract(id: number, op: InteractOp): void;
   sendEdit(op: DocOp): void;
   sendProbe(elem: number, pin: number, kind: 'v' | 'i'): void;
+  sendProbeRef(pid: number, elem: number, pin: number): void;
   sendCursor(x: number, y: number): void;
 }
 
+const RECONNECT_MS = 2500;
+
+/** Connect with automatic reconnection: a server restart mid-session
+ * drops the client to the local sim, then transparently rejoins. */
 export function connect(h: NetHandlers): Net {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(`${proto}://${location.host}/ws`);
+  let ws: WebSocket | null = null;
+  let wasOpen = false;
 
-  ws.onmessage = (ev) => {
+  const open = () => {
+    ws = new WebSocket(`${proto}://${location.host}/ws`);
+    ws.onopen = () => (wasOpen = true);
+    ws.onclose = () => {
+      if (wasOpen) h.onClose();
+      wasOpen = false;
+      setTimeout(open, RECONNECT_MS);
+    };
+    ws.onerror = () => ws?.close();
+    ws.onmessage = onMessage;
+  };
+
+  const onMessage = (ev: MessageEvent) => {
     const m = JSON.parse(ev.data as string);
     switch (m.t) {
       case 'hello':
@@ -62,16 +80,17 @@ export function connect(h: NetHandlers): Net {
         break;
     }
   };
-  ws.onclose = () => h.onClose();
-  ws.onerror = () => ws.close();
+
+  open();
 
   const send = (o: unknown) => {
-    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(o));
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(o));
   };
   return {
     sendInteract: (id, op) => send({ t: 'interact', id, op }),
     sendEdit: (op) => send({ t: 'edit', op }),
     sendProbe: (elem, pin, kind) => send({ t: 'probe', elem, pin, kind }),
+    sendProbeRef: (pid, elem, pin) => send({ t: 'proberef', pid, elem, pin }),
     sendCursor: (x, y) => send({ t: 'cursor', x, y }),
   };
 }

@@ -7,6 +7,8 @@ export interface Probe {
   elem: number;
   pin: number;
   kind: 'v' | 'i';
+  /** Differential reference [elem, pin]; absent/null = ground-referenced. */
+  r?: [number, number] | null;
 }
 
 export const PROBE_COLORS = [
@@ -128,6 +130,7 @@ function windowStats(a: number[], t0: number, t1: number): TraceStats | null {
   return { last, min, max, mean, freq };
 }
 
+/** Docked-panel entry point: render into a whole `<canvas>` element. */
 export function renderScope(
   canvas: HTMLCanvasElement,
   store: TraceStore,
@@ -144,7 +147,28 @@ export function renderScope(
   }
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, W, H);
+  renderScopeInto(ctx, 0, 0, W, H, store, probes, timebase);
+}
 
+/** Render traces into an arbitrary rect of an existing context (used by
+ * both the docked panel and the in-place floating scopes). */
+export function renderScopeInto(
+  ctx: CanvasRenderingContext2D,
+  X: number,
+  Y: number,
+  W: number,
+  H: number,
+  store: TraceStore,
+  probes: Probe[],
+  timebase: number,
+) {
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(X, Y, W, H);
+  ctx.clip();
+  ctx.translate(X, Y);
+
+  const compact = H < 80 || W < 180;
   const tNow = store.maxTime();
   const t0 = tNow - timebase;
 
@@ -165,8 +189,10 @@ export function renderScope(
   ctx.stroke();
 
   ctx.font = '11px ui-monospace, monospace';
-  ctx.fillStyle = '#6a6a78';
-  ctx.fillText(`${fmtSI(timebase / 10, 's')}/div`, W - 78, H - 6);
+  if (!compact) {
+    ctx.fillStyle = '#6a6a78';
+    ctx.fillText(`${fmtSI(timebase / 10, 's')}/div`, W - 78, H - 6);
+  }
 
   let labelX = 10;
   probes.forEach((p) => {
@@ -228,10 +254,11 @@ export function renderScope(
       ctx.stroke();
 
       // measurement chips
-      const name = `${p.kind.toUpperCase()}${p.pid}`;
-      const label =
-        `${name} ${fmtSI(stats.last, unit)}  pp ${fmtSI(stats.max - stats.min, unit)}` +
-        (stats.freq > 0.05 ? `  ${stats.freq.toFixed(stats.freq < 10 ? 2 : 0)} Hz` : '');
+      const name = `${p.kind.toUpperCase()}${p.pid}${p.r ? 'Δ' : ''}`;
+      const label = compact
+        ? `${name} ${fmtSI(stats.last, unit)}`
+        : `${name} ${fmtSI(stats.last, unit)}  pp ${fmtSI(stats.max - stats.min, unit)}` +
+          (stats.freq > 0.05 ? `  ${stats.freq.toFixed(stats.freq < 10 ? 2 : 0)} Hz` : '');
       ctx.fillStyle = color;
       ctx.fillText(label, labelX, 14);
       labelX += ctx.measureText(label).width + 18;
@@ -241,4 +268,5 @@ export function renderScope(
       labelX += 60;
     }
   });
+  ctx.restore();
 }

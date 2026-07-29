@@ -143,6 +143,9 @@ struct Probe {
     elem: u32,
     pin: usize,
     kind: ProbeKind,
+    /// Optional reference point for differential voltage measurement:
+    /// the trace shows v(pin) - v(ref). None = referenced to ground.
+    r: Option<(u32, usize)>,
 }
 
 /// Sim substeps between waveform samples: dt=20 µs × 16 → 3.125 kHz
@@ -163,6 +166,11 @@ enum Cmd {
         pin: usize,
         kind: ProbeKind,
     },
+    ProbeRef {
+        pid: u32,
+        elem: u32,
+        pin: usize,
+    },
     Join,
     Leave,
 }
@@ -178,21 +186,91 @@ struct Room {
     next_client: AtomicU32,
     next_pid: AtomicU32,
     population: AtomicU32,
+    /// Set when the document changes; the sim task checkpoints to disk.
+    dirty: std::sync::atomic::AtomicBool,
+}
+
+/// Room checkpoint: the document and probes survive server restarts (the
+/// continuous electrical state re-settles within milliseconds).
+#[derive(serde::Serialize, Deserialize)]
+struct SaveFile {
+    elements: Vec<ElementSpec>,
+    #[serde(default)]
+    probes: Vec<SavedProbe>,
+    #[serde(default)]
+    next_pid: u32,
+}
+
+#[derive(serde::Serialize, Deserialize)]
+struct SavedProbe {
+    pid: u32,
+    elem: u32,
+    pin: usize,
+    kind: ProbeKind,
+    #[serde(default)]
+    r: Option<(u32, usize)>,
+}
+
+fn save_path() -> String {
+    std::env::var("EE_SAVE").unwrap_or_else(|_| "room-save.json".into())
+}
+
+fn load_room() -> Option<SaveFile> {
+    let data = std::fs::read_to_string(save_path()).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
+fn checkpoint(room: &Room) {
+    let save = SaveFile {
+        elements: room.elements.lock().unwrap().clone(),
+        probes: room
+            .probes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|p| SavedProbe {
+                pid: p.pid,
+                elem: p.elem,
+                pin: p.pin,
+                kind: p.kind,
+                r: p.r,
+            })
+            .collect(),
+        next_pid: room.next_pid.load(Ordering::Relaxed),
+    };
+    if let Ok(json) = serde_json::to_string(&save) {
+        let path = save_path();
+        let tmp = format!("{path}.tmp");
+        if std::fs::write(&tmp, json).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
 }
 
 /// The sim task: sole owner of the Engine. Ops apply between ticks —
 /// the "tick boundary" rule from the plan, at demo scale.
 async fn sim_task(room: Arc<Room>, mut cmds: mpsc::UnboundedReceiver<Cmd>) {
     let mut eng = Engine::new(DT);
-    eng.set_elements(&demo_room_circuit());
+    {
+        let elems = room.elements.lock().unwrap().clone();
+        eng.set_elements(&elems);
+    }
 
     let tick = std::time::Duration::from_secs_f64(1.0 / TICK_HZ);
     let mut interval = tokio::time::interval(tick);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let steps_per_tick = ((1.0 / TICK_HZ) / DT).round() as u32;
+    let mut ticks_since_save: u32 = 0;
 
     loop {
         interval.tick().await;
+
+        // Checkpoint the document every ~5 s when it has changed.
+        ticks_since_save += 1;
+        if ticks_since_save >= 150 && room.dirty.swap(false, Ordering::Relaxed) {
+            ticks_since_save = 0;
+            checkpoint(&room);
+        }
 
         while let Ok(cmd) = cmds.try_recv() {
             match cmd {
@@ -205,6 +283,7 @@ async fn sim_task(room: Arc<Room>, mut cmds: mpsc::UnboundedReceiver<Cmd>) {
                 }
                 Cmd::Edit { op } => {
                     if apply_doc_op(&room, &op) {
+                        room.dirty.store(true, Ordering::Relaxed);
                         let elems = room.elements.lock().unwrap().clone();
                         eng.set_elements(&elems); // continuous state survives by id
                                                   // Probes on a removed element die with it.
@@ -212,7 +291,14 @@ async fn sim_task(room: Arc<Room>, mut cmds: mpsc::UnboundedReceiver<Cmd>) {
                             let mut probes = room.probes.lock().unwrap();
                             let before = probes.len();
                             probes.retain(|p| p.elem != *id);
-                            if probes.len() != before {
+                            let mut ref_cleared = false;
+                            for p in probes.iter_mut() {
+                                if matches!(p.r, Some((e, _)) if e == *id) {
+                                    p.r = None;
+                                    ref_cleared = true;
+                                }
+                            }
+                            if probes.len() != before || ref_cleared {
                                 let _ = room
                                     .events
                                     .send(json!({"t": "probes", "list": *probes}).to_string());
@@ -223,6 +309,7 @@ async fn sim_task(room: Arc<Room>, mut cmds: mpsc::UnboundedReceiver<Cmd>) {
                 }
                 Cmd::Probe { elem, pin, kind } => {
                     let mut probes = room.probes.lock().unwrap();
+                    room.dirty.store(true, Ordering::Relaxed);
                     if let Some(k) = probes
                         .iter()
                         .position(|p| p.elem == elem && p.pin == pin && p.kind == kind)
@@ -242,11 +329,26 @@ async fn sim_task(room: Arc<Room>, mut cmds: mpsc::UnboundedReceiver<Cmd>) {
                             elem,
                             pin,
                             kind,
+                            r: None,
                         });
                     }
                     let _ = room
                         .events
                         .send(json!({"t": "probes", "list": *probes}).to_string());
+                }
+                Cmd::ProbeRef { pid, elem, pin } => {
+                    let mut probes = room.probes.lock().unwrap();
+                    room.dirty.store(true, Ordering::Relaxed);
+                    if let Some(p) = probes.iter_mut().find(|p| p.pid == pid) {
+                        // Same point again clears the reference (ground).
+                        p.r = match p.r {
+                            Some((e, n)) if e == elem && n == pin => None,
+                            _ => Some((elem, pin)),
+                        };
+                        let _ = room
+                            .events
+                            .send(json!({"t": "probes", "list": *probes}).to_string());
+                    }
                 }
                 Cmd::Join | Cmd::Leave => {
                     let n = room.population.load(Ordering::Relaxed);
@@ -276,7 +378,14 @@ async fn sim_task(room: Arc<Room>, mut cmds: mpsc::UnboundedReceiver<Cmd>) {
                 let fr = need_frame.then(|| eng.frame());
                 for (buf, p) in bufs.iter_mut().zip(probes.iter()) {
                     let v = match (p.kind, &fr) {
-                        (ProbeKind::V, _) => eng.pin_voltage(p.elem, p.pin),
+                        (ProbeKind::V, _) => {
+                            let v = eng.pin_voltage(p.elem, p.pin);
+                            // Differential: subtract the reference point.
+                            let vref =
+                                p.r.and_then(|(re, rp)| eng.pin_voltage(re, rp))
+                                    .unwrap_or(0.0);
+                            v.map(|v| v - vref)
+                        }
                         (ProbeKind::I, Some(fr)) => {
                             fr.iter().find(|f| f.id == p.elem).map(|f| f.i[p.pin])
                         }
@@ -383,6 +492,16 @@ fn apply_doc_op(room: &Room, op: &DocOp) -> bool {
             e.pins = pins.clone();
             true
         }
+        DocOp::SetKind { id, kind } => {
+            let Some(e) = elems.iter_mut().find(|e| e.id == *id) else {
+                return false;
+            };
+            if kind.pin_count() != e.pins.len() {
+                return false;
+            }
+            e.kind = *kind;
+            true
+        }
     }
 }
 
@@ -400,6 +519,11 @@ enum ClientMsg {
         elem: u32,
         pin: usize,
         kind: ProbeKind,
+    },
+    ProbeRef {
+        pid: u32,
+        elem: u32,
+        pin: usize,
     },
     Cursor {
         x: f64,
@@ -454,6 +578,9 @@ async fn client_session(mut socket: WebSocket, room: Arc<Room>) {
                         Ok(ClientMsg::Probe { elem, pin, kind }) => {
                             let _ = room.cmds.send(Cmd::Probe { elem, pin, kind });
                         }
+                        Ok(ClientMsg::ProbeRef { pid, elem, pin }) => {
+                            let _ = room.cmds.send(Cmd::ProbeRef { pid, elem, pin });
+                        }
                         Ok(ClientMsg::Cursor { x, y }) => {
                             let _ = room.events.send(
                                 json!({"t": "cursor", "who": me, "x": x, "y": y}).to_string(),
@@ -476,14 +603,41 @@ async fn main() {
 
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (event_tx, _) = broadcast::channel(256);
+    // Restore the room from the last checkpoint; fresh rooms start with
+    // the showcase circuit.
+    let saved = load_room();
+    let (elements, probes, next_pid) = match saved {
+        Some(s) => {
+            tracing::info!(
+                "restored room from {} ({} elements)",
+                save_path(),
+                s.elements.len()
+            );
+            let probes = s
+                .probes
+                .iter()
+                .map(|p| Probe {
+                    pid: p.pid,
+                    elem: p.elem,
+                    pin: p.pin,
+                    kind: p.kind,
+                    r: p.r,
+                })
+                .collect();
+            (s.elements, probes, s.next_pid.max(1))
+        }
+        None => (demo_room_circuit(), Vec::new(), 1),
+    };
+
     let room = Arc::new(Room {
         cmds: cmd_tx,
         events: event_tx,
-        elements: std::sync::Mutex::new(demo_room_circuit()),
-        probes: std::sync::Mutex::new(Vec::new()),
+        elements: std::sync::Mutex::new(elements),
+        probes: std::sync::Mutex::new(probes),
         next_client: AtomicU32::new(1),
-        next_pid: AtomicU32::new(1),
+        next_pid: AtomicU32::new(next_pid),
         population: AtomicU32::new(0),
+        dirty: std::sync::atomic::AtomicBool::new(false),
     });
     tokio::spawn(sim_task(room.clone(), cmd_rx));
 
@@ -493,6 +647,14 @@ async fn main() {
 
     let app = Router::new()
         .route("/ws", get(ws_handler))
+        // Dev-friendly caching: the app shell must always revalidate so a
+        // rebuilt bundle never leaves a stale page pointing at dead hashes.
+        .layer(
+            tower_http::set_header::SetResponseHeaderLayer::if_not_present(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-cache"),
+            ),
+        )
         .fallback_service(static_files)
         .with_state(room);
 

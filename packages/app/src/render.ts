@@ -449,7 +449,8 @@ export function drawElement(d: DrawCtx, e: ElementSpec) {
 
 const dot = (a: Px, b: Px) => a[0] * b[0] + a[1] * b[1];
 
-/** Distance in px from (x, y) to the element (nearest pin-chain segment). */
+/** Distance in px from (x, y) to the element (nearest pin-chain segment;
+ * 3-pin parts also count their body around the centroid). */
 export function hitTest(cam: Camera, e: ElementSpec, x: number, y: number): number {
   const P = e.pins.map((p) => px(cam, p));
   if (P.length === 1) return Math.hypot(x - P[0]![0], y - P[0]![1]);
@@ -464,6 +465,11 @@ export function hitTest(cam: Camera, e: ElementSpec, x: number, y: number): numb
     let t = l2 === 0 ? 0 : ((x - a[0]) * dx + (y - a[1]) * dy) / l2;
     t = Math.max(0, Math.min(1, t));
     best = Math.min(best, Math.hypot(x - (a[0] + t * dx), y - (a[1] + t * dy)));
+  }
+  if (P.length === 3) {
+    const cx = (P[0]![0] + P[1]![0] + P[2]![0]) / 3;
+    const cy = (P[0]![1] + P[1]![1] + P[2]![1]) / 3;
+    best = Math.min(best, Math.max(0, Math.hypot(x - cx, y - cy) - cam.scale * 0.8));
   }
   return best;
 }

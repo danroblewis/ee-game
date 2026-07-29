@@ -9,7 +9,7 @@ sim-core = { path = "../sim-core", features = ["serde"] }
 sim-golden = { path = "../sim-golden" }
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
-tower-http = { version = "0.6", features = ["fs"] }
+tower-http = { version = "0.6", features = ["fs", "set-header"] }
 serde.workspace = true
 serde_json.workspace = true
 tracing = "0.1"
