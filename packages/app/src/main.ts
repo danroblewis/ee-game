@@ -14,6 +14,7 @@
 //   ⌘/Ctrl+C, ⌘/Ctrl+V    copy selection / paste bound to cursor
 //   Q                     rotate placement ghost, paste ghost, or selection
 //   1 / 2                 voltage probe / current clamp at hover
+//   3                     listen: play that node's waveform (WebAudio)
 //   0                     set selected V-probe's reference (differential)
 //   O                     drop an in-place oscilloscope;  X delete;  / palette
 //   wheel zoom (over a scope: timebase) · middle/right/space drag pan
@@ -30,6 +31,7 @@ import {
   type InteractOp,
   type Point,
 } from './circuit';
+import { AudioPlayer } from './audio';
 import { CATALOG, makePins, searchParts, type PartDef } from './catalog';
 import { connect } from './net';
 import { DotFlow, drawElement, hitTest, type Camera } from './render';
@@ -77,6 +79,11 @@ const traces = new TraceStore();
 let localPidCounter = 1;
 let scopeTimebase = 5; // docked panel, seconds across
 
+/** '3' listens to one probe's stream; online the pid arrives with the
+ * server's probe list, so remember what we asked to hear. */
+const audio = new AudioPlayer();
+let listenWanted: { elem: number; pin: number } | null = null;
+
 let selectedIds = new Set<number>();
 let selectedProbe: number | null = null;
 
@@ -104,7 +111,7 @@ localSim.setElements(elements);
 function applyOp(e: ElementSpec, op: InteractOp) {
   if (op.t === 'SetSwitch' && e.kind.t === 'Switch') e.kind.closed = op.closed;
   if (op.t === 'SetValue') {
-    if (e.kind.t === 'Resistor' || e.kind.t === 'Lamp') e.kind.ohms = op.value;
+    if (e.kind.t === 'Resistor' || e.kind.t === 'Lamp' || e.kind.t === 'Speaker') e.kind.ohms = op.value;
     else if (e.kind.t === 'Capacitor') e.kind.farads = op.value;
     else if (e.kind.t === 'Inductor') e.kind.henries = op.value;
     else if (e.kind.t === 'VoltageSource') e.kind.dc = op.value;
@@ -171,10 +178,21 @@ const net = connect({
     traces.prune(alive);
     if (selectedProbe !== null && !alive.has(selectedProbe)) selectedProbe = null;
     for (const s of floatScopes) if (s.pids) s.pids = s.pids.filter((pid) => alive.has(pid));
+    if (listenWanted) {
+      const p = list.find(
+        (x) => x.elem === listenWanted!.elem && x.pin === listenWanted!.pin && x.kind === 'v',
+      );
+      if (p) {
+        listenWanted = null;
+        audio.listen(p.pid);
+      }
+    }
+    if (audio.pid !== null && !alive.has(audio.pid)) audio.stop();
   },
   onSamples(t0, dts, s) {
     for (const [pid, samples] of Object.entries(s)) {
       traces.appendChunk(Number(pid), t0, dts, samples);
+      audio.pushChunk(Number(pid), t0, dts, samples);
     }
   },
   onPresence(n) {
@@ -212,6 +230,26 @@ function toggleProbe(elem: number, pin: number, kind: 'v' | 'i') {
   if (k >= 0) probes.splice(k, 1);
   else if (probes.length < 8) probes.push({ pid: localPidCounter++, elem, pin, kind });
   traces.prune(new Set(probes.map((p) => p.pid)));
+}
+
+/** '3': hear this node. The audio source is a normal voltage probe's sample
+ * stream, so make sure one exists here, then latch the player onto it —
+ * pressing '3' again on the same pin stops (the probe stays). */
+function toggleListen(elem: number, pin: number) {
+  const here = probes.find((p) => p.elem === elem && p.pin === pin && p.kind === 'v');
+  if (here) {
+    listenWanted = null;
+    if (audio.pid === here.pid) audio.stop();
+    else audio.listen(here.pid);
+    return;
+  }
+  listenWanted = { elem, pin };
+  toggleProbe(elem, pin, 'v');
+  const made = probes.find((p) => p.elem === elem && p.pin === pin && p.kind === 'v');
+  if (made) {
+    listenWanted = null;
+    audio.listen(made.pid);
+  }
 }
 
 function setProbeRef(pid: number, elem: number, pin: number) {
@@ -594,7 +632,7 @@ const scopeProbes = (s: FloatScope): Probe[] =>
   s.pids === null ? probes : probes.filter((p) => s.pids!.includes(p.pid));
 
 const dragModeOf = (e: ElementSpec): 'log' | 'linear' | null =>
-  e.kind.t === 'Resistor' || e.kind.t === 'Lamp'
+  e.kind.t === 'Resistor' || e.kind.t === 'Lamp' || e.kind.t === 'Speaker'
     ? 'log'
     : e.kind.t === 'Potentiometer'
       ? 'linear'
@@ -728,7 +766,7 @@ canvas.addEventListener('pointerdown', (ev) => {
   if (mode) {
     const startVal =
       e.kind.t === 'Potentiometer' ? e.kind.wiper
-      : e.kind.t === 'Resistor' || e.kind.t === 'Lamp' ? e.kind.ohms
+      : e.kind.t === 'Resistor' || e.kind.t === 'Lamp' || e.kind.t === 'Speaker' ? e.kind.ohms
       : 0;
     valueDrag = { e, mode, startY: ev.clientY, startVal, lastSent: 0, moved: false };
   } else {
@@ -982,6 +1020,11 @@ window.addEventListener('keydown', (ev) => {
     if (e && e.kind.t !== 'Ground') toggleProbe(e.id, 0, 'i');
     return;
   }
+  if (ev.key === '3' && mouse) {
+    const e = elementAt(mouse.x, mouse.y);
+    if (e && e.kind.t !== 'Ground') toggleListen(e.id, nearestPin(e, mouse.x, mouse.y));
+    return;
+  }
   if (ev.key === '0' && mouse) {
     const target =
       selectedProbe !== null
@@ -1020,6 +1063,8 @@ function describeValue(e: ElementSpec): string {
     case 'Resistor':
     case 'Lamp':
       return `R ${fmt(e.kind.ohms, 'Ω')}  (drag ↕)`;
+    case 'Speaker':
+      return `${fmt(e.kind.ohms, 'Ω')} coil  (drag ↕, 3 listens)`;
     case 'Capacitor':
       return `C ${fmt(e.kind.farads, 'F')}`;
     case 'Inductor':
@@ -1086,6 +1131,31 @@ function drawHighlight(e: ElementSpec, strong: boolean) {
   ctx.globalAlpha = 1;
 }
 
+/** Little speaker next to the flag of the probe we are listening to; its
+ * arcs ride the stream's own amplitude. */
+function drawListenGlyph(x: number, y: number, color: string) {
+  const lvl = audio.level;
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(x, y - 2);
+  ctx.lineTo(x + 3, y - 2);
+  ctx.lineTo(x + 6, y - 5);
+  ctx.lineTo(x + 6, y + 5);
+  ctx.lineTo(x + 3, y + 2);
+  ctx.lineTo(x, y + 2);
+  ctx.closePath();
+  ctx.fill();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.2;
+  for (let k = 0; k < 2; k++) {
+    ctx.globalAlpha = Math.min(1, 0.25 + lvl * 2.5 - k * 0.35);
+    ctx.beginPath();
+    ctx.arc(x + 6, y, 4 + k * 3.5, -0.9, 0.9);
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+}
+
 function drawProbeMarkers() {
   for (const p of probes) {
     const c = probeFlagPx(p);
@@ -1112,6 +1182,7 @@ function drawProbeMarkers() {
     ctx.fillStyle = '#101014';
     ctx.font = 'bold 9px ui-monospace';
     ctx.fillText(p.kind === 'v' ? 'V' : 'I', c[0] - 3, c[1] + 3);
+    if (audio.pid === p.pid) drawListenGlyph(c[0] + 9, c[1], color);
 
     if (p.r) {
       const re = elements.find((x) => x.id === p.r![0]);
@@ -1245,6 +1316,7 @@ function frame(now: number) {
         v -= rl?.v[p.r[1]] ?? 0;
       }
       traces.appendPoint(p.pid, simTime, v);
+      audio.pushPoint(p.pid, simTime, v);
     }
   }
 
@@ -1367,7 +1439,7 @@ function frame(now: number) {
     `EE Game   sim t = ${simTime.toFixed(2)} s   ` +
     (online ? `● ONLINE — ${population} player${population === 1 ? '' : 's'}` : '○ offline (local sim)') +
     (mode ? `   ${mode}` : '') +
-    `\nparts: R C L W G V D N P M A U S B T Z E F I · Q rotate · drag pin = wire · drag empty = select · ⌘C/⌘V copy/paste · 1/2 probe · 0 ref · O scope · X delete · / search`;
+    `\nparts: R C L W G V D N P M A U S B T Z E F I · Q rotate · drag pin = wire · drag empty = select · ⌘C/⌘V copy/paste · 1/2 probe · 3 listen · 0 ref · O scope · X delete · / search`;
 
   requestAnimationFrame(frame);
 }
