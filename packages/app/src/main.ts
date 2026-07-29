@@ -10,13 +10,17 @@
 //                         B lamp, T pot) — click places (Q rotates first),
 //                         drag places with drag orientation, Esc exits
 //   click                 select part / probe flag;  drag on empty = marquee
+//   drag a part body      move it (whole selection if it is in one)
+//   double-click a part   floating property editor next to it
+//   right-click           context menu (part: edit/rotate/delete/probe/copy;
+//                         empty canvas: paste / add part / select all)
 //   drag from a pin       draw wire (pins must overlap to connect)
 //   ⌘/Ctrl+C, ⌘/Ctrl+V    copy selection / paste bound to cursor
 //   Q                     rotate placement ghost, paste ghost, or selection
 //   1 / 2                 voltage probe / current clamp at hover
 //   0                     set selected V-probe's reference (differential)
 //   O                     drop an in-place oscilloscope;  X delete;  / palette
-//   wheel zoom (over a scope: timebase) · middle/right/space drag pan
+//   wheel zoom (over a scope: timebase) · pan: middle-drag, ctrl+drag, space+drag
 
 import init, { Sim } from './wasm/sim_wasm';
 import {
@@ -355,7 +359,9 @@ psearch.onkeydown = (ev) => {
 
 // ---------------------------------------------------------------- props
 const propsDiv = document.getElementById('props') as HTMLDivElement;
-let propsShownFor = '';
+const propsDlg = document.getElementById('propsdlg') as HTMLDivElement;
+/** Element the floating editor is open for (double-click / context menu). */
+let dlgFor: number | null = null;
 
 const FIELD_LABELS: Record<string, string> = {
   ohms: 'resistance Ω',
@@ -377,27 +383,26 @@ const FIELD_LABELS: Record<string, string> = {
   wiper: 'wiper 0-1',
 };
 
-function syncPropsPanel() {
-  const target =
-    selectedIds.size === 1
-      ? elements.find((e) => e.id === [...selectedIds][0])
-      : undefined;
-  if (!target) {
-    propsDiv.style.display = 'none';
-    propsShownFor = '';
-    return;
-  }
-  const key = JSON.stringify([target.id, target.kind]);
-  if (key === propsShownFor) return;
-  if (propsDiv.contains(document.activeElement) && propsShownFor.startsWith(`[${target.id},`)) {
-    return;
-  }
-  propsShownFor = key;
-  propsDiv.style.display = 'block';
-  propsDiv.innerHTML = '';
+/** The property editor, rendered into any host box. Used twice: docked
+ *  (single-click selection) and floating next to the part (double-click).
+ *  `onClose` — when given — adds a × button and is called after a delete. */
+function buildProps(host: HTMLElement, target: ElementSpec, onClose?: () => void) {
+  const mark = (kind: ElementSpec['kind']) => {
+    host.dataset.key = JSON.stringify([target.id, kind]);
+  };
+  mark(target.kind);
+  host.innerHTML = '';
   const h = document.createElement('h3');
   h.textContent = `${target.kind.t}  #${target.id}`;
-  propsDiv.appendChild(h);
+  host.appendChild(h);
+  if (onClose) {
+    const x = document.createElement('button');
+    x.className = 'xbtn';
+    x.textContent = '×';
+    x.title = 'close (Esc)';
+    x.onclick = onClose;
+    h.appendChild(x);
+  }
 
   for (const [field, value] of Object.entries(target.kind)) {
     if (field === 't') continue;
@@ -412,7 +417,7 @@ function syncPropsPanel() {
       input.onchange = () => {
         const kind = { ...target.kind, [field]: input.checked } as ElementSpec['kind'];
         editDoc({ t: 'SetKind', id: target.id, kind });
-        propsShownFor = JSON.stringify([target.id, kind]);
+        mark(kind);
       };
     } else {
       input.type = 'number';
@@ -423,30 +428,122 @@ function syncPropsPanel() {
         if (!Number.isFinite(num)) return;
         const kind = { ...target.kind, [field]: num } as ElementSpec['kind'];
         editDoc({ t: 'SetKind', id: target.id, kind });
-        propsShownFor = JSON.stringify([target.id, kind]);
+        mark(kind);
       };
     }
     label.appendChild(input);
-    propsDiv.appendChild(label);
+    host.appendChild(label);
   }
 
   const row = document.createElement('div');
   row.className = 'row';
   const rot = document.createElement('button');
   rot.textContent = '⟳ rotate (Q)';
-  rot.onclick = () => rotateSelection();
+  rot.onclick = () => rotateElements(groupOf(target));
   const del = document.createElement('button');
   del.textContent = '✕ delete';
-  del.onclick = () => editDoc({ t: 'Remove', id: target.id });
+  del.onclick = () => {
+    deleteElements(groupOf(target));
+    onClose?.();
+  };
   row.appendChild(rot);
   row.appendChild(del);
-  propsDiv.appendChild(row);
+  host.appendChild(row);
 }
 
-/** Rotate the whole selection 90° clockwise about its shared centroid. */
-function rotateSelection() {
-  const sel = elements.filter((e) => selectedIds.has(e.id));
-  if (sel.length === 0) return;
+/** Docked panel: mirrors a single-part selection. */
+function syncPropsPanel() {
+  const target =
+    selectedIds.size === 1
+      ? elements.find((e) => e.id === [...selectedIds][0])
+      : undefined;
+  if (!target) {
+    propsDiv.style.display = 'none';
+    propsDiv.dataset.key = '';
+    return;
+  }
+  const key = JSON.stringify([target.id, target.kind]);
+  if (key === propsDiv.dataset.key) return;
+  if (
+    propsDiv.contains(document.activeElement) &&
+    (propsDiv.dataset.key ?? '').startsWith(`[${target.id},`)
+  ) {
+    return;
+  }
+  propsDiv.style.display = 'block';
+  buildProps(propsDiv, target);
+}
+
+/** Bounding box of a part in screen pixels. */
+function boundsPx(e: ElementSpec): [number, number, number, number] {
+  let [x0, y0, x1, y1] = [Infinity, Infinity, -Infinity, -Infinity];
+  for (const p of e.pins) {
+    const [x, y] = toPx(p);
+    x0 = Math.min(x0, x);
+    y0 = Math.min(y0, y);
+    x1 = Math.max(x1, x);
+    y1 = Math.max(y1, y);
+  }
+  return [x0, y0, x1, y1];
+}
+
+function openPropsDialog(target: ElementSpec) {
+  dlgFor = target.id;
+  selectedIds = new Set([target.id]);
+  selectedProbe = null;
+  propsDlg.style.display = 'block';
+  propsDlg.style.left = '0px';
+  propsDlg.style.top = '0px';
+  buildProps(propsDlg, target, closePropsDialog);
+  placeDialogNear(target);
+  const first = propsDlg.querySelector('input');
+  if (first instanceof HTMLInputElement) first.focus();
+}
+
+/** Park the floating editor just clear of the part, inside the viewport. */
+function placeDialogNear(target: ElementSpec) {
+  const [x0, y0, x1, y1] = boundsPx(target);
+  const r = propsDlg.getBoundingClientRect();
+  let x = x1 + 18;
+  if (x + r.width + 8 > window.innerWidth) x = x0 - r.width - 18;
+  const y = (y0 + y1) / 2 - r.height / 2;
+  propsDlg.style.left = `${Math.round(Math.min(Math.max(8, x), Math.max(8, window.innerWidth - r.width - 8)))}px`;
+  propsDlg.style.top = `${Math.round(Math.min(Math.max(8, y), Math.max(8, window.innerHeight - r.height - 8)))}px`;
+}
+
+function closePropsDialog() {
+  dlgFor = null;
+  propsDlg.style.display = 'none';
+  propsDlg.dataset.key = '';
+  propsDlg.innerHTML = '';
+}
+
+/** Keep the floating editor honest about server/peer edits; close if the
+ *  part is gone. Never rebuilds while the player is typing in it. */
+function syncPropsDialog() {
+  if (dlgFor === null) return;
+  const target = elements.find((e) => e.id === dlgFor);
+  if (!target) {
+    closePropsDialog();
+    return;
+  }
+  const key = JSON.stringify([target.id, target.kind]);
+  if (key === propsDlg.dataset.key) return;
+  if (propsDlg.contains(document.activeElement)) return;
+  buildProps(propsDlg, target, closePropsDialog);
+}
+
+/** What a part-targeted command acts on: the selection when the part is part
+ *  of a multi-selection, otherwise just the part. */
+function groupOf(e: ElementSpec): ElementSpec[] {
+  if (selectedIds.has(e.id) && selectedIds.size > 1) {
+    return elements.filter((x) => selectedIds.has(x.id));
+  }
+  return [e];
+}
+
+/** Integer centroid of a set of parts, in grid units. */
+function centroidOf(sel: ElementSpec[]): Point {
   let sx = 0;
   let sy = 0;
   let n = 0;
@@ -457,33 +554,39 @@ function rotateSelection() {
       n++;
     }
   }
-  const cx = Math.round(sx / n);
-  const cy = Math.round(sy / n);
+  return [Math.round(sx / n), Math.round(sy / n)];
+}
+
+/** Rotate parts 90° clockwise about their shared centroid. */
+function rotateElements(sel: ElementSpec[]) {
+  if (sel.length === 0) return;
+  const [cx, cy] = centroidOf(sel);
   for (const e of sel) {
     const pins = e.pins.map(([x, y]) => [cx - (y - cy), cy + (x - cx)] as Point);
     editDoc({ t: 'Move', id: e.id, pins });
   }
 }
 
-function copySelection() {
-  const sel = elements.filter((e) => selectedIds.has(e.id));
+const rotateSelection = () => rotateElements(elements.filter((e) => selectedIds.has(e.id)));
+
+function deleteElements(sel: ElementSpec[]) {
+  for (const e of sel) editDoc({ t: 'Remove', id: e.id });
+}
+
+function copyElements(sel: ElementSpec[]) {
   if (sel.length === 0) return;
-  let sx = 0;
-  let sy = 0;
-  let n = 0;
-  for (const e of sel) {
-    for (const p of e.pins) {
-      sx += p[0];
-      sy += p[1];
-      n++;
-    }
-  }
-  const cx = Math.round(sx / n);
-  const cy = Math.round(sy / n);
+  const [cx, cy] = centroidOf(sel);
   clipboard = sel.map((e) => ({
     kind: JSON.parse(JSON.stringify(e.kind)) as ElementKind,
     pins: e.pins.map(([x, y]) => [x - cx, y - cy] as Point),
   }));
+}
+
+const copySelection = () => copyElements(elements.filter((e) => selectedIds.has(e.id)));
+
+function selectAll() {
+  selectedIds = new Set(elements.map((e) => e.id));
+  selectedProbe = null;
 }
 
 function commitPaste(at: Point) {
@@ -504,6 +607,22 @@ function commitPaste(at: Point) {
   selectedIds = new Set(ids);
   selectedProbe = null;
   pasting = null;
+}
+
+/** Paste the clipboard straight down at `at` (context-menu Paste). */
+function pasteAt(at: Point) {
+  if (clipboard.length === 0) return;
+  pasting = clipboard.map((c) => ({ kind: c.kind, pins: c.pins }));
+  placing = null;
+  commitPaste(at);
+}
+
+/** Arm the cursor-bound paste ghost (⌘/Ctrl+V). */
+function armPaste() {
+  if (clipboard.length === 0) return;
+  pasting = clipboard.map((c) => ({ kind: c.kind, pins: c.pins }));
+  placing = null;
+  canvas.style.cursor = 'crosshair';
 }
 
 // ---------------------------------------------------------------- input
@@ -593,21 +712,76 @@ function scopeZoneAt(x: number, y: number): ScopeZone | null {
 const scopeProbes = (s: FloatScope): Probe[] =>
   s.pids === null ? probes : probes.filter((p) => s.pids!.includes(p.pid));
 
-const dragModeOf = (e: ElementSpec): 'log' | 'linear' | null =>
-  e.kind.t === 'Resistor' || e.kind.t === 'Lamp'
-    ? 'log'
-    : e.kind.t === 'Potentiometer'
-      ? 'linear'
-      : null;
+// ------------------------------------------------------------ context menu
+const ctxMenu = document.getElementById('ctxmenu') as HTMLDivElement;
+type MenuItem = { label: string; run: () => void } | { sep: true } | { head: string };
+const ctxIsOpen = () => ctxMenu.style.display === 'block';
+/** Set when a click-away closed the menu, so the canvas ignores that click. */
+let swallowPointer = false;
 
-let valueDrag: {
-  e: ElementSpec;
-  mode: 'log' | 'linear';
-  startY: number;
-  startVal: number;
-  lastSent: number;
-  moved: boolean;
-} | null = null;
+function closeCtxMenu() {
+  ctxMenu.style.display = 'none';
+  ctxMenu.innerHTML = '';
+}
+
+function openCtxMenu(x: number, y: number, items: MenuItem[]) {
+  ctxMenu.innerHTML = '';
+  for (const it of items) {
+    const row = document.createElement('div');
+    if ('sep' in it) {
+      row.className = 'sep';
+    } else if ('head' in it) {
+      row.className = 'hd';
+      row.textContent = it.head;
+    } else {
+      row.className = 'mi';
+      row.textContent = it.label;
+      row.onclick = () => {
+        closeCtxMenu();
+        it.run();
+      };
+    }
+    ctxMenu.appendChild(row);
+  }
+  ctxMenu.style.display = 'block';
+  ctxMenu.style.left = '0px';
+  ctxMenu.style.top = '0px';
+  const r = ctxMenu.getBoundingClientRect();
+  ctxMenu.style.left = `${Math.round(Math.max(4, Math.min(x, window.innerWidth - r.width - 6)))}px`;
+  ctxMenu.style.top = `${Math.round(Math.max(4, Math.min(y, window.innerHeight - r.height - 6)))}px`;
+}
+
+function partMenu(e: ElementSpec, x: number, y: number): MenuItem[] {
+  const n = groupOf(e).length;
+  const many = n > 1 ? ` (${n})` : '';
+  const items: MenuItem[] = [
+    { head: `${e.kind.t} #${e.id}` },
+    { label: 'Edit…', run: () => openPropsDialog(e) },
+    { label: `Rotate${many}`, run: () => rotateElements(groupOf(e)) },
+    { label: `Delete${many}`, run: () => deleteElements(groupOf(e)) },
+  ];
+  if (e.kind.t !== 'Ground') {
+    items.push(
+      { sep: true },
+      { label: 'Probe voltage', run: () => toggleProbe(e.id, nearestPin(e, x, y), 'v') },
+      { label: 'Probe current', run: () => toggleProbe(e.id, 0, 'i') },
+    );
+  }
+  items.push({ sep: true }, { label: `Copy${many}`, run: () => copyElements(groupOf(e)) });
+  return items;
+}
+
+function canvasMenu(x: number, y: number): MenuItem[] {
+  const items: MenuItem[] = [];
+  if (clipboard.length > 0) {
+    const n = clipboard.length;
+    items.push({ label: `Paste${n > 1 ? ` (${n})` : ''}`, run: () => pasteAt(snap(x, y)) });
+  }
+  items.push({ label: 'Add part…', run: openPalette }, { label: 'Select all', run: selectAll });
+  return items;
+}
+
+// ------------------------------------------------------------------ drags
 let panDrag: { x: number; y: number; ox: number; oy: number } | null = null;
 let wireDrag: { a: Point; b: Point } | null = null;
 let placeDrag: { a: Point; b: Point } | null = null;
@@ -637,11 +811,41 @@ canvas.addEventListener('wheel', (ev) => {
   cam.oy = ev.clientY - (ev.clientY - cam.oy) * (s2 / cam.scale);
   cam.scale = s2;
 }, { passive: false });
-canvas.addEventListener('contextmenu', (ev) => ev.preventDefault());
+// Right-click is ours: suppress the browser menu and raise a Falstad-style one.
+canvas.addEventListener('contextmenu', (ev) => {
+  ev.preventDefault();
+  // macOS ctrl+click arrives as a left button *and* a contextmenu event — if it
+  // already started a pan, do not also pop the menu.
+  if (panDrag || placing || pasting) return;
+  if (scopeZoneAt(ev.clientX, ev.clientY)) return;
+  const e = elementAt(ev.clientX, ev.clientY);
+  openCtxMenu(
+    ev.clientX,
+    ev.clientY,
+    e ? partMenu(e, ev.clientX, ev.clientY) : canvasMenu(ev.clientX, ev.clientY),
+  );
+});
+
+// Click-away closes the menu (and that click does nothing else).
+window.addEventListener(
+  'pointerdown',
+  (ev) => {
+    if (!ctxIsOpen()) return;
+    if (ev.target instanceof Node && ctxMenu.contains(ev.target)) return;
+    closeCtxMenu();
+    swallowPointer = ev.button === 0 && ev.target === canvas;
+  },
+  true,
+);
 
 canvas.addEventListener('pointerdown', (ev) => {
+  if (ev.button === 2) return; // right button only ever opens the menu
+  if (swallowPointer) {
+    swallowPointer = false;
+    return;
+  }
   try { canvas.setPointerCapture(ev.pointerId); } catch { /* synthetic pointers */ }
-  if (ev.button === 1 || ev.button === 2 || spaceHeld) {
+  if (ev.button === 1 || spaceHeld || ev.ctrlKey) {
     panDrag = { x: ev.clientX, y: ev.clientY, ox: cam.ox, oy: cam.oy };
     return;
   }
@@ -713,27 +917,18 @@ canvas.addEventListener('pointerdown', (ev) => {
       clickTarget: e.id,
     };
   };
-  // Dragging a member of a multi-selection moves the whole group.
-  if (selectedIds.has(e.id) && selectedIds.size > 1) {
-    startMove([...selectedIds]);
-    return;
-  }
-  if (e.kind.t === 'Switch') {
-    interact(e, { t: 'SetSwitch', closed: !e.kind.closed });
-    selectedIds = new Set([e.id]);
-    selectedProbe = null;
-    return;
-  }
-  const mode = dragModeOf(e);
-  if (mode) {
-    const startVal =
-      e.kind.t === 'Potentiometer' ? e.kind.wiper
-      : e.kind.t === 'Resistor' || e.kind.t === 'Lamp' ? e.kind.ohms
-      : 0;
-    valueDrag = { e, mode, startY: ev.clientY, startVal, lastSent: 0, moved: false };
-  } else {
-    startMove([e.id]);
-  }
+  // Dragging any part body moves it; a member of a multi-selection drags the
+  // whole group. Values are edited in the properties editor, never by dragging.
+  if (selectedIds.has(e.id) && selectedIds.size > 1) startMove([...selectedIds]);
+  else startMove([e.id]);
+});
+
+// Double-click a part: floating property editor, parked next to it.
+canvas.addEventListener('dblclick', (ev) => {
+  if (placing || pasting) return;
+  if (scopeZoneAt(ev.clientX, ev.clientY)) return;
+  const e = elementAt(ev.clientX, ev.clientY);
+  if (e) openPropsDialog(e);
 });
 
 canvas.addEventListener('pointermove', (ev) => {
@@ -794,35 +989,26 @@ canvas.addEventListener('pointermove', (ev) => {
     }
     return;
   }
-  if (valueDrag) {
-    const dy = valueDrag.startY - ev.clientY;
-    if (Math.abs(dy) > 3) valueDrag.moved = true;
-    if (!valueDrag.moved) return;
-    const value =
-      valueDrag.mode === 'log'
-        ? valueDrag.startVal * Math.pow(10, dy / 160)
-        : Math.min(0.99, Math.max(0.01, valueDrag.startVal + dy / 200));
-    if (now - valueDrag.lastSent > 40) {
-      valueDrag.lastSent = now;
-      interact(valueDrag.e, { t: 'SetValue', value });
-    }
-    return;
-  }
   const z = scopeZoneAt(ev.clientX, ev.clientY);
   const over = z ? undefined : elementAt(ev.clientX, ev.clientY);
+  const onPin = !z && !!pinAt(ev.clientX, ev.clientY);
   canvas.style.cursor = placing || pasting
     ? 'crosshair'
-    : z
-      ? z.zone === 'title'
-        ? 'move'
-        : z.zone === 'resize'
-          ? 'nwse-resize'
-          : 'default'
-      : over?.kind.t === 'Switch'
-        ? 'pointer'
-        : over && dragModeOf(over)
-          ? 'ns-resize'
-          : 'default';
+    : spaceHeld
+      ? 'grab'
+      : z
+        ? z.zone === 'title'
+          ? 'move'
+          : z.zone === 'resize'
+            ? 'nwse-resize'
+            : 'default'
+        : onPin
+          ? 'crosshair' // drag from a terminal draws a wire
+          : over?.kind.t === 'Switch'
+            ? 'pointer'
+            : over
+              ? 'move' // plain drag moves any part
+              : 'default';
 });
 
 canvas.addEventListener('pointerup', (ev) => {
@@ -881,24 +1067,24 @@ canvas.addEventListener('pointerup', (ev) => {
       }
       if (!online) localSim.setElements(elements);
     } else {
+      // A click that never moved: select, and flip a switch if that is what it is.
+      const t = elements.find((x) => x.id === moveDrag!.clickTarget);
+      if (t && t.kind.t === 'Switch') interact(t, { t: 'SetSwitch', closed: !t.kind.closed });
       selectedIds = new Set([moveDrag.clickTarget]);
       selectedProbe = null;
     }
     moveDrag = null;
-    return;
-  }
-  if (valueDrag) {
-    if (!valueDrag.moved) {
-      selectedIds = new Set([valueDrag.e.id]);
-      selectedProbe = null;
-    }
-    valueDrag = null;
   }
 });
 canvas.addEventListener('pointerleave', () => (mouse = null));
 
 window.addEventListener('keydown', (ev) => {
-  if (ev.target === psearch || (ev.target instanceof Node && propsDiv.contains(ev.target))) return;
+  const inEditor =
+    ev.target instanceof Node && (propsDiv.contains(ev.target) || propsDlg.contains(ev.target));
+  if (ev.target === psearch || inEditor) {
+    if (ev.key === 'Escape' && dlgFor !== null) closePropsDialog();
+    return;
+  }
 
   // Clipboard first: ⌘/Ctrl+C copies, ⌘/Ctrl+V arms pasting at the cursor.
   if (ev.metaKey || ev.ctrlKey) {
@@ -906,11 +1092,7 @@ window.addEventListener('keydown', (ev) => {
       copySelection();
       ev.preventDefault();
     } else if (ev.key === 'v') {
-      if (clipboard.length > 0) {
-        pasting = clipboard.map((c) => ({ kind: c.kind, pins: c.pins }));
-        placing = null;
-        canvas.style.cursor = 'crosshair';
-      }
+      armPaste();
       ev.preventDefault();
     }
     return;
@@ -928,6 +1110,15 @@ window.addEventListener('keydown', (ev) => {
     return;
   }
   if (ev.key === 'Escape') {
+    // Peel one layer at a time: menu, then editor, then tools/selection.
+    if (ctxIsOpen()) {
+      closeCtxMenu();
+      return;
+    }
+    if (dlgFor !== null) {
+      closePropsDialog();
+      return;
+    }
     placing = null;
     pasting = null;
     selectedIds.clear();
@@ -1019,7 +1210,7 @@ function describeValue(e: ElementSpec): string {
   switch (e.kind.t) {
     case 'Resistor':
     case 'Lamp':
-      return `R ${fmt(e.kind.ohms, 'Ω')}  (drag ↕)`;
+      return `R ${fmt(e.kind.ohms, 'Ω')}`;
     case 'Capacitor':
       return `C ${fmt(e.kind.farads, 'F')}`;
     case 'Inductor':
@@ -1029,7 +1220,7 @@ function describeValue(e: ElementSpec): string {
         ? `${fmt(e.kind.dc, 'V')} DC`
         : `${fmt(e.kind.dc, 'V')} ± ${fmt(e.kind.amp, 'V')} @ ${e.kind.hz} Hz`;
     case 'Potentiometer':
-      return `${fmt(e.kind.ohms, 'Ω')} @ ${(e.kind.wiper * 100).toFixed(0)}%  (drag ↕)`;
+      return `${fmt(e.kind.ohms, 'Ω')} @ ${(e.kind.wiper * 100).toFixed(0)}%`;
     case 'Npn':
     case 'Pnp':
       return `β ${e.kind.beta}`;
@@ -1266,10 +1457,12 @@ function frame(now: number) {
 
   // Hover highlight (blue element + pin dots), Falstad-style.
   const zHover = mouse ? scopeZoneAt(mouse.x, mouse.y) : null;
-  const hover =
-    mouse && !valueDrag && !moveDrag && !placing && !pasting && !zHover
+  const md = moveDrag;
+  const hover = md
+    ? elements.find((e) => e.id === md.clickTarget)
+    : mouse && !placing && !pasting && !zHover
       ? elementAt(mouse.x, mouse.y)
-      : valueDrag?.e;
+      : undefined;
   if (hover) drawHighlight(hover, true);
   for (const id of selectedIds) {
     const e = elements.find((x) => x.id === id);
@@ -1331,6 +1524,7 @@ function frame(now: number) {
   drawFloatScopes();
   drawCursors(now);
   syncPropsPanel();
+  syncPropsDialog();
 
   if (probes.length > 0) {
     scopeDiv.style.display = 'block';
@@ -1339,7 +1533,7 @@ function frame(now: number) {
     scopeDiv.style.display = 'none';
   }
 
-  if (hover && mouse && !placing && !pasting && !wireDrag) {
+  if (hover && mouse && !placing && !pasting && !wireDrag && !moveDrag) {
     const l = live.get(hover.id);
     tip.style.display = 'block';
     tip.style.left = `${mouse.x + 14}px`;
@@ -1367,7 +1561,8 @@ function frame(now: number) {
     `EE Game   sim t = ${simTime.toFixed(2)} s   ` +
     (online ? `● ONLINE — ${population} player${population === 1 ? '' : 's'}` : '○ offline (local sim)') +
     (mode ? `   ${mode}` : '') +
-    `\nparts: R C L W G V D N P M A U S B T Z E F I · Q rotate · drag pin = wire · drag empty = select · ⌘C/⌘V copy/paste · 1/2 probe · 0 ref · O scope · X delete · / search`;
+    `\nparts: R C L W G V D N P M A U S B T Z E F I · drag part = move · dbl-click = edit values · right-click = menu` +
+    `\ndrag pin = wire · drag empty = select · Q rotate · ⌘C/⌘V copy/paste · 1/2 probe · 0 ref · O scope · X delete · / search · pan: middle / ctrl+drag / space+drag`;
 
   requestAnimationFrame(frame);
 }
