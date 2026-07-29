@@ -19,7 +19,7 @@
         white-space: pre;
       }
       #palette {
-        position: fixed; top: 54px; left: 12px; width: 220px; display: none;
+        position: fixed; top: 76px; left: 12px; width: 220px; display: none;
         background: #16161de6; border: 1px solid #33333f; border-radius: 6px;
         padding: 8px; font: 13px/1.6 ui-monospace, monospace;
       }
@@ -42,23 +42,53 @@
         display: none; background: #101016f2; border-top: 1px solid #2c2c38;
       }
       #scopecv { width: 100%; height: 100%; display: block; }
-      #props {
-        position: fixed; top: 54px; right: 12px; width: 240px; display: none;
+      #props, #propsdlg {
+        position: fixed; width: 240px; display: none;
         background: #16161de6; border: 1px solid #33333f; border-radius: 6px;
         padding: 10px; font: 13px/1.7 ui-monospace, monospace; color: #c9c9d4;
       }
-      #props h3 { margin: 0 0 6px; font-size: 13px; color: #fff; font-weight: 600; }
-      #props label { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
-      #props input[type=number], #props input[type=text] {
+      #props { top: 54px; right: 12px; }
+      /* Floating editor: same box, parked next to the part by double-click. */
+      #propsdlg {
+        left: 0; top: 0; z-index: 30; background: #17171ef7;
+        border-color: #454558; box-shadow: 0 8px 28px #000a;
+      }
+      #props h3, #propsdlg h3 {
+        margin: 0 0 6px; font-size: 13px; color: #fff; font-weight: 600;
+        display: flex; justify-content: space-between; align-items: center; gap: 8px;
+      }
+      #props label, #propsdlg label {
+        display: flex; justify-content: space-between; align-items: center; gap: 8px;
+      }
+      #props input[type=number], #props input[type=text],
+      #propsdlg input[type=number], #propsdlg input[type=text] {
         width: 110px; background: #0f0f14; color: #e8e8ef; border: 1px solid #3a3a48;
         border-radius: 4px; padding: 2px 6px; font: inherit; outline: none;
       }
-      #props .row { display: flex; gap: 6px; margin-top: 8px; }
-      #props button {
+      #props .row, #propsdlg .row { display: flex; gap: 6px; margin-top: 8px; }
+      #props button, #propsdlg button {
         flex: 1; background: #22222c; color: #c9c9d4; border: 1px solid #3a3a48;
         border-radius: 4px; padding: 4px 0; font: inherit; cursor: pointer;
       }
-      #props button:hover { background: #2e2e3c; color: #fff; }
+      #props button:hover, #propsdlg button:hover { background: #2e2e3c; color: #fff; }
+      #propsdlg h3 .xbtn {
+        flex: 0 0 auto; background: none; border: none; color: #8a8a98;
+        font: 16px/1 ui-monospace, monospace; padding: 0 2px; cursor: pointer;
+      }
+      #propsdlg h3 .xbtn:hover { background: none; color: #fff; }
+      #ctxmenu {
+        position: fixed; left: 0; top: 0; display: none; min-width: 170px; z-index: 40;
+        background: #16161df7; border: 1px solid #33333f; border-radius: 6px;
+        padding: 4px; font: 13px/1.6 ui-monospace, monospace;
+        box-shadow: 0 8px 28px #000a;
+      }
+      #ctxmenu .mi {
+        color: #c9c9d4; padding: 3px 8px; border-radius: 3px; cursor: pointer;
+        white-space: nowrap;
+      }
+      #ctxmenu .mi:hover { background: #2a2a3a; color: #fff; }
+      #ctxmenu .hd { color: #6e6e7e; padding: 2px 8px 4px; font-size: 11px; }
+      #ctxmenu .sep { height: 1px; background: #2c2c38; margin: 4px 2px; }
     </style>
   </head>
   <body>
@@ -67,6 +97,8 @@
     <div id="tip"></div>
     <div id="scope"><canvas id="scopecv"></canvas></div>
     <div id="props"></div>
+    <div id="propsdlg"></div>
+    <div id="ctxmenu"></div>
     <button id="pbtn">+ part&nbsp;&nbsp;(/)</button>
     <div id="palette">
       <input id="psearch" placeholder="search parts…" autocomplete="off" />
