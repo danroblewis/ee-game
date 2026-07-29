@@ -1,0 +1,21 @@
+[package]
+name = "sim-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+sim-core = { path = "../sim-core", features = ["serde"] }
+sim-golden = { path = "../sim-golden", optional = true }
+wasm-bindgen.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde-wasm-bindgen = "0.6"
+
+[features]
+# Exposes goldenHash() for the S1 cross-target determinism harness; never
+# enabled in the shipping client build.
+golden = ["dep:sim-golden"]

@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>EE Game — M1 demo</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #101014; overflow: hidden; }
+      #canvas { display: block; width: 100vw; height: 100vh; cursor: default; }
+      #hud {
+        position: fixed; top: 10px; left: 12px; color: #9a9aa5;
+        font: 12px/1.5 ui-monospace, monospace; pointer-events: none;
+        white-space: pre;
+      }
+      #tip {
+        position: fixed; display: none; color: #e8e8ef; background: #1c1c24e6;
+        border: 1px solid #33333f; border-radius: 4px; padding: 6px 8px;
+        font: 12px/1.5 ui-monospace, monospace; pointer-events: none;
+        white-space: pre;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="canvas"></canvas>
+    <div id="hud"></div>
+    <div id="tip"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

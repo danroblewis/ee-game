@@ -1,0 +1,5 @@
+# Pinned for cross-target bit-determinism (S1). Bump deliberately, re-running
+# the determinism harness on all targets.
+[toolchain]
+channel = "1.95.0"
+targets = ["wasm32-unknown-unknown"]

@@ -1,0 +1,6 @@
+/target
+node_modules/
+dist/
+*.wasm.d.ts
+packages/app/src/wasm/
+.DS_Store

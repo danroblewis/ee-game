@@ -1,0 +1,18 @@
+[package]
+name = "sim-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# No I/O, no threads, no platform deps — must compile identically for
+# native and wasm32.
+[dependencies]
+sim-math = { path = "../sim-math" }
+libm.workspace = true
+xxhash-rust.workspace = true
+serde = { workspace = true, optional = true }
+
+[features]
+default = []
+serde = ["dep:serde"]
+dump-matrix = []
