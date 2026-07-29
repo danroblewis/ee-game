@@ -18,12 +18,36 @@
         font: 12px/1.5 ui-monospace, monospace; pointer-events: none;
         white-space: pre;
       }
+      #palette {
+        position: fixed; top: 54px; left: 12px; width: 220px; display: none;
+        background: #16161de6; border: 1px solid #33333f; border-radius: 6px;
+        padding: 8px; font: 13px/1.6 ui-monospace, monospace;
+      }
+      #psearch {
+        width: 100%; box-sizing: border-box; background: #0f0f14; color: #e8e8ef;
+        border: 1px solid #3a3a48; border-radius: 4px; padding: 5px 8px;
+        font: inherit; outline: none;
+      }
+      #plist { max-height: 320px; overflow-y: auto; margin-top: 6px; }
+      #plist div { color: #c9c9d4; padding: 2px 6px; border-radius: 3px; cursor: pointer; }
+      #plist div:hover, #plist div.sel { background: #2a2a3a; color: #fff; }
+      #pbtn {
+        position: fixed; top: 12px; right: 12px; background: #1c1c24e6;
+        color: #c9c9d4; border: 1px solid #33333f; border-radius: 6px;
+        padding: 6px 12px; font: 13px ui-monospace, monospace; cursor: pointer;
+      }
+      #pbtn:hover { background: #2a2a3a; color: #fff; }
     </style>
   </head>
   <body>
     <canvas id="canvas"></canvas>
     <div id="hud"></div>
     <div id="tip"></div>
+    <button id="pbtn">+ part&nbsp;&nbsp;(/)</button>
+    <div id="palette">
+      <input id="psearch" placeholder="search parts…" autocomplete="off" />
+      <div id="plist"></div>
+    </div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

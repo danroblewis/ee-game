@@ -168,6 +168,17 @@ impl ElementSpec {
     }
 }
 
+/// Document edits: the schematic-drawing verbs. Applied server-side in
+/// arrival order (M4 upgrades this to the full validated op pipeline).
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(tag = "t"))]
+pub enum DocOp {
+    Add { spec: ElementSpec },
+    Remove { id: u32 },
+    Move { id: u32, pins: Vec<Point> },
+}
+
 /// Interactions that mutate a live element without a recompile-worthy edit.
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]

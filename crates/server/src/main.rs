@@ -15,7 +15,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
-use sim_core::{ElementSpec, Engine, InteractOp};
+use sim_core::{DocOp, ElementSpec, Engine, InteractOp};
 use std::sync::{
     atomic::{AtomicU32, Ordering},
     Arc,
@@ -132,6 +132,7 @@ fn demo_room_circuit() -> Vec<ElementSpec> {
 
 enum Cmd {
     Interact { id: u32, op: InteractOp },
+    Edit { op: DocOp },
     Join,
     Leave,
 }
@@ -167,6 +168,13 @@ async fn sim_task(room: Arc<Room>, mut cmds: mpsc::UnboundedReceiver<Cmd>) {
                     let _ = room
                         .events
                         .send(json!({"t": "op", "id": id, "op": op}).to_string());
+                }
+                Cmd::Edit { op } => {
+                    if apply_doc_op(&room, &op) {
+                        let elems = room.elements.lock().unwrap().clone();
+                        eng.set_elements(&elems); // continuous state survives by id
+                        let _ = room.events.send(json!({"t": "doc", "op": op}).to_string());
+                    }
                 }
                 Cmd::Join | Cmd::Leave => {
                     let n = room.population.load(Ordering::Relaxed);
@@ -229,10 +237,44 @@ fn apply_to_specs(room: &Room, id: u32, op: InteractOp) {
     }
 }
 
+/// Validate and apply a document edit. Returns false to drop the op
+/// (malformed or unknown id) — the full permission/rules pipeline is M4.
+fn apply_doc_op(room: &Room, op: &DocOp) -> bool {
+    let mut elems = room.elements.lock().unwrap();
+    match op {
+        DocOp::Add { spec } => {
+            if spec.pins.len() != spec.kind.pin_count()
+                || elems.iter().any(|e| e.id == spec.id)
+                || elems.len() >= 2000
+            {
+                return false;
+            }
+            elems.push(spec.clone());
+            true
+        }
+        DocOp::Remove { id } => {
+            let before = elems.len();
+            elems.retain(|e| e.id != *id);
+            elems.len() != before
+        }
+        DocOp::Move { id, pins } => {
+            let Some(e) = elems.iter_mut().find(|e| e.id == *id) else {
+                return false;
+            };
+            if pins.len() != e.kind.pin_count() {
+                return false;
+            }
+            e.pins = pins.clone();
+            true
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "t", rename_all = "lowercase")]
 enum ClientMsg {
     Interact { id: u32, op: InteractOp },
+    Edit { op: DocOp },
     Cursor { x: f64, y: f64 },
 }
 
@@ -275,6 +317,9 @@ async fn client_session(mut socket: WebSocket, room: Arc<Room>) {
                     match serde_json::from_str::<ClientMsg>(&text) {
                         Ok(ClientMsg::Interact { id, op }) => {
                             let _ = room.cmds.send(Cmd::Interact { id, op });
+                        }
+                        Ok(ClientMsg::Edit { op }) => {
+                            let _ = room.cmds.send(Cmd::Edit { op });
                         }
                         Ok(ClientMsg::Cursor { x, y }) => {
                             let _ = room.events.send(

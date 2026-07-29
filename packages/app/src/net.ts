@@ -1,7 +1,7 @@
 // WebSocket net layer. The client is a renderer of server truth; when no
 // server answers, main.ts falls back to the local WASM sim.
 
-import type { ElementSpec, InteractOp } from './circuit';
+import type { DocOp, ElementSpec, InteractOp } from './circuit';
 
 export interface ServerFrame {
   time: number;
@@ -13,6 +13,7 @@ export interface NetHandlers {
   onHello(you: number, elements: ElementSpec[]): void;
   onFrame(f: ServerFrame): void;
   onOp(id: number, op: InteractOp): void;
+  onDoc(op: DocOp): void;
   onPresence(n: number): void;
   onCursor(who: number, x: number, y: number): void;
   onClose(): void;
@@ -20,6 +21,7 @@ export interface NetHandlers {
 
 export interface Net {
   sendInteract(id: number, op: InteractOp): void;
+  sendEdit(op: DocOp): void;
   sendCursor(x: number, y: number): void;
 }
 
@@ -39,6 +41,9 @@ export function connect(h: NetHandlers): Net {
       case 'op':
         h.onOp(m.id, m.op);
         break;
+      case 'doc':
+        h.onDoc(m.op);
+        break;
       case 'presence':
         h.onPresence(m.n);
         break;
@@ -55,6 +60,7 @@ export function connect(h: NetHandlers): Net {
   };
   return {
     sendInteract: (id, op) => send({ t: 'interact', id, op }),
+    sendEdit: (op) => send({ t: 'edit', op }),
     sendCursor: (x, y) => send({ t: 'cursor', x, y }),
   };
 }

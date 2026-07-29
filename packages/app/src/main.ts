@@ -1,16 +1,27 @@
 // EE Game client. The sim runs the moment the page loads — no run button.
 // Online: this browser renders the server's authoritative sim and sends
-// interactions. Offline (no server): the same engine runs locally in WASM.
+// interactions/edits. Offline: the same engine runs locally in WASM.
+//
+// Player controls:
+//   wheel            zoom to cursor
+//   middle/right or space+drag   pan
+//   drag on empty    draw wire
+//   / or "+ part"    open the parts palette, then drag to place
+//   click switch     toggle; drag lamp/resistor/pot vertically = knob
+//   shift+drag       move an element;  hover + Delete/x = remove
 
 import init, { Sim } from './wasm/sim_wasm';
 import {
   demoCircuit,
   pinLabels,
   unpackFrame,
+  type DocOp,
   type ElementSpec,
   type ElemLive,
   type InteractOp,
+  type Point,
 } from './circuit';
+import { CATALOG, makePins, searchParts, type PartDef } from './catalog';
 import { connect } from './net';
 import { DotFlow, drawElement, hitTest, type Camera } from './render';
 
@@ -43,6 +54,20 @@ function applyOp(e: ElementSpec, op: InteractOp) {
   }
 }
 
+function applyDoc(op: DocOp) {
+  if (op.t === 'Add') {
+    if (!elements.some((e) => e.id === op.spec.id)) elements.push(op.spec);
+  } else if (op.t === 'Remove') {
+    elements = elements.filter((e) => e.id !== op.id);
+  } else {
+    const e = elements.find((x) => x.id === op.id);
+    if (e) e.pins = op.pins;
+  }
+}
+
+let idCounter = 1;
+const newId = () => (myId > 0 ? myId : 999) * 1_000_000 + idCounter++;
+
 const net = connect({
   onHello(you, serverElements) {
     online = true;
@@ -62,6 +87,9 @@ const net = connect({
   onOp(id, op) {
     const e = elements.find((x) => x.id === id);
     if (e) applyOp(e, op);
+  },
+  onDoc(op) {
+    applyDoc(op); // idempotent for our own echoes
   },
   onPresence(n) {
     population = n;
@@ -84,6 +112,12 @@ function interact(e: ElementSpec, op: InteractOp) {
   else localSim.interact(e.id, op);
 }
 
+function editDoc(op: DocOp) {
+  applyDoc(op); // optimistic
+  if (online) net.sendEdit(op);
+  else localSim.setElements(elements);
+}
+
 // ---------------------------------------------------------------- canvas
 const canvas = document.getElementById('canvas') as HTMLCanvasElement;
 const hud = document.getElementById('hud') as HTMLDivElement;
@@ -91,8 +125,20 @@ const tip = document.getElementById('tip') as HTMLDivElement;
 const ctx = canvas.getContext('2d')!;
 
 const cam: Camera = { scale: 48, ox: 60, oy: 60 };
+// Exposed for end-to-end tests: lets them convert grid coords to pixels
+// without replicating camera math.
+(window as unknown as { __cam: Camera }).__cam = cam;
 const dots = new DotFlow();
 let mouse: { x: number; y: number } | null = null;
+
+const toGrid = (x: number, y: number): [number, number] => [
+  (x - cam.ox) / cam.scale,
+  (y - cam.oy) / cam.scale,
+];
+const snap = (x: number, y: number): Point => {
+  const [gx, gy] = toGrid(x, y);
+  return [Math.round(gx), Math.round(gy)];
+};
 
 function fitCamera() {
   let [x0, y0, x1, y1] = [Infinity, Infinity, -Infinity, -Infinity];
@@ -104,7 +150,12 @@ function fitCamera() {
       y1 = Math.max(y1, p[1]);
     }
   }
-  if (!isFinite(x0)) return;
+  if (!isFinite(x0)) {
+    cam.scale = 48;
+    cam.ox = window.innerWidth / 2;
+    cam.oy = window.innerHeight / 2;
+    return;
+  }
   const w = x1 - x0 + 4;
   const ht = y1 - y0 + 4;
   cam.scale = Math.max(20, Math.min(window.innerWidth / w, window.innerHeight / ht));
@@ -117,10 +168,56 @@ function resize() {
   canvas.width = window.innerWidth * dpr;
   canvas.height = window.innerHeight * dpr;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  fitCamera();
 }
 window.addEventListener('resize', resize);
 resize();
+fitCamera();
+
+// ---------------------------------------------------------------- palette
+const palette = document.getElementById('palette') as HTMLDivElement;
+const psearch = document.getElementById('psearch') as HTMLInputElement;
+const plist = document.getElementById('plist') as HTMLDivElement;
+const pbtn = document.getElementById('pbtn') as HTMLButtonElement;
+
+let placing: PartDef | null = null;
+
+function renderPaletteList() {
+  const parts = searchParts(psearch.value);
+  plist.innerHTML = '';
+  parts.forEach((p, k) => {
+    const row = document.createElement('div');
+    row.textContent = p.name;
+    if (k === 0) row.className = 'sel';
+    row.onclick = () => choosePart(p);
+    plist.appendChild(row);
+  });
+}
+function openPalette() {
+  palette.style.display = 'block';
+  psearch.value = '';
+  renderPaletteList();
+  psearch.focus();
+}
+function closePalette() {
+  palette.style.display = 'none';
+  psearch.blur();
+}
+function choosePart(p: PartDef) {
+  placing = p;
+  closePalette();
+  canvas.style.cursor = 'crosshair';
+}
+pbtn.onclick = () => (palette.style.display === 'block' ? closePalette() : openPalette());
+psearch.oninput = renderPaletteList;
+psearch.onkeydown = (ev) => {
+  if (ev.key === 'Enter') {
+    const top = searchParts(psearch.value)[0];
+    if (top) choosePart(top);
+  } else if (ev.key === 'Escape') {
+    closePalette();
+  }
+  ev.stopPropagation();
+};
 
 // ---------------------------------------------------------------- input
 function elementAt(x: number, y: number): ElementSpec | undefined {
@@ -136,8 +233,24 @@ function elementAt(x: number, y: number): ElementSpec | undefined {
   return best;
 }
 
-// Knob-draggable kinds: resistive values sweep log (a decade per 160 px);
-// the pot wiper sweeps linearly.
+/** Grid point of the nearest element pin, if the cursor is on one. Wires
+ * start from pins — dragging a pin must never move the component. */
+function pinAt(x: number, y: number): Point | null {
+  const r = Math.min(14, cam.scale * 0.4);
+  let best: Point | null = null;
+  let bestD = r;
+  for (const e of elements) {
+    for (const p of e.pins) {
+      const d = Math.hypot(cam.ox + p[0] * cam.scale - x, cam.oy + p[1] * cam.scale - y);
+      if (d < bestD) {
+        bestD = d;
+        best = p;
+      }
+    }
+  }
+  return best;
+}
+
 const dragMode = (e: ElementSpec): 'log' | 'linear' | null =>
   e.kind.t === 'Resistor' || e.kind.t === 'Lamp'
     ? 'log'
@@ -145,63 +258,190 @@ const dragMode = (e: ElementSpec): 'log' | 'linear' | null =>
       ? 'linear'
       : null;
 
-let drag: {
+let valueDrag: {
   e: ElementSpec;
   mode: 'log' | 'linear';
   startY: number;
   startVal: number;
   lastSent: number;
 } | null = null;
+let panDrag: { x: number; y: number; ox: number; oy: number } | null = null;
+let wireDrag: { a: Point; b: Point } | null = null;
+let placeDrag: { a: Point; b: Point } | null = null;
+let moveDrag: {
+  e: ElementSpec;
+  startPins: Point[];
+  start: Point;
+  lastSent: number;
+} | null = null;
+let spaceHeld = false;
 let lastCursorSent = 0;
+
+canvas.addEventListener('wheel', (ev) => {
+  ev.preventDefault();
+  const k = Math.exp(-ev.deltaY * 0.0015);
+  const s2 = Math.min(160, Math.max(8, cam.scale * k));
+  cam.ox = ev.clientX - (ev.clientX - cam.ox) * (s2 / cam.scale);
+  cam.oy = ev.clientY - (ev.clientY - cam.oy) * (s2 / cam.scale);
+  cam.scale = s2;
+}, { passive: false });
+canvas.addEventListener('contextmenu', (ev) => ev.preventDefault());
+
+canvas.addEventListener('pointerdown', (ev) => {
+  canvas.setPointerCapture(ev.pointerId);
+  if (ev.button === 1 || ev.button === 2 || spaceHeld) {
+    panDrag = { x: ev.clientX, y: ev.clientY, ox: cam.ox, oy: cam.oy };
+    return;
+  }
+  if (placing) {
+    const p = snap(ev.clientX, ev.clientY);
+    placeDrag = { a: p, b: p };
+    return;
+  }
+  // Pins take priority: dragging from any terminal draws a wire.
+  if (!ev.shiftKey) {
+    const pin = pinAt(ev.clientX, ev.clientY);
+    if (pin) {
+      wireDrag = { a: pin, b: pin };
+      return;
+    }
+  }
+  const e = elementAt(ev.clientX, ev.clientY);
+  if (!e) {
+    const p = snap(ev.clientX, ev.clientY);
+    wireDrag = { a: p, b: p };
+    return;
+  }
+  if (ev.shiftKey) {
+    moveDrag = { e, startPins: e.pins.map((p) => [...p] as Point), start: snap(ev.clientX, ev.clientY), lastSent: 0 };
+    return;
+  }
+  if (e.kind.t === 'Switch') {
+    interact(e, { t: 'SetSwitch', closed: !e.kind.closed });
+    return;
+  }
+  const mode = dragMode(e);
+  if (mode) {
+    const startVal =
+      e.kind.t === 'Potentiometer' ? e.kind.wiper
+      : e.kind.t === 'Resistor' || e.kind.t === 'Lamp' ? e.kind.ohms
+      : 0;
+    valueDrag = { e, mode, startY: ev.clientY, startVal, lastSent: 0 };
+  } else {
+    // Anything without a knob moves with a plain drag.
+    moveDrag = { e, startPins: e.pins.map((p) => [...p] as Point), start: snap(ev.clientX, ev.clientY), lastSent: 0 };
+  }
+});
 
 canvas.addEventListener('pointermove', (ev) => {
   mouse = { x: ev.clientX, y: ev.clientY };
   const now = performance.now();
   if (online && now - lastCursorSent > 50) {
     lastCursorSent = now;
-    net.sendCursor((ev.clientX - cam.ox) / cam.scale, (ev.clientY - cam.oy) / cam.scale);
+    const [gx, gy] = toGrid(ev.clientX, ev.clientY);
+    net.sendCursor(gx, gy);
   }
-  if (drag) {
-    // EveryCircuit-style vertical knob drag, live within a frame:
-    // log values sweep a decade per 160 px, the pot wiper is linear.
-    const dy = drag.startY - ev.clientY;
+  if (panDrag) {
+    cam.ox = panDrag.ox + (ev.clientX - panDrag.x);
+    cam.oy = panDrag.oy + (ev.clientY - panDrag.y);
+    return;
+  }
+  if (placeDrag) {
+    placeDrag.b = snap(ev.clientX, ev.clientY);
+    return;
+  }
+  if (wireDrag) {
+    wireDrag.b = snap(ev.clientX, ev.clientY);
+    return;
+  }
+  if (moveDrag) {
+    const here = snap(ev.clientX, ev.clientY);
+    const dx = here[0] - moveDrag.start[0];
+    const dy = here[1] - moveDrag.start[1];
+    const pins = moveDrag.startPins.map(([x, y]) => [x + dx, y + dy] as Point);
+    moveDrag.e.pins = pins;
+    if (now - moveDrag.lastSent > 60) {
+      moveDrag.lastSent = now;
+      if (online) net.sendEdit({ t: 'Move', id: moveDrag.e.id, pins });
+      else localSim.setElements(elements);
+    }
+    return;
+  }
+  if (valueDrag) {
+    const dy = valueDrag.startY - ev.clientY;
     const value =
-      drag.mode === 'log'
-        ? drag.startVal * Math.pow(10, dy / 160)
-        : Math.min(0.99, Math.max(0.01, drag.startVal + dy / 200));
-    if (now - drag.lastSent > 40) {
-      drag.lastSent = now;
-      interact(drag.e, { t: 'SetValue', value });
+      valueDrag.mode === 'log'
+        ? valueDrag.startVal * Math.pow(10, dy / 160)
+        : Math.min(0.99, Math.max(0.01, valueDrag.startVal + dy / 200));
+    if (now - valueDrag.lastSent > 40) {
+      valueDrag.lastSent = now;
+      interact(valueDrag.e, { t: 'SetValue', value });
     }
     return;
   }
   const over = elementAt(ev.clientX, ev.clientY);
-  canvas.style.cursor =
-    over?.kind.t === 'Switch' ? 'pointer' : over && dragMode(over) ? 'ns-resize' : 'default';
+  canvas.style.cursor = placing
+    ? 'crosshair'
+    : over?.kind.t === 'Switch'
+      ? 'pointer'
+      : over && dragMode(over)
+        ? 'ns-resize'
+        : 'default';
+});
+
+canvas.addEventListener('pointerup', (ev) => {
+  canvas.releasePointerCapture(ev.pointerId);
+  if (panDrag) {
+    panDrag = null;
+    return;
+  }
+  if (placeDrag && placing) {
+    const kind = placing.make();
+    const pins = makePins(kind, placeDrag.a, placeDrag.b);
+    editDoc({ t: 'Add', spec: { id: newId(), kind, pins } });
+    if (!ev.shiftKey) {
+      placing = null;
+      canvas.style.cursor = 'default';
+    }
+    placeDrag = null;
+    return;
+  }
+  if (wireDrag) {
+    if (wireDrag.a[0] !== wireDrag.b[0] || wireDrag.a[1] !== wireDrag.b[1]) {
+      editDoc({ t: 'Add', spec: { id: newId(), kind: { t: 'Wire' }, pins: [wireDrag.a, wireDrag.b] } });
+    }
+    wireDrag = null;
+    return;
+  }
+  if (moveDrag) {
+    if (online) net.sendEdit({ t: 'Move', id: moveDrag.e.id, pins: moveDrag.e.pins });
+    else localSim.setElements(elements);
+    moveDrag = null;
+    return;
+  }
+  valueDrag = null;
 });
 canvas.addEventListener('pointerleave', () => (mouse = null));
-canvas.addEventListener('pointerdown', (ev) => {
-  const e = elementAt(ev.clientX, ev.clientY);
-  if (!e) return;
-  const mode = dragMode(e);
-  if (e.kind.t === 'Switch') {
-    interact(e, { t: 'SetSwitch', closed: !e.kind.closed });
-  } else if (mode) {
-    const startVal =
-      e.kind.t === 'Potentiometer'
-        ? e.kind.wiper
-        : e.kind.t === 'Resistor' || e.kind.t === 'Lamp'
-          ? e.kind.ohms
-          : 0;
-    drag = { e, mode, startY: ev.clientY, startVal, lastSent: 0 };
-    canvas.setPointerCapture(ev.pointerId);
+
+window.addEventListener('keydown', (ev) => {
+  if (ev.target === psearch) return;
+  if (ev.key === ' ') {
+    spaceHeld = true;
+    ev.preventDefault();
+  } else if (ev.key === '/' || ev.key === 'p') {
+    openPalette();
+    ev.preventDefault();
+  } else if (ev.key === 'Escape') {
+    placing = null;
+    closePalette();
+    canvas.style.cursor = 'default';
+  } else if ((ev.key === 'Delete' || ev.key === 'Backspace' || ev.key === 'x') && mouse) {
+    const e = elementAt(mouse.x, mouse.y);
+    if (e) editDoc({ t: 'Remove', id: e.id });
   }
 });
-canvas.addEventListener('pointerup', (ev) => {
-  if (drag) {
-    canvas.releasePointerCapture(ev.pointerId);
-    drag = null;
-  }
+window.addEventListener('keyup', (ev) => {
+  if (ev.key === ' ') spaceHeld = false;
 });
 
 // ---------------------------------------------------------------- render
@@ -283,22 +523,40 @@ function frame(now: number) {
   }
 
   ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
-  ctx.fillStyle = '#1c1c22';
-  const gx0 = Math.ceil(-cam.ox / cam.scale);
-  const gy0 = Math.ceil(-cam.oy / cam.scale);
-  for (let gx = gx0; gx * cam.scale + cam.ox < window.innerWidth; gx++) {
-    for (let gy = gy0; gy * cam.scale + cam.oy < window.innerHeight; gy++) {
-      ctx.fillRect(cam.ox + gx * cam.scale - 1, cam.oy + gy * cam.scale - 1, 2, 2);
+  if (cam.scale >= 14) {
+    ctx.fillStyle = '#1c1c22';
+    const gx0 = Math.ceil(-cam.ox / cam.scale);
+    const gy0 = Math.ceil(-cam.oy / cam.scale);
+    for (let gx = gx0; gx * cam.scale + cam.ox < window.innerWidth; gx++) {
+      for (let gy = gy0; gy * cam.scale + cam.oy < window.innerHeight; gy++) {
+        ctx.fillRect(cam.ox + gx * cam.scale - 1, cam.oy + gy * cam.scale - 1, 2, 2);
+      }
     }
   }
 
   for (const e of elements) {
     drawElement({ ctx, cam, live: live.get(e.id), dots, dtSec: wallDt }, e);
   }
+
+  // Ghost previews for in-progress edits.
+  ctx.globalAlpha = 0.45;
+  if (wireDrag) {
+    drawElement({ ctx, cam, dots, dtSec: 0 }, { id: 0, kind: { t: 'Wire' }, pins: [wireDrag.a, wireDrag.b] });
+  }
+  if (placeDrag && placing) {
+    const kind = placing.make();
+    drawElement({ ctx, cam, dots, dtSec: 0 }, { id: 0, kind, pins: makePins(kind, placeDrag.a, placeDrag.b) });
+  } else if (placing && mouse) {
+    const kind = placing.make();
+    const a = snap(mouse.x, mouse.y);
+    drawElement({ ctx, cam, dots, dtSec: 0 }, { id: 0, kind, pins: makePins(kind, a, a) });
+  }
+  ctx.globalAlpha = 1;
+
   drawCursors(now);
 
-  const hover = mouse && !drag ? elementAt(mouse.x, mouse.y) : drag?.e;
-  if (hover && mouse) {
+  const hover = mouse && !valueDrag ? elementAt(mouse.x, mouse.y) : valueDrag?.e;
+  if (hover && mouse && !placing && !wireDrag) {
     const l = live.get(hover.id);
     tip.style.display = 'block';
     tip.style.left = `${mouse.x + 14}px`;
@@ -318,7 +576,8 @@ function frame(now: number) {
   hud.textContent =
     `EE Game   sim t = ${simTime.toFixed(2)} s   ` +
     (online ? `● ONLINE — ${population} player${population === 1 ? '' : 's'}` : '○ offline (local sim)') +
-    `\nclick the switch · drag a lamp ↕ to change resistance`;
+    (placing ? `   placing: ${placing.name} (drag to orient, Esc cancels)` : '') +
+    `\ndraw wires on empty grid · / = parts · click switch · drag knob ↕ · shift-drag move · hover+X delete · wheel zoom · space/right-drag pan`;
 
   requestAnimationFrame(frame);
 }

@@ -6,7 +6,7 @@ mod engine;
 mod netlist;
 
 pub use engine::{AdvanceReport, ElemFrame, Engine, GMIN};
-pub use netlist::{ElementKind, ElementSpec, InteractOp, Point, MAX_PINS};
+pub use netlist::{DocOp, ElementKind, ElementSpec, InteractOp, Point, MAX_PINS};
 
 #[cfg(test)]
 mod tests {

@@ -1,0 +1,100 @@
+// The parts palette: every placeable device, its default parameters, and
+// its placement geometry. Cost gates quantity/ratings later — never access
+// (design pillar): the full palette is available from minute one.
+
+import type { ElementKind, Point } from './circuit';
+
+export interface PartDef {
+  name: string;
+  /** Extra search keywords. */
+  keys: string;
+  make(): ElementKind;
+}
+
+export const CATALOG: PartDef[] = [
+  { name: 'Wire', keys: 'w line', make: () => ({ t: 'Wire' }) },
+  { name: 'Ground', keys: 'gnd earth', make: () => ({ t: 'Ground' }) },
+  { name: 'Resistor', keys: 'r ohm', make: () => ({ t: 'Resistor', ohms: 1000 }) },
+  { name: 'Lamp', keys: 'light bulb', make: () => ({ t: 'Lamp', ohms: 90, rated_watts: 1 }) },
+  { name: 'Capacitor', keys: 'c cap farad', make: () => ({ t: 'Capacitor', farads: 10e-6 }) },
+  { name: 'Inductor', keys: 'l coil henry', make: () => ({ t: 'Inductor', henries: 10e-3 }) },
+  {
+    name: 'Battery',
+    keys: 'v dc source volt',
+    make: () => ({ t: 'VoltageSource', dc: 9, amp: 0, hz: 0, phase: 0 }),
+  },
+  {
+    name: 'AC Source',
+    keys: 'sine ac oscillator signal',
+    make: () => ({ t: 'VoltageSource', dc: 0, amp: 5, hz: 2, phase: 0 }),
+  },
+  { name: 'Current Source', keys: 'i amp', make: () => ({ t: 'CurrentSource', amps: 0.01 }) },
+  { name: 'Switch', keys: 'sw toggle', make: () => ({ t: 'Switch', closed: false }) },
+  { name: 'Diode', keys: 'd rectifier', make: () => ({ t: 'Diode' }) },
+  { name: 'Zener', keys: 'z regulator breakdown', make: () => ({ t: 'Zener', vz: 5.6 }) },
+  { name: 'LED', keys: 'light emitting', make: () => ({ t: 'Led', color: 0 }) },
+  { name: 'NPN', keys: 'q bjt transistor', make: () => ({ t: 'Npn', beta: 100 }) },
+  { name: 'PNP', keys: 'q bjt transistor', make: () => ({ t: 'Pnp', beta: 100 }) },
+  { name: 'NMOS', keys: 'fet mosfet transistor', make: () => ({ t: 'Nmos', vt: 1.5, k: 0.05 }) },
+  { name: 'PMOS', keys: 'fet mosfet transistor', make: () => ({ t: 'Pmos', vt: 1.5, k: 0.05 }) },
+  { name: 'Op-Amp', keys: 'amplifier comparator', make: () => ({ t: 'OpAmp', rail: 12 }) },
+  {
+    name: 'Potentiometer',
+    keys: 'pot knob wiper variable',
+    make: () => ({ t: 'Potentiometer', ohms: 10000, wiper: 0.5 }),
+  },
+];
+
+export function searchParts(q: string): PartDef[] {
+  const s = q.trim().toLowerCase();
+  if (!s) return CATALOG;
+  return CATALOG.filter(
+    (p) => p.name.toLowerCase().includes(s) || p.keys.split(' ').some((k) => k.startsWith(s)),
+  );
+}
+
+function pinCount(kind: ElementKind): number {
+  switch (kind.t) {
+    case 'Ground':
+      return 1;
+    case 'Npn':
+    case 'Pnp':
+    case 'Nmos':
+    case 'Pmos':
+    case 'OpAmp':
+    case 'Potentiometer':
+      return 3;
+    default:
+      return 2;
+  }
+}
+
+/** Pin layout for a part dragged from grid point A to B. */
+export function makePins(kind: ElementKind, a: Point, b: Point): Point[] {
+  if (pinCount(kind) === 1) return [a];
+  if (a[0] === b[0] && a[1] === b[1]) b = [a[0] + 3, a[1]];
+  if (pinCount(kind) === 2) return [a, b];
+  // 3-pin: split the far end (or inputs) perpendicular to the drag axis.
+  const dx = b[0] - a[0];
+  const dy = b[1] - a[1];
+  const horiz = Math.abs(dx) >= Math.abs(dy);
+  const p: Point = horiz ? [0, 1] : [Math.sign(dy) >= 0 ? -1 : 1, 0];
+  const off = (pt: Point, k: number): Point => [pt[0] + p[0] * k, pt[1] + p[1] * k];
+  switch (kind.t) {
+    case 'Npn':
+    case 'Pnp':
+    case 'Nmos':
+    case 'Pmos':
+      // [base/gate at A], [collector/drain], [emitter/source]
+      return [a, off(b, -2), off(b, 2)];
+    case 'OpAmp':
+      // [in+], [in-] on the near side, [out] at B
+      return [off(a, -1), off(a, 1), b];
+    case 'Potentiometer': {
+      const mid: Point = [Math.round((a[0] + b[0]) / 2), Math.round((a[1] + b[1]) / 2)];
+      return [a, off(mid, -2), b];
+    }
+    default:
+      return [a, b];
+  }
+}
