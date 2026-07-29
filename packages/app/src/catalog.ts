@@ -38,6 +38,7 @@ export const CATALOG: PartDef[] = [
   { name: 'NMOS', keys: 'fet mosfet transistor', make: () => ({ t: 'Nmos', vt: 1.5, k: 0.05 }) },
   { name: 'PMOS', keys: 'fet mosfet transistor', make: () => ({ t: 'Pmos', vt: 1.5, k: 0.05 }) },
   { name: 'Op-Amp', keys: 'amplifier comparator', make: () => ({ t: 'OpAmp', rail: 12 }) },
+  { name: 'OTA', keys: 'transconductance current amplifier gm vco', make: () => ({ t: 'Ota' }) },
   {
     name: 'Potentiometer',
     keys: 'pot knob wiper variable',
@@ -57,6 +58,8 @@ function pinCount(kind: ElementKind): number {
   switch (kind.t) {
     case 'Ground':
       return 1;
+    case 'Ota':
+      return 4;
     case 'Npn':
     case 'Pnp':
     case 'Nmos':
@@ -74,6 +77,20 @@ export function makePins(kind: ElementKind, a: Point, b: Point): Point[] {
   if (pinCount(kind) === 1) return [a];
   if (a[0] === b[0] && a[1] === b[1]) b = [a[0] + 3, a[1]];
   if (pinCount(kind) === 2) return [a, b];
+  if (kind.t === 'Ota') {
+    // [in+, in-, out, bias]: inputs split at A, out at B, bias below.
+    const dx = b[0] - a[0];
+    const dy = b[1] - a[1];
+    const horiz = Math.abs(dx) >= Math.abs(dy);
+    const p: Point = horiz ? [0, 1] : [Math.sign(dy) >= 0 ? -1 : 1, 0];
+    const mid: Point = [Math.round((a[0] + b[0]) / 2), Math.round((a[1] + b[1]) / 2)];
+    return [
+      [a[0] - p[0], a[1] - p[1]],
+      [a[0] + p[0], a[1] + p[1]],
+      b,
+      [mid[0] + p[0] * 2, mid[1] + p[1] * 2],
+    ];
+  }
   // 3-pin: split the far end (or inputs) perpendicular to the drag axis.
   const dx = b[0] - a[0];
   const dy = b[1] - a[1];

@@ -2,7 +2,7 @@
 //! Tolerances follow trapezoidal local truncation error at the chosen dt,
 //! plus device-model tolerances for the semiconductor operating points.
 
-use sim_core::{Engine, InteractOp};
+use sim_core::{ElementSpec, Engine, InteractOp};
 use sim_golden::*;
 
 const DT: f64 = 1e-6;
@@ -225,6 +225,80 @@ fn opamp_relaxation_oscillates() {
     assert!(
         (5..=40).contains(&flips),
         "expected ~13 flips in 40 ms, got {flips}"
+    );
+}
+
+/// Count square-wave sign flips at the VCO's Schmitt output over 40 ms.
+fn vco_flips(vctrl: f64) -> u32 {
+    let mut eng = engine_with(ota_vco(vctrl));
+    let mut flips = 0u32;
+    let mut last_sign = 0i32;
+    for _ in 0..800 {
+        eng.advance(50); // 50 µs per observation
+        let out = eng.voltage_at((12, 2)).unwrap();
+        let sign = if out > 1.0 {
+            1
+        } else if out < -1.0 {
+            -1
+        } else {
+            0
+        };
+        if sign != 0 && last_sign != 0 && sign != last_sign {
+            flips += 1;
+        }
+        if sign != 0 {
+            last_sign = sign;
+        }
+    }
+    assert!(!eng.is_quarantined(), "VCO quarantined at vctrl={vctrl}");
+    flips
+}
+
+#[test]
+fn ota_vco_frequency_follows_control_voltage() {
+    // f = (vctrl - Vbe)/(100k · 4 · 10n · 2.5): ~135 Hz at 2 V,
+    // ~735 Hz at 8 V. Flips = 2f · 40 ms.
+    let lo = vco_flips(2.0);
+    let hi = vco_flips(8.0);
+    assert!(lo >= 6, "VCO barely oscillates at 2 V: {lo} flips");
+    assert!(
+        (40..=80).contains(&hi),
+        "VCO at 8 V: {hi} flips (expect ~59)"
+    );
+    let ratio = hi as f64 / lo as f64;
+    // Ideal ratio (8-0.65)/(2-0.65) ≈ 5.4; allow model tolerance.
+    assert!(
+        (3.5..8.0).contains(&ratio),
+        "frequency not tracking control voltage: lo={lo} hi={hi} ratio={ratio:.2}"
+    );
+}
+
+#[test]
+fn ota_output_current_saturates_at_iabc() {
+    // Open-loop: drive the inputs hard; the output current into a load
+    // resistor must saturate at Iabc = (5 - Vbe)/100k ≈ 43 µA.
+    let elems = vec![
+        ElementSpec {
+            id: 1,
+            kind: sim_core::ElementKind::Ota,
+            pins: vec![(0, 0), (0, 2), (4, 1), (2, 4)],
+        },
+        spec(2, dc(3.0), (0, 0), (0, 6)), // in+ at +3 V (way past 2Vt)
+        gnd(3, (0, 6)),
+        gnd(4, (0, 2)),                     // in- grounded
+        spec(5, r(1000.0), (4, 1), (4, 6)), // load to ground
+        gnd(6, (4, 6)),
+        spec(7, dc(5.0), (8, 4), (8, 8)),
+        gnd(8, (8, 8)),
+        spec(9, r(100_000.0), (8, 4), (2, 4)), // bias
+    ];
+    let mut eng = engine_with(elems);
+    eng.advance(200);
+    assert!(!eng.is_quarantined());
+    let i_load = elem_current(&eng, 5, 0);
+    assert!(
+        (38e-6..48e-6).contains(&i_load),
+        "saturated OTA output {i_load} (expect ~43 µA)"
     );
 }
 

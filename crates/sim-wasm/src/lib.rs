@@ -12,8 +12,8 @@ pub struct Sim {
     frame_buf: Vec<f32>,
 }
 
-/// Flat frame layout per element: [id, npins, v0, v1, v2, i0, i1, i2, power].
-pub const FRAME_STRIDE: usize = 9;
+/// Flat frame layout per element: [id, npins, v0..v3, i0..i3, power].
+pub const FRAME_STRIDE: usize = 11;
 
 #[wasm_bindgen]
 impl Sim {
@@ -53,10 +53,10 @@ impl Sim {
         for f in self.engine.frame() {
             self.frame_buf.push(f.id as f32);
             self.frame_buf.push(f.npins as f32);
-            for p in 0..3 {
+            for p in 0..4 {
                 self.frame_buf.push(f.v[p] as f32);
             }
-            for p in 0..3 {
+            for p in 0..4 {
                 self.frame_buf.push(f.i[p] as f32);
             }
             self.frame_buf.push(f.power as f32);

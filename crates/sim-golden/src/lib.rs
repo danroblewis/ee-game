@@ -234,6 +234,42 @@ pub fn opamp_relaxation() -> Vec<ElementSpec> {
     ]
 }
 
+/// OTA-based voltage-controlled oscillator (LM13700-datasheet style).
+/// The OTA sinks/sources ±Iabc into an integrating cap (triangle wave);
+/// an op-amp Schmitt trigger (thresholds ±2.5 V) flips the OTA input.
+/// Iabc = (vctrl - ~0.65 V)/100k, f = Iabc / (4·C·2.5 V) — frequency is
+/// proportional to the control voltage.
+pub fn ota_vco(vctrl: f64) -> Vec<ElementSpec> {
+    vec![
+        // OTA pins: [in+, in-, out, bias]
+        ElementSpec {
+            id: 1,
+            kind: ElementKind::Ota,
+            pins: vec![(0, 0), (0, 2), (4, 1), (2, 4)],
+        },
+        gnd(2, (0, 0)), // in+ grounded: OTA inverts the square wave
+        spec(3, ElementKind::Capacitor { farads: 10e-9 }, (4, 1), (4, 5)),
+        gnd(4, (4, 5)),
+        // Schmitt trigger: non-inverting comparator with hysteresis.
+        spec(5, r(1_000_000.0), (4, 1), (8, 1)), // triangle -> in+ (light load!)
+        spec3(6, ElementKind::OpAmp { rail: 5.0 }, (8, 1), (8, 3), (12, 2)),
+        gnd(7, (8, 3)),
+        spec(8, r(2_000_000.0), (12, 2), (12, -2)), // feedback: out -> in+
+        spec(9, ElementKind::Wire, (12, -2), (8, -2)),
+        spec(10, ElementKind::Wire, (8, -2), (8, 1)),
+        // Square wave back to the OTA inverting input.
+        spec(11, ElementKind::Wire, (12, 2), (12, 6)),
+        spec(12, ElementKind::Wire, (12, 6), (-2, 6)),
+        spec(13, ElementKind::Wire, (-2, 6), (-2, 2)),
+        spec(14, ElementKind::Wire, (-2, 2), (0, 2)),
+        // Control voltage -> R -> bias pin (sets Iabc).
+        spec(15, dc(vctrl), (16, 4), (16, 8)),
+        gnd(16, (16, 8)),
+        spec(17, r(100_000.0), (16, 4), (12, 4)),
+        spec(18, ElementKind::Wire, (12, 4), (2, 4)),
+    ]
+}
+
 /// LED through 330 Ω from 9 V: forward drop ≈ 2.1 V, I ≈ 21 mA.
 pub fn led_loop() -> Vec<ElementSpec> {
     vec![
@@ -259,6 +295,7 @@ pub fn all_golden() -> Vec<(&'static str, Vec<ElementSpec>)> {
         ("opamp_comparator", opamp_comparator()),
         ("zener_regulator", zener_regulator()),
         ("opamp_relaxation", opamp_relaxation()),
+        ("ota_vco", ota_vco(5.0)),
         ("pot_divider", pot_divider()),
         ("led_loop", led_loop()),
     ]

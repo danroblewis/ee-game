@@ -419,7 +419,8 @@ export function drawElement(d: DrawCtx, e: ElementSpec) {
       drawDots(ctx, cam, Dp, Sp, d.dots.advance(e.id, idd, d.dtSec), idd);
       break;
     }
-    case 'OpAmp': {
+    case 'OpAmp':
+    case 'Ota': {
       const [Pp, Mp, Op] = [P[0]!, P[1]!, P[2]!];
       const back = lerp(Pp, Mp, 0.5);
       const pmDir = norm(sub(Pp, Mp));
@@ -440,6 +441,22 @@ export function drawElement(d: DrawCtx, e: ElementSpec) {
       const inset = add(back, norm(sub(Op, back)), s * 0.22);
       ctx.fillText('+', inset[0] + (Pp[0] - back[0]) * 0.55 - s * 0.1, inset[1] + (Pp[1] - back[1]) * 0.55 + s * 0.1);
       ctx.fillText('−', inset[0] + (Mp[0] - back[0]) * 0.55 - s * 0.1, inset[1] + (Mp[1] - back[1]) * 0.55 + s * 0.1);
+      if (e.kind.t === 'Ota' && P[3]) {
+        // Bias lead into the triangle's belly; a double bar marks the
+        // current-output nature.
+        const center = lerp(back, Op, 0.45);
+        stroke(ctx, voltageColor(v(3)), [P[3]!, center]);
+        const uo = norm(sub(Op, back));
+        const no = perp(uo);
+        ctx.strokeStyle = '#c9c9d4';
+        for (const k of [0.62, 0.74]) {
+          const c = lerp(back, Op, k);
+          ctx.beginPath();
+          ctx.moveTo(...add(c, no, s * 0.16));
+          ctx.lineTo(...add(c, no, -s * 0.16));
+          ctx.stroke();
+        }
+      }
       const io = iPin(2);
       drawDots(ctx, cam, Op, add(Op, norm(sub(Op, back)), s * 0.01), d.dots.advance(e.id, io, d.dtSec), 0);
       break;
@@ -457,7 +474,7 @@ export function hitTest(cam: Camera, e: ElementSpec, x: number, y: number): numb
   let best = Infinity;
   const segs: [Px, Px][] = [];
   for (let k = 0; k + 1 < P.length; k++) segs.push([P[k]!, P[k + 1]!]);
-  if (P.length === 3) segs.push([P[0]!, P[2]!]);
+  if (P.length >= 3) segs.push([P[0]!, P[2]!]);
   for (const [a, b] of segs) {
     const dx = b[0] - a[0];
     const dy = b[1] - a[1];
@@ -466,7 +483,8 @@ export function hitTest(cam: Camera, e: ElementSpec, x: number, y: number): numb
     t = Math.max(0, Math.min(1, t));
     best = Math.min(best, Math.hypot(x - (a[0] + t * dx), y - (a[1] + t * dy)));
   }
-  if (P.length === 3) {
+  if (P.length >= 3) {
+    // Body hit: centroid of the first three pins (triangle for op-amps).
     const cx = (P[0]![0] + P[1]![0] + P[2]![0]) / 3;
     const cy = (P[0]![1] + P[1]![1] + P[2]![1]) / 3;
     best = Math.min(best, Math.max(0, Math.hypot(x - cx, y - cy) - cam.scale * 0.8));

@@ -55,6 +55,7 @@ const PART_HOTKEYS: Record<string, string> = {
   m: 'NMOS',
   M: 'PMOS',
   a: 'Op-Amp',
+  u: 'OTA',
   s: 'Switch',
   b: 'Lamp',
   t: 'Potentiometer',
@@ -146,8 +147,14 @@ const net = connect({
   onFrame(f) {
     simTime = f.time;
     const m = new Map<number, ElemLive>();
-    for (const [id, npins, v0, v1, v2, i0, i1, i2, power] of f.e) {
-      m.set(id, { id, npins, v: [v0, v1, v2], i: [i0, i1, i2], power });
+    for (const r of f.e) {
+      m.set(r[0]!, {
+        id: r[0]!,
+        npins: r[1]!,
+        v: [r[2]!, r[3]!, r[4]!, r[5]!],
+        i: [r[6]!, r[7]!, r[8]!, r[9]!],
+        power: r[10]!,
+      });
     }
     live = m;
   },
@@ -1033,6 +1040,8 @@ function describeValue(e: ElementSpec): string {
       return `Vz ${fmt(e.kind.vz, 'V')}`;
     case 'OpAmp':
       return `rail ±${fmt(e.kind.rail, 'V')}`;
+    case 'Ota':
+      return 'Iout = Iabc·tanh(vd/2Vt)';
     default:
       return '';
   }
@@ -1358,7 +1367,7 @@ function frame(now: number) {
     `EE Game   sim t = ${simTime.toFixed(2)} s   ` +
     (online ? `● ONLINE — ${population} player${population === 1 ? '' : 's'}` : '○ offline (local sim)') +
     (mode ? `   ${mode}` : '') +
-    `\nparts: R C L W G V D N P M A S B T Z E F I · Q rotate · drag pin = wire · drag empty = select · ⌘C/⌘V copy/paste · 1/2 probe · 0 ref · O scope · X delete · / search`;
+    `\nparts: R C L W G V D N P M A U S B T Z E F I · Q rotate · drag pin = wire · drag empty = select · ⌘C/⌘V copy/paste · 1/2 probe · 0 ref · O scope · X delete · / search`;
 
   requestAnimationFrame(frame);
 }

@@ -41,6 +41,8 @@ const MOS_DAMP: f64 = 0.5;
 /// what lets relaxation oscillators and flip-flops self-start.
 const OPAMP_GAIN: f64 = 1e5;
 const OPAMP_VOFF: f64 = 1e-4;
+/// OTA bias-pin diode (LM13700-style: Iabc injected into a junction).
+const OTA_IS: f64 = 1e-14;
 
 const NR_MAX_ITERS: usize = 100;
 const NR_ABSTOL: f64 = 1e-6;
@@ -601,6 +603,30 @@ impl Engine {
                     self.stamp_partial(s, s, m.gm + m.gds);
                     self.stamp_i_into(s, -i0);
                 }
+                ElementKind::Ota => {
+                    let (p, m, out, bias) = (node[0], node[1], node[2], node[3]);
+                    // Bias pin: diode junction to ground; injected current
+                    // is Iabc.
+                    let vb = state.vg2;
+                    let eb = libm::exp(vb / VT);
+                    let g_b = OTA_IS / VT * eb;
+                    let i_b = OTA_IS * (eb - 1.0);
+                    self.stamp_partial(bias, bias, g_b);
+                    self.stamp_i_into(bias, i_b - g_b * vb);
+                    // Output: Iout = Iabc * tanh(vd / 2Vt) flowing OUT of
+                    // the out pin. Linearize in vd AND vbias.
+                    let iabc = i_b.max(0.0);
+                    let vd = state.vg1;
+                    let th = libm::tanh(vd / (2.0 * VT));
+                    let gm_eff = iabc / (2.0 * VT) * (1.0 - th * th);
+                    let d_ib = if i_b > 0.0 { g_b } else { 0.0 };
+                    let iout = iabc * th;
+                    // I_into(out) = -Iout; partials are negated.
+                    self.stamp_partial(out, p, -gm_eff);
+                    self.stamp_partial(out, m, gm_eff);
+                    self.stamp_partial(out, bias, -d_ib * th);
+                    self.stamp_i_into(out, -iout + gm_eff * vd + d_ib * th * vb);
+                }
                 ElementKind::OpAmp { rail } => {
                     let bi = self.num_nodes + branch.ok_or(())?;
                     let (p, m, out) = (node[0], node[1], node[2]);
@@ -719,6 +745,18 @@ impl Engine {
                         *last += delta.clamp(-MOS_DAMP, MOS_DAMP);
                     }
                 }
+                ElementKind::Ota => {
+                    let vd = self.xv(node[0]) - self.xv(node[1]);
+                    let vb = self.xv(node[3]);
+                    let vcrit = VT * libm::log(VT / (core::f64::consts::SQRT_2 * OTA_IS));
+                    let st = &mut self.elems[ei].state;
+                    let nb = pnjlim(vb, st.vg2, VT, vcrit);
+                    if !close(vd, st.vg1) || !close(nb, st.vg2) {
+                        converged = false;
+                    }
+                    st.vg1 = vd; // tanh is safe at any argument; no limiting
+                    st.vg2 = nb;
+                }
                 ElementKind::OpAmp { rail } => {
                     let target = OPAMP_GAIN * (self.xv(node[0]) - self.xv(node[1]) + OPAMP_VOFF);
                     let st = &mut self.elems[ei].state;
@@ -786,10 +824,15 @@ impl Engine {
             };
             let v01 = self.xv(node[0]) - self.xv(node[1]);
             let bi_val = branch.map(|b| self.x[self.num_nodes + b]);
-            let vs: [f64; MAX_PINS] = [self.xv(node[0]), self.xv(node[1]), self.xv(node[2])];
+            let mut vs = [0.0; MAX_PINS];
+            for (k, v) in vs.iter_mut().enumerate() {
+                *v = self.xv(node[k]);
+            }
             let st = &mut self.elems[ei].state;
             let mut two = |i: f64| {
-                st.pin_i = [i, -i, 0.0];
+                st.pin_i = [0.0; MAX_PINS];
+                st.pin_i[0] = i;
+                st.pin_i[1] = -i;
             };
             match kind {
                 ElementKind::Wire | ElementKind::Ground => {}
@@ -799,7 +842,10 @@ impl Engine {
                     let r2 = (ohms * (1.0 - wiper)).max(1e-3);
                     let ia = (vs[0] - vs[1]) / r1;
                     let ib = (vs[2] - vs[1]) / r2;
-                    st.pin_i = [ia, -(ia + ib), ib];
+                    st.pin_i = [0.0; MAX_PINS];
+                    st.pin_i[0] = ia;
+                    st.pin_i[1] = -(ia + ib);
+                    st.pin_i[2] = ib;
                 }
                 ElementKind::Capacitor { farads } => {
                     let geq = if be { farads / h } else { 2.0 * farads / h };
@@ -849,7 +895,10 @@ impl Engine {
                     let i_r = BJT_IS * (libm::exp(vbc / VT) - 1.0);
                     let ic = i_f - i_r * (1.0 + 1.0 / BJT_BETA_R);
                     let ib = i_f / beta + i_r / BJT_BETA_R;
-                    st.pin_i = [pol * ib, pol * ic, -pol * (ib + ic)];
+                    st.pin_i = [0.0; MAX_PINS];
+                    st.pin_i[0] = pol * ib;
+                    st.pin_i[1] = pol * ic;
+                    st.pin_i[2] = -pol * (ib + ic);
                     st.vg1 = vbe;
                     st.vg2 = vbc;
                 }
@@ -867,7 +916,18 @@ impl Engine {
                     st.pin_i[m.s_index] = -id;
                 }
                 ElementKind::OpAmp { .. } => {
-                    st.pin_i = [0.0, 0.0, bi_val.unwrap_or(0.0)];
+                    st.pin_i = [0.0; MAX_PINS];
+                    st.pin_i[2] = bi_val.unwrap_or(0.0);
+                }
+                ElementKind::Ota => {
+                    let eb = libm::exp(vs[3] / VT);
+                    let iabc = (OTA_IS * (eb - 1.0)).max(0.0);
+                    let iout = iabc * libm::tanh((vs[0] - vs[1]) / (2.0 * VT));
+                    st.pin_i = [0.0; MAX_PINS];
+                    st.pin_i[2] = -iout;
+                    st.pin_i[3] = OTA_IS * (eb - 1.0);
+                    st.vg1 = vs[0] - vs[1];
+                    st.vg2 = vs[3];
                 }
             }
         }

@@ -7,8 +7,8 @@
 
 pub type Point = (i32, i32);
 
-/// Largest pin count of any element (BJT/MOSFET/op-amp/pot are 3-pin).
-pub const MAX_PINS: usize = 3;
+/// Largest pin count of any element (the OTA is 4-pin).
+pub const MAX_PINS: usize = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -84,6 +84,12 @@ pub enum ElementKind {
     OpAmp {
         rail: f64,
     },
+    /// Operational transconductance amplifier (LM13700-style).
+    /// Pins: [in+, in-, out, bias]. The bias pin is a diode junction to
+    /// ground; the current injected into it sets Iabc, and the output
+    /// sources Iout = Iabc * tanh(vd / 2Vt) — a current, not a voltage.
+    /// gm = Iabc / 2Vt, output current saturates at ±Iabc.
+    Ota,
     /// Potentiometer. Pins: [end a, wiper, end b]; `wiper` in 0..1 is the
     /// fractional position from end a. `SetValue` moves the wiper.
     Potentiometer {
@@ -97,6 +103,7 @@ impl ElementKind {
         use ElementKind::*;
         match self {
             Ground => 1,
+            Ota => 4,
             Npn { .. }
             | Pnp { .. }
             | Nmos { .. }
@@ -128,6 +135,7 @@ impl ElementKind {
                 | ElementKind::Nmos { .. }
                 | ElementKind::Pmos { .. }
                 | ElementKind::OpAmp { .. }
+                | ElementKind::Ota
         )
     }
 }

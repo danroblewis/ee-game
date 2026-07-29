@@ -6,8 +6,8 @@ import type { Probe } from './scope';
 
 export interface ServerFrame {
   time: number;
-  /** [id, npins, v0, v1, v2, i0, i1, i2, power] per element. */
-  e: [number, number, number, number, number, number, number, number, number][];
+  /** [id, npins, v0..v3, i0..i3, power] per element. */
+  e: number[][];
 }
 
 export interface NetHandlers {

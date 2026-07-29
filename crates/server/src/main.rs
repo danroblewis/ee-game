@@ -179,6 +179,56 @@ fn demo_room_circuit() -> Vec<ElementSpec> {
         spec(106, K::Wire, (37, 26), (35, 26)),
         gnd(107, (35, 26)),
         spec(108, K::Wire, (35, 26), (33, 26)),
+        // ---- H: OTA voltage-controlled oscillator. The OTA charges the
+        // cap with ±Iabc (triangle); the op-amp Schmitt (1M/2M ->
+        // thresholds ±2.5 V) flips the OTA input. Drag the pot: Iabc =
+        // (Vwiper - 0.6)/100k sweeps the frequency ~0.05..8 Hz. The LED
+        // blinks at the VCO rate.
+        ElementSpec {
+            id: 120,
+            kind: K::Ota,
+            pins: vec![(4, 36), (4, 38), (8, 37), (6, 40)],
+        },
+        spec(121, K::Wire, (4, 36), (2, 36)),
+        gnd(122, (2, 36)),
+        spec(123, K::Capacitor { farads: 1e-6 }, (8, 37), (8, 41)),
+        gnd(124, (8, 41)),
+        spec(125, r(1_000_000.0), (8, 37), (13, 37)), // triangle -> Schmitt in+
+        // Schmitt trigger pins: [in+, in-, out]
+        spec3(130, K::OpAmp { rail: 5.0 }, (13, 37), (13, 39), (17, 38)),
+        spec(131, r(2_000_000.0), (19, 34), (19, 38)), // feedback
+        spec(132, K::Wire, (17, 38), (19, 38)),
+        spec(133, K::Wire, (19, 34), (13, 34)),
+        spec(134, K::Wire, (13, 34), (13, 37)),
+        spec(135, K::Wire, (13, 39), (11, 39)),
+        gnd(136, (11, 39)),
+        // Loop: square wave back to the OTA inverting input.
+        spec(137, K::Wire, (17, 38), (17, 42)),
+        spec(138, K::Wire, (17, 42), (2, 42)),
+        spec(139, K::Wire, (2, 42), (2, 38)),
+        spec(140, K::Wire, (2, 38), (4, 38)),
+        // Rate indicator.
+        spec(141, r(470.0), (17, 38), (21, 38)),
+        spec(142, K::Led { color: 4 }, (21, 38), (21, 42)),
+        gnd(143, (21, 42)),
+        // Control: battery -> pot -> 100k -> bias pin.
+        spec(144, dc(9.0), (25, 34), (25, 42)),
+        gnd(145, (25, 42)),
+        spec(146, K::Wire, (25, 34), (27, 34)),
+        spec(147, K::Wire, (25, 42), (27, 42)),
+        spec3(
+            148,
+            K::Potentiometer {
+                ohms: 10_000.0,
+                wiper: 0.4,
+            },
+            (27, 42),
+            (29, 38),
+            (27, 34),
+        ),
+        spec(149, r(100_000.0), (29, 38), (29, 44)),
+        spec(150, K::Wire, (29, 44), (6, 44)),
+        spec(151, K::Wire, (6, 44), (6, 40)),
     ]
 }
 
@@ -466,8 +516,8 @@ async fn sim_task(room: Arc<Room>, mut cmds: mpsc::UnboundedReceiver<Cmd>) {
 
         if room.events.receiver_count() > 0 {
             // Same flat layout as the WASM facade:
-            // [id, npins, v0, v1, v2, i0, i1, i2, power].
-            let e: Vec<[f64; 9]> = eng
+            // [id, npins, v0..v3, i0..i3, power].
+            let e: Vec<[f64; 11]> = eng
                 .frame()
                 .iter()
                 .map(|f| {
@@ -477,9 +527,11 @@ async fn sim_task(room: Arc<Room>, mut cmds: mpsc::UnboundedReceiver<Cmd>) {
                         f.v[0],
                         f.v[1],
                         f.v[2],
+                        f.v[3],
                         f.i[0],
                         f.i[1],
                         f.i[2],
+                        f.i[3],
                         f.power,
                     ]
                 })

@@ -20,6 +20,7 @@ export type ElementKind =
   | { t: 'Nmos'; vt: number; k: number }
   | { t: 'Pmos'; vt: number; k: number }
   | { t: 'OpAmp'; rail: number }
+  | { t: 'Ota' }
   | { t: 'Potentiometer'; ohms: number; wiper: number };
 
 export interface ElementSpec {
@@ -49,6 +50,8 @@ export function pinLabels(kind: ElementKind): string[] {
       return ['G', 'D', 'S'];
     case 'OpAmp':
       return ['+', '−', 'out'];
+    case 'Ota':
+      return ['+', '−', 'out', 'Iabc'];
     case 'Potentiometer':
       return ['A', 'W', 'B'];
     case 'Ground':
@@ -84,7 +87,7 @@ export interface ElemLive {
   power: number;
 }
 
-export const FRAME_STRIDE = 9;
+export const FRAME_STRIDE = 11;
 
 export function unpackFrame(flat: ArrayLike<number>): Map<number, ElemLive> {
   const out = new Map<number, ElemLive>();
@@ -93,9 +96,9 @@ export function unpackFrame(flat: ArrayLike<number>): Map<number, ElemLive> {
     out.set(id, {
       id,
       npins: flat[o + 1]!,
-      v: [flat[o + 2]!, flat[o + 3]!, flat[o + 4]!],
-      i: [flat[o + 5]!, flat[o + 6]!, flat[o + 7]!],
-      power: flat[o + 8]!,
+      v: [flat[o + 2]!, flat[o + 3]!, flat[o + 4]!, flat[o + 5]!],
+      i: [flat[o + 6]!, flat[o + 7]!, flat[o + 8]!, flat[o + 9]!],
+      power: flat[o + 10]!,
     });
   }
   return out;
