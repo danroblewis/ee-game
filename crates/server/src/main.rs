@@ -255,6 +255,54 @@ struct Probe {
 const SAMPLE_EVERY: u32 = 16;
 const MAX_PROBES: usize = 8;
 
+/// A control panel: a dotted region of the schematic that gets a
+/// mission-control window on every client. Room-scoped like probes, so a
+/// panel one player draws is a shared instrument. Only the rectangle is
+/// stored — membership is re-derived from element geometry by the client,
+/// never persisted (moving a part in or out re-wires the panel live).
+#[derive(Clone, serde::Serialize, Deserialize)]
+struct Panel {
+    plid: u32,
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+    name: String,
+}
+
+const MAX_PANELS: usize = 32;
+const MAX_PANEL_NAME: usize = 28;
+/// Smallest accepted region in grid units: a stray click must not make one.
+const MIN_PANEL_SPAN: f64 = 1.0;
+
+#[derive(Clone, Deserialize)]
+#[serde(tag = "t", rename_all = "lowercase")]
+enum PanelOp {
+    Add {
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+        #[serde(default)]
+        name: Option<String>,
+    },
+    Remove {
+        plid: u32,
+    },
+    /// Move/resize the region (the client drags the name tab).
+    Rect {
+        plid: u32,
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+    },
+    Rename {
+        plid: u32,
+        name: String,
+    },
+}
+
 enum Cmd {
     Interact {
         id: u32,
@@ -273,6 +321,9 @@ enum Cmd {
         elem: u32,
         pin: usize,
     },
+    Panel {
+        op: PanelOp,
+    },
     Join,
     Leave,
 }
@@ -285,15 +336,18 @@ struct Room {
     /// Room-scoped probes (shared instrumentation — plan pillar: probes
     /// live on the authoritative tick so cross-player overlay is trivial).
     probes: std::sync::Mutex<Vec<Probe>>,
+    /// Room-scoped control-panel regions (shared, same rationale as probes).
+    panels: std::sync::Mutex<Vec<Panel>>,
     next_client: AtomicU32,
     next_pid: AtomicU32,
+    next_plid: AtomicU32,
     population: AtomicU32,
     /// Set when the document changes; the sim task checkpoints to disk.
     dirty: std::sync::atomic::AtomicBool,
 }
 
-/// Room checkpoint: the document and probes survive server restarts (the
-/// continuous electrical state re-settles within milliseconds).
+/// Room checkpoint: the document, probes and panels survive server restarts
+/// (the continuous electrical state re-settles within milliseconds).
 #[derive(serde::Serialize, Deserialize)]
 struct SaveFile {
     elements: Vec<ElementSpec>,
@@ -301,6 +355,11 @@ struct SaveFile {
     probes: Vec<SavedProbe>,
     #[serde(default)]
     next_pid: u32,
+    /// serde defaults: saves written before panels existed still load.
+    #[serde(default)]
+    panels: Vec<Panel>,
+    #[serde(default)]
+    next_plid: u32,
 }
 
 #[derive(serde::Serialize, Deserialize)]
@@ -339,6 +398,8 @@ fn checkpoint(room: &Room) {
             })
             .collect(),
         next_pid: room.next_pid.load(Ordering::Relaxed),
+        panels: room.panels.lock().unwrap().clone(),
+        next_plid: room.next_plid.load(Ordering::Relaxed),
     };
     if let Ok(json) = serde_json::to_string(&save) {
         let path = save_path();
@@ -450,6 +511,15 @@ async fn sim_task(room: Arc<Room>, mut cmds: mpsc::UnboundedReceiver<Cmd>) {
                         let _ = room
                             .events
                             .send(json!({"t": "probes", "list": *probes}).to_string());
+                    }
+                }
+                Cmd::Panel { op } => {
+                    let mut panels = room.panels.lock().unwrap();
+                    if apply_panel_op(&mut panels, &room.next_plid, &op) {
+                        room.dirty.store(true, Ordering::Relaxed);
+                        let _ = room
+                            .events
+                            .send(json!({"t": "panels", "list": *panels}).to_string());
                     }
                 }
                 Cmd::Join | Cmd::Leave => {
@@ -609,6 +679,91 @@ fn apply_doc_op(room: &Room, op: &DocOp) -> bool {
     }
 }
 
+fn clean_panel_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_PANEL_NAME)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// Normalize a drag rectangle. None = degenerate or non-finite input, which
+/// the caller drops (same "validate then apply" rule as document ops).
+fn norm_panel_rect(x0: f64, y0: f64, x1: f64, y1: f64) -> Option<(f64, f64, f64, f64)> {
+    if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite()) {
+        return None;
+    }
+    let (ax, bx) = (x0.min(x1), x0.max(x1));
+    let (ay, by) = (y0.min(y1), y0.max(y1));
+    if bx - ax < MIN_PANEL_SPAN || by - ay < MIN_PANEL_SPAN {
+        return None;
+    }
+    Some((ax, ay, bx, by))
+}
+
+/// Apply a panel op to the room's panel list. Returns false to drop the op
+/// (malformed rect, unknown plid, panel budget reached).
+fn apply_panel_op(panels: &mut Vec<Panel>, next_plid: &AtomicU32, op: &PanelOp) -> bool {
+    match op {
+        PanelOp::Add { x0, y0, x1, y1, name } => {
+            let Some((x0, y0, x1, y1)) = norm_panel_rect(*x0, *y0, *x1, *y1) else {
+                return false;
+            };
+            if panels.len() >= MAX_PANELS {
+                return false;
+            }
+            let plid = next_plid.fetch_add(1, Ordering::Relaxed);
+            let name = name
+                .as_deref()
+                .map(clean_panel_name)
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| format!("PANEL {plid}"));
+            panels.push(Panel {
+                plid,
+                x0,
+                y0,
+                x1,
+                y1,
+                name,
+            });
+            true
+        }
+        PanelOp::Remove { plid } => {
+            let before = panels.len();
+            panels.retain(|p| p.plid != *plid);
+            panels.len() != before
+        }
+        PanelOp::Rect {
+            plid,
+            x0,
+            y0,
+            x1,
+            y1,
+        } => {
+            let Some((x0, y0, x1, y1)) = norm_panel_rect(*x0, *y0, *x1, *y1) else {
+                return false;
+            };
+            let Some(p) = panels.iter_mut().find(|p| p.plid == *plid) else {
+                return false;
+            };
+            (p.x0, p.y0, p.x1, p.y1) = (x0, y0, x1, y1);
+            true
+        }
+        PanelOp::Rename { plid, name } => {
+            let name = clean_panel_name(name);
+            if name.is_empty() {
+                return false;
+            }
+            let Some(p) = panels.iter_mut().find(|p| p.plid == *plid) else {
+                return false;
+            };
+            p.name = name;
+            true
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "t", rename_all = "lowercase")]
 enum ClientMsg {
@@ -629,6 +784,9 @@ enum ClientMsg {
         elem: u32,
         pin: usize,
     },
+    Panel {
+        op: PanelOp,
+    },
     Cursor {
         x: f64,
         y: f64,
@@ -648,7 +806,12 @@ async fn client_session(mut socket: WebSocket, room: Arc<Room>) {
     let hello = {
         let elems = room.elements.lock().unwrap();
         let probes = room.probes.lock().unwrap();
-        json!({"t": "hello", "you": me, "elements": *elems, "probes": *probes}).to_string()
+        let panels = room.panels.lock().unwrap();
+        json!({
+            "t": "hello", "you": me, "elements": *elems,
+            "probes": *probes, "panels": *panels,
+        })
+        .to_string()
     };
     if socket.send(Message::Text(hello.into())).await.is_err() {
         room.population.fetch_sub(1, Ordering::Relaxed);
@@ -685,6 +848,9 @@ async fn client_session(mut socket: WebSocket, room: Arc<Room>) {
                         Ok(ClientMsg::ProbeRef { pid, elem, pin }) => {
                             let _ = room.cmds.send(Cmd::ProbeRef { pid, elem, pin });
                         }
+                        Ok(ClientMsg::Panel { op }) => {
+                            let _ = room.cmds.send(Cmd::Panel { op });
+                        }
                         Ok(ClientMsg::Cursor { x, y }) => {
                             let _ = room.events.send(
                                 json!({"t": "cursor", "who": me, "x": x, "y": y}).to_string(),
@@ -710,7 +876,7 @@ async fn main() {
     // Restore the room from the last checkpoint; fresh rooms start with
     // the showcase circuit.
     let saved = load_room();
-    let (elements, probes, next_pid) = match saved {
+    let (elements, probes, next_pid, panels, next_plid) = match saved {
         Some(s) => {
             tracing::info!(
                 "restored room from {} ({} elements)",
@@ -728,9 +894,14 @@ async fn main() {
                     r: p.r,
                 })
                 .collect();
-            (s.elements, probes, s.next_pid.max(1))
+            // Never hand out a plid a restored panel already owns.
+            let next_plid = s
+                .next_plid
+                .max(s.panels.iter().map(|p| p.plid + 1).max().unwrap_or(1))
+                .max(1);
+            (s.elements, probes, s.next_pid.max(1), s.panels, next_plid)
         }
-        None => (demo_room_circuit(), Vec::new(), 1),
+        None => (demo_room_circuit(), Vec::new(), 1, Vec::new(), 1),
     };
 
     let room = Arc::new(Room {
@@ -738,8 +909,10 @@ async fn main() {
         events: event_tx,
         elements: std::sync::Mutex::new(elements),
         probes: std::sync::Mutex::new(probes),
+        panels: std::sync::Mutex::new(panels),
         next_client: AtomicU32::new(1),
         next_pid: AtomicU32::new(next_pid),
+        next_plid: AtomicU32::new(next_plid),
         population: AtomicU32::new(0),
         dirty: std::sync::atomic::AtomicBool::new(false),
     });
@@ -811,5 +984,139 @@ mod tests {
             }
         }
         assert!(flips >= 10, "oscillator only flipped {flips} times in 30 s");
+    }
+
+    #[test]
+    fn panel_ops_add_move_rename_remove() {
+        let mut panels: Vec<Panel> = Vec::new();
+        let next = AtomicU32::new(1);
+
+        // A backwards drag is normalized; the plid comes from the room.
+        let add = PanelOp::Add {
+            x0: 10.0,
+            y0: 9.0,
+            x1: 2.0,
+            y1: 1.0,
+            name: None,
+        };
+        assert!(apply_panel_op(&mut panels, &next, &add));
+        assert_eq!(panels.len(), 1);
+        let plid = panels[0].plid;
+        assert_eq!((panels[0].x0, panels[0].y0), (2.0, 1.0));
+        assert_eq!((panels[0].x1, panels[0].y1), (10.0, 9.0));
+        assert_eq!(panels[0].name, format!("PANEL {plid}"));
+
+        // Degenerate and non-finite rectangles are dropped.
+        for bad in [
+            PanelOp::Add {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 0.5,
+                y1: 8.0,
+                name: None,
+            },
+            PanelOp::Add {
+                x0: f64::NAN,
+                y0: 0.0,
+                x1: 8.0,
+                y1: 8.0,
+                name: None,
+            },
+        ] {
+            assert!(!apply_panel_op(&mut panels, &next, &bad));
+        }
+        assert_eq!(panels.len(), 1);
+
+        // Move/resize, then rename (control chars stripped, length capped).
+        assert!(apply_panel_op(
+            &mut panels,
+            &next,
+            &PanelOp::Rect {
+                plid,
+                x0: 4.0,
+                y0: 4.0,
+                x1: 12.0,
+                y1: 10.0,
+            }
+        ));
+        assert_eq!((panels[0].x0, panels[0].y1), (4.0, 10.0));
+        assert!(apply_panel_op(
+            &mut panels,
+            &next,
+            &PanelOp::Rename {
+                plid,
+                name: "  dimmer\nbench  ".into(),
+            }
+        ));
+        assert_eq!(panels[0].name, "dimmerbench");
+        assert!(!apply_panel_op(
+            &mut panels,
+            &next,
+            &PanelOp::Rename {
+                plid,
+                name: "   ".into(),
+            }
+        ));
+        assert!(!apply_panel_op(
+            &mut panels,
+            &next,
+            &PanelOp::Rect {
+                plid: plid + 999,
+                x0: 0.0,
+                y0: 0.0,
+                x1: 5.0,
+                y1: 5.0,
+            }
+        ));
+
+        // Budget, then removal.
+        while panels.len() < MAX_PANELS {
+            assert!(apply_panel_op(
+                &mut panels,
+                &next,
+                &PanelOp::Add {
+                    x0: 0.0,
+                    y0: 0.0,
+                    x1: 6.0,
+                    y1: 6.0,
+                    name: Some("bench".into()),
+                }
+            ));
+        }
+        assert!(!apply_panel_op(
+            &mut panels,
+            &next,
+            &PanelOp::Add {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 6.0,
+                y1: 6.0,
+                name: None,
+            }
+        ));
+        assert!(apply_panel_op(&mut panels, &next, &PanelOp::Remove { plid }));
+        assert!(!apply_panel_op(&mut panels, &next, &PanelOp::Remove { plid }));
+        assert_eq!(panels.len(), MAX_PANELS - 1);
+    }
+
+    #[test]
+    fn old_saves_without_panels_load() {
+        let s: SaveFile =
+            serde_json::from_str(r#"{"elements":[],"probes":[],"next_pid":3}"#).unwrap();
+        assert!(s.panels.is_empty());
+        assert_eq!(s.next_plid, 0);
+    }
+
+    #[test]
+    fn panel_client_msg_parses() {
+        let msg: ClientMsg =
+            serde_json::from_str(r#"{"t":"panel","op":{"t":"add","x0":1,"y0":2,"x1":9,"y1":8}}"#)
+                .unwrap();
+        let ClientMsg::Panel { op } = msg else {
+            panic!("expected a panel message")
+        };
+        let mut panels = Vec::new();
+        assert!(apply_panel_op(&mut panels, &AtomicU32::new(7), &op));
+        assert_eq!(panels[0].plid, 7);
     }
 }
