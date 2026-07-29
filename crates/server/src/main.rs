@@ -706,7 +706,13 @@ fn norm_panel_rect(x0: f64, y0: f64, x1: f64, y1: f64) -> Option<(f64, f64, f64,
 /// (malformed rect, unknown plid, panel budget reached).
 fn apply_panel_op(panels: &mut Vec<Panel>, next_plid: &AtomicU32, op: &PanelOp) -> bool {
     match op {
-        PanelOp::Add { x0, y0, x1, y1, name } => {
+        PanelOp::Add {
+            x0,
+            y0,
+            x1,
+            y1,
+            name,
+        } => {
             let Some((x0, y0, x1, y1)) = norm_panel_rect(*x0, *y0, *x1, *y1) else {
                 return false;
             };
@@ -1094,8 +1100,16 @@ mod tests {
                 name: None,
             }
         ));
-        assert!(apply_panel_op(&mut panels, &next, &PanelOp::Remove { plid }));
-        assert!(!apply_panel_op(&mut panels, &next, &PanelOp::Remove { plid }));
+        assert!(apply_panel_op(
+            &mut panels,
+            &next,
+            &PanelOp::Remove { plid }
+        ));
+        assert!(!apply_panel_op(
+            &mut panels,
+            &next,
+            &PanelOp::Remove { plid }
+        ));
         assert_eq!(panels.len(), MAX_PANELS - 1);
     }
 
