@@ -205,6 +205,35 @@ pub fn pot_divider() -> Vec<ElementSpec> {
     ]
 }
 
+/// Op-amp relaxation oscillator (astable multivibrator): Schmitt
+/// hysteresis from R1/R2 positive feedback, RC integration on the
+/// inverting input. Period ≈ 2·RC·ln(3) ≈ 2.2 ms; self-starts via the
+/// op-amp's input offset voltage.
+pub fn opamp_relaxation() -> Vec<ElementSpec> {
+    vec![
+        // pins: [in+, in-, out]
+        spec3(1, ElementKind::OpAmp { rail: 5.0 }, (0, 6), (0, 2), (4, 4)),
+        // integrator: Rf out -> in-, C in- -> ground
+        spec(2, r(10_000.0), (4, 4), (8, 4)),
+        spec(3, ElementKind::Wire, (8, 4), (8, 0)),
+        spec(4, ElementKind::Wire, (8, 0), (0, 0)),
+        spec(5, ElementKind::Wire, (0, 0), (0, 2)),
+        spec(
+            6,
+            ElementKind::Capacitor { farads: 100e-9 },
+            (0, 2),
+            (-4, 2),
+        ),
+        gnd(7, (-4, 2)),
+        // hysteresis divider: R1 out -> in+, R2 in+ -> ground
+        spec(8, r(10_000.0), (4, 4), (4, 8)),
+        spec(9, ElementKind::Wire, (4, 8), (0, 8)),
+        spec(10, ElementKind::Wire, (0, 8), (0, 6)),
+        spec(11, r(10_000.0), (0, 8), (-4, 8)),
+        gnd(12, (-4, 8)),
+    ]
+}
+
 /// LED through 330 Ω from 9 V: forward drop ≈ 2.1 V, I ≈ 21 mA.
 pub fn led_loop() -> Vec<ElementSpec> {
     vec![
@@ -229,6 +258,7 @@ pub fn all_golden() -> Vec<(&'static str, Vec<ElementSpec>)> {
         ("opamp_follower", opamp_follower()),
         ("opamp_comparator", opamp_comparator()),
         ("zener_regulator", zener_regulator()),
+        ("opamp_relaxation", opamp_relaxation()),
         ("pot_divider", pot_divider()),
         ("led_loop", led_loop()),
     ]

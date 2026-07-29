@@ -34,8 +34,13 @@ const BJT_BETA_R: f64 = 1.0;
 /// MOSFET off-state drain-source leak, and per-iteration voltage damping.
 const MOS_LEAK: f64 = 1e-8;
 const MOS_DAMP: f64 = 0.5;
-/// Op-amp open-loop gain.
+/// Op-amp open-loop gain and input offset voltage. The offset is a real
+/// device property, and it matters here: an ideal offset-free op-amp in a
+/// positive-feedback loop has an exact metastable solution that a
+/// noiseless deterministic solver would sit on forever — the offset is
+/// what lets relaxation oscillators and flip-flops self-start.
 const OPAMP_GAIN: f64 = 1e5;
+const OPAMP_VOFF: f64 = 1e-4;
 
 const NR_MAX_ITERS: usize = 100;
 const NR_ABSTOL: f64 = 1e-6;
@@ -355,6 +360,13 @@ impl Engine {
     fn solve_step(&mut self, h: f64, be: bool, report: &mut AdvanceReport) -> Result<(), ()> {
         let iters = if self.linear { 1 } else { NR_MAX_ITERS };
         let mut converged = self.linear;
+        // Reset per-pass op-amp region-change budgets (lastv[0] doubles as
+        // the counter for op-amps; they have no MOS damping state).
+        for e in self.elems.iter_mut() {
+            if matches!(e.spec.kind, ElementKind::OpAmp { .. }) {
+                e.state.lastv[0] = 0.0;
+            }
+        }
         for _ in 0..iters {
             report.nr_iters += 1;
             self.build(self.time + h, h, be)?;
@@ -608,7 +620,8 @@ impl Engine {
                             if out > 0 {
                                 self.a[bi * n + (out - 1)] -= 1.0;
                             }
-                            self.b[bi] = 0.0;
+                            // vout = A(vp - vm + Voff)
+                            self.b[bi] = -OPAMP_GAIN * OPAMP_VOFF;
                         }
                         r => {
                             if out > 0 {
@@ -707,7 +720,7 @@ impl Engine {
                     }
                 }
                 ElementKind::OpAmp { rail } => {
-                    let target = OPAMP_GAIN * (self.xv(node[0]) - self.xv(node[1]));
+                    let target = OPAMP_GAIN * (self.xv(node[0]) - self.xv(node[1]) + OPAMP_VOFF);
                     let st = &mut self.elems[ei].state;
                     let new_region = match st.region {
                         0 => {
@@ -723,16 +736,39 @@ impl Engine {
                             }
                         }
                         r => {
-                            if (r as f64) * target < rail {
-                                0
-                            } else {
+                            // Any opposing drive flips DIRECTLY to the
+                            // other rail: positive-feedback circuits leave
+                            // a rail hard, and routing through the linear
+                            // region would chatter (its solution sits back
+                            // on the old rail) until NR gives up —
+                            // Schmitt triggers and relaxation oscillators
+                            // with slow RC vs dt hit this exactly at the
+                            // threshold crossing. Only a weakening
+                            // same-sign drive relaxes to linear (negative
+                            // feedback coming out of saturation).
+                            let drive = (r as f64) * target;
+                            if drive >= rail {
                                 r
+                            } else if drive < 0.0 {
+                                -r
+                            } else {
+                                0
                             }
                         }
                     };
                     if new_region != st.region {
-                        converged = false;
-                        st.region = new_region;
+                        // At most 2 region changes per NR pass. At the
+                        // exact threshold crossing (within the offset
+                        // window, microvolts wide) the railed and linear
+                        // regions can point at each other indefinitely;
+                        // holding the current region yields a consistent
+                        // solve, and the next substep's capacitor motion
+                        // resolves the ambiguity cleanly.
+                        if st.lastv[0] < 2.0 {
+                            st.lastv[0] += 1.0;
+                            converged = false;
+                            st.region = new_region;
+                        }
                     }
                 }
                 _ => {}

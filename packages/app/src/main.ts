@@ -2,16 +2,21 @@
 // Online: this browser renders the server's authoritative sim and sends
 // interactions/edits. Offline: the same engine runs locally in WASM.
 //
-// Player controls:
-//   wheel                 zoom to cursor (over a scope: its timebase)
-//   middle/right/space    pan
-//   drag from pin/empty   draw wire;  drag on body = move (knobs: value)
-//   click                 select part or probe flag (properties panel)
-//   /                     parts palette;  R rotate selected part
-//   hover + V / I         toggle voltage probe / current clamp
-//   hover + G             set selected V-probe's reference (differential)
-//   O                     drop an in-place oscilloscope at the cursor
-//   hover + X / Delete    remove part
+// Controls (Falstad-style):
+//   letter keys           arm a part for placement (R resistor, L inductor,
+//                         C capacitor, W wire, G ground, V battery, F AC,
+//                         I current src, D diode, Z zener, E LED, N npn,
+//                         P pnp, M nmos, shift+M pmos, A op-amp, S switch,
+//                         B lamp, T pot) — click places (Q rotates first),
+//                         drag places with drag orientation, Esc exits
+//   click                 select part / probe flag;  drag on empty = marquee
+//   drag from a pin       draw wire (pins must overlap to connect)
+//   ⌘/Ctrl+C, ⌘/Ctrl+V    copy selection / paste bound to cursor
+//   Q                     rotate placement ghost, paste ghost, or selection
+//   1 / 2                 voltage probe / current clamp at hover
+//   0                     set selected V-probe's reference (differential)
+//   O                     drop an in-place oscilloscope;  X delete;  / palette
+//   wheel zoom (over a scope: timebase) · middle/right/space drag pan
 
 import init, { Sim } from './wasm/sim_wasm';
 import {
@@ -19,18 +24,41 @@ import {
   pinLabels,
   unpackFrame,
   type DocOp,
+  type ElementKind,
   type ElementSpec,
   type ElemLive,
   type InteractOp,
   type Point,
 } from './circuit';
-import { makePins, searchParts, type PartDef } from './catalog';
+import { CATALOG, makePins, searchParts, type PartDef } from './catalog';
 import { connect } from './net';
 import { DotFlow, drawElement, hitTest, type Camera } from './render';
 import { probeColor, renderScope, renderScopeInto, TraceStore, type Probe } from './scope';
 
 const DT = 10e-6;
 const MAX_STEPS_PER_FRAME = 4000; // local-mode wall budget
+
+const PART_HOTKEYS: Record<string, string> = {
+  w: 'Wire',
+  r: 'Resistor',
+  c: 'Capacitor',
+  l: 'Inductor',
+  g: 'Ground',
+  v: 'Battery',
+  f: 'AC Source',
+  i: 'Current Source',
+  d: 'Diode',
+  z: 'Zener',
+  e: 'LED',
+  n: 'NPN',
+  p: 'PNP',
+  m: 'NMOS',
+  M: 'PMOS',
+  a: 'Op-Amp',
+  s: 'Switch',
+  b: 'Lamp',
+  t: 'Potentiometer',
+};
 
 await init();
 
@@ -48,17 +76,22 @@ const traces = new TraceStore();
 let localPidCounter = 1;
 let scopeTimebase = 5; // docked panel, seconds across
 
-type Selection = { t: 'elem'; id: number } | { t: 'probe'; pid: number } | null;
-let selected: Selection = null;
+let selectedIds = new Set<number>();
+let selectedProbe: number | null = null;
+
+/** Copy/paste: kinds + pins relative to the selection centroid. */
+type ClipItem = { kind: ElementKind; pins: Point[] };
+let clipboard: ClipItem[] = [];
+let pasting: ClipItem[] | null = null;
 
 /** In-place oscilloscopes: world-anchored, per-player instruments. */
 interface FloatScope {
   sid: number;
-  x: number; // grid units
+  x: number;
   y: number;
   w: number;
   h: number;
-  tb: number; // seconds across
+  tb: number;
   pids: number[] | null; // null = all probes
 }
 let floatScopes: FloatScope[] = [];
@@ -84,7 +117,7 @@ function applyDoc(op: DocOp) {
     if (!elements.some((e) => e.id === op.spec.id)) elements.push(op.spec);
   } else if (op.t === 'Remove') {
     elements = elements.filter((e) => e.id !== op.id);
-    if (selected?.t === 'elem' && selected.id === op.id) selected = null;
+    selectedIds.delete(op.id);
   } else if (op.t === 'Move') {
     const e = elements.find((x) => x.id === op.id);
     if (e) e.pins = op.pins;
@@ -105,8 +138,6 @@ const net = connect({
     elements = serverElements;
     probes = serverProbes;
     live = new Map();
-    // Only auto-fit on the first join — a mid-session reconnect must not
-    // yank the camera away from where the player is working.
     if (firstHello) {
       firstHello = false;
       fitCamera();
@@ -131,7 +162,7 @@ const net = connect({
     probes = list;
     const alive = new Set(list.map((p) => p.pid));
     traces.prune(alive);
-    if (selected?.t === 'probe' && !alive.has(selected.pid)) selected = null;
+    if (selectedProbe !== null && !alive.has(selectedProbe)) selectedProbe = null;
     for (const s of floatScopes) if (s.pids) s.pids = s.pids.filter((pid) => alive.has(pid));
   },
   onSamples(t0, dts, s) {
@@ -147,7 +178,6 @@ const net = connect({
   },
   onClose() {
     if (online) {
-      // Server went away: carry on locally from the same document.
       online = false;
       localSim.setElements(elements);
     }
@@ -166,8 +196,6 @@ function editDoc(op: DocOp) {
   else localSim.setElements(elements);
 }
 
-/** Toggle a probe. Online the server owns the list; offline we mirror
- * the same toggle semantics locally. */
 function toggleProbe(elem: number, pin: number, kind: 'v' | 'i') {
   if (online) {
     net.sendProbe(elem, pin, kind);
@@ -189,7 +217,6 @@ function setProbeRef(pid: number, elem: number, pin: number) {
   p.r = p.r && p.r[0] === elem && p.r[1] === pin ? null : [elem, pin];
 }
 
-/** Pin index of `e` nearest to the cursor. */
 function nearestPin(e: ElementSpec, x: number, y: number): number {
   let best = 0;
   let bestD = Infinity;
@@ -210,8 +237,7 @@ const tip = document.getElementById('tip') as HTMLDivElement;
 const ctx = canvas.getContext('2d')!;
 
 const cam: Camera = { scale: 48, ox: 60, oy: 60 };
-// Exposed for end-to-end tests: lets them convert grid coords to pixels
-// without replicating camera math.
+// Exposed for end-to-end tests.
 (window as unknown as { __cam: Camera }).__cam = cam;
 const dots = new DotFlow();
 let mouse: { x: number; y: number } | null = null;
@@ -224,6 +250,7 @@ const snap = (x: number, y: number): Point => {
   const [gx, gy] = toGrid(x, y);
   return [Math.round(gx), Math.round(gy)];
 };
+const toPx = (p: Point): [number, number] => [cam.ox + p[0] * cam.scale, cam.oy + p[1] * cam.scale];
 
 function fitCamera() {
   let [x0, y0, x1, y1] = [Infinity, Infinity, -Infinity, -Infinity];
@@ -243,7 +270,7 @@ function fitCamera() {
   }
   const w = x1 - x0 + 4;
   const ht = y1 - y0 + 4;
-  cam.scale = Math.max(20, Math.min(window.innerWidth / w, window.innerHeight / ht));
+  cam.scale = Math.max(18, Math.min(window.innerWidth / w, window.innerHeight / ht));
   cam.ox = (window.innerWidth - (x0 + x1) * cam.scale) / 2;
   cam.oy = (window.innerHeight - (y0 + y1) * cam.scale) / 2;
 }
@@ -265,6 +292,20 @@ const plist = document.getElementById('plist') as HTMLDivElement;
 const pbtn = document.getElementById('pbtn') as HTMLButtonElement;
 
 let placing: PartDef | null = null;
+let placeRot = 0; // 0..3, quarter turns; Q rotates
+
+const ROT_DIRS: Point[] = [
+  [1, 0],
+  [0, 1],
+  [-1, 0],
+  [0, -1],
+];
+
+/** Default far endpoint for a click-place at `a` with the armed rotation. */
+function placeEnd(a: Point): Point {
+  const d = ROT_DIRS[placeRot]!;
+  return [a[0] + d[0] * 4, a[1] + d[1] * 4];
+}
 
 function renderPaletteList() {
   const parts = searchParts(psearch.value);
@@ -289,6 +330,7 @@ function closePalette() {
 }
 function choosePart(p: PartDef) {
   placing = p;
+  pasting = null;
   closePalette();
   canvas.style.cursor = 'crosshair';
 }
@@ -306,7 +348,7 @@ psearch.onkeydown = (ev) => {
 
 // ---------------------------------------------------------------- props
 const propsDiv = document.getElementById('props') as HTMLDivElement;
-let propsShownFor = ''; // JSON key of what the panel currently shows
+let propsShownFor = '';
 
 const FIELD_LABELS: Record<string, string> = {
   ohms: 'resistance Ω',
@@ -330,7 +372,9 @@ const FIELD_LABELS: Record<string, string> = {
 
 function syncPropsPanel() {
   const target =
-    selected?.t === 'elem' ? elements.find((e) => e.id === (selected as { id: number }).id) : undefined;
+    selectedIds.size === 1
+      ? elements.find((e) => e.id === [...selectedIds][0])
+      : undefined;
   if (!target) {
     propsDiv.style.display = 'none';
     propsShownFor = '';
@@ -338,7 +382,6 @@ function syncPropsPanel() {
   }
   const key = JSON.stringify([target.id, target.kind]);
   if (key === propsShownFor) return;
-  // Don't yank the DOM out from under an actively-editing user.
   if (propsDiv.contains(document.activeElement) && propsShownFor.startsWith(`[${target.id},`)) {
     return;
   }
@@ -383,8 +426,8 @@ function syncPropsPanel() {
   const row = document.createElement('div');
   row.className = 'row';
   const rot = document.createElement('button');
-  rot.textContent = '⟳ rotate (R)';
-  rot.onclick = () => rotateSelected();
+  rot.textContent = '⟳ rotate (Q)';
+  rot.onclick = () => rotateSelection();
   const del = document.createElement('button');
   del.textContent = '✕ delete';
   del.onclick = () => editDoc({ t: 'Remove', id: target.id });
@@ -393,15 +436,67 @@ function syncPropsPanel() {
   propsDiv.appendChild(row);
 }
 
-function rotateSelected() {
-  if (selected?.t !== 'elem') return;
-  const e = elements.find((x) => x.id === (selected as { id: number }).id);
-  if (!e) return;
-  const cx = Math.round(e.pins.reduce((s, p) => s + p[0], 0) / e.pins.length);
-  const cy = Math.round(e.pins.reduce((s, p) => s + p[1], 0) / e.pins.length);
-  // 90° clockwise about the centroid: (dx, dy) -> (-dy, dx).
-  const pins = e.pins.map(([x, y]) => [cx - (y - cy), cy + (x - cx)] as Point);
-  editDoc({ t: 'Move', id: e.id, pins });
+/** Rotate the whole selection 90° clockwise about its shared centroid. */
+function rotateSelection() {
+  const sel = elements.filter((e) => selectedIds.has(e.id));
+  if (sel.length === 0) return;
+  let sx = 0;
+  let sy = 0;
+  let n = 0;
+  for (const e of sel) {
+    for (const p of e.pins) {
+      sx += p[0];
+      sy += p[1];
+      n++;
+    }
+  }
+  const cx = Math.round(sx / n);
+  const cy = Math.round(sy / n);
+  for (const e of sel) {
+    const pins = e.pins.map(([x, y]) => [cx - (y - cy), cy + (x - cx)] as Point);
+    editDoc({ t: 'Move', id: e.id, pins });
+  }
+}
+
+function copySelection() {
+  const sel = elements.filter((e) => selectedIds.has(e.id));
+  if (sel.length === 0) return;
+  let sx = 0;
+  let sy = 0;
+  let n = 0;
+  for (const e of sel) {
+    for (const p of e.pins) {
+      sx += p[0];
+      sy += p[1];
+      n++;
+    }
+  }
+  const cx = Math.round(sx / n);
+  const cy = Math.round(sy / n);
+  clipboard = sel.map((e) => ({
+    kind: JSON.parse(JSON.stringify(e.kind)) as ElementKind,
+    pins: e.pins.map(([x, y]) => [x - cx, y - cy] as Point),
+  }));
+}
+
+function commitPaste(at: Point) {
+  if (!pasting) return;
+  const ids: number[] = [];
+  for (const item of pasting) {
+    const id = newId();
+    ids.push(id);
+    editDoc({
+      t: 'Add',
+      spec: {
+        id,
+        kind: JSON.parse(JSON.stringify(item.kind)) as ElementKind,
+        pins: item.pins.map(([x, y]) => [x + at[0], y + at[1]] as Point),
+      },
+    });
+  }
+  selectedIds = new Set(ids);
+  selectedProbe = null;
+  pasting = null;
 }
 
 // ---------------------------------------------------------------- input
@@ -418,15 +513,15 @@ function elementAt(x: number, y: number): ElementSpec | undefined {
   return best;
 }
 
-/** Grid point of the nearest element pin, if the cursor is on one. Wires
- * start from pins — dragging a pin must never move the component. */
+/** Grid point of the nearest element pin, if the cursor is on one. */
 function pinAt(x: number, y: number): Point | null {
   const r = Math.min(14, cam.scale * 0.4);
   let best: Point | null = null;
   let bestD = r;
   for (const e of elements) {
     for (const p of e.pins) {
-      const d = Math.hypot(cam.ox + p[0] * cam.scale - x, cam.oy + p[1] * cam.scale - y);
+      const [px, py] = toPx(p);
+      const d = Math.hypot(px - x, py - y);
       if (d < bestD) {
         bestD = d;
         best = p;
@@ -436,12 +531,19 @@ function pinAt(x: number, y: number): Point | null {
   return best;
 }
 
-/** Probe flag center in px (must match drawProbeMarkers). */
+/** Does any element have a pin exactly at grid point `p`? */
+function pinExistsAt(p: Point, excludeId = -1): boolean {
+  return elements.some(
+    (e) => e.id !== excludeId && e.pins.some((q) => q[0] === p[0] && q[1] === p[1]),
+  );
+}
+
 function probeFlagPx(p: Probe): [number, number] | null {
   const e = elements.find((x) => x.id === p.elem);
   if (!e) return null;
   const pin = e.pins[Math.min(p.pin, e.pins.length - 1)]!;
-  return [cam.ox + pin[0] * cam.scale + 14, cam.oy + pin[1] * cam.scale - 18];
+  const [x, y] = toPx(pin);
+  return [x + 14, y - 18];
 }
 
 function probeAt(x: number, y: number): Probe | undefined {
@@ -452,7 +554,6 @@ function probeAt(x: number, y: number): Probe | undefined {
   return undefined;
 }
 
-// Floating-scope hit testing. Title bar is a fixed 18 px strip.
 const SCOPE_TITLE_PX = 18;
 type ScopeZone =
   | { s: FloatScope; zone: 'title' | 'body' | 'close' | 'resize' }
@@ -469,7 +570,6 @@ function scopeZoneAt(x: number, y: number): ScopeZone | null {
     if (x < X || x > X + W || y < Y || y > Y + H) continue;
     if (y <= Y + SCOPE_TITLE_PX) {
       if (x >= X + W - 18) return { s, zone: 'close' };
-      // channel dots start after the title text
       const dotStart = X + 64;
       const k2 = Math.floor((x - dotStart) / 16);
       if (x >= dotStart && k2 >= 0 && k2 < probes.length) {
@@ -504,12 +604,13 @@ let valueDrag: {
 let panDrag: { x: number; y: number; ox: number; oy: number } | null = null;
 let wireDrag: { a: Point; b: Point } | null = null;
 let placeDrag: { a: Point; b: Point } | null = null;
+let marquee: { x0: number; y0: number; x1: number; y1: number; add: boolean } | null = null;
 let moveDrag: {
-  e: ElementSpec;
-  startPins: Point[];
+  items: { id: number; startPins: Point[] }[];
   start: Point;
   lastSent: number;
   moved: boolean;
+  clickTarget: number;
 } | null = null;
 let scopeDrag: { s: FloatScope; dx: number; dy: number } | null = null;
 let scopeResize: { s: FloatScope } | null = null;
@@ -518,7 +619,6 @@ let lastCursorSent = 0;
 
 canvas.addEventListener('wheel', (ev) => {
   ev.preventDefault();
-  // Over a floating scope, the wheel is its timebase.
   const z = scopeZoneAt(ev.clientX, ev.clientY);
   if (z) {
     z.s.tb = Math.min(60, Math.max(0.05, z.s.tb * Math.exp(ev.deltaY * 0.001)));
@@ -538,12 +638,15 @@ canvas.addEventListener('pointerdown', (ev) => {
     panDrag = { x: ev.clientX, y: ev.clientY, ox: cam.ox, oy: cam.oy };
     return;
   }
+  if (pasting) {
+    commitPaste(snap(ev.clientX, ev.clientY));
+    return;
+  }
   if (placing) {
     const p = snap(ev.clientX, ev.clientY);
     placeDrag = { a: p, b: p };
     return;
   }
-  // Floating scopes sit above the schematic.
   const z = scopeZoneAt(ev.clientX, ev.clientY);
   if (z) {
     if (z.zone === 'close') {
@@ -558,12 +661,12 @@ canvas.addEventListener('pointerdown', (ev) => {
     } else if (z.zone === 'resize') {
       scopeResize = { s: z.s };
     }
-    return; // body swallows the event: no wires under scopes
+    return;
   }
-  // Probe flags select the probe.
   const pr = probeAt(ev.clientX, ev.clientY);
   if (pr) {
-    selected = { t: 'probe', pid: pr.pid };
+    selectedProbe = pr.pid;
+    selectedIds.clear();
     return;
   }
   // Pins take priority: dragging from any terminal draws a wire.
@@ -576,23 +679,42 @@ canvas.addEventListener('pointerdown', (ev) => {
   }
   const e = elementAt(ev.clientX, ev.clientY);
   if (!e) {
-    const p = snap(ev.clientX, ev.clientY);
-    wireDrag = { a: p, b: p };
+    marquee = {
+      x0: ev.clientX,
+      y0: ev.clientY,
+      x1: ev.clientX,
+      y1: ev.clientY,
+      add: ev.shiftKey,
+    };
     return;
   }
   if (ev.shiftKey) {
+    // Shift+click toggles membership in the selection.
+    if (selectedIds.has(e.id)) selectedIds.delete(e.id);
+    else selectedIds.add(e.id);
+    return;
+  }
+  const startMove = (ids: number[]) => {
     moveDrag = {
-      e,
-      startPins: e.pins.map((p) => [...p] as Point),
+      items: ids
+        .map((id) => elements.find((x) => x.id === id))
+        .filter((x): x is ElementSpec => !!x)
+        .map((x) => ({ id: x.id, startPins: x.pins.map((p) => [...p] as Point) })),
       start: snap(ev.clientX, ev.clientY),
       lastSent: 0,
       moved: false,
+      clickTarget: e.id,
     };
+  };
+  // Dragging a member of a multi-selection moves the whole group.
+  if (selectedIds.has(e.id) && selectedIds.size > 1) {
+    startMove([...selectedIds]);
     return;
   }
   if (e.kind.t === 'Switch') {
     interact(e, { t: 'SetSwitch', closed: !e.kind.closed });
-    selected = { t: 'elem', id: e.id };
+    selectedIds = new Set([e.id]);
+    selectedProbe = null;
     return;
   }
   const mode = dragModeOf(e);
@@ -603,14 +725,7 @@ canvas.addEventListener('pointerdown', (ev) => {
       : 0;
     valueDrag = { e, mode, startY: ev.clientY, startVal, lastSent: 0, moved: false };
   } else {
-    // Knob-less parts: drag moves, click selects (resolved on pointerup).
-    moveDrag = {
-      e,
-      startPins: e.pins.map((p) => [...p] as Point),
-      start: snap(ev.clientX, ev.clientY),
-      lastSent: 0,
-      moved: false,
-    };
+    startMove([e.id]);
   }
 });
 
@@ -639,6 +754,11 @@ canvas.addEventListener('pointermove', (ev) => {
     scopeResize.s.h = Math.max(4, Math.round(gy - scopeResize.s.y));
     return;
   }
+  if (marquee) {
+    marquee.x1 = ev.clientX;
+    marquee.y1 = ev.clientY;
+    return;
+  }
   if (placeDrag) {
     placeDrag.b = snap(ev.clientX, ev.clientY);
     return;
@@ -653,12 +773,17 @@ canvas.addEventListener('pointermove', (ev) => {
     const dy = here[1] - moveDrag.start[1];
     if (dx !== 0 || dy !== 0) moveDrag.moved = true;
     if (!moveDrag.moved) return;
-    const pins = moveDrag.startPins.map(([x, y]) => [x + dx, y + dy] as Point);
-    moveDrag.e.pins = pins;
+    for (const item of moveDrag.items) {
+      const e = elements.find((x) => x.id === item.id);
+      if (e) e.pins = item.startPins.map(([x, y]) => [x + dx, y + dy] as Point);
+    }
     if (now - moveDrag.lastSent > 60) {
       moveDrag.lastSent = now;
-      if (online) net.sendEdit({ t: 'Move', id: moveDrag.e.id, pins });
-      else localSim.setElements(elements);
+      for (const item of moveDrag.items) {
+        const e = elements.find((x) => x.id === item.id);
+        if (e && online) net.sendEdit({ t: 'Move', id: e.id, pins: e.pins });
+      }
+      if (!online) localSim.setElements(elements);
     }
     return;
   }
@@ -678,7 +803,7 @@ canvas.addEventListener('pointermove', (ev) => {
   }
   const z = scopeZoneAt(ev.clientX, ev.clientY);
   const over = z ? undefined : elementAt(ev.clientX, ev.clientY);
-  canvas.style.cursor = placing
+  canvas.style.cursor = placing || pasting
     ? 'crosshair'
     : z
       ? z.zone === 'title'
@@ -704,40 +829,62 @@ canvas.addEventListener('pointerup', (ev) => {
     scopeResize = null;
     return;
   }
+  if (marquee) {
+    const [gx0, gy0] = toGrid(Math.min(marquee.x0, marquee.x1), Math.min(marquee.y0, marquee.y1));
+    const [gx1, gy1] = toGrid(Math.max(marquee.x0, marquee.x1), Math.max(marquee.y0, marquee.y1));
+    const dragged = Math.abs(marquee.x1 - marquee.x0) + Math.abs(marquee.y1 - marquee.y0) > 6;
+    if (!marquee.add) {
+      selectedIds.clear();
+      selectedProbe = null;
+    }
+    if (dragged) {
+      for (const e of elements) {
+        if (e.pins.some(([x, y]) => x >= gx0 && x <= gx1 && y >= gy0 && y <= gy1)) {
+          selectedIds.add(e.id);
+        }
+      }
+    }
+    marquee = null;
+    return;
+  }
   if (placeDrag && placing) {
     const kind = placing.make();
-    const pins = makePins(kind, placeDrag.a, placeDrag.b);
+    const a = placeDrag.a;
+    const clicked = placeDrag.b[0] === a[0] && placeDrag.b[1] === a[1];
+    const b = clicked ? placeEnd(a) : placeDrag.b;
     const id = newId();
-    editDoc({ t: 'Add', spec: { id, kind, pins } });
-    selected = { t: 'elem', id };
-    if (!ev.shiftKey) {
-      placing = null;
-      canvas.style.cursor = 'default';
-    }
+    editDoc({ t: 'Add', spec: { id, kind, pins: makePins(kind, a, b) } });
+    selectedIds = new Set([id]);
+    selectedProbe = null;
     placeDrag = null;
-    return;
+    return; // tool stays armed (Falstad-style); Esc exits
   }
   if (wireDrag) {
     if (wireDrag.a[0] !== wireDrag.b[0] || wireDrag.a[1] !== wireDrag.b[1]) {
       editDoc({ t: 'Add', spec: { id: newId(), kind: { t: 'Wire' }, pins: [wireDrag.a, wireDrag.b] } });
-    } else {
-      selected = null; // click on nothing deselects
     }
     wireDrag = null;
     return;
   }
   if (moveDrag) {
     if (moveDrag.moved) {
-      if (online) net.sendEdit({ t: 'Move', id: moveDrag.e.id, pins: moveDrag.e.pins });
-      else localSim.setElements(elements);
+      for (const item of moveDrag.items) {
+        const e = elements.find((x) => x.id === item.id);
+        if (e && online) net.sendEdit({ t: 'Move', id: e.id, pins: e.pins });
+      }
+      if (!online) localSim.setElements(elements);
     } else {
-      selected = { t: 'elem', id: moveDrag.e.id };
+      selectedIds = new Set([moveDrag.clickTarget]);
+      selectedProbe = null;
     }
     moveDrag = null;
     return;
   }
   if (valueDrag) {
-    if (!valueDrag.moved) selected = { t: 'elem', id: valueDrag.e.id };
+    if (!valueDrag.moved) {
+      selectedIds = new Set([valueDrag.e.id]);
+      selectedProbe = null;
+    }
     valueDrag = null;
   }
 });
@@ -745,24 +892,67 @@ canvas.addEventListener('pointerleave', () => (mouse = null));
 
 window.addEventListener('keydown', (ev) => {
   if (ev.target === psearch || (ev.target instanceof Node && propsDiv.contains(ev.target))) return;
+
+  // Clipboard first: ⌘/Ctrl+C copies, ⌘/Ctrl+V arms pasting at the cursor.
+  if (ev.metaKey || ev.ctrlKey) {
+    if (ev.key === 'c') {
+      copySelection();
+      ev.preventDefault();
+    } else if (ev.key === 'v') {
+      if (clipboard.length > 0) {
+        pasting = clipboard.map((c) => ({ kind: c.kind, pins: c.pins }));
+        placing = null;
+        canvas.style.cursor = 'crosshair';
+      }
+      ev.preventDefault();
+    }
+    return;
+  }
+  if (ev.altKey) return;
+
   if (ev.key === ' ') {
     spaceHeld = true;
     ev.preventDefault();
-  } else if (ev.key === '/' || ev.key === 'p') {
+    return;
+  }
+  if (ev.key === '/') {
     openPalette();
     ev.preventDefault();
-  } else if (ev.key === 'Escape') {
+    return;
+  }
+  if (ev.key === 'Escape') {
     placing = null;
-    selected = null;
+    pasting = null;
+    selectedIds.clear();
+    selectedProbe = null;
     closePalette();
     canvas.style.cursor = 'default';
-  } else if (ev.key === 'Delete' || ev.key === 'Backspace' || ev.key === 'x') {
+    return;
+  }
+  if (ev.key === 'Delete' || ev.key === 'Backspace' || ev.key === 'x') {
     const e = mouse ? elementAt(mouse.x, mouse.y) : undefined;
-    if (e) editDoc({ t: 'Remove', id: e.id });
-    else if (selected?.t === 'elem') editDoc({ t: 'Remove', id: selected.id });
-  } else if (ev.key === 'r') {
-    rotateSelected();
-  } else if (ev.key === 'o' && mouse) {
+    if (selectedIds.size > 0) {
+      for (const id of [...selectedIds]) editDoc({ t: 'Remove', id });
+    } else if (e) {
+      editDoc({ t: 'Remove', id: e.id });
+    }
+    return;
+  }
+  if (ev.key === 'q' || ev.key === 'Q') {
+    if (placing) {
+      placeRot = (placeRot + 1) % 4;
+    } else if (pasting) {
+      // Rotate the paste ghost 90° clockwise about its centroid (origin).
+      pasting = pasting.map((c) => ({
+        kind: c.kind,
+        pins: c.pins.map(([x, y]) => [-y, x] as Point),
+      }));
+    } else {
+      rotateSelection();
+    }
+    return;
+  }
+  if (ev.key === 'o' && mouse) {
     const [gx, gy] = toGrid(mouse.x, mouse.y);
     floatScopes.push({
       sid: sidCounter++,
@@ -773,23 +963,34 @@ window.addEventListener('keydown', (ev) => {
       tb: 5,
       pids: null,
     });
-  } else if (ev.key === 'v' && mouse) {
+    return;
+  }
+  if (ev.key === '1' && mouse) {
     const e = elementAt(mouse.x, mouse.y);
     if (e && e.kind.t !== 'Ground') toggleProbe(e.id, nearestPin(e, mouse.x, mouse.y), 'v');
-  } else if (ev.key === 'i' && mouse) {
+    return;
+  }
+  if (ev.key === '2' && mouse) {
     const e = elementAt(mouse.x, mouse.y);
-    // Current clamp reads pin 0: current flowing a -> b through the part.
     if (e && e.kind.t !== 'Ground') toggleProbe(e.id, 0, 'i');
-  } else if (ev.key === 'g' && mouse) {
-    // Set the differential reference of the selected (or latest) V-probe.
+    return;
+  }
+  if (ev.key === '0' && mouse) {
     const target =
-      selected?.t === 'probe'
-        ? probes.find((p) => p.pid === (selected as { pid: number }).pid)
+      selectedProbe !== null
+        ? probes.find((p) => p.pid === selectedProbe)
         : [...probes].reverse().find((p) => p.kind === 'v');
     const e = elementAt(mouse.x, mouse.y);
     if (target && target.kind === 'v' && e && e.kind.t !== 'Ground') {
       setProbeRef(target.pid, e.id, nearestPin(e, mouse.x, mouse.y));
     }
+    return;
+  }
+  // Part hotkeys (Falstad-style). 'M' (shift+m) = PMOS.
+  const partName = PART_HOTKEYS[ev.key];
+  if (partName) {
+    const part = CATALOG.find((p) => p.name === partName);
+    if (part) choosePart(part);
   }
 });
 window.addEventListener('keyup', (ev) => {
@@ -845,14 +1046,44 @@ scopeCv.addEventListener('wheel', (ev) => {
   scopeTimebase = Math.min(60, Math.max(0.05, scopeTimebase * Math.exp(ev.deltaY * 0.001)));
 }, { passive: false });
 
+/** Blue highlight over an element: its pin-chain plus dots on every pin
+ * (pins must overlap exactly to connect — make them visible). */
+function drawHighlight(e: ElementSpec, strong: boolean) {
+  ctx.strokeStyle = strong ? '#5a8cff' : '#4a7de0';
+  ctx.fillStyle = '#7db1ff';
+  ctx.lineWidth = Math.max(4, cam.scale * 0.16);
+  ctx.globalAlpha = strong ? 0.5 : 0.35;
+  const P = e.pins.map(toPx);
+  ctx.beginPath();
+  for (let k = 0; k + 1 < P.length; k++) {
+    ctx.moveTo(...P[k]!);
+    ctx.lineTo(...P[k + 1]!);
+  }
+  if (P.length === 3) {
+    ctx.moveTo(...P[0]!);
+    ctx.lineTo(...P[2]!);
+  }
+  if (P.length === 1) {
+    ctx.moveTo(P[0]![0] - cam.scale * 0.3, P[0]![1]);
+    ctx.lineTo(P[0]![0] + cam.scale * 0.3, P[0]![1]);
+  }
+  ctx.stroke();
+  ctx.globalAlpha = 0.9;
+  for (const [x, y] of P) {
+    ctx.beginPath();
+    ctx.arc(x, y, Math.max(3, cam.scale * 0.11), 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
 function drawProbeMarkers() {
   for (const p of probes) {
     const c = probeFlagPx(p);
     if (!c) continue;
     const e = elements.find((x) => x.id === p.elem)!;
     const pin = e.pins[Math.min(p.pin, e.pins.length - 1)]!;
-    const x = cam.ox + pin[0] * cam.scale;
-    const y = cam.oy + pin[1] * cam.scale;
+    const [x, y] = toPx(pin);
     const color = probeColor(p.pid);
     ctx.strokeStyle = color;
     ctx.fillStyle = color;
@@ -864,7 +1095,7 @@ function drawProbeMarkers() {
     ctx.beginPath();
     ctx.arc(c[0], c[1], 6, 0, Math.PI * 2);
     ctx.fill();
-    if (selected?.t === 'probe' && selected.pid === p.pid) {
+    if (selectedProbe === p.pid) {
       ctx.beginPath();
       ctx.arc(c[0], c[1], 9, 0, Math.PI * 2);
       ctx.stroke();
@@ -873,13 +1104,11 @@ function drawProbeMarkers() {
     ctx.font = 'bold 9px ui-monospace';
     ctx.fillText(p.kind === 'v' ? 'V' : 'I', c[0] - 3, c[1] + 3);
 
-    // Differential reference marker.
     if (p.r) {
       const re = elements.find((x) => x.id === p.r![0]);
       if (re) {
         const rp = re.pins[Math.min(p.r[1], re.pins.length - 1)]!;
-        const rx = cam.ox + rp[0] * cam.scale;
-        const ry = cam.oy + rp[1] * cam.scale;
+        const [rx, ry] = toPx(rp);
         ctx.strokeStyle = color;
         ctx.lineWidth = 2;
         ctx.beginPath();
@@ -895,27 +1124,29 @@ function drawProbeMarkers() {
   }
 }
 
-function drawSelection() {
-  if (selected?.t !== 'elem') return;
-  const e = elements.find((x) => x.id === (selected as { id: number }).id);
-  if (!e) return;
-  let [x0, y0, x1, y1] = [Infinity, Infinity, -Infinity, -Infinity];
-  for (const p of e.pins) {
-    x0 = Math.min(x0, p[0]);
-    y0 = Math.min(y0, p[1]);
-    x1 = Math.max(x1, p[0]);
-    y1 = Math.max(y1, p[1]);
-  }
-  const pad = 0.65 * cam.scale;
+function drawSelectionBoxes() {
+  if (selectedIds.size === 0) return;
   ctx.strokeStyle = '#5a8cff';
   ctx.lineWidth = 1.5;
   ctx.setLineDash([5, 4]);
-  ctx.strokeRect(
-    cam.ox + x0 * cam.scale - pad,
-    cam.oy + y0 * cam.scale - pad,
-    (x1 - x0) * cam.scale + pad * 2,
-    (y1 - y0) * cam.scale + pad * 2,
-  );
+  for (const id of selectedIds) {
+    const e = elements.find((x) => x.id === id);
+    if (!e) continue;
+    let [x0, y0, x1, y1] = [Infinity, Infinity, -Infinity, -Infinity];
+    for (const p of e.pins) {
+      x0 = Math.min(x0, p[0]);
+      y0 = Math.min(y0, p[1]);
+      x1 = Math.max(x1, p[0]);
+      y1 = Math.max(y1, p[1]);
+    }
+    const pad = 0.55 * cam.scale;
+    ctx.strokeRect(
+      cam.ox + x0 * cam.scale - pad,
+      cam.oy + y0 * cam.scale - pad,
+      (x1 - x0) * cam.scale + pad * 2,
+      (y1 - y0) * cam.scale + pad * 2,
+    );
+  }
   ctx.setLineDash([]);
 }
 
@@ -927,13 +1158,11 @@ function drawFloatScopes() {
     ctx.strokeStyle = '#3a3a48';
     ctx.lineWidth = 1;
     ctx.strokeRect(X, Y, W, H);
-    // title bar
     ctx.fillStyle = '#191922';
     ctx.fillRect(X, Y, W, SCOPE_TITLE_PX);
     ctx.fillStyle = '#8a8a98';
     ctx.font = '11px ui-monospace, monospace';
     ctx.fillText(`scope ${s.sid}`, X + 8, Y + 13);
-    // channel dots
     const active = scopeProbes(s);
     probes.forEach((p, k) => {
       const cx = X + 64 + k * 16 + 5;
@@ -948,10 +1177,8 @@ function drawFloatScopes() {
         ctx.stroke();
       }
     });
-    // close ×
     ctx.fillStyle = '#8a8a98';
     ctx.fillText('×', X + W - 13, Y + 13);
-    // resize handle
     ctx.strokeStyle = '#3a3a48';
     ctx.beginPath();
     ctx.moveTo(X + W - 12, Y + H - 3);
@@ -959,7 +1186,6 @@ function drawFloatScopes() {
     ctx.moveTo(X + W - 7, Y + H - 3);
     ctx.lineTo(X + W - 3, Y + H - 7);
     ctx.stroke();
-    // content
     if (H - SCOPE_TITLE_PX > 20) {
       renderScopeInto(ctx, X + 1, Y + SCOPE_TITLE_PX, W - 2, H - SCOPE_TITLE_PX - 1, traces, active, s.tb);
     }
@@ -1001,7 +1227,6 @@ function frame(now: number) {
     simDebt -= want;
     live = unpackFrame(localSim.frame());
     simTime = localSim.time();
-    // Offline probes sample once per rendered frame (differential too).
     for (const p of probes) {
       const l = live.get(p.elem);
       if (!l) continue;
@@ -1030,6 +1255,18 @@ function frame(now: number) {
     drawElement({ ctx, cam, live: live.get(e.id), dots, dtSec: wallDt }, e);
   }
 
+  // Hover highlight (blue element + pin dots), Falstad-style.
+  const zHover = mouse ? scopeZoneAt(mouse.x, mouse.y) : null;
+  const hover =
+    mouse && !valueDrag && !moveDrag && !placing && !pasting && !zHover
+      ? elementAt(mouse.x, mouse.y)
+      : valueDrag?.e;
+  if (hover) drawHighlight(hover, true);
+  for (const id of selectedIds) {
+    const e = elements.find((x) => x.id === id);
+    if (e && e !== hover) drawHighlight(e, false);
+  }
+
   // Ghost previews for in-progress edits.
   ctx.globalAlpha = 0.45;
   if (wireDrag) {
@@ -1037,21 +1274,55 @@ function frame(now: number) {
   }
   if (placeDrag && placing) {
     const kind = placing.make();
-    drawElement({ ctx, cam, dots, dtSec: 0 }, { id: 0, kind, pins: makePins(kind, placeDrag.a, placeDrag.b) });
+    const clicked = placeDrag.b[0] === placeDrag.a[0] && placeDrag.b[1] === placeDrag.a[1];
+    const b = clicked ? placeEnd(placeDrag.a) : placeDrag.b;
+    drawElement({ ctx, cam, dots, dtSec: 0 }, { id: 0, kind, pins: makePins(kind, placeDrag.a, b) });
   } else if (placing && mouse) {
     const kind = placing.make();
     const a = snap(mouse.x, mouse.y);
-    drawElement({ ctx, cam, dots, dtSec: 0 }, { id: 0, kind, pins: makePins(kind, a, a) });
+    drawElement({ ctx, cam, dots, dtSec: 0 }, { id: 0, kind, pins: makePins(kind, a, placeEnd(a)) });
+  }
+  if (pasting && mouse) {
+    const at = snap(mouse.x, mouse.y);
+    for (const item of pasting) {
+      drawElement(
+        { ctx, cam, dots, dtSec: 0 },
+        { id: 0, kind: item.kind, pins: item.pins.map(([x, y]) => [x + at[0], y + at[1]] as Point) },
+      );
+    }
   }
   ctx.globalAlpha = 1;
 
-  drawSelection();
+  // Wire-endpoint connect indicator: green when the endpoint lands on an
+  // existing pin (overlapping pins = connected), gray otherwise.
+  if (wireDrag) {
+    const [bx, by] = toPx(wireDrag.b);
+    const connects = pinExistsAt(wireDrag.b);
+    ctx.strokeStyle = connects ? '#4bff6a' : '#8a8a98';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(bx, by, Math.max(5, cam.scale * 0.18), 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  if (marquee) {
+    ctx.strokeStyle = '#5a8cff';
+    ctx.fillStyle = '#5a8cff18';
+    ctx.lineWidth = 1;
+    const x = Math.min(marquee.x0, marquee.x1);
+    const y = Math.min(marquee.y0, marquee.y1);
+    const w = Math.abs(marquee.x1 - marquee.x0);
+    const h = Math.abs(marquee.y1 - marquee.y0);
+    ctx.fillRect(x, y, w, h);
+    ctx.strokeRect(x, y, w, h);
+  }
+
+  drawSelectionBoxes();
   drawProbeMarkers();
   drawFloatScopes();
   drawCursors(now);
   syncPropsPanel();
 
-  // Docked scope panel: visible whenever anything is probed.
   if (probes.length > 0) {
     scopeDiv.style.display = 'block';
     renderScope(scopeCv, traces, probes, scopeTimebase);
@@ -1059,11 +1330,7 @@ function frame(now: number) {
     scopeDiv.style.display = 'none';
   }
 
-  const hover =
-    mouse && !valueDrag && !scopeZoneAt(mouse.x, mouse.y)
-      ? elementAt(mouse.x, mouse.y)
-      : valueDrag?.e;
-  if (hover && mouse && !placing && !wireDrag) {
+  if (hover && mouse && !placing && !pasting && !wireDrag) {
     const l = live.get(hover.id);
     tip.style.display = 'block';
     tip.style.left = `${mouse.x + 14}px`;
@@ -1080,11 +1347,18 @@ function frame(now: number) {
     tip.style.display = 'none';
   }
 
+  const mode = pasting
+    ? `pasting ${pasting.length} parts (Q rotates, click places, Esc cancels)`
+    : placing
+      ? `placing: ${placing.name} (click or drag, Q rotates, Esc exits)`
+      : selectedIds.size > 1
+        ? `${selectedIds.size} selected (drag moves, Q rotates, ⌘C copies, X deletes)`
+        : '';
   hud.textContent =
     `EE Game   sim t = ${simTime.toFixed(2)} s   ` +
     (online ? `● ONLINE — ${population} player${population === 1 ? '' : 's'}` : '○ offline (local sim)') +
-    (placing ? `   placing: ${placing.name} (drag to orient, Esc cancels)` : '') +
-    `\nclick select · drag pins = wire · / parts · V/I probe · G probe ref · O scope here · R rotate · X delete · wheel zoom · right-drag pan`;
+    (mode ? `   ${mode}` : '') +
+    `\nparts: R C L W G V D N P M A S B T Z E F I · Q rotate · drag pin = wire · drag empty = select · ⌘C/⌘V copy/paste · 1/2 probe · 0 ref · O scope · X delete · / search`;
 
   requestAnimationFrame(frame);
 }

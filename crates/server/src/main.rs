@@ -127,6 +127,58 @@ fn demo_room_circuit() -> Vec<ElementSpec> {
         spec(60, K::Wire, (24, 18), (33, 18)),
         spec(61, K::Wire, (22, 18), (24, 18)),
         gnd(62, (24, 18)),
+        // ---- E: op-amp relaxation oscillator (astable multivibrator).
+        // Schmitt hysteresis from R1/R2 positive feedback (thresholds
+        // ±rail/2), RC integrator on in-. f ≈ 1/(2·RC·ln3) ≈ 1 Hz; the
+        // op-amp input offset self-starts it. LED blinks each + half.
+        spec3(70, K::OpAmp { rail: 5.0 }, (6, 26), (6, 24), (10, 25)),
+        spec(71, K::Wire, (10, 25), (12, 25)),
+        spec(72, r(100_000.0), (12, 25), (12, 21)), // Rf: out -> in-
+        spec(73, K::Wire, (12, 21), (4, 21)),
+        spec(74, K::Wire, (4, 21), (4, 24)),
+        spec(75, K::Wire, (4, 24), (6, 24)),
+        spec(76, K::Capacitor { farads: 4.7e-6 }, (4, 24), (4, 28)),
+        gnd(77, (4, 28)),
+        spec(78, r(100_000.0), (12, 25), (12, 29)), // R1: out -> in+
+        spec(79, K::Wire, (12, 29), (9, 29)),
+        spec(80, K::Wire, (9, 29), (9, 26)),
+        spec(81, K::Wire, (9, 26), (6, 26)),
+        spec(82, r(100_000.0), (9, 29), (9, 32)), // R2: in+ -> ground
+        gnd(83, (9, 32)),
+        spec(84, r(470.0), (12, 25), (15, 25)),
+        spec(85, K::Led { color: 3 }, (15, 25), (15, 29)),
+        gnd(86, (15, 29)),
+        // ---- F: half-wave rectifier with filter cap (τ=0.6 s vs 1 s
+        // cycle -> visible sawtooth ripple; the lamp pulses gently).
+        spec(90, sine(6.0, 1.0), (20, 22), (20, 26)),
+        spec(91, K::Wire, (20, 22), (23, 22)),
+        spec(92, K::Diode, (23, 22), (26, 22)),
+        spec(93, K::Wire, (26, 22), (29, 22)),
+        spec(94, K::Capacitor { farads: 10e-3 }, (26, 22), (26, 26)),
+        spec(
+            95,
+            K::Lamp {
+                ohms: 60.0,
+                rated_watts: 0.3,
+            },
+            (29, 22),
+            (29, 26),
+        ),
+        spec(96, K::Wire, (29, 26), (26, 26)),
+        spec(97, K::Wire, (26, 26), (23, 26)),
+        gnd(98, (23, 26)),
+        spec(99, K::Wire, (23, 26), (20, 26)),
+        // ---- G: zener shunt regulator feeding an LED: 9 V in, 5.6 V
+        // held at the node, steady ~10 mA through the LED.
+        spec(100, dc(9.0), (33, 22), (33, 26)),
+        spec(101, r(220.0), (33, 22), (37, 22)),
+        spec(102, K::Zener { vz: 5.6 }, (37, 26), (37, 22)), // anode down
+        spec(103, r(330.0), (37, 22), (40, 22)),
+        spec(104, K::Led { color: 2 }, (40, 22), (40, 26)),
+        spec(105, K::Wire, (40, 26), (37, 26)),
+        spec(106, K::Wire, (37, 26), (35, 26)),
+        gnd(107, (35, 26)),
+        spec(108, K::Wire, (35, 26), (33, 26)),
     ]
 }
 
@@ -667,4 +719,45 @@ async fn main() {
         })
         .await
         .unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn showcase_room_never_quarantines() {
+        let mut eng = Engine::new(DT);
+        eng.set_elements(&demo_room_circuit());
+        // 30 simulated seconds in 10 ms chunks; the relaxation oscillator
+        // must flip repeatedly and nothing may quarantine.
+        let mut flips = 0;
+        let mut last_sign = 0i32;
+        for chunk in 0..3000 {
+            eng.advance(500);
+            if eng.is_quarantined() {
+                let out = eng.voltage_at((12, 25)).unwrap_or(f64::NAN);
+                let vm = eng.voltage_at((4, 24)).unwrap_or(f64::NAN);
+                panic!(
+                    "quarantined at t={:.4}s (chunk {chunk}): osc out={out:.4} vm={vm:.4}",
+                    eng.time()
+                );
+            }
+            let out = eng.voltage_at((12, 25)).unwrap_or(0.0);
+            let s = if out > 1.0 {
+                1
+            } else if out < -1.0 {
+                -1
+            } else {
+                0
+            };
+            if s != 0 && last_sign != 0 && s != last_sign {
+                flips += 1;
+            }
+            if s != 0 {
+                last_sign = s;
+            }
+        }
+        assert!(flips >= 10, "oscillator only flipped {flips} times in 30 s");
+    }
 }

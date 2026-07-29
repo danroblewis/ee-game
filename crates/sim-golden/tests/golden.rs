@@ -192,6 +192,43 @@ fn opamp_comparator_rails() {
 }
 
 #[test]
+fn opamp_relaxation_oscillates() {
+    // Self-starts via the op-amp input offset (τ = RC = 1 ms to walk out
+    // of the metastable point), then flips at ~2.2 ms period. Over 40 ms
+    // expect a healthy number of rail-to-rail transitions.
+    let mut eng = engine_with(opamp_relaxation());
+    let mut flips = 0u32;
+    let mut last_sign = 0i32;
+    let mut railed = false;
+    for _ in 0..400 {
+        eng.advance(100); // 100 µs per observation
+        let out = eng.voltage_at((4, 4)).unwrap();
+        if out.abs() > 4.5 {
+            railed = true;
+        }
+        let sign = if out > 1.0 {
+            1
+        } else if out < -1.0 {
+            -1
+        } else {
+            0
+        };
+        if sign != 0 && last_sign != 0 && sign != last_sign {
+            flips += 1;
+        }
+        if sign != 0 {
+            last_sign = sign;
+        }
+    }
+    assert!(!eng.is_quarantined(), "oscillator quarantined");
+    assert!(railed, "output never reached the rails");
+    assert!(
+        (5..=40).contains(&flips),
+        "expected ~13 flips in 40 ms, got {flips}"
+    );
+}
+
+#[test]
 fn zener_regulates() {
     let eng = settled(zener_regulator());
     let v = eng.voltage_at((6, 0)).unwrap();
