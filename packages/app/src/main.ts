@@ -5,6 +5,7 @@
 import init, { Sim } from './wasm/sim_wasm';
 import {
   demoCircuit,
+  pinLabels,
   unpackFrame,
   type ElementSpec,
   type ElemLive,
@@ -38,6 +39,7 @@ function applyOp(e: ElementSpec, op: InteractOp) {
     else if (e.kind.t === 'Inductor') e.kind.henries = op.value;
     else if (e.kind.t === 'VoltageSource') e.kind.dc = op.value;
     else if (e.kind.t === 'CurrentSource') e.kind.amps = op.value;
+    else if (e.kind.t === 'Potentiometer') e.kind.wiper = Math.min(0.99, Math.max(0.01, op.value));
   }
 }
 
@@ -52,7 +54,9 @@ const net = connect({
   onFrame(f) {
     simTime = f.time;
     const m = new Map<number, ElemLive>();
-    for (const [id, va, vb, current, power] of f.e) m.set(id, { id, va, vb, current, power });
+    for (const [id, npins, v0, v1, v2, i0, i1, i2, power] of f.e) {
+      m.set(id, { id, npins, v: [v0, v1, v2], i: [i0, i1, i2], power });
+    }
     live = m;
   },
   onOp(id, op) {
@@ -93,7 +97,7 @@ let mouse: { x: number; y: number } | null = null;
 function fitCamera() {
   let [x0, y0, x1, y1] = [Infinity, Infinity, -Infinity, -Infinity];
   for (const e of elements) {
-    for (const p of [e.a, e.b]) {
+    for (const p of e.pins) {
       x0 = Math.min(x0, p[0]);
       y0 = Math.min(y0, p[1]);
       x1 = Math.max(x1, p[0]);
@@ -132,9 +136,22 @@ function elementAt(x: number, y: number): ElementSpec | undefined {
   return best;
 }
 
-const draggableOhms = (e: ElementSpec) => e.kind.t === 'Resistor' || e.kind.t === 'Lamp';
+// Knob-draggable kinds: resistive values sweep log (a decade per 160 px);
+// the pot wiper sweeps linearly.
+const dragMode = (e: ElementSpec): 'log' | 'linear' | null =>
+  e.kind.t === 'Resistor' || e.kind.t === 'Lamp'
+    ? 'log'
+    : e.kind.t === 'Potentiometer'
+      ? 'linear'
+      : null;
 
-let drag: { e: ElementSpec; startY: number; startOhms: number; lastSent: number } | null = null;
+let drag: {
+  e: ElementSpec;
+  mode: 'log' | 'linear';
+  startY: number;
+  startVal: number;
+  lastSent: number;
+} | null = null;
 let lastCursorSent = 0;
 
 canvas.addEventListener('pointermove', (ev) => {
@@ -145,9 +162,13 @@ canvas.addEventListener('pointermove', (ev) => {
     net.sendCursor((ev.clientX - cam.ox) / cam.scale, (ev.clientY - cam.oy) / cam.scale);
   }
   if (drag) {
-    // EveryCircuit-style vertical knob drag: exponential sweep, ~1 decade
-    // per 160 px, live within a frame.
-    const value = drag.startOhms * Math.pow(10, (drag.startY - ev.clientY) / 160);
+    // EveryCircuit-style vertical knob drag, live within a frame:
+    // log values sweep a decade per 160 px, the pot wiper is linear.
+    const dy = drag.startY - ev.clientY;
+    const value =
+      drag.mode === 'log'
+        ? drag.startVal * Math.pow(10, dy / 160)
+        : Math.min(0.99, Math.max(0.01, drag.startVal + dy / 200));
     if (now - drag.lastSent > 40) {
       drag.lastSent = now;
       interact(drag.e, { t: 'SetValue', value });
@@ -156,16 +177,23 @@ canvas.addEventListener('pointermove', (ev) => {
   }
   const over = elementAt(ev.clientX, ev.clientY);
   canvas.style.cursor =
-    over?.kind.t === 'Switch' ? 'pointer' : over && draggableOhms(over) ? 'ns-resize' : 'default';
+    over?.kind.t === 'Switch' ? 'pointer' : over && dragMode(over) ? 'ns-resize' : 'default';
 });
 canvas.addEventListener('pointerleave', () => (mouse = null));
 canvas.addEventListener('pointerdown', (ev) => {
   const e = elementAt(ev.clientX, ev.clientY);
   if (!e) return;
+  const mode = dragMode(e);
   if (e.kind.t === 'Switch') {
     interact(e, { t: 'SetSwitch', closed: !e.kind.closed });
-  } else if (draggableOhms(e) && (e.kind.t === 'Resistor' || e.kind.t === 'Lamp')) {
-    drag = { e, startY: ev.clientY, startOhms: e.kind.ohms, lastSent: 0 };
+  } else if (mode) {
+    const startVal =
+      e.kind.t === 'Potentiometer'
+        ? e.kind.wiper
+        : e.kind.t === 'Resistor' || e.kind.t === 'Lamp'
+          ? e.kind.ohms
+          : 0;
+    drag = { e, mode, startY: ev.clientY, startVal, lastSent: 0 };
     canvas.setPointerCapture(ev.pointerId);
   }
 });
@@ -199,7 +227,19 @@ function describeValue(e: ElementSpec): string {
     case 'VoltageSource':
       return e.kind.amp === 0
         ? `${fmt(e.kind.dc, 'V')} DC`
-        : `${fmt(e.kind.amp, 'V')} @ ${e.kind.hz} Hz`;
+        : `${fmt(e.kind.dc, 'V')} ± ${fmt(e.kind.amp, 'V')} @ ${e.kind.hz} Hz`;
+    case 'Potentiometer':
+      return `${fmt(e.kind.ohms, 'Ω')} @ ${(e.kind.wiper * 100).toFixed(0)}%  (drag ↕)`;
+    case 'Npn':
+    case 'Pnp':
+      return `β ${e.kind.beta}`;
+    case 'Nmos':
+    case 'Pmos':
+      return `Vt ${fmt(e.kind.vt, 'V')}`;
+    case 'Zener':
+      return `Vz ${fmt(e.kind.vz, 'V')}`;
+    case 'OpAmp':
+      return `rail ±${fmt(e.kind.rail, 'V')}`;
     default:
       return '';
   }
@@ -264,11 +304,12 @@ function frame(now: number) {
     tip.style.left = `${mouse.x + 14}px`;
     tip.style.top = `${mouse.y + 14}px`;
     const val = describeValue(hover);
+    const labels = pinLabels(hover.kind);
     tip.textContent =
       `${hover.kind.t}${val ? '  ' + val : ''}\n` +
       (l
-        ? `V(a) ${fmt(l.va, 'V')}   V(b) ${fmt(l.vb, 'V')}\n` +
-          `I ${fmt(l.current, 'A')}   P ${fmt(l.power, 'W')}`
+        ? labels.map((lb, p) => `${lb}: ${fmt(l.v[p] ?? 0, 'V')} ${fmt(l.i[p] ?? 0, 'A')}`).join('\n') +
+          `\nP ${fmt(l.power, 'W')}`
         : '');
   } else {
     tip.style.display = 'none';

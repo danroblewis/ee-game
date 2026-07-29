@@ -23,52 +23,110 @@ use std::sync::{
 use tokio::sync::{broadcast, mpsc};
 use tower_http::services::{ServeDir, ServeFile};
 
-const DT: f64 = 10e-6;
+// The showcase room has slow dynamics (sub-Hz sines, 0.3 s RC fades), so
+// the plan's 5-20 µs configurable band lets us sit at the cheap end while
+// the mixed nonlinear circuit refactors every NR iteration.
+const DT: f64 = 20e-6;
 const TICK_HZ: f64 = 30.0;
 /// Wall budget per tick: cap sim work so a heavy circuit dilates sim time
 /// instead of stalling the loop (Falstad's rule, plan resolution).
 const MAX_STEPS_PER_TICK: u32 = 8000;
 
-/// The show-off circuit: two loops sharing a ground rail.
-/// Top: 9 V battery -> switch -> lamp. Bottom: slow 1.5 Hz sine breathing
-/// through a lamp, so voltage colors and dots visibly oscillate.
+/// The showcase room: four vignettes on one shared simulation.
+///   A: battery -> switch -> lamp (click me)
+///   B: potentiometer -> NPN emitter follower dimming a lamp (drag me)
+///   C: slow sine gate on an NMOS switching a lamp, cap softening the edges
+///   D: op-amp comparator on a slow sine alternately blinking two LEDs
 fn demo_room_circuit() -> Vec<ElementSpec> {
     use sim_core::ElementKind as K;
-    use sim_golden::{dc, sine, spec};
+    use sim_golden::{dc, gnd, r, sine, spec, spec3};
+    let lamp = |ohms: f64, watts: f64| K::Lamp {
+        ohms,
+        rated_watts: watts,
+    };
     vec![
-        // top loop
+        // ---- A: lamp loop (top-left)
         spec(1, dc(9.0), (2, 2), (2, 8)),
         spec(2, K::Wire, (2, 2), (7, 2)),
         spec(3, K::Switch { closed: false }, (7, 2), (11, 2)),
         spec(4, K::Wire, (11, 2), (16, 2)),
-        spec(
-            5,
-            K::Lamp {
-                ohms: 90.0,
-                rated_watts: 1.0,
-            },
-            (16, 2),
-            (16, 8),
-        ),
+        spec(5, lamp(90.0, 1.0), (16, 2), (16, 8)),
         spec(6, K::Wire, (16, 8), (9, 8)),
-        spec(7, K::Ground, (9, 8), (9, 8)),
+        gnd(7, (9, 8)),
         spec(8, K::Wire, (9, 8), (2, 8)),
-        // bottom loop
-        spec(10, sine(6.0, 1.5), (2, 12), (2, 18)),
-        spec(11, K::Wire, (2, 12), (9, 12)),
-        spec(
-            12,
-            K::Lamp {
-                ohms: 40.0,
-                rated_watts: 0.5,
+        // ---- B: pot -> NPN follower lamp dimmer (top-right)
+        spec(10, dc(9.0), (22, 2), (22, 8)),
+        spec(11, K::Wire, (22, 2), (26, 2)),
+        spec(12, K::Wire, (26, 2), (33, 2)),
+        // End a at the bottom rail so dragging the wiper up raises the
+        // base voltage (drag up = brighter).
+        spec3(
+            13,
+            K::Potentiometer {
+                ohms: 10_000.0,
+                wiper: 0.5,
             },
-            (9, 12),
-            (16, 12),
+            (26, 8),
+            (28, 5),
+            (26, 2),
         ),
-        spec(13, K::Wire, (16, 12), (16, 18)),
-        spec(14, K::Wire, (16, 18), (9, 18)),
-        spec(15, K::Ground, (9, 18), (9, 18)),
-        spec(16, K::Wire, (9, 18), (2, 18)),
+        spec(14, r(1000.0), (28, 5), (31, 5)),
+        // pins: [base, collector, emitter]
+        spec3(15, K::Npn { beta: 100.0 }, (31, 5), (33, 2), (33, 6)),
+        spec(16, lamp(60.0, 0.4), (33, 6), (33, 8)),
+        spec(17, K::Wire, (33, 8), (26, 8)),
+        spec(18, K::Wire, (26, 8), (24, 8)),
+        gnd(19, (24, 8)),
+        spec(20, K::Wire, (24, 8), (22, 8)),
+        // ---- C: NMOS slow switch with capacitor fade (bottom-left)
+        spec(30, dc(9.0), (2, 12), (2, 18)),
+        spec(31, K::Wire, (2, 12), (6, 12)),
+        spec(32, lamp(60.0, 0.6), (6, 12), (10, 12)),
+        spec(33, K::Wire, (10, 12), (12, 12)),
+        spec(34, K::Wire, (12, 12), (12, 13)),
+        // pins: [gate, drain, source]
+        spec3(
+            35,
+            K::Nmos { vt: 1.5, k: 0.05 },
+            (10, 15),
+            (12, 13),
+            (12, 17),
+        ),
+        spec(36, K::Wire, (12, 17), (12, 18)),
+        spec(37, K::Wire, (12, 18), (6, 18)),
+        spec(38, K::Wire, (6, 18), (2, 18)),
+        // Gate driver: 3 V ± 3 V at 0.3 Hz sweeps through the 1.5 V threshold.
+        spec(
+            39,
+            K::VoltageSource {
+                dc: 3.0,
+                amp: 3.0,
+                hz: 0.3,
+                phase: 0.0,
+            },
+            (6, 15),
+            (6, 18),
+        ),
+        spec(40, K::Wire, (6, 15), (10, 15)),
+        gnd(41, (6, 18)),
+        spec(42, K::Capacitor { farads: 5e-3 }, (6, 10), (10, 10)),
+        spec(43, K::Wire, (6, 12), (6, 10)),
+        spec(44, K::Wire, (10, 12), (10, 10)),
+        // ---- D: comparator blinker (bottom-right)
+        spec(50, sine(2.0, 0.4), (22, 13), (22, 18)),
+        spec(51, K::Wire, (22, 13), (26, 13)),
+        // pins: [in+, in-, out]
+        spec3(52, K::OpAmp { rail: 5.0 }, (26, 13), (26, 15), (30, 14)),
+        spec(53, K::Wire, (26, 15), (24, 15)),
+        spec(54, K::Wire, (24, 15), (24, 18)),
+        spec(55, r(220.0), (30, 14), (33, 14)),
+        spec(56, K::Led { color: 0 }, (33, 14), (33, 18)),
+        spec(57, K::Wire, (33, 14), (35, 14)),
+        spec(58, K::Led { color: 1 }, (35, 18), (35, 14)),
+        spec(59, K::Wire, (33, 18), (35, 18)),
+        spec(60, K::Wire, (24, 18), (33, 18)),
+        spec(61, K::Wire, (22, 18), (24, 18)),
+        gnd(62, (24, 18)),
     ]
 }
 
@@ -122,10 +180,24 @@ async fn sim_task(room: Arc<Room>, mut cmds: mpsc::UnboundedReceiver<Cmd>) {
         eng.advance(steps_per_tick.min(MAX_STEPS_PER_TICK));
 
         if room.events.receiver_count() > 0 {
-            let e: Vec<[f64; 5]> = eng
+            // Same flat layout as the WASM facade:
+            // [id, npins, v0, v1, v2, i0, i1, i2, power].
+            let e: Vec<[f64; 9]> = eng
                 .frame()
                 .iter()
-                .map(|f| [f.id as f64, f.va, f.vb, f.current, f.power])
+                .map(|f| {
+                    [
+                        f.id as f64,
+                        f.npins as f64,
+                        f.v[0],
+                        f.v[1],
+                        f.v[2],
+                        f.i[0],
+                        f.i[1],
+                        f.i[2],
+                        f.power,
+                    ]
+                })
                 .collect();
             let _ = room
                 .events
@@ -150,6 +222,9 @@ fn apply_to_specs(room: &Room, id: u32, op: InteractOp) {
         (InteractOp::SetValue { value }, K::Inductor { henries }) => *henries = value.max(1e-12),
         (InteractOp::SetValue { value }, K::VoltageSource { dc, .. }) => *dc = value,
         (InteractOp::SetValue { value }, K::CurrentSource { amps }) => *amps = value,
+        (InteractOp::SetValue { value }, K::Potentiometer { wiper, .. }) => {
+            *wiper = value.clamp(0.01, 0.99)
+        }
         _ => {}
     }
 }

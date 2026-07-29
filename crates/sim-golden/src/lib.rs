@@ -5,7 +5,15 @@
 use sim_core::{ElementKind, ElementSpec, Point};
 
 pub fn spec(id: u32, kind: ElementKind, a: Point, b: Point) -> ElementSpec {
-    ElementSpec { id, kind, a, b }
+    ElementSpec::two(id, kind, a, b)
+}
+
+pub fn spec3(id: u32, kind: ElementKind, a: Point, b: Point, c: Point) -> ElementSpec {
+    ElementSpec::three(id, kind, a, b, c)
+}
+
+pub fn gnd(id: u32, at: Point) -> ElementSpec {
+    ElementSpec::ground(id, at)
 }
 
 pub fn dc(volts: f64) -> ElementKind {
@@ -26,13 +34,17 @@ pub fn sine(amp: f64, hz: f64) -> ElementKind {
     }
 }
 
+pub fn r(ohms: f64) -> ElementKind {
+    ElementKind::Resistor { ohms }
+}
+
 /// 10 V source, 1 kΩ, 1 µF: v_c(t) = 10 (1 - e^(-t/τ)), τ = 1 ms.
 pub fn rc_step() -> Vec<ElementSpec> {
     vec![
         spec(1, dc(10.0), (0, 0), (0, 8)),
-        spec(2, ElementKind::Resistor { ohms: 1000.0 }, (0, 0), (8, 0)),
+        spec(2, r(1000.0), (0, 0), (8, 0)),
         spec(3, ElementKind::Capacitor { farads: 1e-6 }, (8, 0), (0, 8)),
-        spec(4, ElementKind::Ground, (0, 8), (0, 8)),
+        gnd(4, (0, 8)),
     ]
 }
 
@@ -40,9 +52,9 @@ pub fn rc_step() -> Vec<ElementSpec> {
 pub fn rl_step() -> Vec<ElementSpec> {
     vec![
         spec(1, dc(5.0), (0, 0), (0, 8)),
-        spec(2, ElementKind::Resistor { ohms: 100.0 }, (0, 0), (8, 0)),
+        spec(2, r(100.0), (0, 0), (8, 0)),
         spec(3, ElementKind::Inductor { henries: 10e-3 }, (8, 0), (0, 8)),
-        spec(4, ElementKind::Ground, (0, 8), (0, 8)),
+        gnd(4, (0, 8)),
     ]
 }
 
@@ -51,10 +63,10 @@ pub fn rl_step() -> Vec<ElementSpec> {
 pub fn rlc_ring() -> Vec<ElementSpec> {
     vec![
         spec(1, dc(1.0), (0, 0), (0, 8)),
-        spec(2, ElementKind::Resistor { ohms: 1.0 }, (0, 0), (4, 0)),
+        spec(2, r(1.0), (0, 0), (4, 0)),
         spec(3, ElementKind::Inductor { henries: 1e-3 }, (4, 0), (8, 0)),
         spec(4, ElementKind::Capacitor { farads: 1e-6 }, (8, 0), (0, 8)),
-        spec(5, ElementKind::Ground, (0, 8), (0, 8)),
+        gnd(5, (0, 8)),
     ]
 }
 
@@ -63,9 +75,9 @@ pub fn half_wave_rectifier() -> Vec<ElementSpec> {
     vec![
         spec(1, sine(10.0, 60.0), (0, 0), (0, 8)),
         spec(2, ElementKind::Diode, (0, 0), (8, 0)),
-        spec(3, ElementKind::Resistor { ohms: 1000.0 }, (8, 0), (0, 8)),
+        spec(3, r(1000.0), (8, 0), (0, 8)),
         spec(4, ElementKind::Capacitor { farads: 100e-6 }, (8, 0), (0, 8)),
-        spec(5, ElementKind::Ground, (0, 8), (0, 8)),
+        gnd(5, (0, 8)),
     ]
 }
 
@@ -85,6 +97,139 @@ pub fn demo_lamp(closed: bool) -> Vec<ElementSpec> {
             (8, 4),
         ),
         spec(5, ElementKind::Wire, (8, 4), (0, 4)),
-        spec(6, ElementKind::Ground, (0, 4), (0, 4)),
+        gnd(6, (0, 4)),
+    ]
+}
+
+/// NPN saturated switch: 9 V rail, 100 Ω collector load, base driven
+/// through 3.3 kΩ (β·Ib ≈ 250 mA >> 90 mA needed). Expect hard
+/// saturation: V(c) well under 0.5 V.
+pub fn npn_switch() -> Vec<ElementSpec> {
+    vec![
+        spec(1, dc(9.0), (0, 0), (0, 10)),
+        spec(2, r(100.0), (0, 0), (4, 2)),  // rail -> collector
+        spec(3, r(3300.0), (0, 0), (4, 6)), // rail -> base
+        // pins: [base, collector, emitter]
+        spec3(4, ElementKind::Npn { beta: 100.0 }, (4, 6), (4, 2), (4, 10)),
+        spec(5, ElementKind::Wire, (4, 10), (0, 10)),
+        gnd(6, (0, 10)),
+    ]
+}
+
+/// NPN emitter follower: base held at 4.5 V by a stiff divider, emitter
+/// through 1 kΩ to ground. Expect V(e) ≈ 4.5 - V(be) ≈ 3.8-3.95.
+pub fn emitter_follower() -> Vec<ElementSpec> {
+    vec![
+        spec(1, dc(9.0), (0, 0), (0, 10)),
+        spec(2, r(1000.0), (0, 0), (4, 4)),  // divider top
+        spec(3, r(1000.0), (4, 4), (0, 10)), // divider bottom
+        spec(4, ElementKind::Wire, (0, 0), (8, 0)),
+        spec3(5, ElementKind::Npn { beta: 100.0 }, (4, 4), (8, 0), (8, 6)),
+        spec(6, r(1000.0), (8, 6), (0, 10)), // emitter load
+        gnd(7, (0, 10)),
+    ]
+}
+
+/// NMOS low-side switch: gate at 5 V (vt 1.5), 90 Ω load from 9 V rail.
+/// Expect the lamp on: I ≈ 90+ mA, V(ds) under 1 V.
+pub fn nmos_switch() -> Vec<ElementSpec> {
+    vec![
+        spec(1, dc(9.0), (0, 0), (0, 10)),
+        spec(2, dc(5.0), (12, 6), (12, 10)),
+        spec(3, r(90.0), (0, 0), (6, 2)), // rail -> drain
+        // pins: [gate, drain, source]
+        spec3(
+            4,
+            ElementKind::Nmos { vt: 1.5, k: 0.05 },
+            (12, 6),
+            (6, 2),
+            (6, 10),
+        ),
+        spec(5, ElementKind::Wire, (6, 10), (0, 10)),
+        spec(6, ElementKind::Wire, (12, 10), (0, 10)),
+        gnd(7, (0, 10)),
+    ]
+}
+
+/// Op-amp voltage follower driving a 1 kΩ load; input 2 V DC.
+pub fn opamp_follower() -> Vec<ElementSpec> {
+    vec![
+        spec(1, dc(2.0), (0, 0), (0, 8)),
+        // pins: [in+, in-, out]; out wired back to in-.
+        spec3(2, ElementKind::OpAmp { rail: 13.5 }, (0, 0), (6, 4), (8, 0)),
+        spec(3, ElementKind::Wire, (8, 0), (6, 4)),
+        spec(4, r(1000.0), (8, 0), (0, 8)),
+        gnd(5, (0, 8)),
+    ]
+}
+
+/// Op-amp comparator: +1 V vs ground; output must sit on the +5 rail.
+pub fn opamp_comparator() -> Vec<ElementSpec> {
+    vec![
+        spec(1, dc(1.0), (0, 0), (0, 8)),
+        spec3(2, ElementKind::OpAmp { rail: 5.0 }, (0, 0), (4, 6), (8, 0)),
+        spec(3, ElementKind::Wire, (4, 6), (0, 8)), // in- to ground
+        spec(4, r(1000.0), (8, 0), (0, 8)),
+        gnd(5, (0, 8)),
+    ]
+}
+
+/// Zener shunt regulator: 9 V through 330 Ω into a 5.6 V zener.
+pub fn zener_regulator() -> Vec<ElementSpec> {
+    vec![
+        spec(1, dc(9.0), (0, 0), (0, 8)),
+        spec(2, r(330.0), (0, 0), (6, 0)),
+        // Cathode to the regulated node: anode = pin 0 at ground side.
+        spec(3, ElementKind::Zener { vz: 5.6 }, (0, 8), (6, 0)),
+        gnd(4, (0, 8)),
+    ]
+}
+
+/// Unloaded potentiometer across 9 V, wiper at 0.3 from end a:
+/// V(wiper) = 9 · (1 - 0.3) = 6.3 V.
+pub fn pot_divider() -> Vec<ElementSpec> {
+    vec![
+        spec(1, dc(9.0), (0, 0), (0, 8)),
+        // pins: [end a, wiper, end b]
+        spec3(
+            2,
+            ElementKind::Potentiometer {
+                ohms: 10_000.0,
+                wiper: 0.3,
+            },
+            (0, 0),
+            (4, 4),
+            (0, 8),
+        ),
+        gnd(3, (0, 8)),
+    ]
+}
+
+/// LED through 330 Ω from 9 V: forward drop ≈ 2.1 V, I ≈ 21 mA.
+pub fn led_loop() -> Vec<ElementSpec> {
+    vec![
+        spec(1, dc(9.0), (0, 0), (0, 8)),
+        spec(2, r(330.0), (0, 0), (6, 0)),
+        spec(3, ElementKind::Led { color: 0 }, (6, 0), (0, 8)),
+        gnd(4, (0, 8)),
+    ]
+}
+
+/// Every golden circuit, for the determinism harness.
+pub fn all_golden() -> Vec<(&'static str, Vec<ElementSpec>)> {
+    vec![
+        ("demo_lamp", demo_lamp(true)),
+        ("rc_step", rc_step()),
+        ("rl_step", rl_step()),
+        ("rlc_ring", rlc_ring()),
+        ("half_wave_rectifier", half_wave_rectifier()),
+        ("npn_switch", npn_switch()),
+        ("emitter_follower", emitter_follower()),
+        ("nmos_switch", nmos_switch()),
+        ("opamp_follower", opamp_follower()),
+        ("opamp_comparator", opamp_comparator()),
+        ("zener_regulator", zener_regulator()),
+        ("pot_divider", pot_divider()),
+        ("led_loop", led_loop()),
     ]
 }

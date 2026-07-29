@@ -1,6 +1,6 @@
-// Falstad-feel Canvas2D renderer for the M1 demo: voltage-colored
-// conductors, animated current dots, glowing lamp. (The real WebGL canvas
-// package arrives with the S2 spike; this proves the sim feels alive.)
+// Falstad-feel Canvas2D renderer: voltage-colored conductors, animated
+// current dots, proper schematic symbols for every device. (The WebGL
+// canvas package arrives with the S2 spike; this is the visual reference.)
 
 import type { ElemLive, ElementSpec, Point } from './circuit';
 
@@ -24,41 +24,47 @@ export function voltageColor(v: number): string {
   return `rgb(${r},${Math.round(base * (1 + t))},${Math.round(base * (1 + t))})`;
 }
 
-const px = (cam: Camera, p: Point): [number, number] => [
-  cam.ox + p[0] * cam.scale,
-  cam.oy + p[1] * cam.scale,
-];
+export const LED_COLORS = ['#ff4b3e', '#4bff6a', '#4b9dff', '#ffe14b', '#f2f2f2'];
 
-function lerp(a: [number, number], b: [number, number], t: number): [number, number] {
-  return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
-}
+type Px = [number, number];
+
+const px = (cam: Camera, p: Point): Px => [cam.ox + p[0] * cam.scale, cam.oy + p[1] * cam.scale];
+
+const lerp = (a: Px, b: Px, t: number): Px => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+const add = (a: Px, b: Px, s = 1): Px => [a[0] + b[0] * s, a[1] + b[1] * s];
+const sub = (a: Px, b: Px): Px => [a[0] - b[0], a[1] - b[1]];
+const mag = (a: Px) => Math.hypot(a[0], a[1]);
+const norm = (a: Px): Px => {
+  const m = mag(a) || 1;
+  return [a[0] / m, a[1] / m];
+};
+const perp = (a: Px): Px => [-a[1], a[0]];
 
 /** Animated dot phase per element, advanced by simulated current. */
 export class DotFlow {
   private phase = new Map<number, number>();
 
   advance(id: number, current: number, dtSec: number): number {
-    const p = (this.phase.get(id) ?? 0) + current * dtSec * 6; // grid units/sec per amp... tuned
+    const p = (this.phase.get(id) ?? 0) + current * dtSec * 6;
     this.phase.set(id, p);
     return p;
   }
 }
 
 const DOT_SPACING = 0.55; // grid units between dots
-
 /** Dots only exist where current flows (Falstad convention). */
 const DOT_MIN_AMPS = 1e-4;
 
 export function drawDots(
   ctx: CanvasRenderingContext2D,
   cam: Camera,
-  a: [number, number],
-  b: [number, number],
+  a: Px,
+  b: Px,
   phase: number,
   current: number,
 ) {
   if (Math.abs(current) < DOT_MIN_AMPS) return;
-  const len = Math.hypot(b[0] - a[0], b[1] - a[1]) / cam.scale;
+  const len = mag(sub(b, a)) / cam.scale;
   if (len < 1e-6) return;
   ctx.fillStyle = '#ffe95e';
   let p = ((phase % DOT_SPACING) + DOT_SPACING) % DOT_SPACING;
@@ -78,125 +84,260 @@ interface DrawCtx {
   dtSec: number;
 }
 
+function stroke(ctx: CanvasRenderingContext2D, color: string, path: Px[]) {
+  ctx.strokeStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(...path[0]!);
+  for (const p of path.slice(1)) ctx.lineTo(...p);
+  ctx.stroke();
+}
+
+function arrowHead(ctx: CanvasRenderingContext2D, tip: Px, dir: Px, size: number, color: string) {
+  const n = perp(dir);
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(...tip);
+  ctx.lineTo(...add(add(tip, dir, -size), n, size * 0.5));
+  ctx.lineTo(...add(add(tip, dir, -size), n, -size * 0.5));
+  ctx.closePath();
+  ctx.fill();
+}
+
+/** Zigzag resistor body between two px points, gradient-colored. */
+function zigzag(ctx: CanvasRenderingContext2D, a: Px, b: Px, va: number, vb: number, s: number) {
+  const u = norm(sub(b, a));
+  const n = perp(u);
+  const amp = s * 0.16;
+  const grad = ctx.createLinearGradient(...a, ...b);
+  grad.addColorStop(0, voltageColor(va));
+  grad.addColorStop(1, voltageColor(vb));
+  const pts: Px[] = [a];
+  const zags = 6;
+  for (let k = 0; k < zags; k++) {
+    const t = (k + 0.5) / zags;
+    pts.push(add(lerp(a, b, t), n, k % 2 === 0 ? amp : -amp));
+  }
+  pts.push(b);
+  ctx.strokeStyle = grad as unknown as string;
+  ctx.beginPath();
+  ctx.moveTo(...pts[0]!);
+  for (const p of pts.slice(1)) ctx.lineTo(...p);
+  ctx.stroke();
+}
+
 export function drawElement(d: DrawCtx, e: ElementSpec) {
   const { ctx, cam } = d;
-  const A = px(cam, e.a);
-  const B = px(cam, e.b);
-  const va = d.live?.va ?? 0;
-  const vb = d.live?.vb ?? 0;
-  const i = d.live?.current ?? 0;
-  ctx.lineWidth = Math.max(2, cam.scale * 0.07);
+  const s = cam.scale;
+  const P = e.pins.map((p) => px(cam, p));
+  const v = (i: number) => d.live?.v[i] ?? 0;
+  const iPin = (i: number) => d.live?.i[i] ?? 0;
+  const i0 = iPin(0);
+  ctx.lineWidth = Math.max(2, s * 0.07);
   ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+
+  const A = P[0]!;
+  const B = P[1] ?? A;
+  const u = norm(sub(B, A));
+  const n = perp(u);
+  const mid = lerp(A, B, 0.5);
+
+  const twoPinDots = (current = i0) =>
+    drawDots(ctx, cam, A, B, d.dots.advance(e.id, current, d.dtSec), current);
 
   switch (e.kind.t) {
     case 'Wire': {
-      ctx.strokeStyle = voltageColor(va);
-      ctx.beginPath();
-      ctx.moveTo(...A);
-      ctx.lineTo(...B);
-      ctx.stroke();
-      drawDots(ctx, cam, A, B, d.dots.advance(e.id, i, d.dtSec), i);
+      stroke(ctx, voltageColor(v(0)), [A, B]);
+      twoPinDots();
       break;
     }
     case 'Ground': {
-      ctx.strokeStyle = voltageColor(va);
-      const s = cam.scale * 0.5;
+      ctx.strokeStyle = voltageColor(v(0));
       ctx.beginPath();
       ctx.moveTo(A[0], A[1]);
-      ctx.lineTo(A[0], A[1] + s * 0.5);
-      for (const [w, dy] of [
-        [0.5, 0.5],
-        [0.33, 0.72],
-        [0.16, 0.94],
-      ] as const) {
-        ctx.moveTo(A[0] - s * w, A[1] + s * dy);
-        ctx.lineTo(A[0] + s * w, A[1] + s * dy);
+      ctx.lineTo(A[0], A[1] + s * 0.25);
+      for (const [w, dy] of [[0.5, 0.25], [0.33, 0.47], [0.16, 0.69]] as const) {
+        ctx.moveTo(A[0] - s * w * 0.5, A[1] + s * dy);
+        ctx.lineTo(A[0] + s * w * 0.5, A[1] + s * dy);
       }
       ctx.stroke();
       break;
     }
+    case 'Resistor': {
+      const e1 = add(mid, u, -s * 0.45);
+      const e2 = add(mid, u, s * 0.45);
+      stroke(ctx, voltageColor(v(0)), [A, e1]);
+      stroke(ctx, voltageColor(v(1)), [e2, B]);
+      zigzag(ctx, e1, e2, v(0), v(1), s);
+      twoPinDots();
+      break;
+    }
+    case 'Potentiometer': {
+      const C = P[2]!;
+      const uAC = norm(sub(C, A));
+      const m2 = lerp(A, C, 0.5);
+      const e1 = add(m2, uAC, -s * 0.45);
+      const e2 = add(m2, uAC, s * 0.45);
+      stroke(ctx, voltageColor(v(0)), [A, e1]);
+      stroke(ctx, voltageColor(v(2)), [e2, C]);
+      zigzag(ctx, e1, e2, v(0), v(2), s);
+      // wiper arrow from pin 1 toward the body position given by `wiper`
+      const w = e.kind.wiper;
+      const tip = add(lerp(e1, e2, w), perp(uAC), Math.sign(dot(sub(P[1]!, m2), perp(uAC))) * s * 0.2);
+      stroke(ctx, voltageColor(v(1)), [P[1]!, tip]);
+      arrowHead(ctx, tip, norm(sub(tip, P[1]!)), s * 0.18, voltageColor(v(1)));
+      break;
+    }
+    case 'Capacitor': {
+      const gap = s * 0.11;
+      const plate = s * 0.42;
+      const p1 = add(mid, u, -gap);
+      const p2 = add(mid, u, gap);
+      stroke(ctx, voltageColor(v(0)), [A, p1]);
+      stroke(ctx, voltageColor(v(1)), [p2, B]);
+      stroke(ctx, voltageColor(v(0)), [add(p1, n, -plate), add(p1, n, plate)]);
+      stroke(ctx, voltageColor(v(1)), [add(p2, n, -plate), add(p2, n, plate)]);
+      drawDots(ctx, cam, A, p1, d.dots.advance(e.id, i0, d.dtSec), i0);
+      drawDots(ctx, cam, p2, B, d.dots.advance(e.id + 1_000_000, i0, d.dtSec), i0);
+      break;
+    }
+    case 'Inductor': {
+      const e1 = add(mid, u, -s * 0.45);
+      const e2 = add(mid, u, s * 0.45);
+      stroke(ctx, voltageColor(v(0)), [A, e1]);
+      stroke(ctx, voltageColor(v(1)), [e2, B]);
+      const grad = ctx.createLinearGradient(...e1, ...e2);
+      grad.addColorStop(0, voltageColor(v(0)));
+      grad.addColorStop(1, voltageColor(v(1)));
+      ctx.strokeStyle = grad as unknown as string;
+      ctx.beginPath();
+      ctx.moveTo(...e1);
+      const bumps = 3;
+      for (let k = 0; k < bumps; k++) {
+        const from = lerp(e1, e2, k / bumps);
+        const to = lerp(e1, e2, (k + 1) / bumps);
+        const cp = add(lerp(from, to, 0.5), n, -s * 0.38);
+        ctx.quadraticCurveTo(cp[0], cp[1], to[0], to[1]);
+      }
+      ctx.stroke();
+      twoPinDots();
+      break;
+    }
     case 'VoltageSource': {
-      // Leads up to the plates; a (+, long plate) at terminal a.
-      const mid = lerp(A, B, 0.5);
-      const dir = [(B[0] - A[0]), (B[1] - A[1])];
-      const len = Math.hypot(dir[0]!, dir[1]!) || 1;
-      const u = [dir[0]! / len, dir[1]! / len]; // a -> b unit
-      const n = [-u[1]!, u[0]!]; // normal
-      const gap = cam.scale * 0.14;
-      const p1: [number, number] = [mid[0] - u[0]! * gap, mid[1] - u[1]! * gap];
-      const p2: [number, number] = [mid[0] + u[0]! * gap, mid[1] + u[1]! * gap];
-      ctx.strokeStyle = voltageColor(va);
+      if (e.kind.amp === 0) {
+        // battery plates, pin 0 = +
+        const gap = s * 0.14;
+        const p1 = add(mid, u, -gap);
+        const p2 = add(mid, u, gap);
+        stroke(ctx, voltageColor(v(0)), [A, p1]);
+        stroke(ctx, voltageColor(v(1)), [p2, B]);
+        stroke(ctx, voltageColor(v(0)), [add(p1, n, -s * 0.45), add(p1, n, s * 0.45)]);
+        stroke(ctx, voltageColor(v(1)), [add(p2, n, -s * 0.22), add(p2, n, s * 0.22)]);
+        ctx.fillStyle = '#c9c9d4';
+        ctx.font = `${Math.round(s * 0.3)}px ui-monospace`;
+        ctx.fillText('+', p1[0] + n[0] * s * 0.45 + 6, p1[1] + n[1] * s * 0.45);
+      } else {
+        // AC source: circle with a sine squiggle
+        const r = s * 0.42;
+        stroke(ctx, voltageColor(v(0)), [A, add(mid, u, -r)]);
+        stroke(ctx, voltageColor(v(1)), [add(mid, u, r), B]);
+        ctx.strokeStyle = '#c9c9d4';
+        ctx.beginPath();
+        ctx.arc(mid[0], mid[1], r, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.beginPath();
+        const w = r * 0.55;
+        ctx.moveTo(mid[0] - w, mid[1]);
+        ctx.quadraticCurveTo(mid[0] - w / 2, mid[1] - w * 1.6, mid[0], mid[1]);
+        ctx.quadraticCurveTo(mid[0] + w / 2, mid[1] + w * 1.6, mid[0] + w, mid[1]);
+        ctx.stroke();
+      }
+      twoPinDots(-i0);
+      break;
+    }
+    case 'CurrentSource': {
+      const r = s * 0.42;
+      stroke(ctx, voltageColor(v(0)), [A, add(mid, u, -r)]);
+      stroke(ctx, voltageColor(v(1)), [add(mid, u, r), B]);
+      ctx.strokeStyle = '#c9c9d4';
       ctx.beginPath();
-      ctx.moveTo(...A);
-      ctx.lineTo(...p1);
+      ctx.arc(mid[0], mid[1], r, 0, Math.PI * 2);
       ctx.stroke();
-      ctx.strokeStyle = voltageColor(vb);
-      ctx.beginPath();
-      ctx.moveTo(...p2);
-      ctx.lineTo(...B);
-      ctx.stroke();
-      // plates
-      const long = cam.scale * 0.45;
-      const short = cam.scale * 0.22;
-      ctx.strokeStyle = voltageColor(va);
-      ctx.beginPath();
-      ctx.moveTo(p1[0] - n[0]! * long, p1[1] - n[1]! * long);
-      ctx.lineTo(p1[0] + n[0]! * long, p1[1] + n[1]! * long);
-      ctx.stroke();
-      ctx.strokeStyle = voltageColor(vb);
-      ctx.beginPath();
-      ctx.moveTo(p2[0] - n[0]! * short, p2[1] - n[1]! * short);
-      ctx.lineTo(p2[0] + n[0]! * short, p2[1] + n[1]! * short);
-      ctx.stroke();
-      ctx.fillStyle = '#c9c9d4';
-      ctx.font = `${Math.round(cam.scale * 0.3)}px ui-monospace`;
-      ctx.fillText('+', p1[0] + n[0]! * long + 6, p1[1] + n[1]! * long);
-      drawDots(ctx, cam, A, B, d.dots.advance(e.id, -i, d.dtSec), i);
+      stroke(ctx, '#c9c9d4', [add(mid, u, -r * 0.5), add(mid, u, r * 0.5)]);
+      arrowHead(ctx, add(mid, u, r * 0.5), u, s * 0.2, '#c9c9d4');
+      twoPinDots();
       break;
     }
     case 'Switch': {
       const t1 = lerp(A, B, 0.3);
       const t2 = lerp(A, B, 0.7);
-      ctx.strokeStyle = voltageColor(va);
-      ctx.beginPath();
-      ctx.moveTo(...A);
-      ctx.lineTo(...t1);
-      ctx.stroke();
-      ctx.strokeStyle = voltageColor(vb);
-      ctx.beginPath();
-      ctx.moveTo(...t2);
-      ctx.lineTo(...B);
-      ctx.stroke();
-      // lever
+      stroke(ctx, voltageColor(v(0)), [A, t1]);
+      stroke(ctx, voltageColor(v(1)), [t2, B]);
       ctx.strokeStyle = '#c9c9d4';
       ctx.beginPath();
       ctx.moveTo(...t1);
       if (e.kind.closed) {
         ctx.lineTo(...t2);
       } else {
+        const lever = sub(t2, t1);
         const ang = -0.55;
-        const dx = t2[0] - t1[0];
-        const dy = t2[1] - t1[1];
         ctx.lineTo(
-          t1[0] + dx * Math.cos(ang) - dy * Math.sin(ang),
-          t1[1] + dx * Math.sin(ang) + dy * Math.cos(ang),
+          t1[0] + lever[0] * Math.cos(ang) - lever[1] * Math.sin(ang),
+          t1[1] + lever[0] * Math.sin(ang) + lever[1] * Math.cos(ang),
         );
       }
       ctx.stroke();
       for (const p of [t1, t2]) {
         ctx.fillStyle = '#c9c9d4';
         ctx.beginPath();
-        ctx.arc(p[0], p[1], cam.scale * 0.06, 0, Math.PI * 2);
+        ctx.arc(p[0], p[1], s * 0.06, 0, Math.PI * 2);
         ctx.fill();
       }
-      if (e.kind.closed) drawDots(ctx, cam, A, B, d.dots.advance(e.id, i, d.dtSec), i);
+      if (e.kind.closed) twoPinDots();
+      break;
+    }
+    case 'Diode':
+    case 'Zener':
+    case 'Led': {
+      const half = s * 0.28;
+      const t1 = add(mid, u, -half);
+      const t2 = add(mid, u, half);
+      stroke(ctx, voltageColor(v(0)), [A, t1]);
+      stroke(ctx, voltageColor(v(1)), [t2, B]);
+      if (e.kind.t === 'Led') {
+        const glow = Math.min(1.5, Math.abs(i0) / 0.02);
+        if (glow > 0.02) {
+          const color = LED_COLORS[e.kind.color] ?? LED_COLORS[0]!;
+          const g = ctx.createRadialGradient(mid[0], mid[1], s * 0.1, mid[0], mid[1], s * (0.8 + glow * 0.8));
+          g.addColorStop(0, color + 'e0');
+          g.addColorStop(1, color + '00');
+          ctx.fillStyle = g;
+          ctx.beginPath();
+          ctx.arc(mid[0], mid[1], s * (0.8 + glow * 0.8), 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+      // anode triangle
+      ctx.fillStyle = voltageColor(v(0));
+      ctx.beginPath();
+      ctx.moveTo(...add(t1, n, s * 0.3));
+      ctx.lineTo(...add(t1, n, -s * 0.3));
+      ctx.lineTo(...t2);
+      ctx.closePath();
+      ctx.fill();
+      // cathode bar (bent for zener)
+      const barColor = voltageColor(v(1));
+      stroke(ctx, barColor, [add(t2, n, s * 0.3), add(t2, n, -s * 0.3)]);
+      if (e.kind.t === 'Zener') {
+        stroke(ctx, barColor, [add(t2, n, s * 0.3), add(add(t2, n, s * 0.3), u, -s * 0.12)]);
+        stroke(ctx, barColor, [add(t2, n, -s * 0.3), add(add(t2, n, -s * 0.3), u, s * 0.12)]);
+      }
+      twoPinDots();
       break;
     }
     case 'Lamp': {
-      const mid = lerp(A, B, 0.5);
-      const r = cam.scale * 0.5;
+      const r = s * 0.5;
       const frac = Math.min(1.6, Math.abs(d.live?.power ?? 0) / e.kind.rated_watts);
-      // glow halo
       if (frac > 0.01) {
         const g = ctx.createRadialGradient(mid[0], mid[1], r * 0.2, mid[0], mid[1], r * (1.5 + frac));
         g.addColorStop(0, `rgba(255,241,150,${Math.min(0.95, frac)})`);
@@ -206,23 +347,8 @@ export function drawElement(d: DrawCtx, e: ElementSpec) {
         ctx.arc(mid[0], mid[1], r * (1.5 + frac), 0, Math.PI * 2);
         ctx.fill();
       }
-      // leads
-      const dir = [(B[0] - A[0]), (B[1] - A[1])];
-      const len = Math.hypot(dir[0]!, dir[1]!) || 1;
-      const u = [dir[0]! / len, dir[1]! / len];
-      const e1: [number, number] = [mid[0] - u[0]! * r, mid[1] - u[1]! * r];
-      const e2: [number, number] = [mid[0] + u[0]! * r, mid[1] + u[1]! * r];
-      ctx.strokeStyle = voltageColor(va);
-      ctx.beginPath();
-      ctx.moveTo(...A);
-      ctx.lineTo(...e1);
-      ctx.stroke();
-      ctx.strokeStyle = voltageColor(vb);
-      ctx.beginPath();
-      ctx.moveTo(...e2);
-      ctx.lineTo(...B);
-      ctx.stroke();
-      // bulb
+      stroke(ctx, voltageColor(v(0)), [A, add(mid, u, -r)]);
+      stroke(ctx, voltageColor(v(1)), [add(mid, u, r), B]);
       ctx.strokeStyle = frac > 0.02 ? '#ffe95e' : '#8a8a95';
       ctx.beginPath();
       ctx.arc(mid[0], mid[1], r, 0, Math.PI * 2);
@@ -234,30 +360,110 @@ export function drawElement(d: DrawCtx, e: ElementSpec) {
       ctx.moveTo(mid[0] + k, mid[1] - k);
       ctx.lineTo(mid[0] - k, mid[1] + k);
       ctx.stroke();
-      drawDots(ctx, cam, A, B, d.dots.advance(e.id, i, d.dtSec), i);
+      twoPinDots();
       break;
     }
-    default: {
-      // Generic two-terminal box (resistor etc.) — enough for M1.
-      ctx.strokeStyle = voltageColor(va);
+    case 'Npn':
+    case 'Pnp': {
+      const [Bp, Cp, Ep] = [P[0]!, P[1]!, P[2]!];
+      const ceMid = lerp(Cp, Ep, 0.5);
+      const ub = norm(sub(ceMid, Bp)); // base -> body
+      const barC = add(ceMid, ub, -s * 0.28);
+      const barN = perp(ub);
+      const halfBar = s * 0.4;
+      // leads
+      stroke(ctx, voltageColor(v(0)), [Bp, barC]);
+      const sC = Math.sign(dot(sub(Cp, barC), barN)) || 1;
+      const cAtt = add(barC, barN, sC * halfBar * 0.7);
+      const eAtt = add(barC, barN, -sC * halfBar * 0.7);
+      stroke(ctx, voltageColor(v(1)), [Cp, cAtt]);
+      stroke(ctx, voltageColor(v(2)), [Ep, eAtt]);
+      // base bar
+      stroke(ctx, '#c9c9d4', [add(barC, barN, halfBar), add(barC, barN, -halfBar)]);
+      // emitter arrow: out for NPN, in for PNP
+      const eDir = norm(sub(Ep, eAtt));
+      const eColor = voltageColor(v(2));
+      if (e.kind.t === 'Npn') {
+        arrowHead(ctx, lerp(eAtt, Ep, 0.6), eDir, s * 0.22, eColor);
+      } else {
+        arrowHead(ctx, lerp(Ep, eAtt, 0.6), norm(sub(eAtt, Ep)), s * 0.22, eColor);
+      }
+      // dots along collector->emitter through the device
+      const ic = iPin(1);
+      drawDots(ctx, cam, Cp, Ep, d.dots.advance(e.id, ic, d.dtSec), ic);
+      break;
+    }
+    case 'Nmos':
+    case 'Pmos': {
+      const [Gp, Dp, Sp] = [P[0]!, P[1]!, P[2]!];
+      const dsMid = lerp(Dp, Sp, 0.5);
+      const toG = norm(sub(Gp, dsMid));
+      // channel bar on the D-S line, gate bar offset toward the gate pin
+      const chA = lerp(Dp, Sp, 0.22);
+      const chB = lerp(Dp, Sp, 0.78);
+      stroke(ctx, voltageColor(v(1)), [Dp, chA]);
+      stroke(ctx, voltageColor(v(2)), [Sp, chB]);
+      stroke(ctx, '#c9c9d4', [chA, chB]);
+      const gA = add(lerp(Dp, Sp, 0.28), toG, s * 0.18);
+      const gB = add(lerp(Dp, Sp, 0.72), toG, s * 0.18);
+      stroke(ctx, '#c9c9d4', [gA, gB]);
+      stroke(ctx, voltageColor(v(0)), [Gp, lerp(gA, gB, 0.5)]);
+      // arrow into (NMOS) / out of (PMOS) the channel at the source end
+      const sDir = norm(sub(chB, Sp));
+      if (e.kind.t === 'Nmos') {
+        arrowHead(ctx, lerp(Sp, chB, 0.7), sDir, s * 0.2, voltageColor(v(2)));
+      } else {
+        arrowHead(ctx, lerp(chB, Sp, 0.7), norm(sub(Sp, chB)), s * 0.2, voltageColor(v(2)));
+      }
+      const idd = iPin(1);
+      drawDots(ctx, cam, Dp, Sp, d.dots.advance(e.id, idd, d.dtSec), idd);
+      break;
+    }
+    case 'OpAmp': {
+      const [Pp, Mp, Op] = [P[0]!, P[1]!, P[2]!];
+      const back = lerp(Pp, Mp, 0.5);
+      const pmDir = norm(sub(Pp, Mp));
+      const half = Math.max(s * 0.9, mag(sub(Pp, Mp)) * 0.75);
+      const v1 = add(back, pmDir, half);
+      const v2 = add(back, pmDir, -half);
+      ctx.fillStyle = '#181820';
+      ctx.strokeStyle = '#c9c9d4';
       ctx.beginPath();
-      ctx.moveTo(...A);
-      ctx.lineTo(...B);
+      ctx.moveTo(...v1);
+      ctx.lineTo(...v2);
+      ctx.lineTo(...Op);
+      ctx.closePath();
+      ctx.fill();
       ctx.stroke();
-      drawDots(ctx, cam, A, B, d.dots.advance(e.id, i, d.dtSec), i);
+      ctx.fillStyle = '#c9c9d4';
+      ctx.font = `${Math.round(s * 0.32)}px ui-monospace`;
+      const inset = add(back, norm(sub(Op, back)), s * 0.22);
+      ctx.fillText('+', inset[0] + (Pp[0] - back[0]) * 0.55 - s * 0.1, inset[1] + (Pp[1] - back[1]) * 0.55 + s * 0.1);
+      ctx.fillText('−', inset[0] + (Mp[0] - back[0]) * 0.55 - s * 0.1, inset[1] + (Mp[1] - back[1]) * 0.55 + s * 0.1);
+      const io = iPin(2);
+      drawDots(ctx, cam, Op, add(Op, norm(sub(Op, back)), s * 0.01), d.dots.advance(e.id, io, d.dtSec), 0);
+      break;
     }
   }
 }
 
-/** Distance from point to segment, in px. */
+const dot = (a: Px, b: Px) => a[0] * b[0] + a[1] * b[1];
+
+/** Distance in px from (x, y) to the element (nearest pin-chain segment). */
 export function hitTest(cam: Camera, e: ElementSpec, x: number, y: number): number {
-  const A = px(cam, e.a);
-  const B = px(cam, e.b);
-  const dx = B[0] - A[0];
-  const dy = B[1] - A[1];
-  const l2 = dx * dx + dy * dy;
-  if (l2 === 0) return Math.hypot(x - A[0], y - A[1]);
-  let t = ((x - A[0]) * dx + (y - A[1]) * dy) / l2;
-  t = Math.max(0, Math.min(1, t));
-  return Math.hypot(x - (A[0] + t * dx), y - (A[1] + t * dy));
+  const P = e.pins.map((p) => px(cam, p));
+  if (P.length === 1) return Math.hypot(x - P[0]![0], y - P[0]![1]);
+  let best = Infinity;
+  const segs: [Px, Px][] = [];
+  for (let k = 0; k + 1 < P.length; k++) segs.push([P[k]!, P[k + 1]!]);
+  if (P.length === 3) segs.push([P[0]!, P[2]!]);
+  for (const [a, b] of segs) {
+    const dx = b[0] - a[0];
+    const dy = b[1] - a[1];
+    const l2 = dx * dx + dy * dy;
+    let t = l2 === 0 ? 0 : ((x - a[0]) * dx + (y - a[1]) * dy) / l2;
+    t = Math.max(0, Math.min(1, t));
+    best = Math.min(best, Math.hypot(x - (a[0] + t * dx), y - (a[1] + t * dy)));
+  }
+  return best;
 }

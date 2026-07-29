@@ -5,7 +5,8 @@ import type { ElementSpec, InteractOp } from './circuit';
 
 export interface ServerFrame {
   time: number;
-  e: [number, number, number, number, number][]; // id, va, vb, i, p
+  /** [id, npins, v0, v1, v2, i0, i1, i2, power] per element. */
+  e: [number, number, number, number, number, number, number, number, number][];
 }
 
 export interface NetHandlers {

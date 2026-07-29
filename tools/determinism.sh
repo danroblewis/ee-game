@@ -12,8 +12,8 @@ wasm-pack build crates/sim-wasm --release --target nodejs \
   --out-dir ../../target/wasm-node -- --features golden > /dev/null 2>&1
 
 node -e "
-const { goldenHash } = require(process.cwd() + '/target/wasm-node/sim_wasm.js');
-for (const n of ['demo_lamp','rc_step','rl_step','rlc_ring','half_wave_rectifier']) {
+const { goldenHash, goldenNames } = require(process.cwd() + '/target/wasm-node/sim_wasm.js');
+for (const n of goldenNames()) {
   console.log(goldenHash(n, 10000));
 }" > "$out/wasm.txt"
 

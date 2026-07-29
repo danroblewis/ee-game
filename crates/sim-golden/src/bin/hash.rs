@@ -5,13 +5,7 @@
 use sim_core::Engine;
 
 fn main() {
-    for (name, elems) in [
-        ("demo_lamp", sim_golden::demo_lamp(true)),
-        ("rc_step", sim_golden::rc_step()),
-        ("rl_step", sim_golden::rl_step()),
-        ("rlc_ring", sim_golden::rlc_ring()),
-        ("half_wave_rectifier", sim_golden::half_wave_rectifier()),
-    ] {
+    for (name, elems) in sim_golden::all_golden() {
         let mut eng = Engine::new(1e-6);
         eng.set_elements(&elems);
         let report = eng.advance(10_000);

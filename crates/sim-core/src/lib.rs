@@ -6,33 +6,25 @@ mod engine;
 mod netlist;
 
 pub use engine::{AdvanceReport, ElemFrame, Engine, GMIN};
-pub use netlist::{ElementKind, ElementSpec, InteractOp, Point};
+pub use netlist::{ElementKind, ElementSpec, InteractOp, Point, MAX_PINS};
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn spec(id: u32, kind: ElementKind, a: Point, b: Point) -> ElementSpec {
-        ElementSpec { id, kind, a, b }
-    }
-
     /// Battery -> switch -> lamp loop: the M1 demo circuit.
     fn demo_circuit(closed: bool) -> Vec<ElementSpec> {
+        let dc9 = ElementKind::VoltageSource {
+            dc: 9.0,
+            amp: 0.0,
+            hz: 0.0,
+            phase: 0.0,
+        };
         vec![
-            spec(
-                1,
-                ElementKind::VoltageSource {
-                    dc: 9.0,
-                    amp: 0.0,
-                    hz: 0.0,
-                    phase: 0.0,
-                },
-                (0, 0),
-                (0, 4),
-            ),
-            spec(2, ElementKind::Wire, (0, 0), (4, 0)),
-            spec(3, ElementKind::Switch { closed }, (4, 0), (8, 0)),
-            spec(
+            ElementSpec::two(1, dc9, (0, 0), (0, 4)),
+            ElementSpec::two(2, ElementKind::Wire, (0, 0), (4, 0)),
+            ElementSpec::two(3, ElementKind::Switch { closed }, (4, 0), (8, 0)),
+            ElementSpec::two(
                 4,
                 ElementKind::Lamp {
                     ohms: 90.0,
@@ -41,8 +33,8 @@ mod tests {
                 (8, 0),
                 (8, 4),
             ),
-            spec(5, ElementKind::Wire, (8, 4), (0, 4)),
-            spec(6, ElementKind::Ground, (0, 4), (0, 4)),
+            ElementSpec::two(5, ElementKind::Wire, (8, 4), (0, 4)),
+            ElementSpec::ground(6, (0, 4)),
         ]
     }
 
@@ -64,41 +56,33 @@ mod tests {
         let f = eng.frame();
         let lamp = f.iter().find(|e| e.id == 4).unwrap();
         // 9 V across 90 ohms: 0.1 A, 0.9 W.
-        assert!(
-            (lamp.current - 0.1).abs() < 1e-6,
-            "lamp current {}",
-            lamp.current
-        );
+        assert!((lamp.i[0] - 0.1).abs() < 1e-6, "lamp current {}", lamp.i[0]);
         assert!((lamp.power - 0.9).abs() < 1e-5, "lamp power {}", lamp.power);
 
         // Wire current recovered by KCL propagation matches the loop
-        // current (direction depends on wire orientation).
+        // current (sign depends on orientation).
         let wire = f.iter().find(|e| e.id == 2).unwrap();
         assert!(
-            (wire.current.abs() - 0.1).abs() < 1e-6,
+            (wire.i[0].abs() - 0.1).abs() < 1e-6,
             "wire current {}",
-            wire.current
+            wire.i[0]
         );
     }
 
     #[test]
     fn divider_is_exact() {
-        // 10 V across 1k + 3k: midpoint at 7.5 V (a-side is +).
+        // 10 V across 1k + 3k: midpoint at 7.5 V (pin-0 side is +).
+        let dc10 = ElementKind::VoltageSource {
+            dc: 10.0,
+            amp: 0.0,
+            hz: 0.0,
+            phase: 0.0,
+        };
         let elems = vec![
-            spec(
-                1,
-                ElementKind::VoltageSource {
-                    dc: 10.0,
-                    amp: 0.0,
-                    hz: 0.0,
-                    phase: 0.0,
-                },
-                (0, 0),
-                (0, 8),
-            ),
-            spec(2, ElementKind::Resistor { ohms: 1000.0 }, (0, 0), (4, 0)),
-            spec(3, ElementKind::Resistor { ohms: 3000.0 }, (4, 0), (0, 8)),
-            spec(4, ElementKind::Ground, (0, 8), (0, 8)),
+            ElementSpec::two(1, dc10, (0, 0), (0, 8)),
+            ElementSpec::two(2, ElementKind::Resistor { ohms: 1000.0 }, (0, 0), (4, 0)),
+            ElementSpec::two(3, ElementKind::Resistor { ohms: 3000.0 }, (4, 0), (0, 8)),
+            ElementSpec::ground(4, (0, 8)),
         ];
         let mut eng = Engine::new(10e-6);
         eng.set_elements(&elems);

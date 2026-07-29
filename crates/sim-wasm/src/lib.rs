@@ -12,7 +12,8 @@ pub struct Sim {
     frame_buf: Vec<f32>,
 }
 
-pub const FRAME_STRIDE: usize = 5;
+/// Flat frame layout per element: [id, npins, v0, v1, v2, i0, i1, i2, power].
+pub const FRAME_STRIDE: usize = 9;
 
 #[wasm_bindgen]
 impl Sim {
@@ -45,14 +46,19 @@ impl Sim {
         Ok(())
     }
 
-    /// Flat frame: [id, va, vb, current, power] * n, in document order.
+    /// Flat frame: [id, npins, v0, v1, v2, i0, i1, i2, power] * n, in
+    /// document order.
     pub fn frame(&mut self) -> Vec<f32> {
         self.frame_buf.clear();
         for f in self.engine.frame() {
             self.frame_buf.push(f.id as f32);
-            self.frame_buf.push(f.va as f32);
-            self.frame_buf.push(f.vb as f32);
-            self.frame_buf.push(f.current as f32);
+            self.frame_buf.push(f.npins as f32);
+            for p in 0..3 {
+                self.frame_buf.push(f.v[p] as f32);
+            }
+            for p in 0..3 {
+                self.frame_buf.push(f.i[p] as f32);
+            }
             self.frame_buf.push(f.power as f32);
         }
         self.frame_buf.clone()
@@ -77,13 +83,11 @@ impl Sim {
 #[cfg(feature = "golden")]
 #[wasm_bindgen(js_name = goldenHash)]
 pub fn golden_hash(name: &str, steps: u32) -> String {
-    let elems = match name {
-        "demo_lamp" => sim_golden::demo_lamp(true),
-        "rc_step" => sim_golden::rc_step(),
-        "rl_step" => sim_golden::rl_step(),
-        "rlc_ring" => sim_golden::rlc_ring(),
-        "half_wave_rectifier" => sim_golden::half_wave_rectifier(),
-        _ => return format!("{name} UNKNOWN"),
+    let Some((_, elems)) = sim_golden::all_golden()
+        .into_iter()
+        .find(|(n, _)| *n == name)
+    else {
+        return format!("{name} UNKNOWN");
     };
     let mut eng = Engine::new(1e-6);
     eng.set_elements(&elems);
@@ -94,4 +98,14 @@ pub fn golden_hash(name: &str, steps: u32) -> String {
         report.steps,
         eng.is_quarantined()
     )
+}
+
+/// The golden circuit names, for the harness driver.
+#[cfg(feature = "golden")]
+#[wasm_bindgen(js_name = goldenNames)]
+pub fn golden_names() -> Vec<String> {
+    sim_golden::all_golden()
+        .iter()
+        .map(|(n, _)| n.to_string())
+        .collect()
 }
