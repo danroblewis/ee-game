@@ -363,6 +363,43 @@ export function drawElement(d: DrawCtx, e: ElementSpec) {
       twoPinDots();
       break;
     }
+    case 'Speaker': {
+      // Classic loudspeaker: the voice coil as a circle on the lead axis,
+      // the cone flaring off one face.
+      const r = s * 0.22;
+      stroke(ctx, voltageColor(v(0)), [A, add(mid, u, -r)]);
+      stroke(ctx, voltageColor(v(1)), [add(mid, u, r), B]);
+      ctx.fillStyle = '#181820';
+      ctx.strokeStyle = '#c9c9d4';
+      ctx.beginPath();
+      ctx.arc(mid[0], mid[1], r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      const throat = add(mid, n, r * 0.72);
+      const mouth = add(mid, n, r + s * 0.4);
+      ctx.beginPath();
+      ctx.moveTo(...add(throat, u, -r * 0.7));
+      ctx.lineTo(...add(mouth, u, -s * 0.42));
+      ctx.lineTo(...add(mouth, u, s * 0.42));
+      ctx.lineTo(...add(throat, u, r * 0.7));
+      ctx.stroke();
+      // Radiating arcs: amplitude is the solver's own terminal voltage, so
+      // a silent circuit draws a silent speaker.
+      const drive = Math.min(1, Math.abs(v(0) - v(1)) / 5);
+      if (drive > 0.02) {
+        const ang = Math.atan2(n[1], n[0]);
+        ctx.strokeStyle = '#ffe95e';
+        for (let k = 0; k < 2; k++) {
+          ctx.globalAlpha = Math.max(0, drive - k * 0.3);
+          ctx.beginPath();
+          ctx.arc(mid[0], mid[1], s * (0.75 + k * 0.2), ang - 0.55, ang + 0.55);
+          ctx.stroke();
+        }
+        ctx.globalAlpha = 1;
+      }
+      twoPinDots();
+      break;
+    }
     case 'Npn':
     case 'Pnp': {
       const [Bp, Cp, Ep] = [P[0]!, P[1]!, P[2]!];

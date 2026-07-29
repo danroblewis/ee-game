@@ -16,6 +16,11 @@ export const CATALOG: PartDef[] = [
   { name: 'Ground', keys: 'gnd earth', make: () => ({ t: 'Ground' }) },
   { name: 'Resistor', keys: 'r ohm', make: () => ({ t: 'Resistor', ohms: 1000 }) },
   { name: 'Lamp', keys: 'light bulb', make: () => ({ t: 'Lamp', ohms: 90, rated_watts: 1 }) },
+  {
+    name: 'Speaker',
+    keys: 'audio sound listen loudspeaker buzzer',
+    make: () => ({ t: 'Speaker', ohms: 8 }),
+  },
   { name: 'Capacitor', keys: 'c cap farad', make: () => ({ t: 'Capacitor', farads: 10e-6 }) },
   { name: 'Inductor', keys: 'l coil henry', make: () => ({ t: 'Inductor', henries: 10e-3 }) },
   {

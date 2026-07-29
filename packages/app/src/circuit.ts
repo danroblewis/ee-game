@@ -7,6 +7,7 @@ export type ElementKind =
   | { t: 'Ground' }
   | { t: 'Resistor'; ohms: number }
   | { t: 'Lamp'; ohms: number; rated_watts: number }
+  | { t: 'Speaker'; ohms: number }
   | { t: 'Capacitor'; farads: number }
   | { t: 'Inductor'; henries: number }
   | { t: 'VoltageSource'; dc: number; amp: number; hz: number; phase: number }

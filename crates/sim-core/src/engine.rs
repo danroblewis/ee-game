@@ -196,9 +196,9 @@ impl Engine {
         match (op, &mut e.spec.kind) {
             (InteractOp::SetSwitch { closed }, ElementKind::Switch { closed: c }) => *c = closed,
             (InteractOp::SetValue { value }, k) => match k {
-                ElementKind::Resistor { ohms } | ElementKind::Lamp { ohms, .. } => {
-                    *ohms = value.max(1e-6)
-                }
+                ElementKind::Resistor { ohms }
+                | ElementKind::Lamp { ohms, .. }
+                | ElementKind::Speaker { ohms } => *ohms = value.max(1e-6),
                 ElementKind::Capacitor { farads } => *farads = value.max(1e-15),
                 ElementKind::Inductor { henries } => *henries = value.max(1e-12),
                 ElementKind::VoltageSource { dc, .. } => *dc = value,
@@ -459,7 +459,9 @@ impl Engine {
             let n = self.n;
             match kind {
                 ElementKind::Wire | ElementKind::Ground => {}
-                ElementKind::Resistor { ohms } | ElementKind::Lamp { ohms, .. } => {
+                ElementKind::Resistor { ohms }
+                | ElementKind::Lamp { ohms, .. }
+                | ElementKind::Speaker { ohms } => {
                     if need_factor {
                         self.stamp_g(node[0], node[1], 1.0 / ohms);
                     }
@@ -836,7 +838,9 @@ impl Engine {
             };
             match kind {
                 ElementKind::Wire | ElementKind::Ground => {}
-                ElementKind::Resistor { ohms } | ElementKind::Lamp { ohms, .. } => two(v01 / ohms),
+                ElementKind::Resistor { ohms }
+                | ElementKind::Lamp { ohms, .. }
+                | ElementKind::Speaker { ohms } => two(v01 / ohms),
                 ElementKind::Potentiometer { ohms, wiper } => {
                     let r1 = (ohms * wiper).max(1e-3);
                     let r2 = (ohms * (1.0 - wiper)).max(1e-3);
