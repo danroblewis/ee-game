@@ -547,7 +547,12 @@ function sourceWidget(id: number, dc0: number, deps: PanelHostDeps): Widget {
   };
 }
 
-/** A probe on a member element becomes a fixed voltmeter / ammeter. */
+/** A probe on a member element becomes a fixed voltmeter / ammeter.
+ *
+ * v1 scope story: a probed member gets this numeric readout only. Embedded
+ * waveform scopes inside a panel window (renderScopeInto into a per-row
+ * canvas, timebase per row) are a follow-up — the docked panel and the
+ * in-place canvas scopes already cover waveforms today. */
 function probeWidget(pid: number): Widget {
   const { el, lab, ctl, val } = makeRow(`pr:${pid}`, `METER ${pid}`);
   const seg = document.createElement('span');
