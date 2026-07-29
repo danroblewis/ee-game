@@ -33,7 +33,18 @@ import {
 import { CATALOG, makePins, searchParts, type PartDef } from './catalog';
 import { connect } from './net';
 import { DotFlow, drawElement, hitTest, type Camera } from './render';
-import { probeColor, renderScope, renderScopeInto, TraceStore, type Probe } from './scope';
+import {
+  applyScopeControl,
+  defaultScopeSettings,
+  probeColor,
+  renderScope,
+  renderScopeInto,
+  scopeControlAt,
+  TraceStore,
+  type Probe,
+  type ScopeControlId,
+  type ScopeSettings,
+} from './scope';
 
 const DT = 10e-6;
 const MAX_STEPS_PER_FRAME = 4000; // local-mode wall budget
@@ -75,7 +86,8 @@ const cursors = new Map<number, { x: number; y: number; seen: number }>();
 let probes: Probe[] = [];
 const traces = new TraceStore();
 let localPidCounter = 1;
-let scopeTimebase = 5; // docked panel, seconds across
+/** Docked-panel instrument settings (timebase, y-scale, trigger). */
+const dockScope = defaultScopeSettings(5);
 
 let selectedIds = new Set<number>();
 let selectedProbe: number | null = null;
@@ -92,7 +104,8 @@ interface FloatScope {
   y: number;
   w: number;
   h: number;
-  tb: number;
+  /** Per-scope instrument settings; owns the timebase. */
+  set: ScopeSettings;
   pids: number[] | null; // null = all probes
 }
 let floatScopes: FloatScope[] = [];
@@ -564,10 +577,18 @@ function probeAt(x: number, y: number): Probe | undefined {
 const SCOPE_TITLE_PX = 18;
 type ScopeZone =
   | { s: FloatScope; zone: 'title' | 'body' | 'close' | 'resize' }
-  | { s: FloatScope; zone: 'chan'; pid: number };
+  | { s: FloatScope; zone: 'chan'; pid: number }
+  | { s: FloatScope; zone: 'ctrl'; id: ScopeControlId };
 
 function scopeRectPx(s: FloatScope): [number, number, number, number] {
   return [cam.ox + s.x * cam.scale, cam.oy + s.y * cam.scale, s.w * cam.scale, s.h * cam.scale];
+}
+
+/** The trace area handed to renderScopeInto — one definition so the on-canvas
+ * control row is hit-tested exactly where scope.ts drew it. */
+function scopeBodyPx(s: FloatScope): [number, number, number, number] {
+  const [X, Y, W, H] = scopeRectPx(s);
+  return [X + 1, Y + SCOPE_TITLE_PX, W - 2, H - SCOPE_TITLE_PX - 1];
 }
 
 function scopeZoneAt(x: number, y: number): ScopeZone | null {
@@ -585,6 +606,9 @@ function scopeZoneAt(x: number, y: number): ScopeZone | null {
       return { s, zone: 'title' };
     }
     if (x >= X + W - 14 && y >= Y + H - 14) return { s, zone: 'resize' };
+    const [bx, by, bw, bh] = scopeBodyPx(s);
+    const id = scopeControlAt(bw, bh, x - bx, y - by, s.set, scopeProbes(s).length);
+    if (id) return { s, zone: 'ctrl', id };
     return { s, zone: 'body' };
   }
   return null;
@@ -628,7 +652,8 @@ canvas.addEventListener('wheel', (ev) => {
   ev.preventDefault();
   const z = scopeZoneAt(ev.clientX, ev.clientY);
   if (z) {
-    z.s.tb = Math.min(60, Math.max(0.05, z.s.tb * Math.exp(ev.deltaY * 0.001)));
+    const tb = z.s.set.timebase;
+    z.s.set.timebase = Math.min(60, Math.max(0.001, tb * Math.exp(ev.deltaY * 0.001)));
     return;
   }
   const k = Math.exp(-ev.deltaY * 0.0015);
@@ -662,6 +687,8 @@ canvas.addEventListener('pointerdown', (ev) => {
       const s = z.s;
       if (s.pids === null) s.pids = probes.map((p) => p.pid);
       s.pids = s.pids.includes(z.pid) ? s.pids.filter((x) => x !== z.pid) : [...s.pids, z.pid];
+    } else if (z.zone === 'ctrl') {
+      applyScopeControl(z.s.set, z.id, scopeProbes(z.s).length);
     } else if (z.zone === 'title') {
       const [gx, gy] = toGrid(ev.clientX, ev.clientY);
       scopeDrag = { s: z.s, dx: gx - z.s.x, dy: gy - z.s.y };
@@ -817,7 +844,9 @@ canvas.addEventListener('pointermove', (ev) => {
         ? 'move'
         : z.zone === 'resize'
           ? 'nwse-resize'
-          : 'default'
+          : z.zone === 'ctrl' || z.zone === 'chan' || z.zone === 'close'
+            ? 'pointer'
+            : 'default'
       : over?.kind.t === 'Switch'
         ? 'pointer'
         : over && dragModeOf(over)
@@ -967,7 +996,7 @@ window.addEventListener('keydown', (ev) => {
       y: Math.round(gy),
       w: 12,
       h: 6,
-      tb: 5,
+      set: defaultScopeSettings(5),
       pids: null,
     });
     return;
@@ -1052,8 +1081,32 @@ const scopeCv = document.getElementById('scopecv') as HTMLCanvasElement;
 scopeCv.addEventListener('wheel', (ev) => {
   ev.preventDefault();
   ev.stopPropagation();
-  scopeTimebase = Math.min(60, Math.max(0.05, scopeTimebase * Math.exp(ev.deltaY * 0.001)));
+  const tb = dockScope.timebase;
+  dockScope.timebase = Math.min(60, Math.max(0.001, tb * Math.exp(ev.deltaY * 0.001)));
 }, { passive: false });
+// The docked panel's controls are the same on-canvas row scope.ts draws for
+// floating scopes, so the click routing is the same hit-test call.
+const dockCtrlAt = (ev: PointerEvent) => {
+  const r = scopeCv.getBoundingClientRect();
+  return scopeControlAt(
+    scopeCv.clientWidth,
+    scopeCv.clientHeight,
+    ev.clientX - r.left,
+    ev.clientY - r.top,
+    dockScope,
+    probes.length,
+  );
+};
+scopeCv.addEventListener('pointerdown', (ev) => {
+  const id = dockCtrlAt(ev);
+  if (id) {
+    ev.preventDefault();
+    applyScopeControl(dockScope, id, probes.length);
+  }
+});
+scopeCv.addEventListener('pointermove', (ev) => {
+  scopeCv.style.cursor = dockCtrlAt(ev) ? 'pointer' : 'default';
+});
 
 /** Blue highlight over an element: its pin-chain plus dots on every pin
  * (pins must overlap exactly to connect — make them visible). */
@@ -1196,7 +1249,8 @@ function drawFloatScopes() {
     ctx.lineTo(X + W - 3, Y + H - 7);
     ctx.stroke();
     if (H - SCOPE_TITLE_PX > 20) {
-      renderScopeInto(ctx, X + 1, Y + SCOPE_TITLE_PX, W - 2, H - SCOPE_TITLE_PX - 1, traces, active, s.tb);
+      const [bx, by, bw, bh] = scopeBodyPx(s);
+      renderScopeInto(ctx, bx, by, bw, bh, traces, active, s.set.timebase, s.set);
     }
   }
 }
@@ -1334,7 +1388,7 @@ function frame(now: number) {
 
   if (probes.length > 0) {
     scopeDiv.style.display = 'block';
-    renderScope(scopeCv, traces, probes, scopeTimebase);
+    renderScope(scopeCv, traces, probes, dockScope.timebase, dockScope);
   } else {
     scopeDiv.style.display = 'none';
   }
