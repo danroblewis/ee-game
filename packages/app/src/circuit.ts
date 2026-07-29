@@ -12,6 +12,7 @@ export type ElementKind =
   | { t: 'VoltageSource'; dc: number; amp: number; hz: number; phase: number }
   | { t: 'CurrentSource'; amps: number }
   | { t: 'Switch'; closed: boolean }
+  | { t: 'Button'; closed: boolean }
   | { t: 'Diode' }
   | { t: 'Zener'; vz: number }
   | { t: 'Led'; color: number }
@@ -21,6 +22,7 @@ export type ElementKind =
   | { t: 'Pmos'; vt: number; k: number }
   | { t: 'OpAmp'; rail: number }
   | { t: 'Ota' }
+  | { t: 'Timer555' }
   | { t: 'Potentiometer'; ohms: number; wiper: number };
 
 export interface ElementSpec {
@@ -52,6 +54,8 @@ export function pinLabels(kind: ElementKind): string[] {
       return ['+', '−', 'out'];
     case 'Ota':
       return ['+', '−', 'out', 'Iabc'];
+    case 'Timer555':
+      return ['VCC', 'GND', 'TRG', 'THR', 'OUT', 'DIS'];
     case 'Potentiometer':
       return ['A', 'W', 'B'];
     case 'Ground':
@@ -87,19 +91,21 @@ export interface ElemLive {
   power: number;
 }
 
-export const FRAME_STRIDE = 11;
+/** [id, npins, v0..v5, i0..i5, power] — MAX_PINS is 6 (the 555 timer). */
+export const FRAME_STRIDE = 15;
+export const MAX_PINS = 6;
 
 export function unpackFrame(flat: ArrayLike<number>): Map<number, ElemLive> {
   const out = new Map<number, ElemLive>();
   for (let o = 0; o + FRAME_STRIDE <= flat.length; o += FRAME_STRIDE) {
     const id = flat[o]!;
-    out.set(id, {
-      id,
-      npins: flat[o + 1]!,
-      v: [flat[o + 2]!, flat[o + 3]!, flat[o + 4]!, flat[o + 5]!],
-      i: [flat[o + 6]!, flat[o + 7]!, flat[o + 8]!, flat[o + 9]!],
-      power: flat[o + 10]!,
-    });
+    const v: number[] = [];
+    const i: number[] = [];
+    for (let p = 0; p < MAX_PINS; p++) {
+      v.push(flat[o + 2 + p]!);
+      i.push(flat[o + 2 + MAX_PINS + p]!);
+    }
+    out.set(id, { id, npins: flat[o + 1]!, v, i, power: flat[o + 2 + 2 * MAX_PINS]! });
   }
   return out;
 }

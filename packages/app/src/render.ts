@@ -2,6 +2,7 @@
 // current dots, proper schematic symbols for every device. (The WebGL
 // canvas package arrives with the S2 spike; this is the visual reference.)
 
+import { pinLabels } from './circuit';
 import type { ElemLive, ElementSpec, Point } from './circuit';
 
 export interface Camera {
@@ -296,6 +297,109 @@ export function drawElement(d: DrawCtx, e: ElementSpec) {
       if (e.kind.closed) twoPinDots();
       break;
     }
+    case 'Button': {
+      // Momentary contact: a bridging bar under a round plunger cap. The
+      // cap sinks onto the contacts while it is held down.
+      const t1 = lerp(A, B, 0.3);
+      const t2 = lerp(A, B, 0.7);
+      stroke(ctx, voltageColor(v(0)), [A, t1]);
+      stroke(ctx, voltageColor(v(1)), [t2, B]);
+      const lift = e.kind.closed ? s * 0.02 : s * 0.26;
+      const b1 = add(t1, n, -lift);
+      const b2 = add(t2, n, -lift);
+      stroke(ctx, '#c9c9d4', [b1, b2]);
+      const stem = lerp(b1, b2, 0.5);
+      const cap = add(stem, n, -s * (e.kind.closed ? 0.3 : 0.42));
+      stroke(ctx, '#c9c9d4', [stem, cap]);
+      ctx.fillStyle = e.kind.closed ? '#ffe95e' : '#c9c9d4';
+      ctx.beginPath();
+      ctx.arc(cap[0], cap[1], s * 0.2, 0, Math.PI * 2);
+      ctx.fill();
+      for (const p of [t1, t2]) {
+        ctx.fillStyle = '#c9c9d4';
+        ctx.beginPath();
+        ctx.arc(p[0], p[1], s * 0.06, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      if (e.kind.closed) twoPinDots();
+      break;
+    }
+    case 'Timer555': {
+      // Local package frame: x runs THR -> OUT (across the DIP), y runs
+      // VCC -> GND (down the left edge), both in grid units.
+      const [Vp, Gp, Op_, Hp] = [P[0]!, P[1]!, P[4]!, P[3]!];
+      const ex = norm(sub(Op_, Hp));
+      const ey = norm(sub(Gp, Vp));
+      const w = mag(sub(Op_, Hp)) / s;
+      const h = mag(sub(Gp, Vp)) / s;
+      const at = (x: number, y: number): Px => add(add(Vp, ex, x * s), ey, y * s);
+      const lx = (p: Px) => dot(sub(p, Vp), ex) / s;
+      const ly = (p: Px) => dot(sub(p, Vp), ey) / s;
+      const stub = Math.min(0.9, w * 0.25);
+      const [x0, x1, y0, y1] = [stub, w - stub, -0.5, h + 0.5];
+      // Pin stubs into the nearest package edge.
+      P.forEach((p, k) => {
+        const left = lx(p) < w * 0.5;
+        stroke(ctx, voltageColor(v(k)), [p, at(left ? x0 : x1, ly(p))]);
+      });
+      // Package body.
+      ctx.fillStyle = '#181820';
+      ctx.strokeStyle = '#c9c9d4';
+      ctx.beginPath();
+      ctx.moveTo(...at(x0, y0));
+      ctx.lineTo(...at(x1, y0));
+      ctx.lineTo(...at(x1, y1));
+      ctx.lineTo(...at(x0, y1));
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+      if (cam.scale > 40) {
+        // Faint hint of the innards: the 2/3–1/3 divider tap points and
+        // the two comparators the latch listens to.
+        ctx.save();
+        ctx.globalAlpha = 0.3;
+        ctx.lineWidth = Math.max(1, s * 0.02);
+        ctx.strokeStyle = '#c9c9d4';
+        ctx.fillStyle = '#c9c9d4';
+        const dvx = x0 + (x1 - x0) * 0.78;
+        stroke(ctx, '#c9c9d4', [at(dvx, y0 + 0.35), at(dvx, y1 - 0.35)]);
+        for (const f of [0.25, 0.5, 0.75]) {
+          const c = at(dvx, y0 + 0.35 + (y1 - y0 - 0.7) * f);
+          ctx.beginPath();
+          ctx.arc(c[0], c[1], Math.max(1.5, s * 0.05), 0, Math.PI * 2);
+          ctx.fill();
+        }
+        const cmpx = x0 + (x1 - x0) * 0.26;
+        for (const cy of [h * 0.3, h * 0.7]) {
+          ctx.beginPath();
+          ctx.moveTo(...at(cmpx - 0.18, cy - 0.34));
+          ctx.lineTo(...at(cmpx - 0.18, cy + 0.34));
+          ctx.lineTo(...at(cmpx + 0.5, cy));
+          ctx.closePath();
+          ctx.stroke();
+        }
+        ctx.restore();
+      }
+      if (cam.scale > 24) {
+        const labels = pinLabels(e.kind);
+        ctx.fillStyle = '#8a8a98';
+        ctx.font = `${Math.round(s * 0.2)}px ui-monospace`;
+        P.forEach((p, k) => {
+          const left = lx(p) < w * 0.5;
+          ctx.textAlign = left ? 'left' : 'right';
+          const [tx, ty] = at(left ? x0 + 0.16 : x1 - 0.16, ly(p) + 0.08);
+          ctx.fillText(labels[k] ?? '', tx, ty);
+        });
+        ctx.textAlign = 'center';
+        ctx.fillStyle = '#c9c9d4';
+        ctx.font = `${Math.round(s * 0.34)}px ui-monospace`;
+        ctx.fillText('555', ...at(w * 0.5, h * 0.5 + 0.12));
+        ctx.textAlign = 'start';
+      }
+      const io = iPin(4);
+      drawDots(ctx, cam, at(x1, ly(Op_)), Op_, d.dots.advance(e.id, io, d.dtSec), io);
+      break;
+    }
     case 'Diode':
     case 'Zener':
     case 'Led': {
@@ -484,10 +588,14 @@ export function hitTest(cam: Camera, e: ElementSpec, x: number, y: number): numb
     best = Math.min(best, Math.hypot(x - (a[0] + t * dx), y - (a[1] + t * dy)));
   }
   if (P.length >= 3) {
-    // Body hit: centroid of the first three pins (triangle for op-amps).
-    const cx = (P[0]![0] + P[1]![0] + P[2]![0]) / 3;
-    const cy = (P[0]![1] + P[1]![1] + P[2]![1]) / 3;
-    best = Math.min(best, Math.max(0, Math.hypot(x - cx, y - cy) - cam.scale * 0.8));
+    // Body hit: centroid of the first three pins (triangle for op-amps);
+    // packages with more than four pins use every pin so the whole box is
+    // grabbable.
+    const body = P.length > 4 ? P : P.slice(0, 3);
+    const cx = body.reduce((a, p) => a + p[0], 0) / body.length;
+    const cy = body.reduce((a, p) => a + p[1], 0) / body.length;
+    const r = cam.scale * (P.length > 4 ? 1.6 : 0.8);
+    best = Math.min(best, Math.max(0, Math.hypot(x - cx, y - cy) - r));
   }
   return best;
 }

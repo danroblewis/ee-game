@@ -30,6 +30,7 @@ export const CATALOG: PartDef[] = [
   },
   { name: 'Current Source', keys: 'i amp', make: () => ({ t: 'CurrentSource', amps: 0.01 }) },
   { name: 'Switch', keys: 'sw toggle', make: () => ({ t: 'Switch', closed: false }) },
+  { name: 'Button', keys: 'push momentary', make: () => ({ t: 'Button', closed: false }) },
   { name: 'Diode', keys: 'd rectifier', make: () => ({ t: 'Diode' }) },
   { name: 'Zener', keys: 'z regulator breakdown', make: () => ({ t: 'Zener', vz: 5.6 }) },
   { name: 'LED', keys: 'light emitting', make: () => ({ t: 'Led', color: 0 }) },
@@ -39,6 +40,7 @@ export const CATALOG: PartDef[] = [
   { name: 'PMOS', keys: 'fet mosfet transistor', make: () => ({ t: 'Pmos', vt: 1.5, k: 0.05 }) },
   { name: 'Op-Amp', keys: 'amplifier comparator', make: () => ({ t: 'OpAmp', rail: 12 }) },
   { name: 'OTA', keys: 'transconductance current amplifier gm vco', make: () => ({ t: 'Ota' }) },
+  { name: '555 Timer', keys: 'timer astable monostable', make: () => ({ t: 'Timer555' }) },
   {
     name: 'Potentiometer',
     keys: 'pot knob wiper variable',
@@ -58,6 +60,8 @@ function pinCount(kind: ElementKind): number {
   switch (kind.t) {
     case 'Ground':
       return 1;
+    case 'Timer555':
+      return 6;
     case 'Ota':
       return 4;
     case 'Npn':
@@ -77,6 +81,21 @@ export function makePins(kind: ElementKind, a: Point, b: Point): Point[] {
   if (pinCount(kind) === 1) return [a];
   if (a[0] === b[0] && a[1] === b[1]) b = [a[0] + 3, a[1]];
   if (pinCount(kind) === 2) return [a, b];
+  if (kind.t === 'Timer555') {
+    // A 4×4 DIP footprint anchored at A, oriented along the drag: VCC at
+    // the anchor (top-left), GND bottom-left, TRG/THR down the left edge,
+    // DIS/OUT on the right edge. [vcc, gnd, trig, thr, out, dis]
+    const dx = b[0] - a[0];
+    const dy = b[1] - a[1];
+    const horiz = Math.abs(dx) >= Math.abs(dy);
+    const ux: Point = horiz ? [Math.sign(dx) || 1, 0] : [0, Math.sign(dy) || 1];
+    const uy: Point = [-ux[1], ux[0]];
+    const at = (x: number, y: number): Point => [
+      a[0] + ux[0] * x + uy[0] * y,
+      a[1] + ux[1] * x + uy[1] * y,
+    ];
+    return [at(0, 0), at(0, 4), at(0, 1), at(0, 3), at(4, 3), at(4, 1)];
+  }
   if (kind.t === 'Ota') {
     // [in+, in-, out, bias]: inputs split at A, out at B, bias below.
     const dx = b[0] - a[0];

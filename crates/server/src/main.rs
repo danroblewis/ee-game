@@ -229,6 +229,44 @@ fn demo_room_circuit() -> Vec<ElementSpec> {
         spec(149, r(100_000.0), (29, 38), (29, 44)),
         spec(150, K::Wire, (29, 44), (6, 44)),
         spec(151, K::Wire, (6, 44), (6, 40)),
+        // ---- I: 555 astable blinking an LED at ~1 Hz. RA = RB = 100k,
+        // C = 4.7 µF -> f = 1.44/((RA + 2·RB)·C) ≈ 1.0 Hz, duty ≈ 67 %.
+        // The cap charges through RA+RB to 2/3 Vcc, then DIS saturates and
+        // it drains through RB to 1/3 Vcc. Hold the pushbutton to ground
+        // TRIG: the trigger comparator wins, so the output pins high and
+        // the LED stays lit until you let go.
+        spec(160, dc(9.0), (34, 36), (34, 48)),
+        gnd(161, (34, 48)),
+        spec(162, K::Wire, (34, 36), (34, 34)),
+        spec(163, K::Wire, (34, 34), (52, 34)), // rail, routed over the chip
+        spec(164, K::Wire, (34, 36), (40, 36)), // rail -> VCC pin
+        // pins: [vcc, gnd, trig, thr, out, dis]
+        ElementSpec {
+            id: 165,
+            kind: K::Timer555,
+            pins: vec![(40, 36), (40, 44), (40, 38), (40, 42), (46, 42), (46, 38)],
+        },
+        spec(166, r(100_000.0), (52, 34), (52, 38)), // RA: rail -> DIS
+        spec(167, K::Wire, (52, 38), (46, 38)),
+        spec(168, r(100_000.0), (52, 38), (52, 42)), // RB: DIS -> THR/TRIG
+        spec(169, K::Wire, (52, 42), (52, 46)),
+        spec(170, K::Wire, (52, 46), (38, 46)), // routed under the chip
+        spec(171, K::Wire, (38, 46), (38, 42)),
+        spec(172, K::Wire, (38, 42), (40, 42)), // -> THR pin
+        spec(173, K::Wire, (38, 42), (38, 38)),
+        spec(174, K::Wire, (38, 38), (40, 38)), // -> TRIG pin (tied to THR)
+        spec(175, K::Capacitor { farads: 4.7e-6 }, (38, 46), (38, 48)),
+        gnd(176, (38, 48)),
+        spec(177, K::Wire, (40, 44), (36, 44)), // GND pin
+        gnd(178, (36, 44)),
+        // Manual retrigger: hold to short TRIG to ground.
+        spec(179, K::Wire, (38, 38), (36, 38)),
+        spec(180, K::Button { closed: false }, (36, 38), (36, 40)),
+        gnd(181, (36, 40)),
+        // Blinker on OUT.
+        spec(182, r(470.0), (46, 42), (49, 42)),
+        spec(183, K::Led { color: 3 }, (49, 42), (49, 44)),
+        gnd(184, (49, 44)),
     ]
 }
 
@@ -516,8 +554,8 @@ async fn sim_task(room: Arc<Room>, mut cmds: mpsc::UnboundedReceiver<Cmd>) {
 
         if room.events.receiver_count() > 0 {
             // Same flat layout as the WASM facade:
-            // [id, npins, v0..v3, i0..i3, power].
-            let e: Vec<[f64; 11]> = eng
+            // [id, npins, v0..v5, i0..i5, power].
+            let e: Vec<[f64; 15]> = eng
                 .frame()
                 .iter()
                 .map(|f| {
@@ -528,10 +566,14 @@ async fn sim_task(room: Arc<Room>, mut cmds: mpsc::UnboundedReceiver<Cmd>) {
                         f.v[1],
                         f.v[2],
                         f.v[3],
+                        f.v[4],
+                        f.v[5],
                         f.i[0],
                         f.i[1],
                         f.i[2],
                         f.i[3],
+                        f.i[4],
+                        f.i[5],
                         f.power,
                     ]
                 })
@@ -552,7 +594,8 @@ fn apply_to_specs(room: &Room, id: u32, op: InteractOp) {
         return;
     };
     match (op, &mut e.kind) {
-        (InteractOp::SetSwitch { closed }, K::Switch { closed: c }) => *c = closed,
+        (InteractOp::SetSwitch { closed }, K::Switch { closed: c })
+        | (InteractOp::SetSwitch { closed }, K::Button { closed: c }) => *c = closed,
         (InteractOp::SetValue { value }, K::Resistor { ohms })
         | (InteractOp::SetValue { value }, K::Lamp { ohms, .. }) => *ohms = value.max(1e-6),
         (InteractOp::SetValue { value }, K::Capacitor { farads }) => *farads = value.max(1e-15),
@@ -785,6 +828,9 @@ mod tests {
         // must flip repeatedly and nothing may quarantine.
         let mut flips = 0;
         let mut last_sign = 0i32;
+        // Vignette I's 555 astable must blink at ~1 Hz the whole time.
+        let mut t555_flips = 0;
+        let mut t555_high = false;
         for chunk in 0..3000 {
             eng.advance(500);
             if eng.is_quarantined() {
@@ -809,7 +855,16 @@ mod tests {
             if s != 0 {
                 last_sign = s;
             }
+            let t555 = eng.voltage_at((46, 42)).unwrap_or(0.0) > 4.5;
+            if t555 != t555_high {
+                t555_flips += 1;
+                t555_high = t555;
+            }
         }
         assert!(flips >= 10, "oscillator only flipped {flips} times in 30 s");
+        assert!(
+            t555_flips >= 20,
+            "555 astable only flipped {t555_flips} times in 30 s (expect ~60)"
+        );
     }
 }

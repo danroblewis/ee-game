@@ -21,6 +21,7 @@
 import init, { Sim } from './wasm/sim_wasm';
 import {
   demoCircuit,
+  MAX_PINS,
   pinLabels,
   unpackFrame,
   type DocOp,
@@ -56,8 +57,10 @@ const PART_HOTKEYS: Record<string, string> = {
   M: 'PMOS',
   a: 'Op-Amp',
   u: 'OTA',
+  '5': '555 Timer',
   s: 'Switch',
   b: 'Lamp',
+  B: 'Button',
   t: 'Potentiometer',
 };
 
@@ -102,7 +105,9 @@ const localSim = new Sim(DT);
 localSim.setElements(elements);
 
 function applyOp(e: ElementSpec, op: InteractOp) {
-  if (op.t === 'SetSwitch' && e.kind.t === 'Switch') e.kind.closed = op.closed;
+  if (op.t === 'SetSwitch' && (e.kind.t === 'Switch' || e.kind.t === 'Button')) {
+    e.kind.closed = op.closed;
+  }
   if (op.t === 'SetValue') {
     if (e.kind.t === 'Resistor' || e.kind.t === 'Lamp') e.kind.ohms = op.value;
     else if (e.kind.t === 'Capacitor') e.kind.farads = op.value;
@@ -148,13 +153,13 @@ const net = connect({
     simTime = f.time;
     const m = new Map<number, ElemLive>();
     for (const r of f.e) {
-      m.set(r[0]!, {
-        id: r[0]!,
-        npins: r[1]!,
-        v: [r[2]!, r[3]!, r[4]!, r[5]!],
-        i: [r[6]!, r[7]!, r[8]!, r[9]!],
-        power: r[10]!,
-      });
+      const v: number[] = [];
+      const i: number[] = [];
+      for (let p = 0; p < MAX_PINS; p++) {
+        v.push(r[2 + p]!);
+        i.push(r[2 + MAX_PINS + p]!);
+      }
+      m.set(r[0]!, { id: r[0]!, npins: r[1]!, v, i, power: r[2 + 2 * MAX_PINS]! });
     }
     live = m;
   },
@@ -621,6 +626,8 @@ let moveDrag: {
 } | null = null;
 let scopeDrag: { s: FloatScope; dx: number; dy: number } | null = null;
 let scopeResize: { s: FloatScope } | null = null;
+/** Momentary pushbutton held down by the pointer (closed until release). */
+let buttonHeld: ElementSpec | null = null;
 let spaceHeld = false;
 let lastCursorSent = 0;
 
@@ -724,6 +731,15 @@ canvas.addEventListener('pointerdown', (ev) => {
     selectedProbe = null;
     return;
   }
+  if (e.kind.t === 'Button') {
+    // Momentary: closed while held, released on pointerup. Pressing wins
+    // over move-dragging on the body, exactly like Switch toggling.
+    interact(e, { t: 'SetSwitch', closed: true });
+    buttonHeld = e;
+    selectedIds = new Set([e.id]);
+    selectedProbe = null;
+    return;
+  }
   const mode = dragModeOf(e);
   if (mode) {
     const startVal =
@@ -818,7 +834,7 @@ canvas.addEventListener('pointermove', (ev) => {
         : z.zone === 'resize'
           ? 'nwse-resize'
           : 'default'
-      : over?.kind.t === 'Switch'
+      : over?.kind.t === 'Switch' || over?.kind.t === 'Button'
         ? 'pointer'
         : over && dragModeOf(over)
           ? 'ns-resize'
@@ -829,6 +845,11 @@ canvas.addEventListener('pointerup', (ev) => {
   try { canvas.releasePointerCapture(ev.pointerId); } catch { /* synthetic pointers */ }
   if (panDrag) {
     panDrag = null;
+    return;
+  }
+  if (buttonHeld) {
+    interact(buttonHeld, { t: 'SetSwitch', closed: false });
+    buttonHeld = null;
     return;
   }
   if (scopeDrag || scopeResize) {
@@ -896,6 +917,14 @@ canvas.addEventListener('pointerup', (ev) => {
   }
 });
 canvas.addEventListener('pointerleave', () => (mouse = null));
+// A cancelled pointer (touch interrupted, capture lost) must not leave a
+// momentary button stuck closed in a shared room.
+canvas.addEventListener('pointercancel', () => {
+  if (buttonHeld) {
+    interact(buttonHeld, { t: 'SetSwitch', closed: false });
+    buttonHeld = null;
+  }
+});
 
 window.addEventListener('keydown', (ev) => {
   if (ev.target === psearch || (ev.target instanceof Node && propsDiv.contains(ev.target))) return;
@@ -1367,7 +1396,7 @@ function frame(now: number) {
     `EE Game   sim t = ${simTime.toFixed(2)} s   ` +
     (online ? `● ONLINE — ${population} player${population === 1 ? '' : 's'}` : '○ offline (local sim)') +
     (mode ? `   ${mode}` : '') +
-    `\nparts: R C L W G V D N P M A U S B T Z E F I · Q rotate · drag pin = wire · drag empty = select · ⌘C/⌘V copy/paste · 1/2 probe · 0 ref · O scope · X delete · / search`;
+    `\nparts: R C L W G V D N P M A U 5 S B T Z E F I · Q rotate · drag pin = wire · drag empty = select · ⌘C/⌘V copy/paste · 1/2 probe · 0 ref · O scope · X delete · / search`;
 
   requestAnimationFrame(frame);
 }

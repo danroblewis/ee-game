@@ -6,7 +6,7 @@ import type { Probe } from './scope';
 
 export interface ServerFrame {
   time: number;
-  /** [id, npins, v0..v3, i0..i3, power] per element. */
+  /** [id, npins, v0..v5, i0..i5, power] per element. */
   e: number[][];
 }
 

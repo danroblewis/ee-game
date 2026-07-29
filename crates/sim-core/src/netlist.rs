@@ -7,8 +7,8 @@
 
 pub type Point = (i32, i32);
 
-/// Largest pin count of any element (the OTA is 4-pin).
-pub const MAX_PINS: usize = 4;
+/// Largest pin count of any element (the 555 timer is 6-pin).
+pub const MAX_PINS: usize = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -47,6 +47,11 @@ pub enum ElementKind {
     /// Closed switch stamps as a 0 V source (its branch current is an MNA
     /// unknown); open switch stamps nothing.
     Switch {
+        closed: bool,
+    },
+    /// Momentary pushbutton: electrically a switch, but the client only
+    /// holds it closed while the pointer is down (`SetSwitch`).
+    Button {
         closed: bool,
     },
     /// Shockley diode, anode = pin 0.
@@ -90,6 +95,17 @@ pub enum ElementKind {
     /// sources Iout = Iabc * tanh(vd / 2Vt) — a current, not a voltage.
     /// gm = Iabc / 2Vt, output current saturates at ±Iabc.
     Ota,
+    /// Bipolar 555 timer (RESET tied high, CTRL left at the internal
+    /// divider). Pins: [vcc, gnd, trig, thr, out, dis].
+    ///
+    /// The internal divider sets the comparator thresholds at 1/3 and 2/3
+    /// of the LIVE supply; an RS latch (discrete state) is set when
+    /// v(trig) < vcc/3 and reset when v(thr) > 2·vcc/3, trigger winning.
+    /// OUT is a totem-pole branch source: vcc - 1.2 V sourced from the
+    /// VCC pin when the latch is high, 0.1 V sunk into GND when low. DIS
+    /// is a saturated transistor to GND (10 Ω) while the latch is low and
+    /// open otherwise. The supply pins draw ~3 mA of quiescent current.
+    Timer555,
     /// Potentiometer. Pins: [end a, wiper, end b]; `wiper` in 0..1 is the
     /// fractional position from end a. `SetValue` moves the wiper.
     Potentiometer {
@@ -103,6 +119,7 @@ impl ElementKind {
         use ElementKind::*;
         match self {
             Ground => 1,
+            Timer555 => 6,
             Ota => 4,
             Npn { .. }
             | Pnp { .. }
@@ -120,7 +137,9 @@ impl ElementKind {
             self,
             ElementKind::VoltageSource { .. }
                 | ElementKind::Switch { closed: true }
+                | ElementKind::Button { closed: true }
                 | ElementKind::OpAmp { .. }
+                | ElementKind::Timer555
         )
     }
 
@@ -136,6 +155,7 @@ impl ElementKind {
                 | ElementKind::Pmos { .. }
                 | ElementKind::OpAmp { .. }
                 | ElementKind::Ota
+                | ElementKind::Timer555
         )
     }
 }
