@@ -130,9 +130,39 @@ fn demo_room_circuit() -> Vec<ElementSpec> {
     ]
 }
 
+#[derive(Clone, Copy, PartialEq, serde::Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ProbeKind {
+    V,
+    I,
+}
+
+#[derive(Clone, Copy, serde::Serialize)]
+struct Probe {
+    pid: u32,
+    elem: u32,
+    pin: usize,
+    kind: ProbeKind,
+}
+
+/// Sim substeps between waveform samples: dt=20 µs × 16 → 3.125 kHz
+/// effective sample rate per probe.
+const SAMPLE_EVERY: u32 = 16;
+const MAX_PROBES: usize = 8;
+
 enum Cmd {
-    Interact { id: u32, op: InteractOp },
-    Edit { op: DocOp },
+    Interact {
+        id: u32,
+        op: InteractOp,
+    },
+    Edit {
+        op: DocOp,
+    },
+    Probe {
+        elem: u32,
+        pin: usize,
+        kind: ProbeKind,
+    },
     Join,
     Leave,
 }
@@ -142,7 +172,11 @@ struct Room {
     events: broadcast::Sender<String>,
     /// Element specs kept in sync with applied ops, for `hello` on join.
     elements: std::sync::Mutex<Vec<ElementSpec>>,
+    /// Room-scoped probes (shared instrumentation — plan pillar: probes
+    /// live on the authoritative tick so cross-player overlay is trivial).
+    probes: std::sync::Mutex<Vec<Probe>>,
     next_client: AtomicU32,
+    next_pid: AtomicU32,
     population: AtomicU32,
 }
 
@@ -173,8 +207,46 @@ async fn sim_task(room: Arc<Room>, mut cmds: mpsc::UnboundedReceiver<Cmd>) {
                     if apply_doc_op(&room, &op) {
                         let elems = room.elements.lock().unwrap().clone();
                         eng.set_elements(&elems); // continuous state survives by id
+                                                  // Probes on a removed element die with it.
+                        if let DocOp::Remove { id } = &op {
+                            let mut probes = room.probes.lock().unwrap();
+                            let before = probes.len();
+                            probes.retain(|p| p.elem != *id);
+                            if probes.len() != before {
+                                let _ = room
+                                    .events
+                                    .send(json!({"t": "probes", "list": *probes}).to_string());
+                            }
+                        }
                         let _ = room.events.send(json!({"t": "doc", "op": op}).to_string());
                     }
+                }
+                Cmd::Probe { elem, pin, kind } => {
+                    let mut probes = room.probes.lock().unwrap();
+                    if let Some(k) = probes
+                        .iter()
+                        .position(|p| p.elem == elem && p.pin == pin && p.kind == kind)
+                    {
+                        probes.remove(k); // toggle off
+                    } else if probes.len() < MAX_PROBES
+                        && room
+                            .elements
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|e| e.id == elem && pin < e.pins.len())
+                    {
+                        let pid = room.next_pid.fetch_add(1, Ordering::Relaxed);
+                        probes.push(Probe {
+                            pid,
+                            elem,
+                            pin,
+                            kind,
+                        });
+                    }
+                    let _ = room
+                        .events
+                        .send(json!({"t": "probes", "list": *probes}).to_string());
                 }
                 Cmd::Join | Cmd::Leave => {
                     let n = room.population.load(Ordering::Relaxed);
@@ -185,7 +257,51 @@ async fn sim_task(room: Arc<Room>, mut cmds: mpsc::UnboundedReceiver<Cmd>) {
             }
         }
 
-        eng.advance(steps_per_tick.min(MAX_STEPS_PER_TICK));
+        // Advance the tick — chunked when probes exist so waveforms are
+        // sampled between substeps, not once per tick.
+        let probes = room.probes.lock().unwrap().clone();
+        let budget = steps_per_tick.min(MAX_STEPS_PER_TICK);
+        if probes.is_empty() {
+            eng.advance(budget);
+        } else {
+            let t0 = eng.time();
+            let chunks = (budget / SAMPLE_EVERY).max(1);
+            let mut bufs: Vec<Vec<f32>> = vec![Vec::with_capacity(chunks as usize); probes.len()];
+            for _ in 0..chunks {
+                eng.advance(SAMPLE_EVERY);
+                // Wire currents come from KCL propagation (frame-only).
+                let need_frame = probes
+                    .iter()
+                    .any(|p| p.kind == ProbeKind::I && eng.is_wire(p.elem));
+                let fr = need_frame.then(|| eng.frame());
+                for (buf, p) in bufs.iter_mut().zip(probes.iter()) {
+                    let v = match (p.kind, &fr) {
+                        (ProbeKind::V, _) => eng.pin_voltage(p.elem, p.pin),
+                        (ProbeKind::I, Some(fr)) => {
+                            fr.iter().find(|f| f.id == p.elem).map(|f| f.i[p.pin])
+                        }
+                        (ProbeKind::I, None) => eng.pin_current(p.elem, p.pin),
+                    };
+                    buf.push(v.unwrap_or(0.0) as f32);
+                }
+            }
+            if room.events.receiver_count() > 0 {
+                let s: serde_json::Map<String, serde_json::Value> = probes
+                    .iter()
+                    .zip(bufs)
+                    .map(|(p, b)| (p.pid.to_string(), serde_json::json!(b)))
+                    .collect();
+                let _ = room.events.send(
+                    json!({
+                        "t": "samples",
+                        "t0": t0,
+                        "dts": DT * SAMPLE_EVERY as f64,
+                        "s": s,
+                    })
+                    .to_string(),
+                );
+            }
+        }
 
         if room.events.receiver_count() > 0 {
             // Same flat layout as the WASM facade:
@@ -273,9 +389,22 @@ fn apply_doc_op(room: &Room, op: &DocOp) -> bool {
 #[derive(Deserialize)]
 #[serde(tag = "t", rename_all = "lowercase")]
 enum ClientMsg {
-    Interact { id: u32, op: InteractOp },
-    Edit { op: DocOp },
-    Cursor { x: f64, y: f64 },
+    Interact {
+        id: u32,
+        op: InteractOp,
+    },
+    Edit {
+        op: DocOp,
+    },
+    Probe {
+        elem: u32,
+        pin: usize,
+        kind: ProbeKind,
+    },
+    Cursor {
+        x: f64,
+        y: f64,
+    },
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(room): State<Arc<Room>>) -> impl IntoResponse {
@@ -290,7 +419,8 @@ async fn client_session(mut socket: WebSocket, room: Arc<Room>) {
 
     let hello = {
         let elems = room.elements.lock().unwrap();
-        json!({"t": "hello", "you": me, "elements": *elems}).to_string()
+        let probes = room.probes.lock().unwrap();
+        json!({"t": "hello", "you": me, "elements": *elems, "probes": *probes}).to_string()
     };
     if socket.send(Message::Text(hello.into())).await.is_err() {
         room.population.fetch_sub(1, Ordering::Relaxed);
@@ -321,6 +451,9 @@ async fn client_session(mut socket: WebSocket, room: Arc<Room>) {
                         Ok(ClientMsg::Edit { op }) => {
                             let _ = room.cmds.send(Cmd::Edit { op });
                         }
+                        Ok(ClientMsg::Probe { elem, pin, kind }) => {
+                            let _ = room.cmds.send(Cmd::Probe { elem, pin, kind });
+                        }
                         Ok(ClientMsg::Cursor { x, y }) => {
                             let _ = room.events.send(
                                 json!({"t": "cursor", "who": me, "x": x, "y": y}).to_string(),
@@ -347,7 +480,9 @@ async fn main() {
         cmds: cmd_tx,
         events: event_tx,
         elements: std::sync::Mutex::new(demo_room_circuit()),
+        probes: std::sync::Mutex::new(Vec::new()),
         next_client: AtomicU32::new(1),
+        next_pid: AtomicU32::new(1),
         population: AtomicU32::new(0),
     });
     tokio::spawn(sim_task(room.clone(), cmd_rx));

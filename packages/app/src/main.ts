@@ -21,9 +21,10 @@ import {
   type InteractOp,
   type Point,
 } from './circuit';
-import { CATALOG, makePins, searchParts, type PartDef } from './catalog';
+import { makePins, searchParts, type PartDef } from './catalog';
 import { connect } from './net';
 import { DotFlow, drawElement, hitTest, type Camera } from './render';
+import { probeColor, renderScope, TraceStore, type Probe } from './scope';
 
 const DT = 10e-6;
 const MAX_STEPS_PER_FRAME = 4000; // local-mode wall budget
@@ -38,6 +39,11 @@ let online = false;
 let population = 0;
 let myId = -1;
 const cursors = new Map<number, { x: number; y: number; seen: number }>();
+
+let probes: Probe[] = [];
+const traces = new TraceStore();
+let localPidCounter = 1;
+let scopeTimebase = 5; // seconds across the panel
 
 const localSim = new Sim(DT);
 localSim.setElements(elements);
@@ -69,10 +75,11 @@ let idCounter = 1;
 const newId = () => (myId > 0 ? myId : 999) * 1_000_000 + idCounter++;
 
 const net = connect({
-  onHello(you, serverElements) {
+  onHello(you, serverElements, serverProbes) {
     online = true;
     myId = you;
     elements = serverElements;
+    probes = serverProbes;
     live = new Map();
     fitCamera();
   },
@@ -90,6 +97,15 @@ const net = connect({
   },
   onDoc(op) {
     applyDoc(op); // idempotent for our own echoes
+  },
+  onProbes(list) {
+    probes = list;
+    traces.prune(new Set(list.map((p) => p.pid)));
+  },
+  onSamples(t0, dts, s) {
+    for (const [pid, samples] of Object.entries(s)) {
+      traces.appendChunk(Number(pid), t0, dts, samples);
+    }
   },
   onPresence(n) {
     population = n;
@@ -116,6 +132,33 @@ function editDoc(op: DocOp) {
   applyDoc(op); // optimistic
   if (online) net.sendEdit(op);
   else localSim.setElements(elements);
+}
+
+/** Toggle a probe. Online the server owns the list; offline we mirror
+ * the same toggle semantics locally. */
+function toggleProbe(elem: number, pin: number, kind: 'v' | 'i') {
+  if (online) {
+    net.sendProbe(elem, pin, kind);
+    return;
+  }
+  const k = probes.findIndex((p) => p.elem === elem && p.pin === pin && p.kind === kind);
+  if (k >= 0) probes.splice(k, 1);
+  else if (probes.length < 8) probes.push({ pid: localPidCounter++, elem, pin, kind });
+  traces.prune(new Set(probes.map((p) => p.pid)));
+}
+
+/** Pin index of `e` nearest to the cursor (for voltage probes). */
+function nearestPin(e: ElementSpec, x: number, y: number): number {
+  let best = 0;
+  let bestD = Infinity;
+  e.pins.forEach((p, k) => {
+    const d = Math.hypot(cam.ox + p[0] * cam.scale - x, cam.oy + p[1] * cam.scale - y);
+    if (d < bestD) {
+      bestD = d;
+      best = k;
+    }
+  });
+  return best;
 }
 
 // ---------------------------------------------------------------- canvas
@@ -438,6 +481,13 @@ window.addEventListener('keydown', (ev) => {
   } else if ((ev.key === 'Delete' || ev.key === 'Backspace' || ev.key === 'x') && mouse) {
     const e = elementAt(mouse.x, mouse.y);
     if (e) editDoc({ t: 'Remove', id: e.id });
+  } else if (ev.key === 'v' && mouse) {
+    const e = elementAt(mouse.x, mouse.y);
+    if (e && e.kind.t !== 'Ground') toggleProbe(e.id, nearestPin(e, mouse.x, mouse.y), 'v');
+  } else if (ev.key === 'i' && mouse) {
+    const e = elementAt(mouse.x, mouse.y);
+    // Current clamp reads pin 0: current flowing a -> b through the part.
+    if (e && e.kind.t !== 'Ground') toggleProbe(e.id, 0, 'i');
   }
 });
 window.addEventListener('keyup', (ev) => {
@@ -485,6 +535,38 @@ function describeValue(e: ElementSpec): string {
   }
 }
 
+const scopeDiv = document.getElementById('scope') as HTMLDivElement;
+const scopeCv = document.getElementById('scopecv') as HTMLCanvasElement;
+scopeCv.addEventListener('wheel', (ev) => {
+  ev.preventDefault();
+  ev.stopPropagation();
+  scopeTimebase = Math.min(60, Math.max(0.05, scopeTimebase * Math.exp(ev.deltaY * 0.001)));
+}, { passive: false });
+
+function drawProbeMarkers() {
+  for (const p of probes) {
+    const e = elements.find((x) => x.id === p.elem);
+    if (!e) continue;
+    const pin = e.pins[Math.min(p.pin, e.pins.length - 1)]!;
+    const x = cam.ox + pin[0] * cam.scale;
+    const y = cam.oy + pin[1] * cam.scale;
+    const color = probeColor(p.pid);
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    ctx.lineTo(x + 10, y - 14);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(x + 14, y - 18, 6, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#101014';
+    ctx.font = 'bold 9px ui-monospace';
+    ctx.fillText(p.kind === 'v' ? 'V' : 'I', x + 11, y - 15);
+  }
+}
+
 function drawCursors(now: number) {
   for (const [who, c] of cursors) {
     if (now - c.seen > 4000) {
@@ -520,6 +602,11 @@ function frame(now: number) {
     simDebt -= want;
     live = unpackFrame(localSim.frame());
     simTime = localSim.time();
+    // Offline probes sample once per rendered frame.
+    for (const p of probes) {
+      const l = live.get(p.elem);
+      if (l) traces.appendPoint(p.pid, simTime, p.kind === 'v' ? l.v[p.pin] ?? 0 : l.i[p.pin] ?? 0);
+    }
   }
 
   ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
@@ -553,7 +640,16 @@ function frame(now: number) {
   }
   ctx.globalAlpha = 1;
 
+  drawProbeMarkers();
   drawCursors(now);
+
+  // Scope panel: visible whenever anything is probed.
+  if (probes.length > 0) {
+    scopeDiv.style.display = 'block';
+    renderScope(scopeCv, traces, probes, scopeTimebase);
+  } else {
+    scopeDiv.style.display = 'none';
+  }
 
   const hover = mouse && !valueDrag ? elementAt(mouse.x, mouse.y) : valueDrag?.e;
   if (hover && mouse && !placing && !wireDrag) {
@@ -577,7 +673,7 @@ function frame(now: number) {
     `EE Game   sim t = ${simTime.toFixed(2)} s   ` +
     (online ? `● ONLINE — ${population} player${population === 1 ? '' : 's'}` : '○ offline (local sim)') +
     (placing ? `   placing: ${placing.name} (drag to orient, Esc cancels)` : '') +
-    `\ndraw wires on empty grid · / = parts · click switch · drag knob ↕ · shift-drag move · hover+X delete · wheel zoom · space/right-drag pan`;
+    `\ndraw wires from pins or empty grid · / = parts · hover+V/I = probe (scope opens) · drag knob ↕ · shift-drag move · hover+X delete · wheel zoom · right-drag pan`;
 
   requestAnimationFrame(frame);
 }

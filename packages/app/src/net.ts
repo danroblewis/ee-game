@@ -2,6 +2,7 @@
 // server answers, main.ts falls back to the local WASM sim.
 
 import type { DocOp, ElementSpec, InteractOp } from './circuit';
+import type { Probe } from './scope';
 
 export interface ServerFrame {
   time: number;
@@ -10,10 +11,12 @@ export interface ServerFrame {
 }
 
 export interface NetHandlers {
-  onHello(you: number, elements: ElementSpec[]): void;
+  onHello(you: number, elements: ElementSpec[], probes: Probe[]): void;
   onFrame(f: ServerFrame): void;
   onOp(id: number, op: InteractOp): void;
   onDoc(op: DocOp): void;
+  onProbes(list: Probe[]): void;
+  onSamples(t0: number, dts: number, s: Record<string, number[]>): void;
   onPresence(n: number): void;
   onCursor(who: number, x: number, y: number): void;
   onClose(): void;
@@ -22,6 +25,7 @@ export interface NetHandlers {
 export interface Net {
   sendInteract(id: number, op: InteractOp): void;
   sendEdit(op: DocOp): void;
+  sendProbe(elem: number, pin: number, kind: 'v' | 'i'): void;
   sendCursor(x: number, y: number): void;
 }
 
@@ -33,7 +37,7 @@ export function connect(h: NetHandlers): Net {
     const m = JSON.parse(ev.data as string);
     switch (m.t) {
       case 'hello':
-        h.onHello(m.you, m.elements);
+        h.onHello(m.you, m.elements, m.probes ?? []);
         break;
       case 'frame':
         h.onFrame(m);
@@ -43,6 +47,12 @@ export function connect(h: NetHandlers): Net {
         break;
       case 'doc':
         h.onDoc(m.op);
+        break;
+      case 'probes':
+        h.onProbes(m.list);
+        break;
+      case 'samples':
+        h.onSamples(m.t0, m.dts, m.s);
         break;
       case 'presence':
         h.onPresence(m.n);
@@ -61,6 +71,7 @@ export function connect(h: NetHandlers): Net {
   return {
     sendInteract: (id, op) => send({ t: 'interact', id, op }),
     sendEdit: (op) => send({ t: 'edit', op }),
+    sendProbe: (elem, pin, kind) => send({ t: 'probe', elem, pin, kind }),
     sendCursor: (x, y) => send({ t: 'cursor', x, y }),
   };
 }

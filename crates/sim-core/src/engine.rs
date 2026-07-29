@@ -850,6 +850,32 @@ impl Engine {
             .map(|(_, node)| self.xv(*node))
     }
 
+    /// Voltage at one pin of an element, from the last solve.
+    pub fn pin_voltage(&self, id: u32, pin: usize) -> Option<f64> {
+        let e = self.elems.iter().find(|e| e.spec.id == id)?;
+        if pin >= e.spec.pins.len() {
+            return None;
+        }
+        Some(self.xv(e.node[pin]))
+    }
+
+    /// Current into one pin of an element, from the last accepted step.
+    /// NOTE: wires get their current from KCL propagation, which only runs
+    /// in `frame()` — for a wire probe, sample via `frame()` instead.
+    pub fn pin_current(&self, id: u32, pin: usize) -> Option<f64> {
+        let e = self.elems.iter().find(|e| e.spec.id == id)?;
+        if pin >= e.spec.pins.len() {
+            return None;
+        }
+        Some(e.state.pin_i[pin])
+    }
+
+    pub fn is_wire(&self, id: u32) -> bool {
+        self.elems
+            .iter()
+            .any(|e| e.spec.id == id && matches!(e.spec.kind, ElementKind::Wire))
+    }
+
     /// Per-element render frame. Wire currents are recovered by KCL
     /// propagation over junctions (wires are node-merged so they have no
     /// unknown of their own).
