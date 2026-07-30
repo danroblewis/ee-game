@@ -20,6 +20,7 @@
 //                         at the cursor.  There is no side palette.
 //   drag from a pin       draw wire (pins must overlap to connect)
 //   ⌘/Ctrl+C, ⌘/Ctrl+V    copy selection / paste bound to cursor
+//   ⌘/Ctrl+Z, +Shift, ^Y  undo / redo — this player's own edits only
 //   Q                     rotate placement ghost, paste ghost, or selection
 //   1 / 2                 voltage probe / current clamp at hover
 //   3                     listen: play that node's waveform (WebAudio)
@@ -52,6 +53,7 @@ import {
 } from './circuit';
 import { AudioPlayer } from './audio';
 import { CATALOG, CATEGORIES, makePins, partsInCategory, type PartDef } from './catalog';
+import { History, isTypingTarget } from './history';
 import { connect } from './net';
 import {
   applyPanelOp,
@@ -282,7 +284,11 @@ function interact(e: ElementSpec, op: InteractOp) {
   else localSim.interact(e.id, op);
 }
 
+/** Local undo/redo: every edit this player makes funnels through editDoc. */
+const history = new History(editDoc);
+
 function editDoc(op: DocOp) {
+  history.record(op, elements); // before applyDoc: captures the prior state
   applyDoc(op); // optimistic
   if (online) net.sendEdit(op);
   else localSim.setElements(elements);
@@ -708,10 +714,12 @@ function centroidOf(sel: ElementSpec[]): Point {
 function rotateElements(sel: ElementSpec[]) {
   if (sel.length === 0) return;
   const [cx, cy] = centroidOf(sel);
+  history.begin(sel, sel.length > 1 ? `rotate ${sel.length} parts` : 'rotate part');
   for (const e of sel) {
     const pins = e.pins.map(([x, y]) => [cx - (y - cy), cy + (x - cx)] as Point);
     editDoc({ t: 'Move', id: e.id, pins });
   }
+  history.end();
 }
 
 const rotateSelection = () => rotateElements(elements.filter((e) => selectedIds.has(e.id)));
@@ -722,18 +730,29 @@ const rotateSelection = () => rotateElements(elements.filter((e) => selectedIds.
 const BULK_DELETE = 32;
 
 function deleteIds(ids: number[]) {
+  // One undo entry per deletion, wherever it was triggered from (key, menu,
+  // properties dialog), however many parts it removes.
+  history.begin(
+    ids.map((id) => elemById(id)),
+    ids.length > 1 ? `delete ${ids.length} parts` : 'delete part',
+  );
   if (ids.length <= BULK_DELETE) {
     for (const id of ids) editDoc({ t: 'Remove', id });
+    history.end();
     return;
   }
   const gone = new Set(ids);
   for (const id of gone) {
+    // Record before mutating: the bulk path bypasses editDoc for speed, so
+    // history would otherwise miss the whole deletion.
+    history.record({ t: 'Remove', id }, elements);
     space.remove(id);
     selectedIds.delete(id);
     if (online) net.sendEdit({ t: 'Remove', id }); // the server still sees every op
   }
   elements = elements.filter((e) => !gone.has(e.id));
   if (!online) localSim.setElements(elements);
+  history.end();
 }
 
 const deleteElements = (sel: ElementSpec[]) => deleteIds(sel.map((e) => e.id));
@@ -757,6 +776,7 @@ function selectAll() {
 function commitPaste(at: Point) {
   if (!pasting) return;
   const ids: number[] = [];
+  history.begin(); // the whole paste undoes as one step
   for (const item of pasting) {
     const id = newId();
     ids.push(id);
@@ -769,6 +789,7 @@ function commitPaste(at: Point) {
       },
     });
   }
+  history.end();
   selectedIds = new Set(ids);
   selectedProbe = null;
   pasting = null;
@@ -1310,6 +1331,9 @@ canvas.addEventListener('pointerdown', (ev) => {
     return;
   }
   const startMove = (ids: number[]) => {
+    // Seed the pre-drag specs: pins are mutated in place during the drag, so
+    // by the time the final Move reaches editDoc the live "before" is stale.
+    history.begin(ids.map((id) => elements.find((x) => x.id === id)));
     moveDrag = {
       items: ids
         .map((id) => elemById(id))
@@ -1542,9 +1566,8 @@ canvas.addEventListener('pointerup', (ev) => {
     if (moveDrag.moved) {
       for (const item of moveDrag.items) {
         const e = elemById(item.id);
-        if (e && online) net.sendEdit({ t: 'Move', id: e.id, pins: e.pins });
+        if (e) editDoc({ t: 'Move', id: e.id, pins: e.pins });
       }
-      if (!online) localSim.setElements(elements);
     } else {
       // A click that never moved: select, and flip a switch if that is what it is.
       const t = elemById(moveDrag.clickTarget);
@@ -1552,6 +1575,7 @@ canvas.addEventListener('pointerup', (ev) => {
       selectedIds = new Set([moveDrag.clickTarget]);
       selectedProbe = null;
     }
+    history.end(); // one undo entry per drag gesture
     moveDrag = null;
   }
 });
@@ -1581,6 +1605,11 @@ window.addEventListener('keydown', (ev) => {
       ev.preventDefault();
     } else if (ev.key === 'v') {
       armPaste();
+      ev.preventDefault();
+    } else if (!isTypingTarget(ev) && (ev.key === 'z' || ev.key === 'Z' || ev.key === 'y')) {
+      // ⌘/Ctrl+Z undo, ⌘/Ctrl+Shift+Z or Ctrl+Y redo — MY edits only.
+      if (ev.key === 'y' || ev.shiftKey) history.redo(elements);
+      else history.undo(elements);
       ev.preventDefault();
     }
     return;
@@ -2223,13 +2252,15 @@ function frame(now: number) {
         : selectedIds.size > 1
           ? `${selectedIds.size} selected (drag moves, Q rotates, ⌘C copies, X deletes)`
           : '';
+  const note = history.note();
   hud.textContent =
     `EE Game   sim t = ${simTime.toFixed(2)} s   ` +
     (online ? `● ONLINE — ${population} player${population === 1 ? '' : 's'}` : '○ offline (local sim)') +
     `   ${perf.drawn}/${perf.total} parts drawn @ ${cam.scale.toFixed(1)} px/unit (cull ${perf.cull.toFixed(2)} ms)` +
     (mode ? `   ${mode}` : '') +
+    (note ? `   ${note}` : '') +
     `\nparts: R C L W G V D N P M A U 5 S B T Z E F I · drag part = move · dbl-click = edit values · right-click = menu` +
-    `\ndrag pin = wire · drag empty = select · Q rotate · ⌘C/⌘V copy/paste · 1/2 probe · 3 listen · 0 ref · O scope · \` dock · J panel · X delete · / parts menu` +
+    `\ndrag pin = wire · drag empty = select · Q rotate · ⌘Z undo · ⌘C/⌘V copy/paste · 1/2 probe · 3 listen · 0 ref · O scope · \` dock · J panel · X delete · / parts menu` +
     `\nH home district · shift+H fit everything · wheel = zoom (0.4–200 px/unit) · pan: middle / ctrl+drag / space+drag`;
 
   requestAnimationFrame(frame);
