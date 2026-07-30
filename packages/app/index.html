@@ -218,6 +218,84 @@
         background: transparent; border: 1.5px solid currentColor;
       }
       .pchan.on { background: currentColor; box-shadow: 0 0 7px currentColor; }
+
+      /* ---- goal card: the hoist's objective readout (hoist.ts owns it) ----
+         Same instrument-window language as .pwin, screen-anchored bottom
+         right, above the scope dock. Hidden until a machine message lands. */
+      .goalcard {
+        position: fixed; right: 12px; bottom: 36px; width: 300px; z-index: 20;
+        color: #c9d6de; font: 12px/1.5 ui-monospace, monospace;
+        background: linear-gradient(#232830, #171b21);
+        border: 1px solid #3c4653; border-radius: 8px;
+        box-shadow: 0 10px 28px #000a, inset 0 1px 0 #ffffff14;
+      }
+      .goal-hd {
+        display: flex; align-items: center; gap: 6px; padding: 5px 8px;
+        border-bottom: 1px solid #2c343d; cursor: pointer;
+        background: linear-gradient(#2b323c, #212730); border-radius: 7px 7px 0 0;
+      }
+      .goalcard.collapsed .goal-hd { border-bottom: none; border-radius: 7px; }
+      .goal-hd:hover { background: linear-gradient(#333b47, #262d37); }
+      .goal-caret { color: #6f8290; flex: none; }
+      .goal-title {
+        font: 600 12px ui-monospace, monospace; letter-spacing: 0.06em;
+        color: #dff0f8; flex: 1 1 auto; min-width: 0;
+      }
+      .goal-badge {
+        flex: none; font: 700 10px ui-monospace, monospace; letter-spacing: 0.1em;
+        color: #93a6b3; background: #262e37; border: 1px solid #3c4653;
+        border-radius: 3px; padding: 1px 5px;
+      }
+      .goal-badge.in { color: #7dffb0; background: #14463a; border-color: #2f7f63; }
+      .goal-badge.win { color: #ffe6a1; background: #4a3a12; border-color: #a9862f; }
+      .goal-body { padding: 8px; }
+      .goalcard.collapsed .goal-body { display: none; }
+      .goal-bar {
+        position: relative; height: 22px; background: #0b0f13;
+        border: 1px solid #3c4653; border-radius: 4px; overflow: hidden;
+      }
+      .goal-fill {
+        position: absolute; left: 0; top: 0; bottom: 0; width: 0;
+        background: linear-gradient(#3fd08a, #1c8f5c);
+        box-shadow: 0 0 12px #3fd08a55;
+      }
+      .goal-bartext {
+        position: absolute; inset: 0; display: flex; align-items: center;
+        justify-content: center; font: 700 12px ui-monospace, monospace;
+        letter-spacing: 0.06em; color: #eaf6ff; text-shadow: 0 1px 2px #000a;
+        font-variant-numeric: tabular-nums;
+      }
+      .goal-grid {
+        display: grid; grid-template-columns: 1fr 1fr; gap: 2px 10px; margin-top: 8px;
+      }
+      .goal-cell { display: flex; justify-content: space-between; gap: 6px; }
+      .goal-cell b {
+        font-weight: 400; color: #8ea3b1; font-size: 11px; letter-spacing: 0.04em;
+      }
+      .goal-cell span { color: #cfe3ee; font-variant-numeric: tabular-nums; }
+      .goal-score {
+        margin-top: 8px; padding: 5px 6px; border-radius: 4px;
+        color: #ffe6a1; background: #40320f; border: 1px solid #a9862f;
+        font-size: 11px; line-height: 1.4;
+      }
+      .goal-row { display: flex; gap: 6px; margin-top: 8px; }
+      .goal-reset {
+        flex: 1; background: #262e37; color: #c9d6de; border: 1px solid #3c4653;
+        border-radius: 4px; padding: 4px 0; font: inherit; cursor: pointer;
+      }
+      .goal-reset:hover { background: #313b46; color: #fff; }
+      .goal-hint {
+        margin-top: 7px; color: #6d7d89; font-size: 11px; line-height: 1.35;
+        white-space: pre-line;
+      }
+      /* Win: the card goes gold (the band flashes on the canvas). */
+      .goalcard.win {
+        border-color: #c9a34a;
+        box-shadow: 0 10px 30px #000a, 0 0 22px #c9a34a44, inset 0 1px 0 #ffffff1f;
+      }
+      .goalcard.win .goal-hd { background: linear-gradient(#3d3418, #2a2513); }
+      .goalcard.win .goal-title { color: #ffe6a1; }
+      .goalcard.win .goal-fill { background: linear-gradient(#ffd76b, #c98f22); }
     </style>
   </head>
   <body>

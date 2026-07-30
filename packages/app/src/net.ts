@@ -2,6 +2,7 @@
 // server answers, main.ts falls back to the local WASM sim.
 
 import type { DocOp, ElementSpec, InteractOp } from './circuit';
+import type { MachineMsg } from './hoist';
 import type { Panel, PanelOp } from './panel';
 import type { Probe } from './scope';
 
@@ -18,6 +19,8 @@ export interface NetHandlers {
   onDoc(op: DocOp): void;
   onProbes(list: Probe[]): void;
   onPanels(list: Panel[]): void;
+  /** Machine state (the hoist), broadcast once per tick beside "frame". */
+  onMachine(m: MachineMsg): void;
   onSamples(t0: number, dts: number, s: Record<string, number[]>): void;
   /** Speaker audio taps, keyed by ELEMENT id. A separate stream from
    * `samples` so scope decimation and speaker audio never fight over a
@@ -34,6 +37,8 @@ export interface Net {
   sendProbe(elem: number, pin: number, kind: 'v' | 'i'): void;
   sendProbeRef(pid: number, elem: number, pin: number): void;
   sendPanel(op: PanelOp): void;
+  /** Lower the crate to the floor, zero the hold and re-arm the goal. */
+  sendMachineReset(): void;
   sendCursor(x: number, y: number): void;
 }
 
@@ -79,6 +84,9 @@ export function connect(h: NetHandlers): Net {
       case 'panels':
         h.onPanels(m.list ?? []);
         break;
+      case 'machine':
+        h.onMachine(m as MachineMsg);
+        break;
       case 'samples':
         h.onSamples(m.t0, m.dts, m.s);
         break;
@@ -105,6 +113,7 @@ export function connect(h: NetHandlers): Net {
     sendProbe: (elem, pin, kind) => send({ t: 'probe', elem, pin, kind }),
     sendProbeRef: (pid, elem, pin) => send({ t: 'proberef', pid, elem, pin }),
     sendPanel: (op) => send({ t: 'panel', op }),
+    sendMachineReset: () => send({ t: 'machinereset' }),
     sendCursor: (x, y) => send({ t: 'cursor', x, y }),
   };
 }
