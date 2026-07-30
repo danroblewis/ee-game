@@ -12,8 +12,11 @@ pub struct Sim {
     frame_buf: Vec<f32>,
 }
 
-/// Flat frame layout per element: [id, npins, v0..v3, i0..i3, power].
-pub const FRAME_STRIDE: usize = 11;
+/// Flat frame layout per element: [id, npins, v0..v5, i0..i5, power].
+pub const FRAME_STRIDE: usize = 15;
+/// Keep the stride honest when MAX_PINS moves (the TS mirror in
+/// `circuit.ts` and the server's frame array must be bumped with it).
+const _: () = assert!(FRAME_STRIDE == 3 + 2 * sim_core::MAX_PINS);
 
 #[wasm_bindgen]
 impl Sim {
@@ -46,18 +49,18 @@ impl Sim {
         Ok(())
     }
 
-    /// Flat frame: [id, npins, v0, v1, v2, i0, i1, i2, power] * n, in
-    /// document order.
+    /// Flat frame: [id, npins, v0..v5, i0..i5, power] * n, in document
+    /// order.
     pub fn frame(&mut self) -> Vec<f32> {
         self.frame_buf.clear();
         for f in self.engine.frame() {
             self.frame_buf.push(f.id as f32);
             self.frame_buf.push(f.npins as f32);
-            for p in 0..4 {
-                self.frame_buf.push(f.v[p] as f32);
+            for v in f.v {
+                self.frame_buf.push(v as f32);
             }
-            for p in 0..4 {
-                self.frame_buf.push(f.i[p] as f32);
+            for i in f.i {
+                self.frame_buf.push(i as f32);
             }
             self.frame_buf.push(f.power as f32);
         }

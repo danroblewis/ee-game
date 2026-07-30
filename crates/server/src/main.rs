@@ -3,8 +3,17 @@
 //! M4-lite protocol (JSON over WebSocket, upgraded to the three-class
 //! binary transport in M4/M5):
 //!   server -> client: hello{you, elements}, frame{time, e}, op{id, op},
-//!                     presence{n}, cursor{who, x, y}
+//!                     presence{n}, cursor{who, x, y},
+//!                     samples{t0, dts, s} (probe scopes, 3.125 kHz),
+//!                     audio{t0, dts, s}   (speaker taps, 12.5 kHz)
 //!   client -> server: interact{id, op}, cursor{x, y}
+//!
+//! `samples` and `audio` are both best-effort: they ride the same broadcast
+//! channel as `frame`, so a lagged consumer skips chunks. A dropped chunk
+//! costs a few milliseconds of a trace or of silence and desyncs nothing —
+//! the next chunk carries its own absolute `t0`.
+//!                     presence{n}, cursor{who, x, y}, machine{...}
+//!   client -> server: interact{id, op}, cursor{x, y}, machinereset{}
 
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
@@ -13,9 +22,10 @@ use axum::{
     routing::get,
     Router,
 };
+use machine::Hoist;
 use serde::Deserialize;
 use serde_json::json;
-use sim_core::{DocOp, ElementSpec, Engine, InteractOp};
+use sim_core::{DocOp, ElementKind, ElementSpec, Engine, InteractOp, ParamWrite};
 use std::sync::{
     atomic::{AtomicU32, Ordering},
     Arc,
@@ -31,6 +41,14 @@ const TICK_HZ: f64 = 30.0;
 /// Wall budget per tick: cap sim work so a heavy circuit dilates sim time
 /// instead of stalling the loop (Falstad's rule, plan resolution).
 const MAX_STEPS_PER_TICK: u32 = 8000;
+
+/// Machine co-simulation cadence: the mechanism integrates once per 32
+/// substeps (640 µs at DT = 20 µs). Between chunks the server reads the
+/// motor's branch current out of the solver and writes back-EMF, sensor
+/// wiper and limit-switch positions back in. h_m/τ_mech = 0.026, so the
+/// mechanism's explicit Euler is nowhere near its stability limit.
+const MACHINE_SUBSTEPS: u32 = 32;
+const MACHINE_H: f64 = MACHINE_SUBSTEPS as f64 * DT;
 
 /// The showcase room: four vignettes on one shared simulation.
 ///   A: battery -> switch -> lamp (click me)
@@ -229,7 +247,212 @@ fn demo_room_circuit() -> Vec<ElementSpec> {
         spec(149, r(100_000.0), (29, 38), (29, 44)),
         spec(150, K::Wire, (29, 44), (6, 44)),
         spec(151, K::Wire, (6, 44), (6, 40)),
+        // ---- I: 555 astable blinking an LED at ~1 Hz. RA = RB = 100k,
+        // C = 4.7 µF -> f = 1.44/((RA + 2·RB)·C) ≈ 1.0 Hz, duty ≈ 67 %.
+        // The cap charges through RA+RB to 2/3 Vcc, then DIS saturates and
+        // it drains through RB to 1/3 Vcc. Hold the pushbutton to ground
+        // TRIG: the trigger comparator wins, so the output pins high and
+        // the LED stays lit until you let go.
+        spec(160, dc(9.0), (34, 36), (34, 48)),
+        gnd(161, (34, 48)),
+        spec(162, K::Wire, (34, 36), (34, 34)),
+        spec(163, K::Wire, (34, 34), (52, 34)), // rail, routed over the chip
+        spec(164, K::Wire, (34, 36), (40, 36)), // rail -> VCC pin
+        // pins: [vcc, gnd, trig, thr, out, dis]
+        ElementSpec {
+            id: 165,
+            kind: K::Timer555,
+            pins: vec![(40, 36), (40, 44), (40, 38), (40, 42), (46, 42), (46, 38)],
+        },
+        spec(166, r(100_000.0), (52, 34), (52, 38)), // RA: rail -> DIS
+        spec(167, K::Wire, (52, 38), (46, 38)),
+        spec(168, r(100_000.0), (52, 38), (52, 42)), // RB: DIS -> THR/TRIG
+        spec(169, K::Wire, (52, 42), (52, 46)),
+        spec(170, K::Wire, (52, 46), (38, 46)), // routed under the chip
+        spec(171, K::Wire, (38, 46), (38, 42)),
+        spec(172, K::Wire, (38, 42), (40, 42)), // -> THR pin
+        spec(173, K::Wire, (38, 42), (38, 38)),
+        spec(174, K::Wire, (38, 38), (40, 38)), // -> TRIG pin (tied to THR)
+        spec(175, K::Capacitor { farads: 4.7e-6 }, (38, 46), (38, 48)),
+        gnd(176, (38, 48)),
+        spec(177, K::Wire, (40, 44), (36, 44)), // GND pin
+        gnd(178, (36, 44)),
+        // Manual retrigger: hold to short TRIG to ground.
+        spec(179, K::Wire, (38, 38), (36, 38)),
+        spec(180, K::Button { closed: false }, (36, 38), (36, 40)),
+        gnd(181, (36, 40)),
+        // Blinker on OUT.
+        spec(182, r(470.0), (46, 42), (49, 42)),
+        spec(183, K::Led { color: 3 }, (49, 42), (49, 44)),
+        gnd(184, (49, 44)),
+        // ---- J: concert A. A 440 Hz source through a series 8 Ω into an
+        // 8 Ω speaker: close the switch and you HEAR it, because the server
+        // streams the coil's own terminal voltage at 12.5 kHz. The switch
+        // starts open so joining a room is quiet.
+        spec(200, sine(5.0, 440.0), (2, 52), (2, 60)),
+        spec(201, K::Wire, (2, 52), (5, 52)),
+        spec(202, K::Switch { closed: false }, (5, 52), (8, 52)),
+        spec(203, r(8.0), (8, 52), (11, 52)),
+        spec(204, K::Speaker { ohms: 8.0 }, (11, 52), (11, 60)),
+        spec(205, K::Wire, (11, 60), (2, 60)),
+        gnd(206, (2, 60)),
     ]
+}
+
+// ------------------------------------------------------------- the hoist
+//
+// THE HOIST — the room's first goal, in its own district east of the
+// showcase vignettes (which occupy x ≤ 40).
+//
+// A crate hangs on a platform in a vertical shaft, driven by a DC motor
+// whose two leads are real wire-able terminals. A green band is painted
+// across the shaft; the faceplate reads "CRATE IN BAND — HOLD 5.0 s".
+// Wiring a constant voltage lifts the crate but cannot hold it — voltage
+// buys speed, not position — so holding it needs feedback from the
+// position sensor. There is no quest log and nothing to accept: the goal
+// is measured from solver quantities and nothing else.
+
+/// The hoist's footprint in GRID units, broadcast to clients as `rect`.
+/// All hoist chrome is drawn inside it; the geometry lives here only.
+const HOIST_RECT: [i32; 4] = [46, 2, 64, 24];
+
+/// The four locked fixture elements. Players wire to their terminals but
+/// cannot move, edit or delete them: ids 900-999 are server-owned and every
+/// doc op touching them is refused.
+const MOTOR_ID: u32 = 900;
+const SENSOR_ID: u32 = 901;
+const LIM_TOP_ID: u32 = 902;
+const LIM_BOT_ID: u32 = 903;
+
+/// Position-sensor pot resistance; light enough to drive a comparator
+/// input, heavy enough not to load a player's supply.
+const SENSOR_OHMS: f64 = 10_000.0;
+
+/// Ids in this range belong to machine fixtures.
+fn reserved_id(id: u32) -> bool {
+    (900..=999).contains(&id)
+}
+
+/// The fixture, laid out on the faceplate inside `HOIST_RECT`:
+///   900 Motor         [M+, M-]
+///   901 Potentiometer [SENSE-A, SENSE-W, SENSE-B]  (the position sensor)
+///   902 Switch        [LIM-TOP-a, LIM-TOP-b]
+///   903 Switch        [LIM-BOT-a, LIM-BOT-b]
+/// The shaft itself takes the left of the rect; the terminal column sits on
+/// the right so wires can reach it without crossing the crate.
+fn hoist_fixture() -> Vec<ElementSpec> {
+    let [x0, y0, ..] = HOIST_RECT;
+    let (a, b) = (x0 + 11, x0 + 15); // terminal column
+    vec![
+        ElementSpec::two(
+            MOTOR_ID,
+            ElementKind::Motor {
+                ohms: machine::R_ARM,
+                henries: machine::L_ARM,
+                bemf: 0.0,
+            },
+            (a, y0 + 3),
+            (a, y0 + 7),
+        ),
+        ElementSpec::three(
+            SENSOR_ID,
+            ElementKind::Potentiometer {
+                ohms: SENSOR_OHMS,
+                // Crate on the floor: wiper = 1 - y/H, clamped off the end.
+                wiper: machine::WIPER_MAX,
+            },
+            (a, y0 + 10),
+            (b, y0 + 12),
+            (a, y0 + 14),
+        ),
+        ElementSpec::two(
+            LIM_TOP_ID,
+            ElementKind::Switch { closed: false },
+            (a, y0 + 17),
+            (b, y0 + 17),
+        ),
+        ElementSpec::two(
+            LIM_BOT_ID,
+            // Closed: the crate starts on the floor.
+            ElementKind::Switch { closed: true },
+            (a, y0 + 20),
+            (b, y0 + 20),
+        ),
+    ]
+}
+
+/// Inject any missing fixture element — a checkpoint written before the
+/// hoist existed has none of them, and they can never be removed after.
+/// Persisted pins and values survive when the part is already the right kind
+/// (a restored wiper or limit-switch position is real state).
+fn ensure_fixture(elems: &mut Vec<ElementSpec>) {
+    for spec in hoist_fixture() {
+        match elems.iter_mut().find(|e| e.id == spec.id) {
+            // A save written before ids 900-999 were reserved could hold a
+            // player's part on a fixture id. The fixture wins: the machine
+            // would otherwise be writing back-EMF into someone's resistor.
+            Some(e) if std::mem::discriminant(&e.kind) != std::mem::discriminant(&spec.kind) => {
+                *e = spec;
+            }
+            Some(_) => {}
+            None => elems.push(spec),
+        }
+    }
+}
+
+/// Ids of the document's sources, cached for the energy meter.
+fn source_ids(elems: &[ElementSpec]) -> Vec<u32> {
+    elems
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.kind,
+                ElementKind::VoltageSource { .. } | ElementKind::CurrentSource { .. }
+            )
+        })
+        .map(|e| e.id)
+        .collect()
+}
+
+/// Power the sources are delivering right now (W), from solver quantities
+/// only: p = (v0 - v1)·i is negative when a source pushes current out of its
+/// + terminal, and a sinking source earns no refund.
+fn source_watts(eng: &Engine, ids: &[u32]) -> f64 {
+    let mut watts = 0.0;
+    for id in ids {
+        let (Some(v0), Some(v1), Some(i)) = (
+            eng.pin_voltage(*id, 0),
+            eng.pin_voltage(*id, 1),
+            eng.pin_current(*id, 0),
+        ) else {
+            continue;
+        };
+        let p = (v0 - v1) * i;
+        if p < 0.0 {
+            watts -= p;
+        }
+    }
+    watts
+}
+
+/// One machine tick: read the motor's armature current out of the solver,
+/// integrate the mechanism, write its state back into the live circuit.
+///
+/// `pin_current` (not `frame()`) on purpose: the branch current is an MNA
+/// unknown already sitting in the solved vector, while `frame()` is
+/// O(elements) and runs KCL propagation for wire currents — 1.5 kHz of that
+/// would be the most expensive thing in the room.
+fn machine_step(eng: &mut Engine, hoist: &mut Hoist, sources: &[u32]) -> machine::Writes {
+    let i = eng.pin_current(MOTOR_ID, 0).unwrap_or(0.0);
+    let w = hoist.tick(i, MACHINE_H);
+    // Back-EMF is RHS-only; the wiper invalidates the factorization; a limit
+    // switch is a topology change and only recompiles when it really moves.
+    eng.write_param(MOTOR_ID, ParamWrite::Bemf { volts: w.bemf });
+    eng.write_param(SENSOR_ID, ParamWrite::Wiper { frac: w.wiper });
+    eng.write_param(LIM_TOP_ID, ParamWrite::Switch { closed: w.lim_top });
+    eng.write_param(LIM_BOT_ID, ParamWrite::Switch { closed: w.lim_bot });
+    hoist.accumulate_joules(source_watts(eng, sources), MACHINE_H);
+    w
 }
 
 #[derive(Clone, Copy, PartialEq, serde::Serialize, Deserialize)]
@@ -255,6 +478,122 @@ struct Probe {
 const SAMPLE_EVERY: u32 = 16;
 const MAX_PROBES: usize = 8;
 
+/// Sim substeps between SPEAKER samples: dt=20 µs × 4 → 12.5 kHz, i.e. a
+/// 6.25 kHz Nyquist limit. Speakers get their own, four-times-faster
+/// cadence than probes because the probe rate is a scope rate, not an audio
+/// rate: 3.125 kHz gives a 440 Hz tone only ~7 samples per cycle, which the
+/// worklet's linear interpolation turns into a buzzsaw. At 12.5 kHz the same
+/// tone gets 28.4 samples per cycle and everything a small speaker can
+/// actually reproduce below 6 kHz survives.
+///
+/// Must divide SAMPLE_EVERY: the tick advances in AUDIO_EVERY-sized chunks
+/// and takes a probe sample every `SAMPLE_EVERY / AUDIO_EVERY` of them, so
+/// both streams stay exactly aligned to sim time (no label drift).
+///
+/// Cost, measured on the showcase room (136 elements, 1667 steps/tick,
+/// release build): the solver alone is 12.66 ms/tick; adding 4 speaker taps
+/// — 416 chunks x 4 taps x 2 pin reads = 3328 O(1) reads, plus the finer
+/// `advance` chunking — takes it to 12.73 ms. That is 0.6 % of the tick and
+/// ~2 % of the 33 ms wall budget. The same reads through `pin_voltage`'s id
+/// scan cost 1.9 us here but grow with the document: ~0.7 ms/tick at 50k
+/// elements, which is why `Engine::tap` exists.
+const AUDIO_EVERY: u32 = 4;
+/// Simultaneously streamed speakers. There is no server-side notion of
+/// "nearest to a listener" (the camera is a client concept), so this is
+/// simply the first N Speaker elements by element id — deterministic, stable
+/// across ticks, and the same set for every client in the room.
+const MAX_AUDIO_TAPS: usize = 4;
+
+/// Element ids of the speakers this tick will stream: the lowest
+/// MAX_AUDIO_TAPS Speaker ids in the document. O(elements) with a tiny
+/// constant, and only called when somebody is listening.
+fn audio_tap_ids(elements: &[ElementSpec]) -> Vec<u32> {
+    let mut ids: Vec<u32> = Vec::with_capacity(MAX_AUDIO_TAPS + 1);
+    for e in elements {
+        if !matches!(e.kind, sim_core::ElementKind::Speaker { .. }) {
+            continue;
+        }
+        let at = ids.partition_point(|&x| x < e.id);
+        if at >= MAX_AUDIO_TAPS {
+            continue;
+        }
+        ids.insert(at, e.id);
+        ids.truncate(MAX_AUDIO_TAPS);
+    }
+    ids
+}
+
+/// Wire-safe sample: quantized to 0.1 mV (a ~94 dB noise floor under a 5 V
+/// peak, well below anything a player can hear) and never NaN/±inf — a
+/// quarantined solver must produce silence, not a `null` the client has to
+/// defend against.
+///
+/// f64, deliberately: serde_json widens f32 to f64 before printing, so an
+/// f32 sample serializes as its exact binary value ("1.2345999479293823",
+/// 18 characters) and triples the stream. Quantizing in f64 keeps the short
+/// decimal the quantization was for — measured 4x smaller on the wire.
+fn wire_sample(v: f64) -> f64 {
+    if !v.is_finite() {
+        return 0.0;
+    }
+    (v * 10_000.0).round() / 10_000.0
+}
+
+/// A control panel: a dotted region of the schematic that gets a
+/// mission-control window on every client. Room-scoped like probes, so a
+/// panel one player draws is a shared instrument. Only the rectangle is
+/// stored — membership is re-derived from element geometry by the client,
+/// never persisted (moving a part in or out re-wires the panel live).
+#[derive(Clone, serde::Serialize, Deserialize)]
+struct Panel {
+    plid: u32,
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+    name: String,
+}
+
+/// Document budget. The world is meant to hold enormous circuits (whole
+/// districts), so this is a guard against a runaway client, not a design
+/// limit. NOTE: the sim is the real ceiling long before this — sim-core
+/// still factors a DENSE matrix (O(n³)); the fixed-pattern sparse LU is
+/// spike S3 and is not built yet.
+const MAX_ELEMENTS: usize = 50_000;
+
+const MAX_PANELS: usize = 256;
+const MAX_PANEL_NAME: usize = 28;
+/// Smallest accepted region in grid units: a stray click must not make one.
+const MIN_PANEL_SPAN: f64 = 1.0;
+
+#[derive(Clone, Deserialize)]
+#[serde(tag = "t", rename_all = "lowercase")]
+enum PanelOp {
+    Add {
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+        #[serde(default)]
+        name: Option<String>,
+    },
+    Remove {
+        plid: u32,
+    },
+    /// Move/resize the region (the client drags the name tab).
+    Rect {
+        plid: u32,
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+    },
+    Rename {
+        plid: u32,
+        name: String,
+    },
+}
+
 enum Cmd {
     Interact {
         id: u32,
@@ -273,6 +612,11 @@ enum Cmd {
         elem: u32,
         pin: usize,
     },
+    Panel {
+        op: PanelOp,
+    },
+    /// Lower the crate to the floor and re-arm the hoist's goal.
+    MachineReset,
     Join,
     Leave,
 }
@@ -285,15 +629,18 @@ struct Room {
     /// Room-scoped probes (shared instrumentation — plan pillar: probes
     /// live on the authoritative tick so cross-player overlay is trivial).
     probes: std::sync::Mutex<Vec<Probe>>,
+    /// Room-scoped control-panel regions (shared, same rationale as probes).
+    panels: std::sync::Mutex<Vec<Panel>>,
     next_client: AtomicU32,
     next_pid: AtomicU32,
+    next_plid: AtomicU32,
     population: AtomicU32,
     /// Set when the document changes; the sim task checkpoints to disk.
     dirty: std::sync::atomic::AtomicBool,
 }
 
-/// Room checkpoint: the document and probes survive server restarts (the
-/// continuous electrical state re-settles within milliseconds).
+/// Room checkpoint: the document, probes and panels survive server restarts
+/// (the continuous electrical state re-settles within milliseconds).
 #[derive(serde::Serialize, Deserialize)]
 struct SaveFile {
     elements: Vec<ElementSpec>,
@@ -301,6 +648,15 @@ struct SaveFile {
     probes: Vec<SavedProbe>,
     #[serde(default)]
     next_pid: u32,
+    /// serde defaults: saves written before panels existed still load.
+    #[serde(default)]
+    panels: Vec<Panel>,
+    #[serde(default)]
+    next_plid: u32,
+    /// Mechanical state of the hoist. Defaulted so saves written before the
+    /// hoist existed still load (crate on the floor, goal armed).
+    #[serde(default)]
+    hoist: Hoist,
 }
 
 #[derive(serde::Serialize, Deserialize)]
@@ -322,8 +678,9 @@ fn load_room() -> Option<SaveFile> {
     serde_json::from_str(&data).ok()
 }
 
-fn checkpoint(room: &Room) {
+fn checkpoint(room: &Room, hoist: &Hoist) {
     let save = SaveFile {
+        hoist: *hoist,
         elements: room.elements.lock().unwrap().clone(),
         probes: room
             .probes
@@ -339,6 +696,8 @@ fn checkpoint(room: &Room) {
             })
             .collect(),
         next_pid: room.next_pid.load(Ordering::Relaxed),
+        panels: room.panels.lock().unwrap().clone(),
+        next_plid: room.next_plid.load(Ordering::Relaxed),
     };
     if let Ok(json) = serde_json::to_string(&save) {
         let path = save_path();
@@ -349,12 +708,31 @@ fn checkpoint(room: &Room) {
     }
 }
 
+/// `{"t":"audio", t0, dts, s:{elemId: [...]}}` — one speaker chunk per tap.
+/// Keyed by ELEMENT id (not pid): speaker audio exists whether or not anyone
+/// probed the part, which is the whole point of this stream.
+fn audio_message(
+    t0: f64,
+    dts: f64,
+    taps: &[(u32, sim_core::ElemTap)],
+    bufs: Vec<Vec<f64>>,
+) -> String {
+    let s: serde_json::Map<String, serde_json::Value> = taps
+        .iter()
+        .zip(bufs)
+        .map(|((id, _), b)| (id.to_string(), serde_json::json!(b)))
+        .collect();
+    json!({"t": "audio", "t0": t0, "dts": dts, "s": s}).to_string()
+}
+
 /// The sim task: sole owner of the Engine. Ops apply between ticks —
 /// the "tick boundary" rule from the plan, at demo scale.
-async fn sim_task(room: Arc<Room>, mut cmds: mpsc::UnboundedReceiver<Cmd>) {
+async fn sim_task(room: Arc<Room>, mut cmds: mpsc::UnboundedReceiver<Cmd>, mut hoist: Hoist) {
     let mut eng = Engine::new(DT);
+    let mut sources;
     {
         let elems = room.elements.lock().unwrap().clone();
+        sources = source_ids(&elems);
         eng.set_elements(&elems);
     }
 
@@ -371,22 +749,32 @@ async fn sim_task(room: Arc<Room>, mut cmds: mpsc::UnboundedReceiver<Cmd>) {
         ticks_since_save += 1;
         if ticks_since_save >= 150 && room.dirty.swap(false, Ordering::Relaxed) {
             ticks_since_save = 0;
-            checkpoint(&room);
+            checkpoint(&room, &hoist);
         }
 
         while let Ok(cmd) = cmds.try_recv() {
             match cmd {
                 Cmd::Interact { id, op } => {
+                    // The hoist fixture is server-owned: no knob drags, no
+                    // hand-flipping its limit switches.
+                    if reserved_id(id) {
+                        continue;
+                    }
                     eng.interact(id, op);
                     apply_to_specs(&room, id, op);
                     let _ = room
                         .events
                         .send(json!({"t": "op", "id": id, "op": op}).to_string());
                 }
+                Cmd::MachineReset => {
+                    hoist.reset();
+                    room.dirty.store(true, Ordering::Relaxed);
+                }
                 Cmd::Edit { op } => {
                     if apply_doc_op(&room, &op) {
                         room.dirty.store(true, Ordering::Relaxed);
                         let elems = room.elements.lock().unwrap().clone();
+                        sources = source_ids(&elems);
                         eng.set_elements(&elems); // continuous state survives by id
                                                   // Probes on a removed element die with it.
                         if let DocOp::Remove { id } = &op {
@@ -452,6 +840,15 @@ async fn sim_task(room: Arc<Room>, mut cmds: mpsc::UnboundedReceiver<Cmd>) {
                             .send(json!({"t": "probes", "list": *probes}).to_string());
                     }
                 }
+                Cmd::Panel { op } => {
+                    let mut panels = room.panels.lock().unwrap();
+                    if apply_panel_op(&mut panels, &room.next_plid, &op) {
+                        room.dirty.store(true, Ordering::Relaxed);
+                        let _ = room
+                            .events
+                            .send(json!({"t": "panels", "list": *panels}).to_string());
+                    }
+                }
                 Cmd::Join | Cmd::Leave => {
                     let n = room.population.load(Ordering::Relaxed);
                     let _ = room
@@ -461,42 +858,73 @@ async fn sim_task(room: Arc<Room>, mut cmds: mpsc::UnboundedReceiver<Cmd>) {
             }
         }
 
-        // Advance the tick — chunked when probes exist so waveforms are
-        // sampled between substeps, not once per tick.
+        // Advance the tick in nested cadences. The mechanism co-simulates
+        // every MACHINE_SUBSTEPS, probes sample every SAMPLE_EVERY and speaker
+        // taps every AUDIO_EVERY; 32 = 2 x 16 = 8 x 4, so one inner step
+        // serves all three and every sample lands on an exact sim time.
         let probes = room.probes.lock().unwrap().clone();
-        let budget = steps_per_tick.min(MAX_STEPS_PER_TICK);
-        if probes.is_empty() {
-            eng.advance(budget);
+        // Nobody subscribed = no audio work at all: a room full of speakers
+        // with an empty gallery must cost exactly what a silent one costs.
+        let listeners = room.events.receiver_count() > 0;
+        let taps: Vec<(u32, sim_core::ElemTap)> = if listeners {
+            // Resolved once per tick (after the edit drain, so the handles
+            // match the netlist this tick will actually step).
+            audio_tap_ids(&room.elements.lock().unwrap())
+                .into_iter()
+                .filter_map(|id| eng.tap(id).map(|t| (id, t)))
+                .collect()
         } else {
+            Vec::new()
+        };
+        let budget = steps_per_tick.min(MAX_STEPS_PER_TICK);
+        // Machine + goal state the tick reports afterwards. `motor_i` is
+        // seeded from the current netlist so a tick that quarantines still
+        // reports the last honest reading rather than zero.
+        let mut motor_i = eng.pin_current(MOTOR_ID, 0).unwrap_or(0.0);
+        let mut impact = 0.0f64;
+        let won_before = hoist.win;
+        // The machine's last write-back this tick, mirrored into the stored
+        // document after the loop (the consumer is outside this scope).
+        let mut writes: Option<machine::Writes> = None;
+        {
+            // Finest cadence anyone needs this tick (the machine always runs).
+            let step = if !taps.is_empty() {
+                AUDIO_EVERY
+            } else if !probes.is_empty() {
+                SAMPLE_EVERY
+            } else {
+                MACHINE_SUBSTEPS
+            };
+            let per_probe = (SAMPLE_EVERY / step).max(1);
+            let per_machine = (MACHINE_SUBSTEPS / step).max(1);
+            // Whole machine periods, which are also whole probe periods: a
+            // ragged tail would leak substeps of drift into `t0 + k * dts`.
+            let chunks = (budget / MACHINE_SUBSTEPS).max(1) * per_machine;
             let t0 = eng.time();
-            let chunks = (budget / SAMPLE_EVERY).max(1);
-            let mut bufs: Vec<Vec<f32>> = vec![Vec::with_capacity(chunks as usize); probes.len()];
-            for _ in 0..chunks {
-                eng.advance(SAMPLE_EVERY);
-                // Wire currents come from KCL propagation (frame-only).
-                let need_frame = probes
-                    .iter()
-                    .any(|p| p.kind == ProbeKind::I && eng.is_wire(p.elem));
-                let fr = need_frame.then(|| eng.frame());
-                for (buf, p) in bufs.iter_mut().zip(probes.iter()) {
-                    let v = match (p.kind, &fr) {
-                        (ProbeKind::V, _) => {
-                            let v = eng.pin_voltage(p.elem, p.pin);
-                            // Differential: subtract the reference point.
-                            let vref =
-                                p.r.and_then(|(re, rp)| eng.pin_voltage(re, rp))
-                                    .unwrap_or(0.0);
-                            v.map(|v| v - vref)
-                        }
-                        (ProbeKind::I, Some(fr)) => {
-                            fr.iter().find(|f| f.id == p.elem).map(|f| f.i[p.pin])
-                        }
-                        (ProbeKind::I, None) => eng.pin_current(p.elem, p.pin),
-                    };
-                    buf.push(v.unwrap_or(0.0) as f32);
+            let mut bufs: Vec<Vec<f32>> =
+                vec![Vec::with_capacity((chunks / per_probe) as usize); probes.len()];
+            let mut abufs: Vec<Vec<f64>> = vec![Vec::with_capacity(chunks as usize); taps.len()];
+            for c in 0..chunks {
+                eng.advance(step);
+                // Speakers: the drive ACROSS the coil, v(pin0) - v(pin1),
+                // which is what a voltage-driven cone follows. Read through
+                // the O(1) tap — frame() is O(elements) and runs KCL.
+                for (buf, (_, tap)) in abufs.iter_mut().zip(taps.iter()) {
+                    buf.push(wire_sample(eng.tap_delta(*tap, 0, 1)));
+                }
+                if !probes.is_empty() && (c + 1) % per_probe == 0 {
+                    sample_probes(&eng, &probes, &mut bufs);
+                }
+                // A quarantined solver has no current to report, so the
+                // machine freezes with it rather than coasting on stale
+                // numbers.
+                if (c + 1) % per_machine == 0 && !eng.is_quarantined() {
+                    motor_i = eng.pin_current(MOTOR_ID, 0).unwrap_or(0.0);
+                    writes = Some(machine_step(&mut eng, &mut hoist, &sources));
+                    impact = impact.max(hoist.impact);
                 }
             }
-            if room.events.receiver_count() > 0 {
+            if listeners && !probes.is_empty() {
                 let s: serde_json::Map<String, serde_json::Value> = probes
                     .iter()
                     .zip(bufs)
@@ -512,12 +940,36 @@ async fn sim_task(room: Arc<Room>, mut cmds: mpsc::UnboundedReceiver<Cmd>) {
                     .to_string(),
                 );
             }
+            // A separate message type so scope decimation and speaker audio
+            // never have to agree on a cadence. Best-effort like `frame`: a
+            // lagged consumer skips chunks, which costs a few ms of silence
+            // and desyncs nothing (the client re-primes on the time gap).
+            if !taps.is_empty() {
+                let _ = room
+                    .events
+                    .send(audio_message(t0, DT * AUDIO_EVERY as f64, &taps, abufs));
+            }
+        }
+
+        // Keep the stored document tracking what the machine drives, so
+        // `hello` and checkpoints carry the fixture's real state. Clients
+        // render the hoist from the machine message, not from these.
+        if let Some(w) = writes {
+            let mut elems = room.elements.lock().unwrap();
+            for e in elems.iter_mut() {
+                match (e.id, &mut e.kind) {
+                    (SENSOR_ID, ElementKind::Potentiometer { wiper, .. }) => *wiper = w.wiper,
+                    (LIM_TOP_ID, ElementKind::Switch { closed }) => *closed = w.lim_top,
+                    (LIM_BOT_ID, ElementKind::Switch { closed }) => *closed = w.lim_bot,
+                    _ => {}
+                }
+            }
         }
 
         if room.events.receiver_count() > 0 {
             // Same flat layout as the WASM facade:
-            // [id, npins, v0..v3, i0..i3, power].
-            let e: Vec<[f64; 11]> = eng
+            // [id, npins, v0..v5, i0..i5, power].
+            let e: Vec<[f64; 15]> = eng
                 .frame()
                 .iter()
                 .map(|f| {
@@ -528,10 +980,14 @@ async fn sim_task(room: Arc<Room>, mut cmds: mpsc::UnboundedReceiver<Cmd>) {
                         f.v[1],
                         f.v[2],
                         f.v[3],
+                        f.v[4],
+                        f.v[5],
                         f.i[0],
                         f.i[1],
                         f.i[2],
                         f.i[3],
+                        f.i[4],
+                        f.i[5],
                         f.power,
                     ]
                 })
@@ -539,7 +995,67 @@ async fn sim_task(room: Arc<Room>, mut cmds: mpsc::UnboundedReceiver<Cmd>) {
             let _ = room
                 .events
                 .send(json!({"t": "frame", "time": eng.time(), "e": e}).to_string());
+
+            // The hoist, once per tick alongside the frame.
+            let _ = room
+                .events
+                .send(machine_msg(&hoist, motor_i, impact).to_string());
         }
+        // A win is worth a checkpoint even if nobody edited anything.
+        if hoist.win && !won_before {
+            room.dirty.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The hoist's per-tick broadcast — the fixed client contract.
+///
+/// Every number in it is a solver quantity or an integral of one: `i` is the
+/// motor's branch unknown, `y`/`vel` are integrals of `i`, `hold` is measured
+/// from `y`, and `joules` integrates source power. Nothing here is asserted.
+/// `rect` is the footprint in GRID units so the client can draw all hoist
+/// chrome without hardcoding geometry; `impact` is non-zero only on the tick
+/// a landing happened.
+fn machine_msg(hoist: &Hoist, motor_i: f64, impact: f64) -> serde_json::Value {
+    json!({
+        "t": "machine",
+        "id": MOTOR_ID,
+        "rect": HOIST_RECT,
+        "h": machine::SHAFT_H,
+        "band": [machine::BAND_LO, machine::BAND_HI],
+        "y": hoist.y,
+        "vel": hoist.velocity(),
+        "i": motor_i,
+        "hold": hoist.hold,
+        "need": machine::HOLD_NEED,
+        "impact": impact,
+        "landings": hoist.landings,
+        "win": hoist.win,
+        "joules": hoist.joules,
+    })
+}
+
+/// Push one sample per probe into its buffer, from the last solved step.
+fn sample_probes(eng: &Engine, probes: &[Probe], bufs: &mut [Vec<f32>]) {
+    // Wire currents come from KCL propagation (frame-only).
+    let need_frame = probes
+        .iter()
+        .any(|p| p.kind == ProbeKind::I && eng.is_wire(p.elem));
+    let fr = need_frame.then(|| eng.frame());
+    for (buf, p) in bufs.iter_mut().zip(probes.iter()) {
+        let v = match (p.kind, &fr) {
+            (ProbeKind::V, _) => {
+                let v = eng.pin_voltage(p.elem, p.pin);
+                // Differential: subtract the reference point.
+                let vref =
+                    p.r.and_then(|(re, rp)| eng.pin_voltage(re, rp))
+                        .unwrap_or(0.0);
+                v.map(|v| v - vref)
+            }
+            (ProbeKind::I, Some(fr)) => fr.iter().find(|f| f.id == p.elem).map(|f| f.i[p.pin]),
+            (ProbeKind::I, None) => eng.pin_current(p.elem, p.pin),
+        };
+        buf.push(v.unwrap_or(0.0) as f32);
     }
 }
 
@@ -552,9 +1068,11 @@ fn apply_to_specs(room: &Room, id: u32, op: InteractOp) {
         return;
     };
     match (op, &mut e.kind) {
-        (InteractOp::SetSwitch { closed }, K::Switch { closed: c }) => *c = closed,
+        (InteractOp::SetSwitch { closed }, K::Switch { closed: c })
+        | (InteractOp::SetSwitch { closed }, K::Button { closed: c }) => *c = closed,
         (InteractOp::SetValue { value }, K::Resistor { ohms })
-        | (InteractOp::SetValue { value }, K::Lamp { ohms, .. }) => *ohms = value.max(1e-6),
+        | (InteractOp::SetValue { value }, K::Lamp { ohms, .. })
+        | (InteractOp::SetValue { value }, K::Speaker { ohms }) => *ohms = value.max(1e-6),
         (InteractOp::SetValue { value }, K::Capacitor { farads }) => *farads = value.max(1e-15),
         (InteractOp::SetValue { value }, K::Inductor { henries }) => *henries = value.max(1e-12),
         (InteractOp::SetValue { value }, K::VoltageSource { dc, .. }) => *dc = value,
@@ -567,14 +1085,25 @@ fn apply_to_specs(room: &Room, id: u32, op: InteractOp) {
 }
 
 /// Validate and apply a document edit. Returns false to drop the op
-/// (malformed or unknown id) — the full permission/rules pipeline is M4.
+/// (malformed id, unknown id, or a server-owned fixture) — the full
+/// permission/rules pipeline is M4.
 fn apply_doc_op(room: &Room, op: &DocOp) -> bool {
+    // Machine fixtures (ids 900-999) cannot be added, moved, reconfigured or
+    // deleted by players. Wiring TO their terminals is untouched: that is an
+    // op on the player's own wire.
+    let target = match op {
+        DocOp::Add { spec } => spec.id,
+        DocOp::Remove { id } | DocOp::Move { id, .. } | DocOp::SetKind { id, .. } => *id,
+    };
+    if reserved_id(target) {
+        return false;
+    }
     let mut elems = room.elements.lock().unwrap();
     match op {
         DocOp::Add { spec } => {
             if spec.pins.len() != spec.kind.pin_count()
                 || elems.iter().any(|e| e.id == spec.id)
-                || elems.len() >= 2000
+                || elems.len() >= MAX_ELEMENTS
             {
                 return false;
             }
@@ -609,6 +1138,97 @@ fn apply_doc_op(room: &Room, op: &DocOp) -> bool {
     }
 }
 
+fn clean_panel_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_PANEL_NAME)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// Normalize a drag rectangle. None = degenerate or non-finite input, which
+/// the caller drops (same "validate then apply" rule as document ops).
+fn norm_panel_rect(x0: f64, y0: f64, x1: f64, y1: f64) -> Option<(f64, f64, f64, f64)> {
+    if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite()) {
+        return None;
+    }
+    let (ax, bx) = (x0.min(x1), x0.max(x1));
+    let (ay, by) = (y0.min(y1), y0.max(y1));
+    if bx - ax < MIN_PANEL_SPAN || by - ay < MIN_PANEL_SPAN {
+        return None;
+    }
+    Some((ax, ay, bx, by))
+}
+
+/// Apply a panel op to the room's panel list. Returns false to drop the op
+/// (malformed rect, unknown plid, panel budget reached).
+fn apply_panel_op(panels: &mut Vec<Panel>, next_plid: &AtomicU32, op: &PanelOp) -> bool {
+    match op {
+        PanelOp::Add {
+            x0,
+            y0,
+            x1,
+            y1,
+            name,
+        } => {
+            let Some((x0, y0, x1, y1)) = norm_panel_rect(*x0, *y0, *x1, *y1) else {
+                return false;
+            };
+            if panels.len() >= MAX_PANELS {
+                return false;
+            }
+            let plid = next_plid.fetch_add(1, Ordering::Relaxed);
+            let name = name
+                .as_deref()
+                .map(clean_panel_name)
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| format!("PANEL {plid}"));
+            panels.push(Panel {
+                plid,
+                x0,
+                y0,
+                x1,
+                y1,
+                name,
+            });
+            true
+        }
+        PanelOp::Remove { plid } => {
+            let before = panels.len();
+            panels.retain(|p| p.plid != *plid);
+            panels.len() != before
+        }
+        PanelOp::Rect {
+            plid,
+            x0,
+            y0,
+            x1,
+            y1,
+        } => {
+            let Some((x0, y0, x1, y1)) = norm_panel_rect(*x0, *y0, *x1, *y1) else {
+                return false;
+            };
+            let Some(p) = panels.iter_mut().find(|p| p.plid == *plid) else {
+                return false;
+            };
+            (p.x0, p.y0, p.x1, p.y1) = (x0, y0, x1, y1);
+            true
+        }
+        PanelOp::Rename { plid, name } => {
+            let name = clean_panel_name(name);
+            if name.is_empty() {
+                return false;
+            }
+            let Some(p) = panels.iter_mut().find(|p| p.plid == *plid) else {
+                return false;
+            };
+            p.name = name;
+            true
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "t", rename_all = "lowercase")]
 enum ClientMsg {
@@ -629,10 +1249,15 @@ enum ClientMsg {
         elem: u32,
         pin: usize,
     },
+    Panel {
+        op: PanelOp,
+    },
     Cursor {
         x: f64,
         y: f64,
     },
+    /// Lower the crate and re-arm the hoist's goal.
+    MachineReset,
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(room): State<Arc<Room>>) -> impl IntoResponse {
@@ -648,7 +1273,12 @@ async fn client_session(mut socket: WebSocket, room: Arc<Room>) {
     let hello = {
         let elems = room.elements.lock().unwrap();
         let probes = room.probes.lock().unwrap();
-        json!({"t": "hello", "you": me, "elements": *elems, "probes": *probes}).to_string()
+        let panels = room.panels.lock().unwrap();
+        json!({
+            "t": "hello", "you": me, "elements": *elems,
+            "probes": *probes, "panels": *panels,
+        })
+        .to_string()
     };
     if socket.send(Message::Text(hello.into())).await.is_err() {
         room.population.fetch_sub(1, Ordering::Relaxed);
@@ -685,6 +1315,12 @@ async fn client_session(mut socket: WebSocket, room: Arc<Room>) {
                         Ok(ClientMsg::ProbeRef { pid, elem, pin }) => {
                             let _ = room.cmds.send(Cmd::ProbeRef { pid, elem, pin });
                         }
+                        Ok(ClientMsg::Panel { op }) => {
+                            let _ = room.cmds.send(Cmd::Panel { op });
+                        }
+                        Ok(ClientMsg::MachineReset) => {
+                            let _ = room.cmds.send(Cmd::MachineReset);
+                        }
                         Ok(ClientMsg::Cursor { x, y }) => {
                             let _ = room.events.send(
                                 json!({"t": "cursor", "who": me, "x": x, "y": y}).to_string(),
@@ -710,7 +1346,7 @@ async fn main() {
     // Restore the room from the last checkpoint; fresh rooms start with
     // the showcase circuit.
     let saved = load_room();
-    let (elements, probes, next_pid) = match saved {
+    let (mut elements, probes, next_pid, panels, next_plid, hoist) = match saved {
         Some(s) => {
             tracing::info!(
                 "restored room from {} ({} elements)",
@@ -728,22 +1364,45 @@ async fn main() {
                     r: p.r,
                 })
                 .collect();
-            (s.elements, probes, s.next_pid.max(1))
+            // Never hand out a plid a restored panel already owns.
+            let next_plid = s
+                .next_plid
+                .max(s.panels.iter().map(|p| p.plid + 1).max().unwrap_or(1))
+                .max(1);
+            (
+                s.elements,
+                probes,
+                s.next_pid.max(1),
+                s.panels,
+                next_plid,
+                s.hoist,
+            )
         }
-        None => (demo_room_circuit(), Vec::new(), 1),
+        None => (
+            demo_room_circuit(),
+            Vec::new(),
+            1,
+            Vec::new(),
+            1,
+            Hoist::default(),
+        ),
     };
+    // The hoist fixture is not optional: a room without it has no goal.
+    ensure_fixture(&mut elements);
 
     let room = Arc::new(Room {
         cmds: cmd_tx,
         events: event_tx,
         elements: std::sync::Mutex::new(elements),
         probes: std::sync::Mutex::new(probes),
+        panels: std::sync::Mutex::new(panels),
         next_client: AtomicU32::new(1),
         next_pid: AtomicU32::new(next_pid),
+        next_plid: AtomicU32::new(next_plid),
         population: AtomicU32::new(0),
         dirty: std::sync::atomic::AtomicBool::new(false),
     });
-    tokio::spawn(sim_task(room.clone(), cmd_rx));
+    tokio::spawn(sim_task(room.clone(), cmd_rx, hoist));
 
     let dist = std::env::var("EE_DIST").unwrap_or_else(|_| "packages/app/dist".into());
     let static_files =
@@ -776,6 +1435,464 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sim_core::ElementKind as K;
+    use sim_golden::{dc, gnd, r, spec, spec3};
+
+    /// The hoist fixture plus a player circuit, driven exactly the way
+    /// `sim_task` drives it: MACHINE_SUBSTEPS of solver, then one machine
+    /// tick that reads the motor's branch current and writes back.
+    struct HoistRun {
+        eng: Engine,
+        hoist: Hoist,
+        sources: Vec<u32>,
+    }
+
+    impl HoistRun {
+        fn new(player_circuit: Vec<ElementSpec>) -> Self {
+            let mut elems = hoist_fixture();
+            elems.extend(player_circuit);
+            let sources = source_ids(&elems);
+            let mut eng = Engine::new(DT);
+            eng.set_elements(&elems);
+            HoistRun {
+                eng,
+                hoist: Hoist::default(),
+                sources,
+            }
+        }
+
+        /// Returns the armature current the machine just used (A).
+        fn step(&mut self) -> f64 {
+            self.eng.advance(MACHINE_SUBSTEPS);
+            assert!(
+                !self.eng.is_quarantined(),
+                "solver quarantined at t={:.4} s (y={:.4} m)",
+                self.eng.time(),
+                self.hoist.y
+            );
+            let i = self.eng.pin_current(MOTOR_ID, 0).unwrap();
+            machine_step(&mut self.eng, &mut self.hoist, &self.sources);
+            i
+        }
+    }
+
+    /// The motor's two terminals, from the fixture geometry.
+    fn motor_pins() -> (sim_core::Point, sim_core::Point) {
+        let m = hoist_fixture()
+            .into_iter()
+            .find(|e| e.id == MOTOR_ID)
+            .unwrap();
+        (m.pins[0], m.pins[1])
+    }
+
+    #[test]
+    fn constant_voltage_lifts_the_crate_but_cannot_hold_it() {
+        // A 12 V battery straight across the motor leads — the naive wiring.
+        let (mp, mm) = motor_pins();
+        let (sp, sm) = ((mp.0 - 9, mp.1), (mm.0 - 9, mm.1));
+        let mut run = HoistRun::new(vec![
+            spec(1, dc(12.0), sp, sm),
+            spec(2, K::Wire, sp, mp),
+            spec(3, K::Wire, sm, mm),
+            gnd(4, sm),
+        ]);
+
+        let mut i_free = 0.0; // armature current while still travelling
+        let mut t_top = f64::NAN;
+        let mut top_switch = false;
+        // 1.0 s of machine time.
+        for _ in 0..(1.0 / MACHINE_H) as u32 {
+            let i = run.step();
+            if run.hoist.y < machine::SHAFT_H {
+                i_free = i;
+            } else if t_top.is_nan() {
+                t_top = run.eng.time();
+            }
+            top_switch |= run.hoist.y >= machine::LIM_TOP_Y;
+        }
+
+        // Solver current against the torque balance: i = (V - K·ω)/R with
+        // ω = 40.2086 rad/s -> 0.9740 A.
+        let omega_ss = (machine::K * 12.0 / machine::R_ARM - machine::LOAD_TORQUE)
+            / (machine::K * machine::K / machine::R_ARM + machine::VISCOUS_B);
+        let i_expect = (12.0 - machine::K * omega_ss) / machine::R_ARM;
+        assert!(
+            (i_free - i_expect).abs() < 0.005,
+            "armature current {i_free} A, closed form {i_expect} A"
+        );
+        assert!(
+            (run.hoist.velocity() - 0.0).abs() < 1e-9 || run.hoist.y == machine::SHAFT_H,
+            "must be parked at the head stop"
+        );
+        // Travel time: 0.40/0.8042 + τ_mech = 0.522 s (plus up to one machine
+        // tick of back-EMF lag through the solver).
+        let expect_top = machine::SHAFT_H / (machine::DRUM_R * omega_ss) + machine::TAU_MECH;
+        assert!(
+            (t_top - expect_top).abs() < 0.01,
+            "head stop at {t_top} s, closed form {expect_top} s"
+        );
+        assert!(top_switch, "LIM-TOP must have been reached");
+
+        // The design pillar, measured: voltage buys speed, not position. The
+        // crate crosses the 40 mm band at 0.80 m/s (50 ms of credit) and then
+        // parks 60 mm above it, so the hold drains back to nothing.
+        assert!(!run.hoist.win, "constant voltage must never win");
+        assert_eq!(run.hoist.hold, 0.0, "hold must drain at the head stop");
+        assert_eq!(run.hoist.landings, 0, "it never came down");
+        assert!(
+            run.hoist.joules > 0.0,
+            "the battery delivered energy: {} J",
+            run.hoist.joules
+        );
+        eprintln!(
+            "12 V open loop: i={i_free:.4} A, top at {t_top:.4} s, {:.2} J",
+            run.hoist.joules
+        );
+    }
+
+    #[test]
+    fn comparator_feedback_holds_the_crate_in_the_band() {
+        // The discovery this goal exists to force: close the loop.
+        //   sensor pot (SENSE-A to +4 V, SENSE-B to ground) -> wiper voltage
+        //   4·y/H, compared against a 3.2 V reference (= band centre 0.32 m).
+        //   The op-amp comparator drives the motor: +5 V lifts, -5 V lowers.
+        // Bang-bang, and the 3× hold drain is sized to let it win.
+        let (mp, mm) = motor_pins();
+        let sensor = hoist_fixture()
+            .into_iter()
+            .find(|e| e.id == SENSOR_ID)
+            .unwrap();
+        let (sa, sw, sb) = (sensor.pins[0], sensor.pins[1], sensor.pins[2]);
+        let (sup_p, sup_n) = ((sa.0 - 17, sa.1), (sb.0 - 17, sb.1));
+        let (ref_p, ref_n) = ((sa.0 - 17, sa.1 + 8), (sa.0 - 17, sa.1 + 12));
+        let (in_p, in_m, out) = (
+            (sa.0 - 9, sa.1 + 8),
+            (sa.0 - 9, sa.1 + 2),
+            (sa.0 - 5, sa.1 + 5),
+        );
+        let mut run = HoistRun::new(vec![
+            // Sensor excitation: 4 V across SENSE-A .. SENSE-B.
+            spec(1, dc(4.0), sup_p, sup_n),
+            gnd(2, sup_n),
+            spec(3, K::Wire, sup_p, sa),
+            spec(4, K::Wire, sup_n, sb),
+            // Setpoint: 3.2 V = 4 V · (0.32 / 0.40).
+            spec(5, dc(3.2), ref_p, ref_n),
+            gnd(6, ref_n),
+            spec(7, K::Wire, ref_p, in_p),
+            // Comparator: in+ = setpoint, in- = wiper, out -> M+.
+            spec3(8, K::OpAmp { rail: 5.0 }, in_p, in_m, out),
+            spec(9, K::Wire, in_m, sw),
+            spec(10, K::Wire, out, mp),
+            spec(11, K::Wire, mm, (mm.0 - 5, mm.1)),
+            gnd(12, (mm.0 - 5, mm.1)),
+        ]);
+
+        let mut peak = 0.0f64;
+        let mut entered = f64::NAN;
+        // 9 s of machine time: ~1.3 s to climb into the band, 5 s to hold,
+        // and slack for the bang-bang chatter.
+        for _ in 0..(9.0 / MACHINE_H) as u32 {
+            run.step();
+            peak = peak.max(run.hoist.y);
+            if entered.is_nan() && run.hoist.in_band() {
+                entered = run.eng.time();
+            }
+            if run.hoist.win {
+                break;
+            }
+        }
+
+        assert!(
+            run.hoist.win,
+            "comparator feedback must win: hold={:.4} s y={:.4} m",
+            run.hoist.hold, run.hoist.y
+        );
+        assert!(
+            run.hoist.in_band(),
+            "and still be in the band: y={}",
+            run.hoist.y
+        );
+        assert!(
+            peak < machine::LIM_TOP_Y,
+            "feedback must not slam the head stop: peak {peak} m"
+        );
+        assert_eq!(run.hoist.landings, 0, "and must not drop the crate");
+        // The hold ran continuously from the moment it entered the band: the
+        // win lands HOLD_NEED after entry, to within the one machine tick
+        // that `entered` is sampled late (the timestamp is read after the
+        // tick that crossed 0.300 m, which is also the tick that first
+        // credited hold).
+        let elapsed = run.eng.time() - entered;
+        assert!(
+            (machine::HOLD_NEED - MACHINE_H..machine::HOLD_NEED + 1.0).contains(&elapsed),
+            "won after {elapsed:.4} s in the band (need {})",
+            machine::HOLD_NEED
+        );
+        eprintln!(
+            "comparator: entered band at {entered:.3} s, won at {:.3} s (band time {elapsed:.3} s), \
+             y={:.4} peak={peak:.4}, {:.1} J",
+            run.eng.time(),
+            run.hoist.y,
+            run.hoist.joules
+        );
+    }
+
+    #[test]
+    fn shorted_leads_lower_the_crate_under_regenerative_braking() {
+        // No source at all: the motor is its own brake through a 2 Ω ballast,
+        // and the crate descends at the closed-form 0.297 m/s.
+        let (mp, mm) = motor_pins();
+        let mut run = HoistRun::new(vec![
+            spec(1, r(2.0), (mp.0 - 6, mp.1), (mp.0 - 6, mm.1)),
+            spec(2, K::Wire, (mp.0 - 6, mp.1), mp),
+            spec(3, K::Wire, (mp.0 - 6, mm.1), mm),
+            gnd(4, (mp.0 - 6, mm.1)),
+        ]);
+        run.hoist.y = machine::SHAFT_H;
+        for _ in 0..(0.30 / MACHINE_H) as u32 {
+            run.step();
+        }
+        // 4 Ω total loop: ω(K²/R + b) = -m·g·r -> -0.2975 m/s.
+        let expect = machine::DRUM_R * -machine::LOAD_TORQUE
+            / (machine::K * machine::K / 4.0 + machine::VISCOUS_B);
+        assert!(
+            (run.hoist.velocity() - expect).abs() < 0.005,
+            "descent {} m/s, closed form {expect} m/s",
+            run.hoist.velocity()
+        );
+        assert_eq!(run.hoist.joules, 0.0, "no source, no energy spent");
+        eprintln!("2 Ω ballast: {:.4} m/s", run.hoist.velocity());
+    }
+
+    #[test]
+    fn fixture_edits_are_refused_but_wiring_to_it_is_not() {
+        let (cmd_tx, _rx) = mpsc::unbounded_channel();
+        let (event_tx, _ev) = broadcast::channel(4);
+        let mut elements = demo_room_circuit();
+        ensure_fixture(&mut elements);
+        let room = Room {
+            cmds: cmd_tx,
+            events: event_tx,
+            elements: std::sync::Mutex::new(elements),
+            probes: std::sync::Mutex::new(Vec::new()),
+            panels: std::sync::Mutex::new(Vec::new()),
+            next_client: AtomicU32::new(1),
+            next_pid: AtomicU32::new(1),
+            next_plid: AtomicU32::new(1),
+            population: AtomicU32::new(0),
+            dirty: std::sync::atomic::AtomicBool::new(false),
+        };
+
+        let (mp, _) = motor_pins();
+        for op in [
+            DocOp::Remove { id: MOTOR_ID },
+            DocOp::Move {
+                id: MOTOR_ID,
+                pins: vec![(0, 0), (0, 4)],
+            },
+            DocOp::SetKind {
+                id: SENSOR_ID,
+                kind: K::Potentiometer {
+                    ohms: 1.0,
+                    wiper: 0.5,
+                },
+            },
+            DocOp::SetKind {
+                id: LIM_TOP_ID,
+                kind: K::Switch { closed: true },
+            },
+            DocOp::Add {
+                spec: spec(950, K::Wire, (0, 0), (0, 4)),
+            },
+        ] {
+            assert!(!apply_doc_op(&room, &op), "must refuse {op:?}");
+        }
+        // The fixture is intact.
+        {
+            let elems = room.elements.lock().unwrap();
+            for id in [MOTOR_ID, SENSOR_ID, LIM_TOP_ID, LIM_BOT_ID] {
+                assert!(elems.iter().any(|e| e.id == id), "{id} vanished");
+            }
+        }
+        // Wiring TO a fixture terminal is a normal player op.
+        assert!(apply_doc_op(
+            &room,
+            &DocOp::Add {
+                spec: spec(500, K::Wire, mp, (mp.0 - 4, mp.1)),
+            }
+        ));
+    }
+
+    /// The wire format is a fixed contract with the client: both halves were
+    /// written against it independently, so it gets a test of its own.
+    #[test]
+    fn machine_protocol_matches_the_contract() {
+        let mut hoist = Hoist::default();
+        hoist.y = 0.321;
+        hoist.omega = 1.5;
+        hoist.hold = 2.5;
+        hoist.landings = 3;
+        hoist.joules = 12.5;
+        let v = machine_msg(&hoist, 0.94, 1.75);
+        assert_eq!(v["t"], "machine");
+        assert_eq!(v["id"], MOTOR_ID);
+        assert_eq!(v["rect"], json!([46, 2, 64, 24]));
+        assert_eq!(v["h"], 0.40);
+        assert_eq!(v["band"], json!([0.30, 0.34]));
+        assert_eq!(v["y"], 0.321);
+        assert_eq!(v["vel"], 1.5 * machine::DRUM_R);
+        assert_eq!(v["i"], 0.94);
+        assert_eq!(v["hold"], 2.5);
+        assert_eq!(v["need"], 5.0);
+        assert_eq!(v["impact"], 1.75);
+        assert_eq!(v["landings"], 3);
+        assert_eq!(v["win"], false);
+        assert_eq!(v["joules"], 12.5);
+        // rect must actually contain every fixture pin, or the client draws
+        // terminals outside the box it was told about.
+        let [x0, y0, x1, y1] = HOIST_RECT;
+        for e in hoist_fixture() {
+            for (px, py) in e.pins {
+                assert!(
+                    (x0..=x1).contains(&px) && (y0..=y1).contains(&py),
+                    "element {} pin ({px},{py}) is outside rect {HOIST_RECT:?}",
+                    e.id
+                );
+            }
+        }
+        // And the fixture must not collide with the showcase district.
+        for e in demo_room_circuit() {
+            for (px, py) in e.pins {
+                assert!(
+                    !((x0..=x1).contains(&px) && (y0..=y1).contains(&py)),
+                    "showcase element {} sits inside the hoist rect",
+                    e.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn machine_reset_is_accepted_on_the_wire() {
+        let msg: ClientMsg = serde_json::from_str(r#"{"t":"machinereset"}"#).unwrap();
+        assert!(matches!(msg, ClientMsg::MachineReset));
+    }
+
+    #[test]
+    fn old_saves_load_without_hoist_state() {
+        let save: SaveFile = serde_json::from_str(r#"{"elements":[]}"#).unwrap();
+        assert_eq!(save.hoist, Hoist::default());
+        assert_eq!(save.hoist.y, 0.0);
+        assert!(!save.hoist.win);
+    }
+
+    #[test]
+    fn ensure_fixture_repairs_old_rooms() {
+        // A pre-hoist save: no fixture at all.
+        let mut elems = vec![spec(1, K::Wire, (0, 0), (0, 4))];
+        ensure_fixture(&mut elems);
+        assert_eq!(elems.len(), 5);
+        // Idempotent, and persisted state survives a reload.
+        if let Some(e) = elems.iter_mut().find(|e| e.id == SENSOR_ID) {
+            e.kind = K::Potentiometer {
+                ohms: SENSOR_OHMS,
+                wiper: 0.25,
+            };
+        }
+        ensure_fixture(&mut elems);
+        assert_eq!(elems.len(), 5);
+        let sensor = elems.iter().find(|e| e.id == SENSOR_ID).unwrap();
+        assert!(matches!(
+            sensor.kind,
+            K::Potentiometer { wiper, .. } if wiper == 0.25
+        ));
+        // A save from before the ids were reserved, with a player's part
+        // squatting on a fixture id: the fixture takes it back.
+        let mut squatted = vec![spec(MOTOR_ID, K::Resistor { ohms: 100.0 }, (0, 0), (0, 4))];
+        ensure_fixture(&mut squatted);
+        let motor = squatted.iter().find(|e| e.id == MOTOR_ID).unwrap();
+        assert!(matches!(motor.kind, K::Motor { .. }), "fixture must win");
+        assert_eq!(motor.pins, motor_pins_vec());
+    }
+
+    fn motor_pins_vec() -> Vec<sim_core::Point> {
+        let (a, b) = motor_pins();
+        vec![a, b]
+    }
+
+    /// A room with no sim task behind it, for exercising op validation.
+    fn test_room(elements: Vec<ElementSpec>) -> Room {
+        let (cmds, _rx) = mpsc::unbounded_channel();
+        let (events, _) = broadcast::channel(8);
+        Room {
+            cmds,
+            events,
+            elements: std::sync::Mutex::new(elements),
+            probes: std::sync::Mutex::new(Vec::new()),
+            panels: std::sync::Mutex::new(Vec::new()),
+            next_client: AtomicU32::new(1),
+            next_pid: AtomicU32::new(1),
+            next_plid: AtomicU32::new(1),
+            population: AtomicU32::new(0),
+            dirty: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// The world is big now (50k parts), but the budget is still a hard wall
+    /// and malformed specs are still refused.
+    #[test]
+    fn document_cap_is_big_and_still_validates() {
+        use sim_core::ElementKind as K;
+        let full: Vec<ElementSpec> = (0..MAX_ELEMENTS as u32)
+            .map(|k| ElementSpec {
+                id: k + 1,
+                kind: K::Wire,
+                pins: vec![(0, 0), (1, 0)],
+            })
+            .collect();
+        let room = test_room(full);
+        let wire = |id: u32| DocOp::Add {
+            spec: ElementSpec {
+                id,
+                kind: K::Wire,
+                pins: vec![(2, 2), (3, 2)],
+            },
+        };
+        // At the cap the op is dropped, not applied.
+        assert!(!apply_doc_op(&room, &wire(900_001)));
+        assert_eq!(room.elements.lock().unwrap().len(), MAX_ELEMENTS);
+        // One slot free: the same op lands, and only once.
+        room.elements.lock().unwrap().pop();
+        assert!(apply_doc_op(&room, &wire(900_001)));
+        assert!(!apply_doc_op(&room, &wire(900_001)), "duplicate id");
+        // Pin-count validation survives the raised cap (checked before it).
+        assert!(!apply_doc_op(
+            &room,
+            &DocOp::Add {
+                spec: ElementSpec {
+                    id: 900_002,
+                    kind: K::Wire,
+                    pins: vec![(0, 0)],
+                },
+            }
+        ));
+        assert!(!apply_doc_op(
+            &room,
+            &DocOp::Move {
+                id: 900_001,
+                pins: vec![(0, 0)],
+            }
+        ));
+        assert!(apply_doc_op(
+            &room,
+            &DocOp::Move {
+                id: 900_001,
+                pins: vec![(4, 4), (5, 4)],
+            }
+        ));
+        assert!(!apply_doc_op(&room, &DocOp::Remove { id: 12_345_678 }));
+    }
 
     #[test]
     fn showcase_room_never_quarantines() {
@@ -785,6 +1902,9 @@ mod tests {
         // must flip repeatedly and nothing may quarantine.
         let mut flips = 0;
         let mut last_sign = 0i32;
+        // Vignette I's 555 astable must blink at ~1 Hz the whole time.
+        let mut t555_flips = 0;
+        let mut t555_high = false;
         for chunk in 0..3000 {
             eng.advance(500);
             if eng.is_quarantined() {
@@ -809,7 +1929,282 @@ mod tests {
             if s != 0 {
                 last_sign = s;
             }
+            let t555 = eng.voltage_at((46, 42)).unwrap_or(0.0) > 4.5;
+            if t555 != t555_high {
+                t555_flips += 1;
+                t555_high = t555;
+            }
         }
         assert!(flips >= 10, "oscillator only flipped {flips} times in 30 s");
+        assert!(
+            t555_flips >= 20,
+            "555 astable only flipped {t555_flips} times in 30 s (expect ~60)"
+        );
+    }
+
+    /// A 440 Hz AC source driving a speaker: the tap stream must carry the
+    /// coil's real waveform at the audio cadence, and the two cadences must
+    /// stay locked to sim time (no drift in the `t0 + k*dts` labels).
+    #[test]
+    fn speaker_tap_streams_the_coil_waveform() {
+        use sim_core::ElementKind as K;
+        use sim_golden::{gnd, r, spec};
+        let elems = vec![
+            spec(
+                1,
+                K::VoltageSource {
+                    dc: 0.0,
+                    amp: 5.0,
+                    hz: 440.0,
+                    phase: 0.0,
+                },
+                (0, 0),
+                (0, 8),
+            ),
+            spec(2, r(8.0), (0, 0), (4, 0)),
+            spec(3, K::Speaker { ohms: 8.0 }, (4, 0), (0, 8)),
+            gnd(4, (0, 8)),
+        ];
+        let mut eng = Engine::new(DT);
+        eng.set_elements(&elems);
+        let taps: Vec<(u32, sim_core::ElemTap)> = audio_tap_ids(&elems)
+            .into_iter()
+            .filter_map(|id| eng.tap(id).map(|t| (id, t)))
+            .collect();
+        assert_eq!(taps.len(), 1, "one speaker, one tap");
+        assert_eq!(taps[0].0, 3);
+
+        // One tick's worth of audio chunks, exactly as sim_task does it.
+        let steps_per_tick = ((1.0 / TICK_HZ) / DT).round() as u32;
+        let budget = steps_per_tick.min(MAX_STEPS_PER_TICK);
+        let chunks = (budget / AUDIO_EVERY).max(1);
+        let t0 = eng.time();
+        let mut buf: Vec<f64> = Vec::with_capacity(chunks as usize);
+        for _ in 0..chunks {
+            eng.advance(AUDIO_EVERY);
+            buf.push(wire_sample(eng.tap_delta(taps[0].1, 0, 1)));
+        }
+        let dts = DT * AUDIO_EVERY as f64;
+
+        // The labels must be the truth: the last sample's stated time is the
+        // engine's own time, to within one sample.
+        let stated_end = t0 + buf.len() as f64 * dts;
+        assert!(
+            (stated_end - eng.time()).abs() < dts * 0.5,
+            "sample clock drifted: stated {stated_end}, engine {}",
+            eng.time()
+        );
+
+        // 12.5 kHz on a 440 Hz tone: ~28 samples per cycle, and the coil sees
+        // half the 5 V source across the 8+8 Ω divider.
+        assert!((dts * 440.0).recip() > 20.0, "too few samples per cycle");
+        let peak = buf.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        assert!(
+            (peak - 2.5).abs() < 0.05,
+            "coil peak should be ~2.5 V, got {peak}"
+        );
+        // Zero crossings confirm the frequency survived the decimation:
+        // 13.3 ms of 440 Hz is ~11.7 cycles, so ~23 crossings.
+        let crossings = buf
+            .windows(2)
+            .filter(|w| (w[0] < 0.0) != (w[1] < 0.0))
+            .count();
+        let cycles = buf.len() as f64 * dts * 440.0;
+        assert!(
+            (crossings as f64 - 2.0 * cycles).abs() < 3.0,
+            "expected ~{:.0} zero crossings for {cycles:.1} cycles, got {crossings}",
+            2.0 * cycles
+        );
+        assert!(buf.iter().all(|v| v.is_finite()), "no NaN on the wire");
+
+        // Honest bandwidth number, asserted so it cannot silently balloon.
+        // Measured: ~94 kB/s per speaker (0.75 Mbit/s), 4 taps => ~375 kB/s.
+        // That is the price of the M4-lite JSON transport; the binary
+        // transport (M4/M5) carries the same 12.5 kHz f32 stream in 50 kB/s.
+        let msg = audio_message(t0, dts, &taps, vec![buf.clone()]);
+        let per_sec = msg.len() as f64 * TICK_HZ;
+        assert!(
+            per_sec < 110_000.0,
+            "one speaker costs {:.0} kB/s of JSON",
+            per_sec / 1000.0
+        );
+        let v: serde_json::Value = serde_json::from_str(&msg).unwrap();
+        assert_eq!(v["t"], "audio");
+        assert_eq!(v["dts"].as_f64().unwrap(), dts);
+        assert_eq!(v["s"]["3"].as_array().unwrap().len(), buf.len());
+    }
+
+    /// The tap set is the first N speakers by element id — deterministic, and
+    /// capped whatever order the document happens to be in.
+    #[test]
+    fn audio_taps_are_the_first_n_speakers_by_id() {
+        use sim_core::ElementKind as K;
+        use sim_golden::{r, spec};
+        let mut elems = vec![spec(500, r(100.0), (0, 0), (2, 0))];
+        // Deliberately out of order, and more speakers than the cap.
+        for id in [90, 12, 77, 3, 41, 55] {
+            elems.push(spec(id, K::Speaker { ohms: 8.0 }, (0, 0), (2, 0)));
+        }
+        assert_eq!(audio_tap_ids(&elems), vec![3, 12, 41, 55]);
+        assert_eq!(audio_tap_ids(&elems).len(), MAX_AUDIO_TAPS);
+        // No speakers, no stream.
+        assert!(audio_tap_ids(&[spec(1, r(1.0), (0, 0), (1, 0))]).is_empty());
+        // The cadences must stay commensurate or the sample labels drift.
+        assert_eq!(SAMPLE_EVERY % AUDIO_EVERY, 0);
+    }
+
+    /// The wire never carries a non-finite sample, whatever the solver did.
+    #[test]
+    fn wire_samples_are_finite_and_quantized() {
+        assert_eq!(wire_sample(f64::NAN), 0.0);
+        assert_eq!(wire_sample(f64::INFINITY), 0.0);
+        assert_eq!(wire_sample(f64::NEG_INFINITY), 0.0);
+        assert_eq!(wire_sample(0.0), 0.0);
+        // 0.1 mV quantization: below a 5 V peak that is a ~94 dB noise floor.
+        assert_eq!(wire_sample(1.234_561_7), 1.2346);
+        assert_eq!(wire_sample(-1.234_561_7), -1.2346);
+        assert!((wire_sample(2.5) - 2.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn panel_ops_add_move_rename_remove() {
+        let mut panels: Vec<Panel> = Vec::new();
+        let next = AtomicU32::new(1);
+
+        // A backwards drag is normalized; the plid comes from the room.
+        let add = PanelOp::Add {
+            x0: 10.0,
+            y0: 9.0,
+            x1: 2.0,
+            y1: 1.0,
+            name: None,
+        };
+        assert!(apply_panel_op(&mut panels, &next, &add));
+        assert_eq!(panels.len(), 1);
+        let plid = panels[0].plid;
+        assert_eq!((panels[0].x0, panels[0].y0), (2.0, 1.0));
+        assert_eq!((panels[0].x1, panels[0].y1), (10.0, 9.0));
+        assert_eq!(panels[0].name, format!("PANEL {plid}"));
+
+        // Degenerate and non-finite rectangles are dropped.
+        for bad in [
+            PanelOp::Add {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 0.5,
+                y1: 8.0,
+                name: None,
+            },
+            PanelOp::Add {
+                x0: f64::NAN,
+                y0: 0.0,
+                x1: 8.0,
+                y1: 8.0,
+                name: None,
+            },
+        ] {
+            assert!(!apply_panel_op(&mut panels, &next, &bad));
+        }
+        assert_eq!(panels.len(), 1);
+
+        // Move/resize, then rename (control chars stripped, length capped).
+        assert!(apply_panel_op(
+            &mut panels,
+            &next,
+            &PanelOp::Rect {
+                plid,
+                x0: 4.0,
+                y0: 4.0,
+                x1: 12.0,
+                y1: 10.0,
+            }
+        ));
+        assert_eq!((panels[0].x0, panels[0].y1), (4.0, 10.0));
+        assert!(apply_panel_op(
+            &mut panels,
+            &next,
+            &PanelOp::Rename {
+                plid,
+                name: "  dimmer\nbench  ".into(),
+            }
+        ));
+        assert_eq!(panels[0].name, "dimmerbench");
+        assert!(!apply_panel_op(
+            &mut panels,
+            &next,
+            &PanelOp::Rename {
+                plid,
+                name: "   ".into(),
+            }
+        ));
+        assert!(!apply_panel_op(
+            &mut panels,
+            &next,
+            &PanelOp::Rect {
+                plid: plid + 999,
+                x0: 0.0,
+                y0: 0.0,
+                x1: 5.0,
+                y1: 5.0,
+            }
+        ));
+
+        // Budget, then removal.
+        while panels.len() < MAX_PANELS {
+            assert!(apply_panel_op(
+                &mut panels,
+                &next,
+                &PanelOp::Add {
+                    x0: 0.0,
+                    y0: 0.0,
+                    x1: 6.0,
+                    y1: 6.0,
+                    name: Some("bench".into()),
+                }
+            ));
+        }
+        assert!(!apply_panel_op(
+            &mut panels,
+            &next,
+            &PanelOp::Add {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 6.0,
+                y1: 6.0,
+                name: None,
+            }
+        ));
+        assert!(apply_panel_op(
+            &mut panels,
+            &next,
+            &PanelOp::Remove { plid }
+        ));
+        assert!(!apply_panel_op(
+            &mut panels,
+            &next,
+            &PanelOp::Remove { plid }
+        ));
+        assert_eq!(panels.len(), MAX_PANELS - 1);
+    }
+
+    #[test]
+    fn old_saves_without_panels_load() {
+        let s: SaveFile =
+            serde_json::from_str(r#"{"elements":[],"probes":[],"next_pid":3}"#).unwrap();
+        assert!(s.panels.is_empty());
+        assert_eq!(s.next_plid, 0);
+    }
+
+    #[test]
+    fn panel_client_msg_parses() {
+        let msg: ClientMsg =
+            serde_json::from_str(r#"{"t":"panel","op":{"t":"add","x0":1,"y0":2,"x1":9,"y1":8}}"#)
+                .unwrap();
+        let ClientMsg::Panel { op } = msg else {
+            panic!("expected a panel message")
+        };
+        let mut panels = Vec::new();
+        assert!(apply_panel_op(&mut panels, &AtomicU32::new(7), &op));
+        assert_eq!(panels[0].plid, 7);
     }
 }

@@ -7,8 +7,8 @@
 
 pub type Point = (i32, i32);
 
-/// Largest pin count of any element (the OTA is 4-pin).
-pub const MAX_PINS: usize = 4;
+/// Largest pin count of any element (the 555 timer is 6-pin).
+pub const MAX_PINS: usize = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -26,6 +26,14 @@ pub enum ElementKind {
     Lamp {
         ohms: f64,
         rated_watts: f64,
+    },
+    /// A loudspeaker: electrically just its voice-coil resistance, so it is
+    /// stamped exactly like a `Resistor`. `ohms` is the nominal impedance
+    /// (8 Ω typical). Nothing here makes sound — the client's "listen"
+    /// probe plays the solver's own node waveform through WebAudio, so what
+    /// you hear is the simulation, not a sound effect.
+    Speaker {
+        ohms: f64,
     },
     Capacitor {
         farads: f64,
@@ -47,6 +55,11 @@ pub enum ElementKind {
     /// Closed switch stamps as a 0 V source (its branch current is an MNA
     /// unknown); open switch stamps nothing.
     Switch {
+        closed: bool,
+    },
+    /// Momentary pushbutton: electrically a switch, but the client only
+    /// holds it closed while the pointer is down (`SetSwitch`).
+    Button {
         closed: bool,
     },
     /// Shockley diode, anode = pin 0.
@@ -90,11 +103,35 @@ pub enum ElementKind {
     /// sources Iout = Iabc * tanh(vd / 2Vt) — a current, not a voltage.
     /// gm = Iabc / 2Vt, output current saturates at ±Iabc.
     Ota,
+    /// Bipolar 555 timer (RESET tied high, CTRL left at the internal
+    /// divider). Pins: [vcc, gnd, trig, thr, out, dis].
+    ///
+    /// The internal divider sets the comparator thresholds at 1/3 and 2/3
+    /// of the LIVE supply; an RS latch (discrete state) is set when
+    /// v(trig) < vcc/3 and reset when v(thr) > 2·vcc/3, trigger winning.
+    /// OUT is a totem-pole branch source: vcc - 1.2 V sourced from the
+    /// VCC pin when the latch is high, 0.1 V sunk into GND when low. DIS
+    /// is a saturated transistor to GND (10 Ω) while the latch is low and
+    /// open otherwise. The supply pins draw ~3 mA of quiescent current.
+    Timer555,
     /// Potentiometer. Pins: [end a, wiper, end b]; `wiper` in 0..1 is the
     /// fractional position from end a. `SetValue` moves the wiper.
     Potentiometer {
         ohms: f64,
         wiper: f64,
+    },
+    /// DC motor armature. Pins: [+, -]; the branch current is an unknown
+    /// and is defined as the current INTO pin 0.
+    /// Law: v(pin0) - v(pin1) = ohms·i + henries·di/dt + bemf.
+    ///
+    /// `bemf` is an INPUT to the electrical model: the mechanical side
+    /// (rotor speed) lives outside sim-core and writes K·ω back through
+    /// `Engine::write_param` every machine tick. sim-core owns no
+    /// mechanical state — it only ever sees a voltage.
+    Motor {
+        ohms: f64,
+        henries: f64,
+        bemf: f64,
     },
 }
 
@@ -103,6 +140,7 @@ impl ElementKind {
         use ElementKind::*;
         match self {
             Ground => 1,
+            Timer555 => 6,
             Ota => 4,
             Npn { .. }
             | Pnp { .. }
@@ -120,7 +158,10 @@ impl ElementKind {
             self,
             ElementKind::VoltageSource { .. }
                 | ElementKind::Switch { closed: true }
+                | ElementKind::Button { closed: true }
                 | ElementKind::OpAmp { .. }
+                | ElementKind::Timer555
+                | ElementKind::Motor { .. }
         )
     }
 
@@ -136,6 +177,7 @@ impl ElementKind {
                 | ElementKind::Pmos { .. }
                 | ElementKind::OpAmp { .. }
                 | ElementKind::Ota
+                | ElementKind::Timer555
         )
     }
 }
@@ -213,4 +255,24 @@ pub enum InteractOp {
     SetValue {
         value: f64,
     },
+}
+
+/// Machine-side parameter writes: how a co-simulated mechanism (a hoist's
+/// rotor, a limit switch, a position sensor) pushes its state back into the
+/// live circuit between substeps. These run at kHz rates, so each variant
+/// declares the cheapest correct invalidation — see `Engine::write_param`.
+///
+/// Unlike `InteractOp` these are NOT player edits: they never clear the
+/// quarantine flag and never re-arm the post-event backward-Euler steps.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ParamWrite {
+    /// Motor back-EMF (volts). RHS-only: the b vector is rebuilt every
+    /// step, so this costs nothing and never refactors.
+    Bemf { volts: f64 },
+    /// Potentiometer wiper (0..1). Changes conductances but not the
+    /// topology: invalidates the factorization only.
+    Wiper { frac: f64 },
+    /// Switch position. Changes the branch-unknown count, so it needs the
+    /// full compile path — but only when the position actually differs.
+    Switch { closed: bool },
 }

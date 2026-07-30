@@ -2,21 +2,30 @@
 // server answers, main.ts falls back to the local WASM sim.
 
 import type { DocOp, ElementSpec, InteractOp } from './circuit';
+import type { MachineMsg } from './hoist';
+import type { Panel, PanelOp } from './panel';
 import type { Probe } from './scope';
 
 export interface ServerFrame {
   time: number;
-  /** [id, npins, v0..v3, i0..i3, power] per element. */
+  /** [id, npins, v0..v5, i0..i5, power] per element. */
   e: number[][];
 }
 
 export interface NetHandlers {
-  onHello(you: number, elements: ElementSpec[], probes: Probe[]): void;
+  onHello(you: number, elements: ElementSpec[], probes: Probe[], panels: Panel[]): void;
   onFrame(f: ServerFrame): void;
   onOp(id: number, op: InteractOp): void;
   onDoc(op: DocOp): void;
   onProbes(list: Probe[]): void;
+  onPanels(list: Panel[]): void;
+  /** Machine state (the hoist), broadcast once per tick beside "frame". */
+  onMachine(m: MachineMsg): void;
   onSamples(t0: number, dts: number, s: Record<string, number[]>): void;
+  /** Speaker audio taps, keyed by ELEMENT id. A separate stream from
+   * `samples` so scope decimation and speaker audio never fight over a
+   * cadence; best-effort, so a dropped chunk is a blip of silence. */
+  onAudio(t0: number, dts: number, s: Record<string, number[]>): void;
   onPresence(n: number): void;
   onCursor(who: number, x: number, y: number): void;
   onClose(): void;
@@ -27,6 +36,9 @@ export interface Net {
   sendEdit(op: DocOp): void;
   sendProbe(elem: number, pin: number, kind: 'v' | 'i'): void;
   sendProbeRef(pid: number, elem: number, pin: number): void;
+  sendPanel(op: PanelOp): void;
+  /** Lower the crate to the floor, zero the hold and re-arm the goal. */
+  sendMachineReset(): void;
   sendCursor(x: number, y: number): void;
 }
 
@@ -55,7 +67,7 @@ export function connect(h: NetHandlers): Net {
     const m = JSON.parse(ev.data as string);
     switch (m.t) {
       case 'hello':
-        h.onHello(m.you, m.elements, m.probes ?? []);
+        h.onHello(m.you, m.elements, m.probes ?? [], m.panels ?? []);
         break;
       case 'frame':
         h.onFrame(m);
@@ -69,8 +81,17 @@ export function connect(h: NetHandlers): Net {
       case 'probes':
         h.onProbes(m.list);
         break;
+      case 'panels':
+        h.onPanels(m.list ?? []);
+        break;
+      case 'machine':
+        h.onMachine(m as MachineMsg);
+        break;
       case 'samples':
         h.onSamples(m.t0, m.dts, m.s);
+        break;
+      case 'audio':
+        h.onAudio(m.t0, m.dts, m.s ?? {});
         break;
       case 'presence':
         h.onPresence(m.n);
@@ -91,6 +112,8 @@ export function connect(h: NetHandlers): Net {
     sendEdit: (op) => send({ t: 'edit', op }),
     sendProbe: (elem, pin, kind) => send({ t: 'probe', elem, pin, kind }),
     sendProbeRef: (pid, elem, pin) => send({ t: 'proberef', pid, elem, pin }),
+    sendPanel: (op) => send({ t: 'panel', op }),
+    sendMachineReset: () => send({ t: 'machinereset' }),
     sendCursor: (x, y) => send({ t: 'cursor', x, y }),
   };
 }

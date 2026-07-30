@@ -12,7 +12,7 @@
 //! - A constant current I into pin p stamps `b[p] -= I`.
 //! - A dependence dI_p/dV_n stamps `a[p][n] += g`.
 
-use crate::netlist::{ElementKind, ElementSpec, InteractOp, Point, MAX_PINS};
+use crate::netlist::{ElementKind, ElementSpec, InteractOp, ParamWrite, Point, MAX_PINS};
 use sim_math::DenseLu;
 
 pub const GMIN: f64 = 1e-12;
@@ -43,6 +43,17 @@ const OPAMP_GAIN: f64 = 1e5;
 const OPAMP_VOFF: f64 = 1e-4;
 /// OTA bias-pin diode (LM13700-style: Iabc injected into a junction).
 const OTA_IS: f64 = 1e-14;
+/// Bipolar 555: totem-pole output drops (sourcing from VCC / sinking to
+/// GND), the saturated discharge transistor's conductance (10 Ω), and the
+/// quiescent supply conductance (~3 mA across a 9 V rail).
+const T555_VDROP_HIGH: f64 = 1.2;
+const T555_VSAT_LOW: f64 = 0.1;
+const T555_G_DIS: f64 = 0.1;
+const T555_G_QUIESCENT: f64 = 3.3e-4;
+/// Comparator thresholds as fractions of the live supply, from the
+/// internal 3-resistor divider.
+const T555_THR_FRAC: f64 = 2.0 / 3.0;
+const T555_TRIG_FRAC: f64 = 1.0 / 3.0;
 
 const NR_MAX_ITERS: usize = 100;
 const NR_ABSTOL: f64 = 1e-6;
@@ -65,7 +76,8 @@ struct ElemState {
     /// polarity-normalized so PNP shares the NPN code path.
     vg1: f64,
     vg2: f64,
-    /// Op-amp rail region: -1, 0 (linear), +1.
+    /// Op-amp rail region: -1, 0 (linear), +1. Doubles as the 555's RS
+    /// latch: 0 = output low, 1 = output high.
     region: i8,
     /// Damped per-pin voltages for MOSFET NR stabilization.
     lastv: [f64; MAX_PINS],
@@ -88,6 +100,14 @@ pub struct AdvanceReport {
     pub nr_iters: u32,
     pub rescues: u32,
     pub quarantined: bool,
+}
+
+/// An O(1) handle to one compiled element, for callers that sample the same
+/// element far more often than once per tick (audio taps). Obtained from
+/// [`Engine::tap`]; invalidated by [`Engine::set_elements`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ElemTap {
+    slot: usize,
 }
 
 /// Per-element view of the live simulation for rendering: everything the
@@ -194,11 +214,12 @@ impl Engine {
             return;
         };
         match (op, &mut e.spec.kind) {
-            (InteractOp::SetSwitch { closed }, ElementKind::Switch { closed: c }) => *c = closed,
+            (InteractOp::SetSwitch { closed }, ElementKind::Switch { closed: c })
+            | (InteractOp::SetSwitch { closed }, ElementKind::Button { closed: c }) => *c = closed,
             (InteractOp::SetValue { value }, k) => match k {
-                ElementKind::Resistor { ohms } | ElementKind::Lamp { ohms, .. } => {
-                    *ohms = value.max(1e-6)
-                }
+                ElementKind::Resistor { ohms }
+                | ElementKind::Lamp { ohms, .. }
+                | ElementKind::Speaker { ohms } => *ohms = value.max(1e-6),
                 ElementKind::Capacitor { farads } => *farads = value.max(1e-15),
                 ElementKind::Inductor { henries } => *henries = value.max(1e-12),
                 ElementKind::VoltageSource { dc, .. } => *dc = value,
@@ -212,6 +233,56 @@ impl Engine {
         // invalidate the factorization. Recompiling handles both and is
         // cheap at current scale.
         self.compile();
+    }
+
+    /// Write a live element's parameter from a co-simulated machine, at the
+    /// cheapest correct cost (see `ParamWrite`). Returns false when the id
+    /// or the parameter/device pairing does not exist.
+    ///
+    /// This is deliberately NOT `interact()`: machine writes land at kHz
+    /// rates, and `interact()`/`compile()` both clear `quarantined` and
+    /// re-arm `be_steps`. Clearing quarantine that often would resurrect a
+    /// diverged circuit every 640 µs and hide the failure forever; re-arming
+    /// BE would silently keep the integrator in first order.
+    pub fn write_param(&mut self, id: u32, write: ParamWrite) -> bool {
+        let Some(e) = self.elems.iter_mut().find(|e| e.spec.id == id) else {
+            return false;
+        };
+        let mut invalidate = false;
+        let mut topology = false;
+        match (write, &mut e.spec.kind) {
+            (ParamWrite::Bemf { volts }, ElementKind::Motor { bemf, .. }) => {
+                // RHS only: `build()` rewrites b[branch] every step.
+                *bemf = volts;
+            }
+            (ParamWrite::Wiper { frac }, ElementKind::Potentiometer { wiper, .. }) => {
+                let new = frac.clamp(0.01, 0.99);
+                if *wiper != new {
+                    *wiper = new;
+                    invalidate = true;
+                }
+            }
+            (ParamWrite::Switch { closed }, ElementKind::Switch { closed: c }) => {
+                if *c != closed {
+                    *c = closed;
+                    topology = true;
+                }
+            }
+            _ => return false,
+        }
+        if invalidate {
+            self.factor_valid = false;
+        }
+        if topology {
+            // A branch appears/disappears: only the compile path can
+            // renumber the unknowns. Carry the solver's health flags across
+            // it untouched.
+            let (be_steps, quarantined) = (self.be_steps, self.quarantined);
+            self.compile();
+            self.be_steps = be_steps;
+            self.quarantined = quarantined;
+        }
+        true
     }
 
     /// Wire closure + node numbering + unknown layout.
@@ -362,10 +433,14 @@ impl Engine {
     fn solve_step(&mut self, h: f64, be: bool, report: &mut AdvanceReport) -> Result<(), ()> {
         let iters = if self.linear { 1 } else { NR_MAX_ITERS };
         let mut converged = self.linear;
-        // Reset per-pass op-amp region-change budgets (lastv[0] doubles as
-        // the counter for op-amps; they have no MOS damping state).
+        // Reset per-pass discrete-state-change budgets for the op-amp rail
+        // region and the 555 latch (lastv[0] doubles as the counter for
+        // both; neither has MOS damping state).
         for e in self.elems.iter_mut() {
-            if matches!(e.spec.kind, ElementKind::OpAmp { .. }) {
+            if matches!(
+                e.spec.kind,
+                ElementKind::OpAmp { .. } | ElementKind::Timer555
+            ) {
                 e.state.lastv[0] = 0.0;
             }
         }
@@ -459,7 +534,9 @@ impl Engine {
             let n = self.n;
             match kind {
                 ElementKind::Wire | ElementKind::Ground => {}
-                ElementKind::Resistor { ohms } | ElementKind::Lamp { ohms, .. } => {
+                ElementKind::Resistor { ohms }
+                | ElementKind::Lamp { ohms, .. }
+                | ElementKind::Speaker { ohms } => {
                     if need_factor {
                         self.stamp_g(node[0], node[1], 1.0 / ohms);
                     }
@@ -519,7 +596,32 @@ impl Engine {
                     }
                     self.b[bi] = v;
                 }
-                ElementKind::Switch { closed } => {
+                ElementKind::Motor {
+                    ohms,
+                    henries,
+                    bemf,
+                } => {
+                    // v0 - v1 = R·i + L·di/dt + bemf with i the branch
+                    // unknown (current INTO pin 0). Backward Euler on the
+                    // inductive term — di/dt ≈ (i - i_prev)/h — gives the
+                    // row  v0 - v1 - (R + L/h)·i = bemf - (L/h)·i_prev.
+                    // BE unconditionally: the armature pole (L/R = 0.75 ms
+                    // for the shipped hoist motor) is stiff next to the
+                    // machine tick, and BE cannot ring against it.
+                    let bi = self.num_nodes + branch.ok_or(())?;
+                    let gl = henries / h;
+                    if need_factor {
+                        for (pin, sgn) in [(node[0], 1.0), (node[1], -1.0)] {
+                            if pin > 0 {
+                                self.a[bi * n + (pin - 1)] += sgn;
+                                self.a[(pin - 1) * n + bi] += sgn;
+                            }
+                        }
+                        self.a[bi * n + bi] -= ohms + gl;
+                    }
+                    self.b[bi] = bemf - gl * state.i_prev;
+                }
+                ElementKind::Switch { closed } | ElementKind::Button { closed } => {
                     if closed {
                         let bi = self.num_nodes + branch.ok_or(())?;
                         if need_factor {
@@ -626,6 +728,39 @@ impl Engine {
                     self.stamp_partial(out, m, gm_eff);
                     self.stamp_partial(out, bias, -d_ib * th);
                     self.stamp_i_into(out, -iout + gm_eff * vd + d_ib * th * vb);
+                }
+                ElementKind::Timer555 => {
+                    let bi = self.num_nodes + branch.ok_or(())?;
+                    let (vcc, gp, out, dis) = (node[0], node[1], node[4], node[5]);
+                    // Quiescent supply current: the chip's own bias
+                    // network, so the rails carry current even with the
+                    // output unloaded and KCL stays sane.
+                    self.stamp_g(vcc, gp, T555_G_QUIESCENT);
+                    // Discharge pin: saturated transistor to GND while the
+                    // latch is low, open circuit while it is high.
+                    if state.region == 0 {
+                        self.stamp_g(dis, gp, T555_G_DIS);
+                    }
+                    // Totem-pole output as a branch voltage source, referred
+                    // to the rail it is working against: high sources from
+                    // the VCC pin at vcc - 1.2 V, low sinks into the GND pin
+                    // at 0.1 V. Tying the return to a supply pin is what
+                    // makes the output current actually come out of the
+                    // battery instead of appearing from nowhere.
+                    let (ret, drop) = if state.region != 0 {
+                        (vcc, -T555_VDROP_HIGH)
+                    } else {
+                        (gp, T555_VSAT_LOW)
+                    };
+                    if out > 0 {
+                        self.a[(out - 1) * n + bi] += 1.0;
+                        self.a[bi * n + (out - 1)] += 1.0;
+                    }
+                    if ret > 0 {
+                        self.a[(ret - 1) * n + bi] -= 1.0;
+                        self.a[bi * n + (ret - 1)] -= 1.0;
+                    }
+                    self.b[bi] = drop;
                 }
                 ElementKind::OpAmp { rail } => {
                     let bi = self.num_nodes + branch.ok_or(())?;
@@ -757,6 +892,35 @@ impl Engine {
                     st.vg1 = vd; // tanh is safe at any argument; no limiting
                     st.vg2 = nb;
                 }
+                ElementKind::Timer555 => {
+                    // Thresholds track the LIVE supply through the internal
+                    // divider: a sagging rail moves both comparators.
+                    let vg = self.xv(node[1]);
+                    let vcc = self.xv(node[0]) - vg;
+                    let vtrig = self.xv(node[2]) - vg;
+                    let vthr = self.xv(node[3]) - vg;
+                    let st = &mut self.elems[ei].state;
+                    // RS latch. Trigger below vcc/3 sets (output high) and
+                    // dominates — holding TRIG low pins the output high on
+                    // a real 555 too; threshold above 2·vcc/3 resets.
+                    let latch = if vtrig < vcc * T555_TRIG_FRAC {
+                        1
+                    } else if vthr > vcc * T555_THR_FRAC {
+                        0
+                    } else {
+                        st.region
+                    };
+                    // At most 2 latch changes per NR pass, exactly like the
+                    // op-amp rail regions: right at a comparator crossing
+                    // the two states can point at each other forever, and
+                    // holding the current one yields a consistent solve that
+                    // the next substep's capacitor motion resolves.
+                    if latch != st.region && st.lastv[0] < 2.0 {
+                        st.lastv[0] += 1.0;
+                        converged = false;
+                        st.region = latch;
+                    }
+                }
                 ElementKind::OpAmp { rail } => {
                     let target = OPAMP_GAIN * (self.xv(node[0]) - self.xv(node[1]) + OPAMP_VOFF);
                     let st = &mut self.elems[ei].state;
@@ -836,7 +1000,9 @@ impl Engine {
             };
             match kind {
                 ElementKind::Wire | ElementKind::Ground => {}
-                ElementKind::Resistor { ohms } | ElementKind::Lamp { ohms, .. } => two(v01 / ohms),
+                ElementKind::Resistor { ohms }
+                | ElementKind::Lamp { ohms, .. }
+                | ElementKind::Speaker { ohms } => two(v01 / ohms),
                 ElementKind::Potentiometer { ohms, wiper } => {
                     let r1 = (ohms * wiper).max(1e-3);
                     let r2 = (ohms * (1.0 - wiper)).max(1e-3);
@@ -871,7 +1037,16 @@ impl Engine {
                 }
                 ElementKind::CurrentSource { amps } => two(amps),
                 ElementKind::VoltageSource { .. } => two(bi_val.unwrap_or(0.0)),
-                ElementKind::Switch { closed } => {
+                ElementKind::Motor { .. } => {
+                    // The armature current is the branch unknown; it is also
+                    // the inductive history for the next step (same slot the
+                    // plain inductor uses).
+                    let i = bi_val.unwrap_or(0.0);
+                    st.v_prev = v01;
+                    st.i_prev = i;
+                    two(i);
+                }
+                ElementKind::Switch { closed } | ElementKind::Button { closed } => {
                     two(if closed { bi_val.unwrap_or(0.0) } else { 0.0 })
                 }
                 ElementKind::Diode | ElementKind::Led { .. } | ElementKind::Zener { .. } => {
@@ -919,6 +1094,24 @@ impl Engine {
                     st.pin_i = [0.0; MAX_PINS];
                     st.pin_i[2] = bi_val.unwrap_or(0.0);
                 }
+                ElementKind::Timer555 => {
+                    st.pin_i = [0.0; MAX_PINS];
+                    // Quiescent rail current.
+                    let iq = (vs[0] - vs[1]) * T555_G_QUIESCENT;
+                    st.pin_i[0] = iq;
+                    st.pin_i[1] = -iq;
+                    // Discharge transistor (only conducting when low).
+                    if st.region == 0 {
+                        let idis = (vs[5] - vs[1]) * T555_G_DIS;
+                        st.pin_i[5] = idis;
+                        st.pin_i[1] -= idis;
+                    }
+                    // Output branch: sourced from VCC when high, sunk into
+                    // GND when low.
+                    let io = bi_val.unwrap_or(0.0);
+                    st.pin_i[4] = io;
+                    st.pin_i[if st.region != 0 { 0 } else { 1 }] -= io;
+                }
                 ElementKind::Ota => {
                     let eb = libm::exp(vs[3] / VT);
                     let iabc = (OTA_IS * (eb - 1.0)).max(0.0);
@@ -953,6 +1146,39 @@ impl Engine {
             return None;
         }
         Some(self.xv(e.node[pin]))
+    }
+
+    /// Resolve an element id to a handle for repeated sampling. `pin_voltage`
+    /// scans the document per call, which is fine once a tick and ruinous at
+    /// audio rates (hundreds of samples per tick per tap), so a high-rate
+    /// sampler resolves once and then reads through the handle.
+    ///
+    /// The handle is INVALIDATED by `set_elements` — resolve it again after
+    /// any document edit. A stale handle reads 0, it never panics.
+    pub fn tap(&self, id: u32) -> Option<ElemTap> {
+        let slot = self.elems.iter().position(|e| e.spec.id == id)?;
+        Some(ElemTap { slot })
+    }
+
+    /// `v(pin a) - v(pin b)` at a tap, from the last accepted step, in O(1).
+    /// This is the quantity a voltage-driven device follows: the drive across
+    /// a loudspeaker's voice coil is exactly its terminal difference.
+    /// Out-of-range slots/pins read 0 so a tap on a deleted element goes
+    /// silent instead of panicking.
+    pub fn tap_delta(&self, t: ElemTap, a: usize, b: usize) -> f64 {
+        let Some(e) = self.elems.get(t.slot) else {
+            return 0.0;
+        };
+        let n = e.spec.pins.len();
+        let va = if a < n { self.xv(e.node[a]) } else { 0.0 };
+        let vb = if b < n { self.xv(e.node[b]) } else { 0.0 };
+        va - vb
+    }
+
+    /// The element id a tap currently points at, for callers that want to
+    /// confirm a handle still means what they resolved it from.
+    pub fn tap_id(&self, t: ElemTap) -> Option<u32> {
+        self.elems.get(t.slot).map(|e| e.spec.id)
     }
 
     /// Current into one pin of an element, from the last accepted step.

@@ -270,6 +270,64 @@ pub fn ota_vco(vctrl: f64) -> Vec<ElementSpec> {
     ]
 }
 
+/// The textbook 555 astable multivibrator on a 9 V rail: RA = RB = 10 kΩ,
+/// C = 100 nF. The cap charges through RA+RB up to 2/3 Vcc, then the DIS
+/// pin saturates and it discharges through RB down to 1/3 Vcc:
+/// f = 1.44/((RA + 2·RB)·C) ≈ 480 Hz, duty = (RA+RB)/(RA+2·RB) ≈ 67 %.
+/// OUT drives a 1 kΩ load so the totem pole actually carries current.
+pub fn timer555_astable() -> Vec<ElementSpec> {
+    vec![
+        spec(1, dc(9.0), (0, 0), (0, 10)),
+        gnd(2, (0, 10)),
+        spec(3, ElementKind::Wire, (0, 0), (2, 0)),
+        spec(4, ElementKind::Wire, (2, 0), (6, 0)),
+        // pins: [vcc, gnd, trig, thr, out, dis]
+        ElementSpec {
+            id: 5,
+            kind: ElementKind::Timer555,
+            pins: vec![(6, 0), (6, 10), (4, 6), (4, 4), (10, 4), (2, 2)],
+        },
+        spec(6, r(10_000.0), (2, 0), (2, 2)), // RA: rail -> DIS
+        spec(7, r(10_000.0), (2, 2), (2, 4)), // RB: DIS -> THR/TRIG
+        spec(8, ElementKind::Wire, (2, 4), (4, 4)),
+        spec(9, ElementKind::Wire, (4, 4), (4, 6)), // THR tied to TRIG
+        spec(
+            10,
+            ElementKind::Capacitor { farads: 100e-9 },
+            (2, 4),
+            (2, 6),
+        ),
+        gnd(11, (2, 6)),
+        spec(12, ElementKind::Wire, (0, 10), (6, 10)),
+        spec(13, r(1000.0), (10, 4), (10, 6)),
+        gnd(14, (10, 6)),
+    ]
+}
+
+/// DC motor armature (the hoist motor: 2 Ω, 1.5 mH) fed from 12 V through a
+/// 1 Ω feeder, with the rotor turning fast enough to generate 2 V of
+/// back-EMF. The armature is an RL branch with a series EMF, so
+/// i(t) = (12 - 2)/3 · (1 - e^(-t/τ)) with τ = L/R_loop = 0.5 ms and
+/// i_ss = 3.3333 A. (Back-EMF is an input here; the mechanism that produces
+/// it lives in the `machine` crate.)
+pub fn motor_step() -> Vec<ElementSpec> {
+    vec![
+        spec(1, dc(12.0), (0, 0), (0, 8)),
+        spec(2, r(1.0), (0, 0), (4, 0)),
+        spec(
+            3,
+            ElementKind::Motor {
+                ohms: 2.0,
+                henries: 1.5e-3,
+                bemf: 2.0,
+            },
+            (4, 0),
+            (0, 8),
+        ),
+        gnd(4, (0, 8)),
+    ]
+}
+
 /// LED through 330 Ω from 9 V: forward drop ≈ 2.1 V, I ≈ 21 mA.
 pub fn led_loop() -> Vec<ElementSpec> {
     vec![
@@ -296,7 +354,9 @@ pub fn all_golden() -> Vec<(&'static str, Vec<ElementSpec>)> {
         ("zener_regulator", zener_regulator()),
         ("opamp_relaxation", opamp_relaxation()),
         ("ota_vco", ota_vco(5.0)),
+        ("timer555_astable", timer555_astable()),
         ("pot_divider", pot_divider()),
         ("led_loop", led_loop()),
+        ("motor_step", motor_step()),
     ]
 }

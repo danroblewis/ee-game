@@ -303,6 +303,126 @@ fn ota_output_current_saturates_at_iabc() {
 }
 
 #[test]
+fn timer555_astable_frequency_and_duty() {
+    // f = 1.44/((RA + 2·RB)·C) = 480 Hz, duty (RA+RB)/(RA+2·RB) = 66.7 %.
+    let mut eng = engine_with(timer555_astable());
+    let half_rail = 4.5;
+    let mut high = false;
+    // (step index, level after the edge) for every OUT transition in 40 ms.
+    let mut edges: Vec<(u32, bool)> = Vec::new();
+    for k in 0..40_000u32 {
+        eng.advance(1);
+        let now = eng.voltage_at((10, 4)).unwrap() > half_rail;
+        if now != high {
+            edges.push((k, now));
+            high = now;
+        }
+    }
+    assert!(!eng.is_quarantined(), "555 astable quarantined");
+    let rise: Vec<u32> = edges.iter().filter(|(_, h)| *h).map(|(k, _)| *k).collect();
+    let fall: Vec<u32> = edges.iter().filter(|(_, h)| !*h).map(|(k, _)| *k).collect();
+    // Skip the power-on cycle: the cap starts at 0 V, not at 1/3 Vcc.
+    assert!(
+        rise.len() >= 4 && fall.len() >= 3,
+        "555 not oscillating: {} rising, {} falling edges",
+        rise.len(),
+        fall.len()
+    );
+    let cycles = (rise.len() - 2) as f64;
+    let period = (rise[rise.len() - 1] - rise[1]) as f64 * DT / cycles;
+    let f = 1.0 / period;
+    let expect = 1.44 / ((10_000.0 + 2.0 * 10_000.0) * 100e-9);
+    assert!(
+        (f - expect).abs() / expect < 0.25,
+        "555 astable at {f:.1} Hz, expected {expect:.1} Hz"
+    );
+    // Duty cycle: rising edge to the next falling edge, over the period.
+    let mut sum = 0.0;
+    let mut n = 0.0;
+    for w in rise[1..].windows(2) {
+        if let Some(f_edge) = fall.iter().find(|k| **k > w[0] && **k < w[1]) {
+            sum += (f_edge - w[0]) as f64 / (w[1] - w[0]) as f64;
+            n += 1.0;
+        }
+    }
+    let duty = sum / n;
+    assert!(
+        (0.55..0.80).contains(&duty),
+        "555 duty {:.1} % (expected ~67 %)",
+        duty * 100.0
+    );
+    // The output really is a totem pole against the live rail.
+    let vout = eng.voltage_at((10, 4)).unwrap();
+    assert!(
+        (vout > 7.0 && vout < 8.0) || vout < 0.2,
+        "555 OUT idles at {vout} V"
+    );
+}
+
+/// A 555 dropped on the canvas with nothing wired to it (the very first
+/// thing a player does) must sit there quietly, not quarantine the room.
+#[test]
+fn unpowered_timer555_is_harmless() {
+    let elems = vec![ElementSpec {
+        id: 1,
+        kind: sim_core::ElementKind::Timer555,
+        pins: vec![(0, 0), (0, 4), (0, 1), (0, 3), (4, 3), (4, 1)],
+    }];
+    let mut eng = engine_with(elems);
+    eng.advance(500);
+    assert!(!eng.is_quarantined(), "floating 555 quarantined");
+    for f in eng.frame() {
+        for p in 0..f.npins {
+            assert!(f.v[p].is_finite() && f.i[p].is_finite(), "non-finite pin");
+        }
+    }
+}
+
+/// Holding a pushbutton across TRIG pins the 555 output high (trigger
+/// dominates the threshold comparator), and releasing it resumes the
+/// oscillation — the manual-retrigger interaction from the demo map.
+#[test]
+fn timer555_button_holds_output_high() {
+    let mut elems = timer555_astable();
+    // Button from the THR/TRIG node to ground.
+    elems.push(ElementSpec {
+        id: 20,
+        kind: sim_core::ElementKind::Button { closed: false },
+        pins: vec![(2, 4), (2, 8)],
+    });
+    elems.push(gnd(21, (2, 8)));
+    let mut eng = engine_with(elems);
+    eng.advance(5_000);
+    eng.interact(20, InteractOp::SetSwitch { closed: true });
+    // Held down for 20 ms — many free-running periods.
+    let mut lows = 0u32;
+    for _ in 0..2_000 {
+        eng.advance(10);
+        if eng.voltage_at((10, 4)).unwrap() < 4.5 {
+            lows += 1;
+        }
+    }
+    assert!(
+        !eng.is_quarantined(),
+        "555 quarantined with the button held"
+    );
+    assert_eq!(lows, 0, "output dropped low {lows} times while triggered");
+    eng.interact(20, InteractOp::SetSwitch { closed: false });
+    let mut flips = 0u32;
+    let mut high = true;
+    for _ in 0..4_000 {
+        eng.advance(10);
+        let now = eng.voltage_at((10, 4)).unwrap() > 4.5;
+        if now != high {
+            flips += 1;
+            high = now;
+        }
+    }
+    assert!(!eng.is_quarantined(), "555 quarantined after release");
+    assert!(flips >= 4, "oscillation did not resume: {flips} flips");
+}
+
+#[test]
 fn zener_regulates() {
     let eng = settled(zener_regulator());
     let v = eng.voltage_at((6, 0)).unwrap();
@@ -327,6 +447,98 @@ fn led_drops_about_two_volts() {
     assert!((1.9..2.3).contains(&v_led), "LED drop {v_led}");
     let i = elem_current(&eng, 3, 0);
     assert!((0.018..0.023).contains(&i), "LED current {i}");
+}
+
+// ------------------------------------------------------------------ motor
+
+#[test]
+fn motor_armature_is_an_rl_branch_with_back_emf() {
+    let mut eng = engine_with(motor_step());
+    // i(t) = (V - bemf)/R_loop · (1 - e^(-t/τ)); R_loop = 1 + 2 Ω,
+    // τ = L/R_loop = 0.5 ms, i_ss = 10/3 A.
+    let (i_ss, tau) = (10.0 / 3.0, 1.5e-3 / 3.0);
+    let mut t = 0.0;
+    for target in [0.25e-3, 0.5e-3, 1e-3] {
+        let steps = ((target - t) / DT).round() as u32;
+        eng.advance(steps);
+        t = target;
+        let i = elem_current(&eng, 3, 0);
+        let expect = i_ss * (1.0 - libm::exp(-t / tau));
+        assert!(
+            (i - expect).abs() < 3e-3,
+            "t={t}: i={i} expected={expect} (backward Euler at h/τ = {})",
+            DT / tau
+        );
+    }
+    // Steady state: 60 τ of settling leaves the exponential tail below
+    // 1e-26, so this is Ohm's law around the loop against the 2 V back-EMF
+    // to the last bit the GMIN leak allows.
+    eng.advance(30_000);
+    let i = elem_current(&eng, 3, 0);
+    assert!((i - i_ss).abs() < 1e-9, "steady armature current {i}");
+    // The armature drop: 12 - 1·i - 2·i - 2 V(bemf) = 0.
+    let v_arm = eng.voltage_at((4, 0)).unwrap();
+    assert!(
+        (v_arm - (2.0 * i + 2.0)).abs() < 1e-9,
+        "armature terminal {v_arm} V vs R·i + bemf = {}",
+        2.0 * i + 2.0
+    );
+    assert!(!eng.is_quarantined());
+}
+
+#[test]
+fn motor_back_emf_write_retargets_the_current_without_a_recompile() {
+    use sim_core::ParamWrite;
+    let mut eng = engine_with(motor_step());
+    eng.advance(30_000); // 60 τ: the L/R tail is gone
+    assert!((elem_current(&eng, 3, 0) - 10.0 / 3.0).abs() < 1e-9);
+
+    // The machine-side write path: back-EMF is RHS-only.
+    assert!(eng.write_param(3, ParamWrite::Bemf { volts: 6.0 }));
+    eng.advance(30_000);
+    let i = elem_current(&eng, 3, 0);
+    assert!(
+        (i - 2.0).abs() < 1e-9,
+        "bemf 6 V -> (12-6)/3 = 2 A, got {i}"
+    );
+
+    // Regenerating: back-EMF above the supply reverses the current.
+    assert!(eng.write_param(3, ParamWrite::Bemf { volts: 15.0 }));
+    eng.advance(30_000);
+    let i = elem_current(&eng, 3, 0);
+    assert!(
+        (i + 1.0).abs() < 1e-9,
+        "bemf 15 V -> (12-15)/3 = -1 A, got {i}"
+    );
+
+    // Wrong parameter for the device, and unknown ids, are refused.
+    assert!(!eng.write_param(2, ParamWrite::Bemf { volts: 1.0 }));
+    assert!(!eng.write_param(3, ParamWrite::Wiper { frac: 0.5 }));
+    assert!(!eng.write_param(999, ParamWrite::Bemf { volts: 1.0 }));
+}
+
+#[test]
+fn param_writes_move_wipers_and_switches() {
+    use sim_core::ParamWrite;
+    let mut eng = settled(pot_divider());
+    assert!(eng.write_param(2, ParamWrite::Wiper { frac: 0.8 }));
+    eng.advance(50);
+    let v = eng.voltage_at((4, 4)).unwrap();
+    assert!((v - 1.8).abs() < 0.01, "wiper written to 0.8: {v}");
+
+    // A switch write is a topology change (the branch count moves).
+    let mut eng = engine_with(demo_lamp(false));
+    eng.advance(100);
+    assert!(elem_current(&eng, 4, 0).abs() < 1e-9, "open switch: dark");
+    assert!(eng.write_param(3, ParamWrite::Switch { closed: true }));
+    eng.advance(100);
+    let i = elem_current(&eng, 4, 0);
+    assert!((i - 0.1).abs() < 1e-6, "closed switch: 0.1 A, got {i}");
+    // Writing the same position again is a no-op, not a recompile.
+    assert!(eng.write_param(3, ParamWrite::Switch { closed: true }));
+    eng.advance(100);
+    assert!((elem_current(&eng, 4, 0) - 0.1).abs() < 1e-6);
+    assert!(!eng.is_quarantined());
 }
 
 #[test]
