@@ -91,6 +91,29 @@ impl DenseLu {
         self.singular
     }
 
+    /// The stored factor, row-major (L below the diagonal with implicit unit
+    /// diagonal, U on and above). Read-only instrumentation: the scale bench
+    /// checks its op-counting mirror of `factor` against this bit-for-bit.
+    pub fn factor_slice(&self) -> &[f64] {
+        &self.lu
+    }
+
+    /// Row permutation as recorded by `factor`: `piv[k]` is the row swapped
+    /// into position `k` at elimination step `k`. Read-only instrumentation.
+    pub fn pivots(&self) -> &[usize] {
+        &self.piv
+    }
+
+    /// Structural nonzeros in the stored factor (L below the diagonal, U on
+    /// and above). Instrumentation only: fill-in against the original nnz is
+    /// what decides whether a sparse solver pays off, and it is also why the
+    /// dense factor of a block-diagonal (many-island) matrix costs a
+    /// fraction of a connected one of the same size — the `m != 0.0` skip in
+    /// `factor` walks straight past the empty blocks.
+    pub fn factor_nnz(&self) -> usize {
+        self.lu.iter().filter(|v| **v != 0.0).count()
+    }
+
     /// Solve `A x = b` using the current factorization. `x` is `b` on entry
     /// and the solution on exit.
     pub fn solve(&self, x: &mut [f64]) {

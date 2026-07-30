@@ -6,6 +6,9 @@ license.workspace = true
 
 [dependencies]
 sim-core = { path = "../sim-core" }
+# The scale bench times factor and solve separately, so it drives the LU
+# kernel directly rather than through the engine.
+sim-math = { path = "../sim-math" }
 
 [dev-dependencies]
 libm.workspace = true

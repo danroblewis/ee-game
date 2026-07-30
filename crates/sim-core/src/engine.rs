@@ -147,6 +147,9 @@ pub struct Engine {
     time: f64,
     be_steps: u32,
     quarantined: bool,
+    /// Count of numeric factorizations since construction (instrumentation
+    /// only; never read by the solver, never hashed).
+    factorizations: u64,
 }
 
 impl Engine {
@@ -169,7 +172,62 @@ impl Engine {
             time: 0.0,
             be_steps: 0,
             quarantined: false,
+            factorizations: 0,
         }
+    }
+
+    // ------------------------------------------------------ instrumentation
+    // Read-only views for the scale benchmark (`sim-golden`, bin `scale`).
+    // None of these participate in the solve or in `state_hash`.
+
+    /// MNA unknowns: `num_nodes + num_branches`. There is exactly ONE
+    /// matrix for the whole world — disconnected islands share it.
+    pub fn unknowns(&self) -> usize {
+        self.n
+    }
+
+    pub fn node_count(&self) -> usize {
+        self.num_nodes
+    }
+
+    pub fn branch_count(&self) -> usize {
+        self.num_branches
+    }
+
+    pub fn element_count(&self) -> usize {
+        self.elems.len()
+    }
+
+    /// False if ANY element is nonlinear: the flag is global, so one diode
+    /// makes the entire world refactor on every NR iteration.
+    pub fn is_linear(&self) -> bool {
+        self.linear
+    }
+
+    /// The last stamped MNA matrix, row-major `n x n`.
+    pub fn matrix(&self) -> &[f64] {
+        &self.a
+    }
+
+    /// Structural nonzeros in the last stamped matrix.
+    pub fn matrix_nnz(&self) -> usize {
+        self.a.iter().filter(|v| **v != 0.0).count()
+    }
+
+    /// The last solved unknown vector.
+    pub fn solution(&self) -> &[f64] {
+        &self.x
+    }
+
+    /// Numeric factorizations performed since construction.
+    pub fn factorizations(&self) -> u64 {
+        self.factorizations
+    }
+
+    /// `(element id, node index per pin)` in element order — lets a caller
+    /// map unknowns back to the part of the world that owns them.
+    pub fn element_nodes(&self) -> Vec<(u32, [usize; MAX_PINS])> {
+        self.elems.iter().map(|e| (e.spec.id, e.node)).collect()
     }
 
     pub fn dt(&self) -> f64 {
@@ -796,6 +854,7 @@ impl Engine {
         }
 
         if need_factor {
+            self.factorizations += 1;
             let ok = {
                 let a = core::mem::take(&mut self.a);
                 let ok = self.lu.factor(&a);
