@@ -2,6 +2,8 @@
 //! behavior. The library exposes builders so the determinism harness, the
 //! benchmarks, and the tests all exercise the exact same circuits.
 
+pub mod scale;
+
 use sim_core::{ElementKind, ElementSpec, Point};
 
 pub fn spec(id: u32, kind: ElementKind, a: Point, b: Point) -> ElementSpec {
