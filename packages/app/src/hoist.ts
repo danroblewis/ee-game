@@ -70,7 +70,6 @@ export interface MachineMsg {
   joules: number;
 }
 
-<<<<<<< HEAD
 /** Just enough of a fixture element to label its terminals. */
 export interface FixturePart {
   id: number;
@@ -84,7 +83,7 @@ const TERMINALS: Record<number, string[]> = {
   902: ['LIM-TOP', ''],
   903: ['LIM-BOT', ''],
 };
-=======
+
 /** Footprint in grid units, corners normalized: [x0, y0, x1, y1]. */
 export type MachineRect = [number, number, number, number];
 
@@ -98,7 +97,6 @@ export type MachineRect = [number, number, number, number];
  * trap that swallows every click aimed at what is bolted to it.
  */
 export type MachineZone = 'grab' | 'body';
->>>>>>> wf/hoist-drag
 
 export interface Hoist {
   /** One machine message from the net layer (or the dev mock). */
@@ -464,15 +462,6 @@ export function createHoist(root: HTMLElement, opts: { reset: () => void }): Hoi
     if (dust.length > 0) dust = dust.filter((d) => d.age < d.life);
   }
 
-<<<<<<< HEAD
-  function draw(
-    ctx: CanvasRenderingContext2D,
-    cam: Camera,
-    now: number,
-    dtSec: number,
-    fixture: FixturePart[] = [],
-  ) {
-=======
   /** The footprint in play: this client's optimistic one while it drags the
    * assembly (and for one round trip after), the server's otherwise.
    *
@@ -500,8 +489,13 @@ export function createHoist(root: HTMLElement, opts: { reset: () => void }): Hoi
     return onBar ? 'grab' : 'body';
   }
 
-  function draw(ctx: CanvasRenderingContext2D, cam: Camera, now: number, dtSec: number) {
->>>>>>> wf/hoist-drag
+  function draw(
+    ctx: CanvasRenderingContext2D,
+    cam: Camera,
+    now: number,
+    dtSec: number,
+    fixture: FixturePart[] = [],
+  ) {
     const mm = m;
     const r = rect();
     if (!mm || !r) return;
