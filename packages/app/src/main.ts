@@ -12,15 +12,18 @@
 //   click                 select part / probe flag;  drag on empty = marquee
 //   drag a part body      move it (whole selection if it is in one)
 //   double-click a part   floating property editor next to it
-//   right-click           context menu (part: edit/rotate/delete/probe/copy;
-//                         empty canvas: paste / add part / select all)
+//   right-click           cascading context menu — on a part:
+//                         edit/rotate/delete/probe/listen/copy; on empty
+//                         canvas: Add part ▸ category ▸ part, paste, scope,
+//                         panel, select all.  '/' opens the parts cascade
+//                         at the cursor.  There is no side palette.
 //   drag from a pin       draw wire (pins must overlap to connect)
 //   ⌘/Ctrl+C, ⌘/Ctrl+V    copy selection / paste bound to cursor
 //   Q                     rotate placement ghost, paste ghost, or selection
 //   1 / 2                 voltage probe / current clamp at hover
 //   3                     listen: play that node's waveform (WebAudio)
 //   0                     set selected V-probe's reference (differential)
-//   O                     drop an in-place oscilloscope;  X delete;  / palette
+//   O                     drop an in-place oscilloscope;  X delete
 //   J                     drag a control-panel region around some parts
 //                         (its floating instrument window follows)
 //   wheel zoom (over a scope: timebase) · pan: middle-drag, ctrl+drag, space+drag
@@ -39,7 +42,7 @@ import {
   type Point,
 } from './circuit';
 import { AudioPlayer } from './audio';
-import { CATALOG, makePins, searchParts, type PartDef } from './catalog';
+import { CATALOG, CATEGORIES, makePins, partsInCategory, type PartDef } from './catalog';
 import { connect } from './net';
 import {
   applyPanelOp,
@@ -396,12 +399,7 @@ window.addEventListener('resize', resize);
 resize();
 fitCamera();
 
-// ---------------------------------------------------------------- palette
-const palette = document.getElementById('palette') as HTMLDivElement;
-const psearch = document.getElementById('psearch') as HTMLInputElement;
-const plist = document.getElementById('plist') as HTMLDivElement;
-const pbtn = document.getElementById('pbtn') as HTMLButtonElement;
-
+// ------------------------------------------------------------- part arming
 let placing: PartDef | null = null;
 let placeRot = 0; // 0..3, quarter turns; Q rotates
 
@@ -418,44 +416,12 @@ function placeEnd(a: Point): Point {
   return [a[0] + d[0] * 4, a[1] + d[1] * 4];
 }
 
-function renderPaletteList() {
-  const parts = searchParts(psearch.value);
-  plist.innerHTML = '';
-  parts.forEach((p, k) => {
-    const row = document.createElement('div');
-    row.textContent = p.name;
-    if (k === 0) row.className = 'sel';
-    row.onclick = () => choosePart(p);
-    plist.appendChild(row);
-  });
-}
-function openPalette() {
-  palette.style.display = 'block';
-  psearch.value = '';
-  renderPaletteList();
-  psearch.focus();
-}
-function closePalette() {
-  palette.style.display = 'none';
-  psearch.blur();
-}
 function choosePart(p: PartDef) {
   placing = p;
   pasting = null;
-  closePalette();
+  closeCtxMenu();
   canvas.style.cursor = 'crosshair';
 }
-pbtn.onclick = () => (palette.style.display === 'block' ? closePalette() : openPalette());
-psearch.oninput = renderPaletteList;
-psearch.onkeydown = (ev) => {
-  if (ev.key === 'Enter') {
-    const top = searchParts(psearch.value)[0];
-    if (top) choosePart(top);
-  } else if (ev.key === 'Escape') {
-    closePalette();
-  }
-  ev.stopPropagation();
-};
 
 // ---------------------------------------------------------------- props
 const propsDiv = document.getElementById('props') as HTMLDivElement;
@@ -824,19 +790,38 @@ const scopeProbes = (s: FloatScope): Probe[] =>
   s.pids === null ? probes : probes.filter((p) => s.pids!.includes(p.pid));
 
 // ------------------------------------------------------------ context menu
+// A cascading menu: #ctxmenu is a transparent full-viewport layer holding one
+// `.ctxpanel` per open level, so click-away detection stays a single
+// `ctxMenu.contains(target)` check no matter how deep the player has gone.
 const ctxMenu = document.getElementById('ctxmenu') as HTMLDivElement;
-type MenuItem = { label: string; run: () => void } | { sep: true } | { head: string };
+type MenuItem =
+  | { label: string; hint?: string; run: () => void }
+  | { label: string; sub: () => MenuItem[] }
+  | { sep: true }
+  | { head: string };
 const ctxIsOpen = () => ctxMenu.style.display === 'block';
 /** Set when a click-away closed the menu, so the canvas ignores that click. */
 let swallowPointer = false;
+/** One entry per open level; index 0 is the root panel. */
+let ctxPanels: HTMLDivElement[] = [];
 
 function closeCtxMenu() {
   ctxMenu.style.display = 'none';
   ctxMenu.innerHTML = '';
+  ctxPanels = [];
 }
 
-function openCtxMenu(x: number, y: number, items: MenuItem[]) {
-  ctxMenu.innerHTML = '';
+/** Drop every panel deeper than `depth` (a sibling row was entered). */
+function closeCtxBelow(depth: number) {
+  for (const p of ctxPanels.splice(depth + 1)) p.remove();
+}
+
+/** Build one panel of the cascade. `depth` 0 = root; anchor is where its
+ * top-left should sit, flipping left/up when it would leave the viewport. */
+function openCtxPanel(depth: number, items: MenuItem[], ax: number, ay: number, flipFrom?: number) {
+  closeCtxBelow(depth - 1);
+  const panel = document.createElement('div');
+  panel.className = 'ctxpanel';
   for (const it of items) {
     const row = document.createElement('div');
     if ('sep' in it) {
@@ -844,22 +829,83 @@ function openCtxMenu(x: number, y: number, items: MenuItem[]) {
     } else if ('head' in it) {
       row.className = 'hd';
       row.textContent = it.head;
+    } else if ('sub' in it) {
+      row.className = 'mi sub';
+      row.textContent = it.label;
+      const openChild = () => {
+        const r = row.getBoundingClientRect();
+        openCtxPanel(depth + 1, it.sub(), r.right - 3, r.top - 4, r.left);
+        row.classList.add('open');
+      };
+      row.onpointerenter = openChild;
+      row.onclick = openChild;
     } else {
       row.className = 'mi';
-      row.textContent = it.label;
+      const text = document.createElement('span');
+      text.textContent = it.label;
+      row.appendChild(text);
+      if (it.hint) {
+        const k = document.createElement('span');
+        k.className = 'kb';
+        k.textContent = it.hint;
+        row.appendChild(k);
+      }
+      // Entering a leaf closes any sibling's submenu.
+      row.onpointerenter = () => {
+        closeCtxBelow(depth);
+        for (const el of panel.querySelectorAll('.open')) el.classList.remove('open');
+      };
       row.onclick = () => {
         closeCtxMenu();
         it.run();
       };
     }
-    ctxMenu.appendChild(row);
+    panel.appendChild(row);
   }
+  ctxMenu.appendChild(panel);
   ctxMenu.style.display = 'block';
-  ctxMenu.style.left = '0px';
-  ctxMenu.style.top = '0px';
-  const r = ctxMenu.getBoundingClientRect();
-  ctxMenu.style.left = `${Math.round(Math.max(4, Math.min(x, window.innerWidth - r.width - 6)))}px`;
-  ctxMenu.style.top = `${Math.round(Math.max(4, Math.min(y, window.innerHeight - r.height - 6)))}px`;
+  ctxPanels[depth] = panel;
+
+  // Position after measuring; submenus flip to the parent's left edge.
+  const r = panel.getBoundingClientRect();
+  let x = ax;
+  if (x + r.width > window.innerWidth - 6) {
+    x = flipFrom !== undefined ? flipFrom - r.width + 3 : window.innerWidth - r.width - 6;
+  }
+  const y = Math.min(ay, window.innerHeight - r.height - 6);
+  panel.style.left = `${Math.round(Math.max(4, x))}px`;
+  panel.style.top = `${Math.round(Math.max(4, y))}px`;
+}
+
+function openCtxMenu(x: number, y: number, items: MenuItem[]) {
+  closeCtxMenu();
+  openCtxPanel(0, items, x, y);
+}
+
+/** Drop an in-place oscilloscope with its top-left at a grid point. */
+function addFloatScope(at: Point) {
+  floatScopes.push({
+    sid: sidCounter++,
+    x: at[0],
+    y: at[1],
+    w: 12,
+    h: 6,
+    set: defaultScopeSettings(5),
+    pids: null,
+  });
+}
+
+/** "Add part" cascade: categories, then the parts in each. */
+function partsMenu(): MenuItem[] {
+  return CATEGORIES.map((cat) => ({
+    label: cat,
+    sub: () =>
+      partsInCategory(cat).map((p) => ({
+        label: p.name,
+        hint: p.key,
+        run: () => choosePart(p),
+      })),
+  }));
 }
 
 function partMenu(e: ElementSpec, x: number, y: number): MenuItem[] {
@@ -868,27 +914,38 @@ function partMenu(e: ElementSpec, x: number, y: number): MenuItem[] {
   const items: MenuItem[] = [
     { head: `${e.kind.t} #${e.id}` },
     { label: 'Edit…', run: () => openPropsDialog(e) },
-    { label: `Rotate${many}`, run: () => rotateElements(groupOf(e)) },
-    { label: `Delete${many}`, run: () => deleteElements(groupOf(e)) },
+    { label: `Rotate${many}`, hint: 'Q', run: () => rotateElements(groupOf(e)) },
+    { label: `Delete${many}`, hint: 'X', run: () => deleteElements(groupOf(e)) },
   ];
   if (e.kind.t !== 'Ground') {
     items.push(
       { sep: true },
-      { label: 'Probe voltage', run: () => toggleProbe(e.id, nearestPin(e, x, y), 'v') },
-      { label: 'Probe current', run: () => toggleProbe(e.id, 0, 'i') },
+      { label: 'Probe voltage', hint: '1', run: () => toggleProbe(e.id, nearestPin(e, x, y), 'v') },
+      { label: 'Probe current', hint: '2', run: () => toggleProbe(e.id, 0, 'i') },
+      { label: 'Listen', hint: '3', run: () => toggleListen(e.id, nearestPin(e, x, y)) },
     );
   }
-  items.push({ sep: true }, { label: `Copy${many}`, run: () => copyElements(groupOf(e)) });
+  items.push(
+    { sep: true },
+    { label: `Copy${many}`, hint: '⌘C', run: () => copyElements(groupOf(e)) },
+    { label: 'Add part', sub: partsMenu },
+  );
   return items;
 }
 
 function canvasMenu(x: number, y: number): MenuItem[] {
-  const items: MenuItem[] = [];
+  const items: MenuItem[] = [{ label: 'Add part', sub: partsMenu }];
   if (clipboard.length > 0) {
     const n = clipboard.length;
     items.push({ label: `Paste${n > 1 ? ` (${n})` : ''}`, run: () => pasteAt(snap(x, y)) });
   }
-  items.push({ label: 'Add part…', run: openPalette }, { label: 'Select all', run: selectAll });
+  items.push(
+    { sep: true },
+    { label: 'Oscilloscope here', hint: 'O', run: () => addFloatScope(snap(x, y)) },
+    { label: 'Control panel here', hint: 'J', run: () => (panelTool = true) },
+    { sep: true },
+    { label: 'Select all', run: selectAll },
+  );
   return items;
 }
 
@@ -1290,7 +1347,7 @@ canvas.addEventListener('pointercancel', () => {
 window.addEventListener('keydown', (ev) => {
   const inEditor =
     ev.target instanceof Node && (propsDiv.contains(ev.target) || propsDlg.contains(ev.target));
-  if (ev.target === psearch || inEditor) {
+  if (inEditor) {
     if (ev.key === 'Escape' && dlgFor !== null) closePropsDialog();
     return;
   }
@@ -1315,7 +1372,9 @@ window.addEventListener('keydown', (ev) => {
     return;
   }
   if (ev.key === '/') {
-    openPalette();
+    // Keyboard route to the same cascade: parts menu at the cursor.
+    const at = mouse ?? { x: window.innerWidth / 2, y: window.innerHeight / 2 };
+    openCtxMenu(at.x, at.y, partsMenu());
     ev.preventDefault();
     return;
   }
@@ -1335,7 +1394,6 @@ window.addEventListener('keydown', (ev) => {
     panelDrag = null;
     selectedIds.clear();
     selectedProbe = null;
-    closePalette();
     canvas.style.cursor = 'default';
     return;
   }
@@ -1372,16 +1430,7 @@ window.addEventListener('keydown', (ev) => {
     return;
   }
   if (ev.key === 'o' && mouse) {
-    const [gx, gy] = toGrid(mouse.x, mouse.y);
-    floatScopes.push({
-      sid: sidCounter++,
-      x: Math.round(gx),
-      y: Math.round(gy),
-      w: 12,
-      h: 6,
-      set: defaultScopeSettings(5),
-      pids: null,
-    });
+    addFloatScope(snap(mouse.x, mouse.y));
     return;
   }
   if (ev.key === '1' && mouse) {
@@ -1852,7 +1901,7 @@ function frame(now: number) {
     (online ? `● ONLINE — ${population} player${population === 1 ? '' : 's'}` : '○ offline (local sim)') +
     (mode ? `   ${mode}` : '') +
     `\nparts: R C L W G V D N P M A U 5 S B T Z E F I · drag part = move · dbl-click = edit values · right-click = menu` +
-    `\ndrag pin = wire · drag empty = select · Q rotate · ⌘C/⌘V copy/paste · 1/2 probe · 3 listen · 0 ref · O scope · J panel · X delete · / search · pan: middle / ctrl+drag / space+drag`;
+    `\ndrag pin = wire · drag empty = select · Q rotate · ⌘C/⌘V copy/paste · 1/2 probe · 3 listen · 0 ref · O scope · J panel · X delete · / parts menu · pan: middle / ctrl+drag / space+drag`;
 
   requestAnimationFrame(frame);
 }

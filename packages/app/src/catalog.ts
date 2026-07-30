@@ -4,54 +4,167 @@
 
 import type { ElementKind, Point } from './circuit';
 
+/** Menu categories, in the order the right-click submenu lists them. */
+export const CATEGORIES = [
+  'Passive',
+  'Sources',
+  'Switches',
+  'Outputs',
+  'Diodes',
+  'Transistors',
+  'Chips',
+] as const;
+export type Category = (typeof CATEGORIES)[number];
+
 export interface PartDef {
   name: string;
   /** Extra search keywords. */
   keys: string;
+  cat: Category;
+  /** Single-key shortcut shown in the menu (see PART_HOTKEYS in main.ts). */
+  key?: string;
   make(): ElementKind;
 }
 
 export const CATALOG: PartDef[] = [
-  { name: 'Wire', keys: 'w line', make: () => ({ t: 'Wire' }) },
-  { name: 'Ground', keys: 'gnd earth', make: () => ({ t: 'Ground' }) },
-  { name: 'Resistor', keys: 'r ohm', make: () => ({ t: 'Resistor', ohms: 1000 }) },
-  { name: 'Lamp', keys: 'light bulb', make: () => ({ t: 'Lamp', ohms: 90, rated_watts: 1 }) },
+  { name: 'Wire', keys: 'w line', cat: 'Passive', key: 'W', make: () => ({ t: 'Wire' }) },
+  { name: 'Ground', keys: 'gnd earth', cat: 'Passive', key: 'G', make: () => ({ t: 'Ground' }) },
   {
-    name: 'Speaker',
-    keys: 'audio sound listen loudspeaker buzzer',
-    make: () => ({ t: 'Speaker', ohms: 8 }),
+    name: 'Resistor',
+    keys: 'r ohm',
+    cat: 'Passive',
+    key: 'R',
+    make: () => ({ t: 'Resistor', ohms: 1000 }),
   },
-  { name: 'Capacitor', keys: 'c cap farad', make: () => ({ t: 'Capacitor', farads: 10e-6 }) },
-  { name: 'Inductor', keys: 'l coil henry', make: () => ({ t: 'Inductor', henries: 10e-3 }) },
+  {
+    name: 'Capacitor',
+    keys: 'c cap farad',
+    cat: 'Passive',
+    key: 'C',
+    make: () => ({ t: 'Capacitor', farads: 10e-6 }),
+  },
+  {
+    name: 'Inductor',
+    keys: 'l coil henry',
+    cat: 'Passive',
+    key: 'L',
+    make: () => ({ t: 'Inductor', henries: 10e-3 }),
+  },
+  {
+    name: 'Potentiometer',
+    keys: 'pot knob wiper variable',
+    cat: 'Passive',
+    key: 'T',
+    make: () => ({ t: 'Potentiometer', ohms: 10000, wiper: 0.5 }),
+  },
   {
     name: 'Battery',
     keys: 'v dc source volt',
+    cat: 'Sources',
+    key: 'V',
     make: () => ({ t: 'VoltageSource', dc: 9, amp: 0, hz: 0, phase: 0 }),
   },
   {
     name: 'AC Source',
     keys: 'sine ac oscillator signal',
+    cat: 'Sources',
+    key: 'F',
     make: () => ({ t: 'VoltageSource', dc: 0, amp: 5, hz: 2, phase: 0 }),
   },
-  { name: 'Current Source', keys: 'i amp', make: () => ({ t: 'CurrentSource', amps: 0.01 }) },
-  { name: 'Switch', keys: 'sw toggle', make: () => ({ t: 'Switch', closed: false }) },
-  { name: 'Button', keys: 'push momentary', make: () => ({ t: 'Button', closed: false }) },
-  { name: 'Diode', keys: 'd rectifier', make: () => ({ t: 'Diode' }) },
-  { name: 'Zener', keys: 'z regulator breakdown', make: () => ({ t: 'Zener', vz: 5.6 }) },
-  { name: 'LED', keys: 'light emitting', make: () => ({ t: 'Led', color: 0 }) },
-  { name: 'NPN', keys: 'q bjt transistor', make: () => ({ t: 'Npn', beta: 100 }) },
-  { name: 'PNP', keys: 'q bjt transistor', make: () => ({ t: 'Pnp', beta: 100 }) },
-  { name: 'NMOS', keys: 'fet mosfet transistor', make: () => ({ t: 'Nmos', vt: 1.5, k: 0.05 }) },
-  { name: 'PMOS', keys: 'fet mosfet transistor', make: () => ({ t: 'Pmos', vt: 1.5, k: 0.05 }) },
-  { name: 'Op-Amp', keys: 'amplifier comparator', make: () => ({ t: 'OpAmp', rail: 12 }) },
-  { name: 'OTA', keys: 'transconductance current amplifier gm vco', make: () => ({ t: 'Ota' }) },
-  { name: '555 Timer', keys: 'timer astable monostable', make: () => ({ t: 'Timer555' }) },
   {
-    name: 'Potentiometer',
-    keys: 'pot knob wiper variable',
-    make: () => ({ t: 'Potentiometer', ohms: 10000, wiper: 0.5 }),
+    name: 'Current Source',
+    keys: 'i amp',
+    cat: 'Sources',
+    key: 'I',
+    make: () => ({ t: 'CurrentSource', amps: 0.01 }),
+  },
+  {
+    name: 'Switch',
+    keys: 'sw toggle',
+    cat: 'Switches',
+    key: 'S',
+    make: () => ({ t: 'Switch', closed: false }),
+  },
+  {
+    name: 'Button',
+    keys: 'push momentary',
+    cat: 'Switches',
+    make: () => ({ t: 'Button', closed: false }),
+  },
+  {
+    name: 'Lamp',
+    keys: 'light bulb',
+    cat: 'Outputs',
+    key: 'B',
+    make: () => ({ t: 'Lamp', ohms: 90, rated_watts: 1 }),
+  },
+  { name: 'LED', keys: 'light emitting', cat: 'Outputs', key: 'E', make: () => ({ t: 'Led', color: 0 }) },
+  {
+    name: 'Speaker',
+    keys: 'audio sound listen loudspeaker buzzer',
+    cat: 'Outputs',
+    make: () => ({ t: 'Speaker', ohms: 8 }),
+  },
+  { name: 'Diode', keys: 'd rectifier', cat: 'Diodes', key: 'D', make: () => ({ t: 'Diode' }) },
+  {
+    name: 'Zener',
+    keys: 'z regulator breakdown',
+    cat: 'Diodes',
+    key: 'Z',
+    make: () => ({ t: 'Zener', vz: 5.6 }),
+  },
+  {
+    name: 'NPN',
+    keys: 'q bjt transistor',
+    cat: 'Transistors',
+    key: 'N',
+    make: () => ({ t: 'Npn', beta: 100 }),
+  },
+  {
+    name: 'PNP',
+    keys: 'q bjt transistor',
+    cat: 'Transistors',
+    key: 'P',
+    make: () => ({ t: 'Pnp', beta: 100 }),
+  },
+  {
+    name: 'NMOS',
+    keys: 'fet mosfet transistor',
+    cat: 'Transistors',
+    key: 'M',
+    make: () => ({ t: 'Nmos', vt: 1.5, k: 0.05 }),
+  },
+  {
+    name: 'PMOS',
+    keys: 'fet mosfet transistor',
+    cat: 'Transistors',
+    key: '⇧M',
+    make: () => ({ t: 'Pmos', vt: 1.5, k: 0.05 }),
+  },
+  {
+    name: 'Op-Amp',
+    keys: 'amplifier comparator',
+    cat: 'Chips',
+    key: 'A',
+    make: () => ({ t: 'OpAmp', rail: 12 }),
+  },
+  {
+    name: 'OTA',
+    keys: 'transconductance current amplifier gm vco',
+    cat: 'Chips',
+    key: 'U',
+    make: () => ({ t: 'Ota' }),
+  },
+  {
+    name: '555 Timer',
+    keys: 'timer astable monostable',
+    cat: 'Chips',
+    key: '5',
+    make: () => ({ t: 'Timer555' }),
   },
 ];
+
+export const partsInCategory = (cat: Category): PartDef[] => CATALOG.filter((p) => p.cat === cat);
 
 export function searchParts(q: string): PartDef[] {
   const s = q.trim().toLowerCase();
