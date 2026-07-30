@@ -13,13 +13,28 @@
 // shown comes out of the solver frame (design pillar); widgets only ever
 // send InteractOps through the same path the canvas uses.
 //
+// An in-place OSCILLOSCOPE whose rect lands inside a region is part of that
+// panel's interface too (`scopeOwner`/`panelScopes`, geometry-derived like
+// member elements): the schematic keeps only a draggable placeholder while the
+// live instrument becomes a canvas widget row in the window.
+//
 // Screen-anchored, per-player chrome (window position, slider-vs-knob
 // choice, widget row order) lives in localStorage keyed by plid; the region
 // itself is shared, so everyone sees the same panel with their own layout.
 
 import type { ElemLive, ElementSpec, InteractOp, Point } from './circuit';
 import { LED_COLORS, type Camera } from './render';
-import { probeColor, type Probe } from './scope';
+import {
+  applyScopeControl,
+  probeColor,
+  renderScope,
+  scopeChannels,
+  scopeControlAt,
+  type FloatScope,
+  type Probe,
+  type ScopeControlId,
+  type TraceStore,
+} from './scope';
 
 // ------------------------------------------------------------ shared state
 
@@ -86,6 +101,41 @@ export function panelMembers(panel: Panel, elements: ElementSpec[]): ElementSpec
   );
 }
 
+/** True when a scope's rect is fully inside a region. */
+const scopeInside = (panel: Panel, s: FloatScope) =>
+  s.x >= panel.x0 && s.x + s.w <= panel.x1 && s.y >= panel.y0 && s.y + s.h <= panel.y1;
+
+const panelArea = (p: Panel) => (p.x1 - p.x0) * (p.y1 - p.y0);
+
+/** The panel a scope belongs to: the SMALLEST region that fully contains its
+ * rect (lowest plid breaks a tie, so every client agrees). null = the scope is
+ * a normal floating instrument on the schematic. Derived from geometry every
+ * frame, exactly like `panelMembers` — dragging a scope out detaches it. */
+export function scopeOwner(panels: Panel[], s: FloatScope): Panel | null {
+  let best: Panel | null = null;
+  for (const p of panels) {
+    if (!scopeInside(p, s)) continue;
+    if (!best) {
+      best = p;
+      continue;
+    }
+    const a = panelArea(p);
+    const b = panelArea(best);
+    if (a < b || (a === b && p.plid < best.plid)) best = p;
+  }
+  return best;
+}
+
+/** A panel's scopes: the floating scopes this region owns. `panels` is the
+ * whole list so nested regions resolve to the innermost one. */
+export function panelScopes(
+  panel: Panel,
+  scopes: FloatScope[],
+  panels: Panel[] = [panel],
+): FloatScope[] {
+  return scopes.filter((s) => scopeOwner(panels, s)?.plid === panel.plid);
+}
+
 // --------------------------------------------------------- canvas regions
 
 const TAB_H = 19;
@@ -100,7 +150,9 @@ function tabRect(cam: Camera, p: Panel): [number, number, number, number] {
   return [cam.ox + p.x0 * cam.scale, cam.oy + p.y0 * cam.scale - TAB_H - 3, w, TAB_H];
 }
 
-function roundRectPath(
+/** Rounded-rect path. Exported so the schematic's panel-owned-scope
+ * placeholder is drawn with exactly the region chrome's corner. */
+export function roundRectPath(
   ctx: CanvasRenderingContext2D,
   x: number,
   y: number,
@@ -266,6 +318,14 @@ export interface PanelHostDeps {
   /** Latest solver frame by element id — the only source of shown numbers. */
   live(): Map<number, ElemLive>;
   probes(): Probe[];
+  /** Sample history for the scope widgets: the very store the canvas scopes
+   * draw, so a scope shows the same waveform wherever it is displayed. */
+  traces(): TraceStore;
+  /** Every client-local floating scope. main.ts owns the array; panels only
+   * borrow the ones their region contains. */
+  scopes(): FloatScope[];
+  /** Delete a floating scope (a panel-owned scope has no canvas chrome). */
+  removeScope(sid: number): void;
   /** Same interact path the canvas uses (optimistic + server echo). */
   interact(e: ElementSpec, op: InteractOp): void;
   /** Panel ops (rename / delete from the window chrome). */
@@ -277,6 +337,10 @@ interface TickCtx {
   byId: Map<number, ElementSpec>;
   live: Map<number, ElemLive>;
   probes: Probe[];
+  /** The whole shared list: scope ownership is resolved against all regions. */
+  panels: Panel[];
+  scopes: FloatScope[];
+  traces: TraceStore;
 }
 
 interface Widget {
@@ -547,12 +611,9 @@ function sourceWidget(id: number, dc0: number, deps: PanelHostDeps): Widget {
   };
 }
 
-/** A probe on a member element becomes a fixed voltmeter / ammeter.
- *
- * v1 scope story: a probed member gets this numeric readout only. Embedded
- * waveform scopes inside a panel window (renderScopeInto into a per-row
- * canvas, timebase per row) are a follow-up — the docked panel and the
- * in-place canvas scopes already cover waveforms today. */
+/** A probe on a member element becomes a fixed voltmeter / ammeter. Waveforms
+ * come from `scopeWidget` below: park an oscilloscope inside the region and it
+ * moves into this window. */
 function probeWidget(pid: number): Widget {
   const { el, lab, ctl, val } = makeRow(`pr:${pid}`, `METER ${pid}`);
   const seg = document.createElement('span');
@@ -585,6 +646,116 @@ function probeWidget(pid: number): Widget {
   };
 }
 
+/** An oscilloscope parked inside this region: the panel IS its enclosure, so
+ * the instrument is drawn into a row canvas instead of onto the schematic.
+ *
+ * It is the same instrument, not a copy: the widget looks the scope up by sid
+ * every tick and renders from main.ts's TraceStore with the scope's own
+ * ScopeSettings object, so timebase / trigger / manual scale are shared with
+ * the canvas (drag it out of the region and it keeps every knob).
+ *
+ * `renderScope` is `renderScopeInto(ctx, 0, 0, W, H, …)` over a whole canvas
+ * plus the fractional-devicePixelRatio backing-store fix — one copy of that
+ * sizing logic beats two. */
+function scopeWidget(sid: number, deps: PanelHostDeps): Widget {
+  const { el, lab, ctl, val } = makeRow(`sc:${sid}`, `SCOPE ${sid}`);
+  el.classList.add('prow-scope');
+
+  const chans = document.createElement('div');
+  chans.className = 'pchans';
+  chans.title = 'channels: click a probe to show/hide it';
+  const kill = document.createElement('button');
+  kill.className = 'ptog';
+  kill.textContent = '×';
+  kill.title = 'delete this oscilloscope';
+  kill.onclick = () => deps.removeScope(sid);
+  ctl.append(chans, kill);
+
+  const cv = document.createElement('canvas');
+  cv.className = 'pscope';
+  el.appendChild(cv);
+
+  let scope: FloatScope | undefined;
+  let probes: Probe[] = [];
+  const active = () => (scope ? scopeChannels(scope, probes) : []);
+
+  /** Body-local coordinates: `.pscope` has no border or padding, so the
+   * element's own box is exactly the rect renderScopeInto drew into. */
+  const ctrlAt = (ev: { clientX: number; clientY: number }): ScopeControlId | null => {
+    if (!scope) return null;
+    const r = cv.getBoundingClientRect();
+    return scopeControlAt(
+      cv.clientWidth,
+      cv.clientHeight,
+      ev.clientX - r.left,
+      ev.clientY - r.top,
+      scope.set,
+      active().length,
+    );
+  };
+  cv.addEventListener('pointerdown', (ev) => {
+    const id = ctrlAt(ev);
+    if (!scope || !id) return;
+    ev.preventDefault();
+    applyScopeControl(scope.set, id, active().length);
+  });
+  cv.addEventListener('pointermove', (ev) => {
+    cv.style.cursor = ctrlAt(ev) ? 'pointer' : 'default';
+  });
+  // Wheel over a scope is its timebase, wherever the scope is drawn.
+  cv.addEventListener(
+    'wheel',
+    (ev) => {
+      if (!scope) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      scope.set.timebase = clamp(scope.set.timebase * Math.exp(ev.deltaY * 0.001), 0.001, 60);
+    },
+    { passive: false },
+  );
+
+  const toggle = (pid: number) => {
+    const s = scope;
+    if (!s) return;
+    if (s.pids === null) s.pids = probes.map((p) => p.pid);
+    s.pids = s.pids.includes(pid) ? s.pids.filter((x) => x !== pid) : [...s.pids, pid];
+  };
+
+  // The canvas scope's channel dots live in its title bar, which a panel-owned
+  // scope does not have: rebuild them here whenever the selection changes.
+  let chanSig = '';
+  const syncChans = () => {
+    const on = new Set(active().map((p) => p.pid));
+    const sig = `${probes.map((p) => `${p.pid}${p.kind}`).join(',')}|${[...on].join(',')}`;
+    if (sig === chanSig) return;
+    chanSig = sig;
+    chans.replaceChildren(
+      ...probes.map((p) => {
+        const b = document.createElement('button');
+        b.className = on.has(p.pid) ? 'pchan on' : 'pchan';
+        b.style.color = probeColor(p.pid);
+        b.title = `${p.kind === 'v' ? 'V' : 'I'}${p.pid}`;
+        b.onclick = () => toggle(p.pid);
+        return b;
+      }),
+    );
+  };
+
+  return {
+    key: `sc:${sid}`,
+    el,
+    update(ctx) {
+      scope = ctx.scopes.find((s) => s.sid === sid);
+      probes = ctx.probes;
+      if (!scope) return;
+      lab.textContent = `SCOPE ${sid}`;
+      syncChans();
+      val.textContent = `${fmtSI(scope.set.timebase / 10, 's')}/div`;
+      renderScope(cv, ctx.traces, active(), scope.set.timebase, scope.set);
+    },
+  };
+}
+
 type WidgetSpec = { key: string; make: () => Widget };
 
 /** Which widgets a panel's members deserve, in document order. */
@@ -592,6 +763,7 @@ function widgetSpecs(
   plid: number,
   members: ElementSpec[],
   probes: Probe[],
+  scopes: FloatScope[],
   deps: PanelHostDeps,
 ): WidgetSpec[] {
   const out: WidgetSpec[] = [];
@@ -622,6 +794,9 @@ function widgetSpecs(
   for (const p of probes) {
     if (ids.has(p.elem)) out.push({ key: `pr:${p.pid}`, make: () => probeWidget(p.pid) });
   }
+  // Oscilloscopes the region encloses; keyed by sid so the saved row order
+  // treats them like any other widget.
+  for (const s of scopes) out.push({ key: `sc:${s.sid}`, make: () => scopeWidget(s.sid, deps) });
   return out;
 }
 
@@ -683,7 +858,8 @@ class PanelWindow {
     this.hint = document.createElement('div');
     this.hint.className = 'pwin-hint';
     this.hint.textContent =
-      'no controls in this region — enclose a pot, switch, lamp, LED, DC source or probe';
+      'no controls in this region — enclose a pot, switch, lamp, LED, DC source, ' +
+      'probe or oscilloscope';
     this.el.append(hd, this.body, this.hint);
     root.appendChild(this.el);
 
@@ -794,7 +970,13 @@ class PanelWindow {
     this.name = panel.name;
     if (document.activeElement !== this.title) this.title.value = panel.name;
     this.fitTitle();
-    const specs = widgetSpecs(this.plid, panelMembers(panel, ctx.elems), ctx.probes, this.deps);
+    const specs = widgetSpecs(
+      this.plid,
+      panelMembers(panel, ctx.elems),
+      ctx.probes,
+      panelScopes(panel, ctx.scopes, ctx.panels),
+      this.deps,
+    );
     const sig = specs.map((s) => s.key).join('|');
     if (sig !== this.sig) {
       this.sig = sig;
@@ -919,6 +1101,9 @@ export class PanelHost {
       byId: new Map(elems.map((e) => [e.id, e])),
       live: this.deps.live(),
       probes: this.deps.probes(),
+      panels,
+      scopes: this.deps.scopes(),
+      traces: this.deps.traces(),
     };
     for (const p of panels) {
       let w = this.wins.get(p.plid);

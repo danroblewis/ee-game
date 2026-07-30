@@ -26,7 +26,9 @@
 //   O                     drop an in-place oscilloscope;  X delete
 //   ` (backquote)         collapse/expand the bottom scope dock (starts collapsed)
 //   J                     drag a control-panel region around some parts
-//                         (its floating instrument window follows)
+//                         (its floating instrument window follows) — a scope
+//                         parked inside a region becomes a widget in that
+//                         panel's window; drag it out to detach it again
 //   H / shift+H           frame the home district / the whole document
 //   wheel zoom (over a scope: timebase) · pan: middle-drag, ctrl+drag, space+drag
 //
@@ -57,6 +59,8 @@ import {
   normPanelRect,
   PanelHost,
   panelZoneAt,
+  roundRectPath,
+  scopeOwner,
   type Panel,
   type PanelOp,
 } from './panel';
@@ -67,11 +71,12 @@ import {
   defaultScopeSettings,
   probeColor,
   renderScopeInto,
+  scopeChannels,
   scopeControlAt,
   TraceStore,
+  type FloatScope,
   type Probe,
   type ScopeControlId,
-  type ScopeSettings,
 } from './scope';
 import { createDock } from './dock';
 
@@ -143,17 +148,8 @@ type ClipItem = { kind: ElementKind; pins: Point[] };
 let clipboard: ClipItem[] = [];
 let pasting: ClipItem[] | null = null;
 
-/** In-place oscilloscopes: world-anchored, per-player instruments. */
-interface FloatScope {
-  sid: number;
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-  /** Per-scope instrument settings; owns the timebase. */
-  set: ScopeSettings;
-  pids: number[] | null; // null = all probes
-}
+/** In-place oscilloscopes: world-anchored, per-player instruments (the shape
+ * lives in scope.ts because panel.ts renders the ones a region encloses). */
 let floatScopes: FloatScope[] = [];
 let sidCounter = 1;
 
@@ -346,12 +342,18 @@ function panelOp(op: PanelOp) {
 }
 
 /** The floating instrument windows. panel.ts owns all DOM and widget logic;
- * we only hand it the shared list, the document, the live frame and the
- * interact path. */
+ * we only hand it the shared list, the document, the live frame, the probe
+ * traces (for scopes a region encloses) and the interact path. The
+ * `floatScopes` array stays ours — panels borrow it, never own it. */
 const panelHost = new PanelHost({
   elements: () => elements,
   live: () => live,
   probes: () => probes,
+  traces: () => traces,
+  scopes: () => floatScopes,
+  removeScope: (sid) => {
+    floatScopes = floatScopes.filter((s) => s.sid !== sid);
+  },
   interact: (e, op) => interact(e, op),
   op: panelOp,
 });
@@ -858,9 +860,36 @@ function scopeBodyPx(s: FloatScope): [number, number, number, number] {
   return [X + 1, Y + SCOPE_TITLE_PX, W - 2, H - SCOPE_TITLE_PX - 1];
 }
 
+/** The control panel this scope belongs to (geometry only, re-derived per
+ * frame): while owned, the instrument is drawn in that panel's window. */
+const scopeOwnerOf = (s: FloatScope): Panel | null => scopeOwner(panels, s);
+
+const SCOPE_BADGE_H = 22;
+const SCOPE_BADGE_FONT = '11px ui-monospace, monospace';
+/** ui-monospace advance at 11px — the badge is drawn and hit-tested from this
+ * one width, exactly like the panel name tabs. */
+const SCOPE_BADGE_CHAR_W = 6.7;
+const scopeBadgeLabel = (s: FloatScope, owner: Panel) => `scope ${s.sid} → ${owner.name}`;
+
+/** The placeholder a panel-owned scope leaves on the schematic, anchored at the
+ * scope's top-left corner (screen-space size: it is chrome, not circuitry). */
+function scopeBadgePx(s: FloatScope, owner: Panel): [number, number, number, number] {
+  const [X, Y] = scopeRectPx(s);
+  return [X, Y, 35 + scopeBadgeLabel(s, owner).length * SCOPE_BADGE_CHAR_W, SCOPE_BADGE_H];
+}
+
 function scopeZoneAt(x: number, y: number): ScopeZone | null {
   for (let k = floatScopes.length - 1; k >= 0; k--) {
     const s = floatScopes[k]!;
+    const owner = scopeOwnerOf(s);
+    if (owner) {
+      // Panel-owned: the body (title bar, controls, resize corner) lives in the
+      // panel window, so on canvas the badge is one drag zone and the rest of
+      // the rect is click-through — canvas input never fights the widget.
+      const [bx, by, bw, bh] = scopeBadgePx(s, owner);
+      if (x >= bx && x <= bx + bw && y >= by && y <= by + bh) return { s, zone: 'title' };
+      continue;
+    }
     const [X, Y, W, H] = scopeRectPx(s);
     if (x < X || x > X + W || y < Y || y > Y + H) continue;
     if (y <= Y + SCOPE_TITLE_PX) {
@@ -881,8 +910,7 @@ function scopeZoneAt(x: number, y: number): ScopeZone | null {
   return null;
 }
 
-const scopeProbes = (s: FloatScope): Probe[] =>
-  s.pids === null ? probes : probes.filter((p) => s.pids!.includes(p.pid));
+const scopeProbes = (s: FloatScope): Probe[] => scopeChannels(s, probes);
 
 // ------------------------------------------------------------ context menu
 // A cascading menu: #ctxmenu is a transparent full-viewport layer holding one
@@ -1788,8 +1816,49 @@ function drawSelectionBoxes(view: ViewRect) {
   ctx.setLineDash([]);
 }
 
+/** Little sine-in-a-screen glyph for the placeholder badge. */
+function drawScopeGlyph(x: number, y: number, w: number, h: number) {
+  ctx.lineWidth = 1;
+  ctx.strokeRect(Math.round(x) + 0.5, Math.round(y) + 0.5, w, h);
+  ctx.beginPath();
+  for (let k = 0; k <= w - 2; k++) {
+    const yy = y + h / 2 - Math.sin((k / (w - 2)) * Math.PI * 2) * (h / 2 - 1.5);
+    if (k === 0) ctx.moveTo(x + 1 + k, yy);
+    else ctx.lineTo(x + 1 + k, yy);
+  }
+  ctx.stroke();
+}
+
+/** A panel-owned scope is displayed in that panel's window, so all the
+ * schematic keeps is this badge at the scope's top-left: it says where the
+ * instrument went and is its drag handle. Deliberately small — the rest of the
+ * scope's rect stays click-through, unlike the body it replaces. */
+function drawScopePlaceholder(s: FloatScope, owner: Panel) {
+  const [X, Y, W, H] = scopeBadgePx(s, owner);
+  ctx.save();
+  roundRectPath(ctx, X, Y, W, H, 6);
+  ctx.fillStyle = '#12171de6';
+  ctx.fill();
+  ctx.setLineDash([4, 4]);
+  ctx.lineWidth = 1.2;
+  ctx.strokeStyle = '#57808f';
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.strokeStyle = '#8ee7ff';
+  ctx.fillStyle = '#8ee7ff';
+  drawScopeGlyph(X + 7, Y + 6, 14, 10);
+  ctx.font = SCOPE_BADGE_FONT;
+  ctx.fillText(scopeBadgeLabel(s, owner), X + 27, Y + 15);
+  ctx.restore();
+}
+
 function drawFloatScopes() {
   for (const s of floatScopes) {
+    const owner = scopeOwnerOf(s);
+    if (owner) {
+      drawScopePlaceholder(s, owner);
+      continue;
+    }
     const [X, Y, W, H] = scopeRectPx(s);
     ctx.fillStyle = '#101016f0';
     ctx.fillRect(X, Y, W, H);
