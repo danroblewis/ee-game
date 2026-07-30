@@ -146,6 +146,9 @@ const dockScope = defaultScopeSettings(5);
 /** '3' listens to one probe's stream; online the pid arrives with the
  * server's probe list, so remember what we asked to hear. */
 const audio = new AudioPlayer();
+// Exposed for end-to-end tests (like __cam): headless runs cannot hear, so
+// they assert on pid/level instead.
+(window as unknown as { __audio: AudioPlayer }).__audio = audio;
 let listenWanted: { elem: number; pin: number } | null = null;
 
 let selectedIds = new Set<number>();
