@@ -627,11 +627,24 @@ function widgetSpecs(
 
 // -------------------------------------------------------- control windows
 
+/** Narrowest the name field ever gets, px. */
+const TITLE_MIN_W = 46;
+/** Header space kept clear of the name field so there is always a strip to
+ * grab, px. */
+const DRAG_MIN_W = 34;
+
 class PanelWindow {
   readonly el: HTMLDivElement;
   private title: HTMLInputElement;
   private body: HTMLDivElement;
   private hint: HTMLDivElement;
+  private hd: HTMLDivElement;
+  private grab: HTMLSpanElement;
+  private close: HTMLButtonElement;
+  /** Hidden twin of the title, used to measure the text width. */
+  private mez: HTMLSpanElement;
+  /** Last (text, focus) the field was sized for — layout reads are not free. */
+  private fitKey = '';
   private widgets = new Map<string, Widget>();
   private sig = '';
   private name = '';
@@ -645,19 +658,25 @@ class PanelWindow {
     this.el.className = 'pwin';
     const hd = document.createElement('div');
     hd.className = 'pwin-hd';
+    this.hd = hd;
     const grab = document.createElement('span');
     grab.className = 'pwin-grab';
     grab.textContent = '⣿';
+    this.grab = grab;
     this.title = document.createElement('input');
     this.title.className = 'pwin-title';
     this.title.spellcheck = false;
-    this.title.title = 'rename this panel';
+    this.title.title = 'click to rename · ⌘/ctrl+drag moves the window';
+    this.mez = document.createElement('span');
+    this.mez.className = 'pwin-mez';
+    this.mez.setAttribute('aria-hidden', 'true');
     const close = document.createElement('button');
     close.className = 'pwin-x';
     close.textContent = '×';
     close.title = 'delete this panel';
     close.onclick = () => deps.op({ t: 'remove', plid });
-    hd.append(grab, this.title, close);
+    this.close = close;
+    hd.append(grab, this.title, this.mez, close);
 
     this.body = document.createElement('div');
     this.body.className = 'pwin-body';
@@ -672,9 +691,29 @@ class PanelWindow {
     this.el.style.left = `${pos.x}px`;
     this.el.style.top = `${pos.y}px`;
 
+    // Title-bar drag. The name field is content-sized, so the header space
+    // to its right is a real drag strip; ⌘/ctrl held drags from ANYWHERE in
+    // the header, the name included, instead of editing it.
+    let lastPress = -1e9;
     hd.addEventListener('pointerdown', (ev) => {
-      if (ev.target === close || ev.target === this.title) return;
+      if (ev.button !== 0) return;
+      const force = ev.ctrlKey || ev.metaKey;
+      if (!force && (ev.target === close || ev.target === this.title)) return;
+      if (force && ev.target === close) return; // ⌘+× still deletes
       ev.preventDefault();
+      // Double-press on the bar itself renames. Counted here rather than via
+      // dblclick because the drag's preventDefault can swallow that event.
+      const dbl = ev.timeStamp - lastPress < 350;
+      lastPress = ev.timeStamp;
+      if (dbl && !force) {
+        this.title.focus();
+        this.title.select();
+        return;
+      }
+      // Grabbing the bar leaves the name field: preventDefault above means
+      // the browser will not blur it for us, and a focused field would keep
+      // swallowing canvas hotkeys (panelHost.owns).
+      if (document.activeElement === this.title) this.title.blur();
       const [sx, sy] = [ev.clientX, ev.clientY];
       const [ox, oy] = [this.el.offsetLeft, this.el.offsetTop];
       try {
@@ -697,6 +736,15 @@ class PanelWindow {
       hd.addEventListener('pointercancel', up);
     });
 
+    // A modified press on the name must not steal focus — mousedown is where
+    // focus is decided, so that is where it has to be refused.
+    this.title.addEventListener('mousedown', (ev) => {
+      if (ev.ctrlKey || ev.metaKey) ev.preventDefault();
+    });
+    // macOS turns ctrl+click into a context menu; the ctrl-drag owns it here.
+    hd.addEventListener('contextmenu', (ev) => {
+      if (ev.ctrlKey || ev.metaKey) ev.preventDefault();
+    });
     this.title.addEventListener('change', () => {
       const v = this.title.value.trim();
       if (v && v !== this.name) deps.op({ t: 'rename', plid, name: v });
@@ -709,15 +757,43 @@ class PanelWindow {
         this.title.blur();
       }
     });
+    // The drag strip has to track the text as it changes.
+    for (const evt of ['input', 'focus', 'blur', 'change'] as const) {
+      this.title.addEventListener(evt, () => this.fitTitle());
+    }
+    this.fitTitle();
   }
 
   destroy() {
     this.el.remove();
   }
 
+  /** Size the name field to its own text (clamped), leaving the rest of the
+   * header as drag surface. Measured with the hidden twin so the CSS font,
+   * letter-spacing and uppercase transform are all accounted for. */
+  private fitTitle() {
+    const focused = document.activeElement === this.title;
+    const key = `${this.title.value} ${focused ? 1 : 0}`;
+    if (key === this.fitKey) return;
+    this.fitKey = key;
+    // A focused field shows the raw text; unfocused it is uppercased by CSS.
+    this.mez.classList.toggle('raw', focused);
+    this.mez.textContent = this.title.value || ' ';
+    // × carries margin-left:auto, so its left edge marks the end of the
+    // usable strip whatever the field's current width is.
+    const laid = this.hd.getBoundingClientRect().width > 0;
+    const room = laid
+      ? this.close.getBoundingClientRect().left - this.grab.getBoundingClientRect().right - DRAG_MIN_W
+      : 140;
+    const want = Math.ceil(this.mez.getBoundingClientRect().width) + 6;
+    const cap = Math.max(TITLE_MIN_W, room);
+    this.title.style.width = `${Math.round(Math.max(TITLE_MIN_W, Math.min(want, cap)))}px`;
+  }
+
   update(panel: Panel, ctx: TickCtx) {
     this.name = panel.name;
     if (document.activeElement !== this.title) this.title.value = panel.name;
+    this.fitTitle();
     const specs = widgetSpecs(this.plid, panelMembers(panel, ctx.elems), ctx.probes, this.deps);
     const sig = specs.map((s) => s.key).join('|');
     if (sig !== this.sig) {

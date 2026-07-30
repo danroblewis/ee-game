@@ -92,19 +92,32 @@
         display: flex; align-items: center; gap: 6px; padding: 5px 6px 5px 8px;
         cursor: move; border-bottom: 1px solid #2c343d;
         background: linear-gradient(#2b323c, #212730);
-        border-radius: 7px 7px 0 0;
+        border-radius: 7px 7px 0 0; position: relative;
       }
       .pwin-grab { color: #5d6b78; cursor: move; }
+      /* The name field is sized to its text by panel.ts (never flex: 1), so
+         the header space to its right is real, grabbable title bar. */
+      .pwin-title, .pwin-mez {
+        font: 600 12px ui-monospace, monospace; letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
       .pwin-title {
-        flex: 1; min-width: 0; background: transparent; border: 1px solid transparent;
-        border-radius: 3px; color: #dff0f8; font: 600 12px ui-monospace, monospace;
-        letter-spacing: 0.08em; text-transform: uppercase; padding: 1px 4px; outline: none;
+        flex: 0 0 auto; width: 96px; min-width: 0; background: transparent;
+        border: 1px solid transparent; border-radius: 3px; color: #dff0f8;
+        padding: 1px 4px; outline: none; cursor: text;
       }
       .pwin-title:hover { border-color: #3c4653; }
       .pwin-title:focus { border-color: #4ad4ff; background: #10151a; text-transform: none; }
+      /* Hidden twin: measuring the name is what keeps the drag strip exactly
+         where the text ends as the panel is renamed. */
+      .pwin-mez {
+        position: absolute; left: 0; top: 0; visibility: hidden; white-space: pre;
+        pointer-events: none; padding: 0; border: 0;
+      }
+      .pwin-mez.raw { text-transform: none; }
       .pwin-x {
         background: none; border: none; color: #6f8290; font: 15px/1 ui-monospace, monospace;
-        cursor: pointer; padding: 0 3px;
+        cursor: pointer; padding: 0 3px; margin-left: auto;
       }
       .pwin-x:hover { color: #ff8f8f; }
       .pwin-body { padding: 4px 0; }
