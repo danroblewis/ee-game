@@ -769,15 +769,34 @@ function scopeBodyPx(s: FloatScope): [number, number, number, number] {
  * frame): while owned, the instrument is drawn in that panel's window. */
 const scopeOwnerOf = (s: FloatScope): Panel | null => scopeOwner(panels, s);
 
+const SCOPE_BADGE_H = 22;
+const SCOPE_BADGE_FONT = '11px ui-monospace, monospace';
+/** ui-monospace advance at 11px — the badge is drawn and hit-tested from this
+ * one width, exactly like the panel name tabs. */
+const SCOPE_BADGE_CHAR_W = 6.7;
+const scopeBadgeLabel = (s: FloatScope, owner: Panel) => `scope ${s.sid} → ${owner.name}`;
+
+/** The placeholder a panel-owned scope leaves on the schematic, anchored at the
+ * scope's top-left corner (screen-space size: it is chrome, not circuitry). */
+function scopeBadgePx(s: FloatScope, owner: Panel): [number, number, number, number] {
+  const [X, Y] = scopeRectPx(s);
+  return [X, Y, 35 + scopeBadgeLabel(s, owner).length * SCOPE_BADGE_CHAR_W, SCOPE_BADGE_H];
+}
+
 function scopeZoneAt(x: number, y: number): ScopeZone | null {
   for (let k = floatScopes.length - 1; k >= 0; k--) {
     const s = floatScopes[k]!;
+    const owner = scopeOwnerOf(s);
+    if (owner) {
+      // Panel-owned: the body (title bar, controls, resize corner) lives in the
+      // panel window, so on canvas the badge is one drag zone and the rest of
+      // the rect is click-through — canvas input never fights the widget.
+      const [bx, by, bw, bh] = scopeBadgePx(s, owner);
+      if (x >= bx && x <= bx + bw && y >= by && y <= by + bh) return { s, zone: 'title' };
+      continue;
+    }
     const [X, Y, W, H] = scopeRectPx(s);
     if (x < X || x > X + W || y < Y || y > Y + H) continue;
-    // Panel-owned: the schematic shows a placeholder only, so every zone
-    // collapses into one drag handle — canvas input must not fight the widget
-    // (its title bar, controls and resize corner live in the panel window).
-    if (scopeOwnerOf(s)) return { s, zone: 'title' };
     if (y <= Y + SCOPE_TITLE_PX) {
       if (x >= X + W - 18) return { s, zone: 'close' };
       const dotStart = X + 64;
@@ -1699,29 +1718,26 @@ function drawScopeGlyph(x: number, y: number, w: number, h: number) {
   ctx.stroke();
 }
 
-/** A panel-owned scope is displayed in that panel's window, so the schematic
- * keeps only a ghost of its rect: it shows where the instrument lives and stays
- * draggable, and dragging it clear of the region hands the body straight back
- * (ownership is pure geometry, re-derived next frame). */
+/** A panel-owned scope is displayed in that panel's window, so all the
+ * schematic keeps is this badge at the scope's top-left: it says where the
+ * instrument went and is its drag handle. Deliberately small — the rest of the
+ * scope's rect stays click-through, unlike the body it replaces. */
 function drawScopePlaceholder(s: FloatScope, owner: Panel) {
-  const [X, Y, W, H] = scopeRectPx(s);
+  const [X, Y, W, H] = scopeBadgePx(s, owner);
   ctx.save();
-  roundRectPath(ctx, X, Y, W, H, Math.min(10, cam.scale * 0.35));
-  // Barely-there fill: the ghost marks the rect that has to leave the region
-  // to detach the scope, and must not hide the parts underneath it.
-  ctx.fillStyle = '#10141a55';
+  roundRectPath(ctx, X, Y, W, H, 6);
+  ctx.fillStyle = '#12171de6';
   ctx.fill();
-  ctx.setLineDash([4, 5]);
+  ctx.setLineDash([4, 4]);
   ctx.lineWidth = 1.2;
   ctx.strokeStyle = '#57808f';
   ctx.stroke();
   ctx.setLineDash([]);
-  const label = `scope ${s.sid} → ${owner.name}`;
-  ctx.font = '11px ui-monospace, monospace';
   ctx.strokeStyle = '#8ee7ff';
   ctx.fillStyle = '#8ee7ff';
-  if (W > 34 && H > 20) drawScopeGlyph(X + 8, Y + 7, 14, 10);
-  if (W > 30 + ctx.measureText(label).width && H > 20) ctx.fillText(label, X + 27, Y + 16);
+  drawScopeGlyph(X + 7, Y + 6, 14, 10);
+  ctx.font = SCOPE_BADGE_FONT;
+  ctx.fillText(scopeBadgeLabel(s, owner), X + 27, Y + 15);
   ctx.restore();
 }
 
