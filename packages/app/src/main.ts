@@ -16,6 +16,7 @@
 //   1 / 2                 voltage probe / current clamp at hover
 //   0                     set selected V-probe's reference (differential)
 //   O                     drop an in-place oscilloscope;  X delete;  / palette
+//   ` (backquote)         collapse/expand the bottom scope dock (starts collapsed)
 //   wheel zoom (over a scope: timebase) · middle/right/space drag pan
 
 import init, { Sim } from './wasm/sim_wasm';
@@ -33,7 +34,8 @@ import {
 import { CATALOG, makePins, searchParts, type PartDef } from './catalog';
 import { connect } from './net';
 import { DotFlow, drawElement, hitTest, type Camera } from './render';
-import { probeColor, renderScope, renderScopeInto, TraceStore, type Probe } from './scope';
+import { probeColor, renderScopeInto, TraceStore, type Probe } from './scope';
+import { createDock } from './dock';
 
 const DT = 10e-6;
 const MAX_STEPS_PER_FRAME = 4000; // local-mode wall budget
@@ -959,6 +961,11 @@ window.addEventListener('keydown', (ev) => {
     }
     return;
   }
+  if (ev.key === '`' || ev.key === '~') {
+    dock.toggle();
+    ev.preventDefault();
+    return;
+  }
   if (ev.key === 'o' && mouse) {
     const [gx, gy] = toGrid(mouse.x, mouse.y);
     floatScopes.push({
@@ -1054,6 +1061,7 @@ scopeCv.addEventListener('wheel', (ev) => {
   ev.stopPropagation();
   scopeTimebase = Math.min(60, Math.max(0.05, scopeTimebase * Math.exp(ev.deltaY * 0.001)));
 }, { passive: false });
+const dock = createDock(scopeDiv, scopeCv);
 
 /** Blue highlight over an element: its pin-chain plus dots on every pin
  * (pins must overlap exactly to connect — make them visible). */
@@ -1332,12 +1340,7 @@ function frame(now: number) {
   drawCursors(now);
   syncPropsPanel();
 
-  if (probes.length > 0) {
-    scopeDiv.style.display = 'block';
-    renderScope(scopeCv, traces, probes, scopeTimebase);
-  } else {
-    scopeDiv.style.display = 'none';
-  }
+  dock.update(now, probes, traces, scopeTimebase);
 
   if (hover && mouse && !placing && !pasting && !wireDrag) {
     const l = live.get(hover.id);
@@ -1367,7 +1370,7 @@ function frame(now: number) {
     `EE Game   sim t = ${simTime.toFixed(2)} s   ` +
     (online ? `● ONLINE — ${population} player${population === 1 ? '' : 's'}` : '○ offline (local sim)') +
     (mode ? `   ${mode}` : '') +
-    `\nparts: R C L W G V D N P M A U S B T Z E F I · Q rotate · drag pin = wire · drag empty = select · ⌘C/⌘V copy/paste · 1/2 probe · 0 ref · O scope · X delete · / search`;
+    `\nparts: R C L W G V D N P M A U S B T Z E F I · Q rotate · drag pin = wire · drag empty = select · ⌘C/⌘V copy/paste · 1/2 probe · 0 ref · O scope · \` scope dock · X delete · / search`;
 
   requestAnimationFrame(frame);
 }
