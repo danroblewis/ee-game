@@ -26,7 +26,12 @@
 //   O                     drop an in-place oscilloscope;  X delete
 //   J                     drag a control-panel region around some parts
 //                         (its floating instrument window follows)
+//   H / shift+H           frame the home district / the whole document
 //   wheel zoom (over a scope: timebase) · pan: middle-drag, ctrl+drag, space+drag
+//
+// The world is large (tens of thousands of parts): the draw loop and the
+// pointer hit-tests go through the grid-space spatial index in spatial.ts,
+// and the zoom band 0.4..200 px/unit drops symbol detail below ~6 px/unit.
 
 import init, { Sim } from './wasm/sim_wasm';
 import {
@@ -54,7 +59,8 @@ import {
   type Panel,
   type PanelOp,
 } from './panel';
-import { DotFlow, drawElement, hitTest, type Camera } from './render';
+import { DotFlow, drawElement, drawElementsLod, drawGrid, hitTest, type Camera } from './render';
+import { SpatialIndex } from './spatial';
 import {
   applyScopeControl,
   defaultScopeSettings,
@@ -100,6 +106,13 @@ await init();
 
 // ---------------------------------------------------------------- state
 let elements: ElementSpec[] = demoCircuit();
+/** Viewport cull + hit-test index over `elements` (grid-space hash grid).
+ * Every geometry change must go through applyDoc or call space.update — the
+ * draw loop and the pointer paths trust its cached bboxes. */
+const space = new SpatialIndex();
+space.rebuild(elements);
+/** O(1) id lookup: `elements.find` is a full scan and the world is big now. */
+const elemById = (id: number): ElementSpec | undefined => space.get(id);
 let live = new Map<number, ElemLive>();
 let simTime = 0;
 let online = false;
@@ -162,16 +175,26 @@ function applyOp(e: ElementSpec, op: InteractOp) {
 
 function applyDoc(op: DocOp) {
   if (op.t === 'Add') {
-    if (!elements.some((e) => e.id === op.spec.id)) elements.push(op.spec);
+    if (!space.get(op.spec.id)) {
+      elements.push(op.spec);
+      space.insert(op.spec);
+    }
   } else if (op.t === 'Remove') {
     elements = elements.filter((e) => e.id !== op.id);
+    space.remove(op.id);
     selectedIds.delete(op.id);
   } else if (op.t === 'Move') {
-    const e = elements.find((x) => x.id === op.id);
-    if (e) e.pins = op.pins;
+    const e = elemById(op.id);
+    if (e) {
+      e.pins = op.pins;
+      space.update(e);
+    }
   } else if (op.t === 'SetKind') {
-    const e = elements.find((x) => x.id === op.id);
-    if (e) e.kind = op.kind;
+    const e = elemById(op.id);
+    if (e) {
+      e.kind = op.kind;
+      space.update(e); // pin count can change with the kind
+    }
   }
 }
 
@@ -184,12 +207,13 @@ const net = connect({
     online = true;
     myId = you;
     elements = serverElements;
+    space.rebuild(elements);
     probes = serverProbes;
     panels = serverPanels;
     live = new Map();
     if (firstHello) {
       firstHello = false;
-      fitCamera();
+      fitHome();
     }
   },
   onFrame(f) {
@@ -207,7 +231,7 @@ const net = connect({
     live = m;
   },
   onOp(id, op) {
-    const e = elements.find((x) => x.id === id);
+    const e = elemById(id);
     if (e) applyOp(e, op);
   },
   onDoc(op) {
@@ -366,9 +390,30 @@ const snap = (x: number, y: number): Point => {
 };
 const toPx = (p: Point): [number, number] => [cam.ox + p[0] * cam.scale, cam.oy + p[1] * cam.scale];
 
-function fitCamera() {
+/** Zoom range, px per grid unit. 0.4 shows ~4800 grid units across a
+ * 1920 px window (the world is big now); 200 is knee-deep in one symbol. */
+const MIN_SCALE = 0.4;
+const MAX_SCALE = 200;
+
+/** The starter district: joining frames THIS, not the whole document, so a
+ * world with a 40k-element city two thousand units east still opens on the
+ * demo bench. 'H' returns here, shift+H frames everything. */
+const HOME_RECT = { x0: -10, y0: -10, x1: 60, y1: 60 };
+
+/** Frame a grid-space rect, with margin, clamped to a usable zoom band. */
+function fitRect(x0: number, y0: number, x1: number, y1: number, loScale = 4, hiScale = 60) {
+  const w = Math.max(1, x1 - x0 + 4);
+  const ht = Math.max(1, y1 - y0 + 4);
+  const fit = Math.min(window.innerWidth / w, window.innerHeight / ht);
+  cam.scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, Math.max(loScale, Math.min(hiScale, fit))));
+  cam.ox = (window.innerWidth - (x0 + x1) * cam.scale) / 2;
+  cam.oy = (window.innerHeight - (y0 + y1) * cam.scale) / 2;
+}
+
+/** Pin bbox of a list of elements; null when the list is empty. */
+function pinBounds(list: ElementSpec[]): [number, number, number, number] | null {
   let [x0, y0, x1, y1] = [Infinity, Infinity, -Infinity, -Infinity];
-  for (const e of elements) {
+  for (const e of list) {
     for (const p of e.pins) {
       x0 = Math.min(x0, p[0]);
       y0 = Math.min(y0, p[1]);
@@ -376,17 +421,30 @@ function fitCamera() {
       y1 = Math.max(y1, p[1]);
     }
   }
-  if (!isFinite(x0)) {
-    cam.scale = 48;
-    cam.ox = window.innerWidth / 2;
-    cam.oy = window.innerHeight / 2;
-    return;
-  }
-  const w = x1 - x0 + 4;
-  const ht = y1 - y0 + 4;
-  cam.scale = Math.max(18, Math.min(window.innerWidth / w, window.innerHeight / ht));
-  cam.ox = (window.innerWidth - (x0 + x1) * cam.scale) / 2;
-  cam.oy = (window.innerHeight - (y0 + y1) * cam.scale) / 2;
+  return isFinite(x0) ? [x0, y0, x1, y1] : null;
+}
+
+/** 'H' / join / reset: frame what is in the home district (or the district
+ * itself when it is still empty). */
+function fitHome() {
+  const inHome = space
+    .query(HOME_RECT.x0, HOME_RECT.y0, HOME_RECT.x1, HOME_RECT.y1)
+    .filter((e) =>
+      e.pins.every(
+        ([x, y]) =>
+          x >= HOME_RECT.x0 && x <= HOME_RECT.x1 && y >= HOME_RECT.y0 && y <= HOME_RECT.y1,
+      ),
+    );
+  const b = pinBounds(inHome);
+  if (b) fitRect(...b, 8, 60);
+  else fitRect(HOME_RECT.x0, HOME_RECT.y0, HOME_RECT.x1, HOME_RECT.y1, MIN_SCALE, 60);
+}
+
+/** shift+H: frame the whole document, however far it sprawls. */
+function fitAll() {
+  const b = pinBounds(elements);
+  if (b) fitRect(...b, MIN_SCALE, 60);
+  else fitHome();
 }
 
 function resize() {
@@ -397,7 +455,7 @@ function resize() {
 }
 window.addEventListener('resize', resize);
 resize();
-fitCamera();
+fitHome();
 
 // ------------------------------------------------------------- part arming
 let placing: PartDef | null = null;
@@ -520,9 +578,7 @@ function buildProps(host: HTMLElement, target: ElementSpec, onClose?: () => void
 /** Docked panel: mirrors a single-part selection. */
 function syncPropsPanel() {
   const target =
-    selectedIds.size === 1
-      ? elements.find((e) => e.id === [...selectedIds][0])
-      : undefined;
+    selectedIds.size === 1 ? elemById([...selectedIds][0]!) : undefined;
   if (!target) {
     propsDiv.style.display = 'none';
     propsDiv.dataset.key = '';
@@ -588,7 +644,7 @@ function closePropsDialog() {
  *  part is gone. Never rebuilds while the player is typing in it. */
 function syncPropsDialog() {
   if (dlgFor === null) return;
-  const target = elements.find((e) => e.id === dlgFor);
+  const target = elemById(dlgFor);
   if (!target) {
     closePropsDialog();
     return;
@@ -635,9 +691,27 @@ function rotateElements(sel: ElementSpec[]) {
 
 const rotateSelection = () => rotateElements(elements.filter((e) => selectedIds.has(e.id)));
 
-function deleteElements(sel: ElementSpec[]) {
-  for (const e of sel) editDoc({ t: 'Remove', id: e.id });
+/** Bulk-delete threshold: above this, rebuild the array (and the local
+ * netlist) once instead of once per element — a marquee over a district can
+ * hold thousands of parts and per-op work is quadratic. */
+const BULK_DELETE = 32;
+
+function deleteIds(ids: number[]) {
+  if (ids.length <= BULK_DELETE) {
+    for (const id of ids) editDoc({ t: 'Remove', id });
+    return;
+  }
+  const gone = new Set(ids);
+  for (const id of gone) {
+    space.remove(id);
+    selectedIds.delete(id);
+    if (online) net.sendEdit({ t: 'Remove', id }); // the server still sees every op
+  }
+  elements = elements.filter((e) => !gone.has(e.id));
+  if (!online) localSim.setElements(elements);
 }
+
+const deleteElements = (sel: ElementSpec[]) => deleteIds(sel.map((e) => e.id));
 
 function copyElements(sel: ElementSpec[]) {
   if (sel.length === 0) return;
@@ -692,13 +766,31 @@ function armPaste() {
 }
 
 // ---------------------------------------------------------------- input
+/** Pointer hit-test slack in px (matches elementAt's threshold). */
+const HIT_PX = 14;
+
+/** Elements whose bbox could reach a cursor point: one bucket query, never
+ * a document scan. `padPx` is the hit slack, `padGrid` covers the body
+ * distance hitTest allows past the pins. */
+const hitScratch: ElementSpec[] = [];
+function nearCursor(x: number, y: number, padPx: number, padGrid = 1): ElementSpec[] {
+  const [gx, gy] = toGrid(x, y);
+  const pad = padPx / cam.scale + padGrid;
+  return space.query(gx - pad, gy - pad, gx + pad, gy + pad, hitScratch);
+}
+
 function elementAt(x: number, y: number): ElementSpec | undefined {
   let best: ElementSpec | undefined;
-  let bestD = 14;
-  for (const e of elements) {
+  let bestD = HIT_PX;
+  let bestSeq = Infinity;
+  for (const e of nearCursor(x, y, HIT_PX)) {
     const d = hitTest(cam, e, x, y);
-    if (d < bestD) {
+    const seq = space.seqOf(e.id);
+    // Bucket order is not document order: break exact ties the way the old
+    // document-order scan did (first spec wins) so picking stays stable.
+    if (d < bestD || (d === bestD && seq < bestSeq)) {
       bestD = d;
+      bestSeq = seq;
       best = e;
     }
   }
@@ -707,10 +799,10 @@ function elementAt(x: number, y: number): ElementSpec | undefined {
 
 /** Grid point of the nearest element pin, if the cursor is on one. */
 function pinAt(x: number, y: number): Point | null {
-  const r = Math.min(14, cam.scale * 0.4);
+  const r = Math.min(HIT_PX, cam.scale * 0.4);
   let best: Point | null = null;
   let bestD = r;
-  for (const e of elements) {
+  for (const e of nearCursor(x, y, r, 0)) {
     for (const p of e.pins) {
       const [px, py] = toPx(p);
       const d = Math.hypot(px - x, py - y);
@@ -725,13 +817,15 @@ function pinAt(x: number, y: number): Point | null {
 
 /** Does any element have a pin exactly at grid point `p`? */
 function pinExistsAt(p: Point, excludeId = -1): boolean {
-  return elements.some(
-    (e) => e.id !== excludeId && e.pins.some((q) => q[0] === p[0] && q[1] === p[1]),
-  );
+  for (const e of space.query(p[0] - 1, p[1] - 1, p[0] + 1, p[1] + 1)) {
+    if (e.id === excludeId) continue;
+    if (e.pins.some((q) => q[0] === p[0] && q[1] === p[1])) return true;
+  }
+  return false;
 }
 
 function probeFlagPx(p: Probe): [number, number] | null {
-  const e = elements.find((x) => x.id === p.elem);
+  const e = elemById(p.elem);
   if (!e) return null;
   const pin = e.pins[Math.min(p.pin, e.pins.length - 1)]!;
   const [x, y] = toPx(pin);
@@ -989,7 +1083,7 @@ canvas.addEventListener('wheel', (ev) => {
     return;
   }
   const k = Math.exp(-ev.deltaY * 0.0015);
-  const s2 = Math.min(160, Math.max(8, cam.scale * k));
+  const s2 = Math.min(MAX_SCALE, Math.max(MIN_SCALE, cam.scale * k));
   cam.ox = ev.clientX - (ev.clientX - cam.ox) * (s2 / cam.scale);
   cam.oy = ev.clientY - (ev.clientY - cam.oy) * (s2 / cam.scale);
   cam.scale = s2;
@@ -1116,7 +1210,7 @@ canvas.addEventListener('pointerdown', (ev) => {
   const startMove = (ids: number[]) => {
     moveDrag = {
       items: ids
-        .map((id) => elements.find((x) => x.id === id))
+        .map((id) => elemById(id))
         .filter((x): x is ElementSpec => !!x)
         .map((x) => ({ id: x.id, startPins: x.pins.map((p) => [...p] as Point) })),
       start: snap(ev.clientX, ev.clientY),
@@ -1210,13 +1304,16 @@ canvas.addEventListener('pointermove', (ev) => {
     if (dx !== 0 || dy !== 0) moveDrag.moved = true;
     if (!moveDrag.moved) return;
     for (const item of moveDrag.items) {
-      const e = elements.find((x) => x.id === item.id);
-      if (e) e.pins = item.startPins.map(([x, y]) => [x + dx, y + dy] as Point);
+      const e = elemById(item.id);
+      if (e) {
+        e.pins = item.startPins.map(([x, y]) => [x + dx, y + dy] as Point);
+        space.update(e); // the drag edits pins in place: re-bucket as it goes
+      }
     }
     if (now - moveDrag.lastSent > 60) {
       moveDrag.lastSent = now;
       for (const item of moveDrag.items) {
-        const e = elements.find((x) => x.id === item.id);
+        const e = elemById(item.id);
         if (e && online) net.sendEdit({ t: 'Move', id: e.id, pins: e.pins });
       }
       if (!online) localSim.setElements(elements);
@@ -1289,7 +1386,7 @@ canvas.addEventListener('pointerup', (ev) => {
       selectedProbe = null;
     }
     if (dragged) {
-      for (const e of elements) {
+      for (const e of space.query(gx0, gy0, gx1, gy1)) {
         if (e.pins.some(([x, y]) => x >= gx0 && x <= gx1 && y >= gy0 && y <= gy1)) {
           selectedIds.add(e.id);
         }
@@ -1320,13 +1417,13 @@ canvas.addEventListener('pointerup', (ev) => {
   if (moveDrag) {
     if (moveDrag.moved) {
       for (const item of moveDrag.items) {
-        const e = elements.find((x) => x.id === item.id);
+        const e = elemById(item.id);
         if (e && online) net.sendEdit({ t: 'Move', id: e.id, pins: e.pins });
       }
       if (!online) localSim.setElements(elements);
     } else {
       // A click that never moved: select, and flip a switch if that is what it is.
-      const t = elements.find((x) => x.id === moveDrag!.clickTarget);
+      const t = elemById(moveDrag.clickTarget);
       if (t && t.kind.t === 'Switch') interact(t, { t: 'SetSwitch', closed: !t.kind.closed });
       selectedIds = new Set([moveDrag.clickTarget]);
       selectedProbe = null;
@@ -1397,6 +1494,13 @@ window.addEventListener('keydown', (ev) => {
     canvas.style.cursor = 'default';
     return;
   }
+  if (ev.key === 'h' || ev.key === 'H') {
+    // The world is far bigger than one screen: 'H' comes home to the
+    // starter district, shift+H frames everything that exists.
+    if (ev.shiftKey) fitAll();
+    else fitHome();
+    return;
+  }
   if (ev.key === 'j' || ev.key === 'J') {
     // Arm the panel tool: drag a region around the parts you want on a
     // control panel. Its window appears as soon as the region exists.
@@ -1408,11 +1512,8 @@ window.addEventListener('keydown', (ev) => {
   }
   if (ev.key === 'Delete' || ev.key === 'Backspace' || ev.key === 'x') {
     const e = mouse ? elementAt(mouse.x, mouse.y) : undefined;
-    if (selectedIds.size > 0) {
-      for (const id of [...selectedIds]) editDoc({ t: 'Remove', id });
-    } else if (e) {
-      editDoc({ t: 'Remove', id: e.id });
-    }
+    if (selectedIds.size > 0) deleteIds([...selectedIds]);
+    else if (e) deleteIds([e.id]);
     return;
   }
   if (ev.key === 'q' || ev.key === 'Q') {
@@ -1607,7 +1708,7 @@ function drawProbeMarkers() {
   for (const p of probes) {
     const c = probeFlagPx(p);
     if (!c) continue;
-    const e = elements.find((x) => x.id === p.elem)!;
+    const e = elemById(p.elem)!;
     const pin = e.pins[Math.min(p.pin, e.pins.length - 1)]!;
     const [x, y] = toPx(pin);
     const color = probeColor(p.pid);
@@ -1632,7 +1733,7 @@ function drawProbeMarkers() {
     if (audio.pid === p.pid) drawListenGlyph(c[0] + 9, c[1], color);
 
     if (p.r) {
-      const re = elements.find((x) => x.id === p.r![0]);
+      const re = elemById(p.r[0]);
       if (re) {
         const rp = re.pins[Math.min(p.r[1], re.pins.length - 1)]!;
         const [rx, ry] = toPx(rp);
@@ -1651,13 +1752,16 @@ function drawProbeMarkers() {
   }
 }
 
-function drawSelectionBoxes() {
+function drawSelectionBoxes(view: ViewRect) {
   if (selectedIds.size === 0) return;
   ctx.strokeStyle = '#5a8cff';
   ctx.lineWidth = 1.5;
   ctx.setLineDash([5, 4]);
   for (const id of selectedIds) {
-    const e = elements.find((x) => x.id === id);
+    // Select-all on a big world can hold tens of thousands of ids: only the
+    // ones on screen cost anything.
+    if (!inView(view, id)) continue;
+    const e = elemById(id);
     if (!e) continue;
     let [x0, y0, x1, y1] = [Infinity, Infinity, -Infinity, -Infinity];
     for (const p of e.pins) {
@@ -1741,6 +1845,38 @@ function drawCursors(now: number) {
   }
 }
 
+// ------------------------------------------------------------ viewport cull
+/** Padded viewport in grid units: [x0, y0, x1, y1]. */
+type ViewRect = [number, number, number, number];
+
+/** The cull window. Padding covers highlight strokes and glow halos that
+ * spill past an element's own bbox. */
+function viewRect(pad = 2): ViewRect {
+  const [x0, y0] = toGrid(0, 0);
+  const [x1, y1] = toGrid(window.innerWidth, window.innerHeight);
+  return [x0 - pad, y0 - pad, x1 + pad, y1 + pad];
+}
+
+function inView(v: ViewRect, id: number): boolean {
+  const b = space.bboxOf(id);
+  return !!b && b.x1 >= v[0] && b.x0 <= v[2] && b.y1 >= v[1] && b.y0 <= v[3];
+}
+
+/** Level of detail, px per grid unit:
+ *   >= 6  full symbols (dots, glow, text)
+ *   2..6  conductor chains only, still solver-colored
+ *   < 2   one segment per element */
+const LOD_FULL = 6;
+const LOD_CHAIN = 2;
+
+/** Reused draw list so a steady frame allocates nothing. */
+const visible: ElementSpec[] = [];
+/** Above this many on-screen elements, skip the document-order sort: at that
+ * density the z-order of overlapping symbols is not visible anyway. */
+const SORT_LIMIT = 3000;
+/** Last frame's cull cost + counts, for the perf line in the HUD. */
+const perf = { cull: 0, drawn: 0, total: 0 };
+
 let simDebt = 0;
 let lastT = performance.now();
 
@@ -1769,37 +1905,44 @@ function frame(now: number) {
   }
 
   ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
-  if (cam.scale >= 14) {
-    ctx.fillStyle = '#1c1c22';
-    const gx0 = Math.ceil(-cam.ox / cam.scale);
-    const gy0 = Math.ceil(-cam.oy / cam.scale);
-    for (let gx = gx0; gx * cam.scale + cam.ox < window.innerWidth; gx++) {
-      for (let gy = gy0; gy * cam.scale + cam.oy < window.innerHeight; gy++) {
-        ctx.fillRect(cam.ox + gx * cam.scale - 1, cam.oy + gy * cam.scale - 1, 2, 2);
-      }
-    }
-  }
+  drawGrid(ctx, cam, window.innerWidth, window.innerHeight);
 
   // Panel regions sit under the schematic: they frame parts, never hide them.
   const pzHover = mouse ? panelZoneAt(cam, panels, mouse.x, mouse.y) : null;
   drawPanelRegions(ctx, cam, panels, pzHover?.panel.plid ?? panelMove?.plid ?? null);
   if (panelDrag) drawPanelGhost(ctx, cam, panelDrag.a, panelDrag.b);
 
-  for (const e of elements) {
-    drawElement({ ctx, cam, live: live.get(e.id), dots, dtSec: wallDt }, e);
+  // Cull to the viewport through the spatial index: a 20k-element world
+  // costs what is on screen, not what exists.
+  const view = viewRect();
+  const cull0 = performance.now();
+  space.query(view[0], view[1], view[2], view[3], visible);
+  if (visible.length <= SORT_LIMIT) space.sortByDoc(visible);
+  perf.cull = performance.now() - cull0;
+  perf.drawn = visible.length;
+  perf.total = space.count;
+
+  if (cam.scale >= LOD_FULL) {
+    for (const e of visible) {
+      drawElement({ ctx, cam, live: live.get(e.id), dots, dtSec: wallDt }, e);
+    }
+  } else {
+    // Too small for symbols: conductors only, colored by the solver frame.
+    drawElementsLod(ctx, cam, visible, live, cam.scale < LOD_CHAIN);
   }
 
   // Hover highlight (blue element + pin dots), Falstad-style.
   const zHover = mouse ? scopeZoneAt(mouse.x, mouse.y) : null;
   const md = moveDrag;
   const hover = md
-    ? elements.find((e) => e.id === md.clickTarget)
+    ? elemById(md.clickTarget)
     : mouse && !placing && !pasting && !panelTool && !zHover
       ? elementAt(mouse.x, mouse.y)
       : undefined;
   if (hover) drawHighlight(hover, true);
   for (const id of selectedIds) {
-    const e = elements.find((x) => x.id === id);
+    if (!inView(view, id)) continue;
+    const e = elemById(id);
     if (e && e !== hover) drawHighlight(e, false);
   }
 
@@ -1853,7 +1996,7 @@ function frame(now: number) {
     ctx.strokeRect(x, y, w, h);
   }
 
-  drawSelectionBoxes();
+  drawSelectionBoxes(view);
   drawProbeMarkers();
   drawFloatScopes();
   drawCursors(now);
@@ -1899,9 +2042,11 @@ function frame(now: number) {
   hud.textContent =
     `EE Game   sim t = ${simTime.toFixed(2)} s   ` +
     (online ? `● ONLINE — ${population} player${population === 1 ? '' : 's'}` : '○ offline (local sim)') +
+    `   ${perf.drawn}/${perf.total} parts drawn @ ${cam.scale.toFixed(1)} px/unit (cull ${perf.cull.toFixed(2)} ms)` +
     (mode ? `   ${mode}` : '') +
     `\nparts: R C L W G V D N P M A U 5 S B T Z E F I · drag part = move · dbl-click = edit values · right-click = menu` +
-    `\ndrag pin = wire · drag empty = select · Q rotate · ⌘C/⌘V copy/paste · 1/2 probe · 3 listen · 0 ref · O scope · J panel · X delete · / parts menu · pan: middle / ctrl+drag / space+drag`;
+    `\ndrag pin = wire · drag empty = select · Q rotate · ⌘C/⌘V copy/paste · 1/2 probe · 3 listen · 0 ref · O scope · J panel · X delete · / parts menu` +
+    `\nH home district · shift+H fit everything · wheel = zoom (0.4–200 px/unit) · pan: middle / ctrl+drag / space+drag`;
 
   requestAnimationFrame(frame);
 }
