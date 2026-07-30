@@ -96,6 +96,19 @@ pub enum ElementKind {
         ohms: f64,
         wiper: f64,
     },
+    /// DC motor armature. Pins: [+, -]; the branch current is an unknown
+    /// and is defined as the current INTO pin 0.
+    /// Law: v(pin0) - v(pin1) = ohms·i + henries·di/dt + bemf.
+    ///
+    /// `bemf` is an INPUT to the electrical model: the mechanical side
+    /// (rotor speed) lives outside sim-core and writes K·ω back through
+    /// `Engine::write_param` every machine tick. sim-core owns no
+    /// mechanical state — it only ever sees a voltage.
+    Motor {
+        ohms: f64,
+        henries: f64,
+        bemf: f64,
+    },
 }
 
 impl ElementKind {
@@ -121,6 +134,7 @@ impl ElementKind {
             ElementKind::VoltageSource { .. }
                 | ElementKind::Switch { closed: true }
                 | ElementKind::OpAmp { .. }
+                | ElementKind::Motor { .. }
         )
     }
 
@@ -213,4 +227,24 @@ pub enum InteractOp {
     SetValue {
         value: f64,
     },
+}
+
+/// Machine-side parameter writes: how a co-simulated mechanism (a hoist's
+/// rotor, a limit switch, a position sensor) pushes its state back into the
+/// live circuit between substeps. These run at kHz rates, so each variant
+/// declares the cheapest correct invalidation — see `Engine::write_param`.
+///
+/// Unlike `InteractOp` these are NOT player edits: they never clear the
+/// quarantine flag and never re-arm the post-event backward-Euler steps.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ParamWrite {
+    /// Motor back-EMF (volts). RHS-only: the b vector is rebuilt every
+    /// step, so this costs nothing and never refactors.
+    Bemf { volts: f64 },
+    /// Potentiometer wiper (0..1). Changes conductances but not the
+    /// topology: invalidates the factorization only.
+    Wiper { frac: f64 },
+    /// Switch position. Changes the branch-unknown count, so it needs the
+    /// full compile path — but only when the position actually differs.
+    Switch { closed: bool },
 }

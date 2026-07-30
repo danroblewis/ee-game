@@ -329,6 +329,98 @@ fn led_drops_about_two_volts() {
     assert!((0.018..0.023).contains(&i), "LED current {i}");
 }
 
+// ------------------------------------------------------------------ motor
+
+#[test]
+fn motor_armature_is_an_rl_branch_with_back_emf() {
+    let mut eng = engine_with(motor_step());
+    // i(t) = (V - bemf)/R_loop · (1 - e^(-t/τ)); R_loop = 1 + 2 Ω,
+    // τ = L/R_loop = 0.5 ms, i_ss = 10/3 A.
+    let (i_ss, tau) = (10.0 / 3.0, 1.5e-3 / 3.0);
+    let mut t = 0.0;
+    for target in [0.25e-3, 0.5e-3, 1e-3] {
+        let steps = ((target - t) / DT).round() as u32;
+        eng.advance(steps);
+        t = target;
+        let i = elem_current(&eng, 3, 0);
+        let expect = i_ss * (1.0 - libm::exp(-t / tau));
+        assert!(
+            (i - expect).abs() < 3e-3,
+            "t={t}: i={i} expected={expect} (backward Euler at h/τ = {})",
+            DT / tau
+        );
+    }
+    // Steady state: 60 τ of settling leaves the exponential tail below
+    // 1e-26, so this is Ohm's law around the loop against the 2 V back-EMF
+    // to the last bit the GMIN leak allows.
+    eng.advance(30_000);
+    let i = elem_current(&eng, 3, 0);
+    assert!((i - i_ss).abs() < 1e-9, "steady armature current {i}");
+    // The armature drop: 12 - 1·i - 2·i - 2 V(bemf) = 0.
+    let v_arm = eng.voltage_at((4, 0)).unwrap();
+    assert!(
+        (v_arm - (2.0 * i + 2.0)).abs() < 1e-9,
+        "armature terminal {v_arm} V vs R·i + bemf = {}",
+        2.0 * i + 2.0
+    );
+    assert!(!eng.is_quarantined());
+}
+
+#[test]
+fn motor_back_emf_write_retargets_the_current_without_a_recompile() {
+    use sim_core::ParamWrite;
+    let mut eng = engine_with(motor_step());
+    eng.advance(30_000); // 60 τ: the L/R tail is gone
+    assert!((elem_current(&eng, 3, 0) - 10.0 / 3.0).abs() < 1e-9);
+
+    // The machine-side write path: back-EMF is RHS-only.
+    assert!(eng.write_param(3, ParamWrite::Bemf { volts: 6.0 }));
+    eng.advance(30_000);
+    let i = elem_current(&eng, 3, 0);
+    assert!(
+        (i - 2.0).abs() < 1e-9,
+        "bemf 6 V -> (12-6)/3 = 2 A, got {i}"
+    );
+
+    // Regenerating: back-EMF above the supply reverses the current.
+    assert!(eng.write_param(3, ParamWrite::Bemf { volts: 15.0 }));
+    eng.advance(30_000);
+    let i = elem_current(&eng, 3, 0);
+    assert!(
+        (i + 1.0).abs() < 1e-9,
+        "bemf 15 V -> (12-15)/3 = -1 A, got {i}"
+    );
+
+    // Wrong parameter for the device, and unknown ids, are refused.
+    assert!(!eng.write_param(2, ParamWrite::Bemf { volts: 1.0 }));
+    assert!(!eng.write_param(3, ParamWrite::Wiper { frac: 0.5 }));
+    assert!(!eng.write_param(999, ParamWrite::Bemf { volts: 1.0 }));
+}
+
+#[test]
+fn param_writes_move_wipers_and_switches() {
+    use sim_core::ParamWrite;
+    let mut eng = settled(pot_divider());
+    assert!(eng.write_param(2, ParamWrite::Wiper { frac: 0.8 }));
+    eng.advance(50);
+    let v = eng.voltage_at((4, 4)).unwrap();
+    assert!((v - 1.8).abs() < 0.01, "wiper written to 0.8: {v}");
+
+    // A switch write is a topology change (the branch count moves).
+    let mut eng = engine_with(demo_lamp(false));
+    eng.advance(100);
+    assert!(elem_current(&eng, 4, 0).abs() < 1e-9, "open switch: dark");
+    assert!(eng.write_param(3, ParamWrite::Switch { closed: true }));
+    eng.advance(100);
+    let i = elem_current(&eng, 4, 0);
+    assert!((i - 0.1).abs() < 1e-6, "closed switch: 0.1 A, got {i}");
+    // Writing the same position again is a no-op, not a recompile.
+    assert!(eng.write_param(3, ParamWrite::Switch { closed: true }));
+    eng.advance(100);
+    assert!((elem_current(&eng, 4, 0) - 0.1).abs() < 1e-6);
+    assert!(!eng.is_quarantined());
+}
+
 #[test]
 fn all_golden_circuits_run_clean() {
     for (name, elems) in all_golden() {
