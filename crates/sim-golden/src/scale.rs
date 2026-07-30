@@ -684,5 +684,9 @@ pub fn kind_name(k: &ElementKind) -> &'static str {
         OpAmp { .. } => "opamp",
         Ota => "ota",
         Potentiometer { .. } => "pot",
+        Speaker { .. } => "speaker",
+        Button { .. } => "button",
+        Timer555 => "555",
+        Motor { .. } => "motor",
     }
 }
