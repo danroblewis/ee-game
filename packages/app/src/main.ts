@@ -54,6 +54,7 @@ import {
 import { AudioPlayer } from './audio';
 import { CATALOG, CATEGORIES, makePins, partsInCategory, type PartDef } from './catalog';
 import { History, isTypingTarget } from './history';
+import { createHoist } from './hoist';
 import { connect } from './net';
 import {
   applyPanelOp,
@@ -209,6 +210,16 @@ function applyDoc(op: DocOp) {
 let idCounter = 1;
 const newId = () => (myId > 0 ? myId : 999) * 1_000_000 + idCounter++;
 
+/** THE HOIST: machine chrome on the canvas plus the goal card. hoist.ts owns
+ * every pixel and every DOM node of it; the four fixture parts it stands on
+ * (ids 900..903) are ordinary elements the normal renderer draws on top. */
+const hoist = createHoist(document.body, { reset: () => net.sendMachineReset() });
+
+/** Ids 900..999 are the server's machine fixtures: players wire to them but
+ * cannot move, rotate, retype or delete them. The server rejects those ops, so
+ * applying one locally would only desync this client. */
+const isFixtureId = (id: number) => id >= 900 && id <= 999;
+
 let firstHello = true;
 const net = connect({
   onHello(you, serverElements, serverProbes, serverPanels) {
@@ -261,6 +272,9 @@ const net = connect({
   onPanels(list) {
     panels = list;
   },
+  onMachine(m) {
+    hoist.onMachine(m);
+  },
   onSamples(t0, dts, s) {
     for (const [pid, samples] of Object.entries(s)) {
       traces.appendChunk(Number(pid), t0, dts, samples);
@@ -291,6 +305,7 @@ function interact(e: ElementSpec, op: InteractOp) {
 const history = new History(editDoc);
 
 function editDoc(op: DocOp) {
+  if (isFixtureId(op.t === 'Add' ? op.spec.id : op.id)) return; // locked fixture
   history.record(op, elements); // before applyDoc: captures the prior state
   applyDoc(op); // optimistic
   if (online) net.sendEdit(op);
@@ -732,7 +747,11 @@ const rotateSelection = () => rotateElements(elements.filter((e) => selectedIds.
  * hold thousands of parts and per-op work is quadratic. */
 const BULK_DELETE = 32;
 
-function deleteIds(ids: number[]) {
+function deleteIds(all: number[]) {
+  // Server-owned machine fixtures survive every delete path (the bulk branch
+  // below bypasses editDoc, so filtering has to happen here).
+  const ids = all.filter((id) => !isFixtureId(id));
+  if (ids.length === 0) return;
   // One undo entry per deletion, wherever it was triggered from (key, menu,
   // properties dialog), however many parts it removes.
   history.begin(
@@ -1333,7 +1352,10 @@ canvas.addEventListener('pointerdown', (ev) => {
     else selectedIds.add(e.id);
     return;
   }
-  const startMove = (ids: number[]) => {
+  const startMove = (all: number[]) => {
+    // Machine fixtures are selectable and probe-able but bolted down: leaving
+    // them out of the drag keeps a mixed selection dragging everything else.
+    const ids = all.filter((id) => !isFixtureId(id));
     // Seed the pre-drag specs: pins are mutated in place during the drag, so
     // by the time the final Move reaches editDoc the live "before" is stale.
     history.begin(ids.map((id) => elements.find((x) => x.id === id)));
@@ -2118,6 +2140,11 @@ function frame(now: number) {
 
   ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
   drawGrid(ctx, cam, window.innerWidth, window.innerHeight);
+
+  // Machine chrome (the hoist) is scenery: it goes down before the panel
+  // regions and the schematic so its fixture parts stay visible and wire-able.
+  // The same call refreshes the goal card overlay.
+  hoist.draw(ctx, cam, now, wallDt);
 
   // Panel regions sit under the schematic: they frame parts, never hide them.
   // The one under the pointer (or being dragged) shows its resize grips.
