@@ -526,7 +526,12 @@ export function createHoist(root: HTMLElement, opts: { reset: () => void }): Hoi
     }
 
     // ---- crate + platform (with motion blur and the landing shake)
-    const shake = landK * Math.min(sw * 0.05, 4) * Math.sin(landAge * 90);
+    // Guard the phase, not the amplitude: landAge is Infinity until the first
+    // landing, and Math.sin(Infinity) is NaN — which `* landK` does NOT clear,
+    // because 0 * NaN is NaN. An NaN here reached the crate's x and threw out
+    // of createLinearGradient, killing the whole frame.
+    const shake =
+      landK > 0 ? landK * Math.min(sw * 0.05, 4) * Math.sin(landAge * 90) : 0;
     const cw = sw * 0.72;
     const ch = CRATE_H * H;
     const slabH = Math.max(2, SLAB_H * H);
