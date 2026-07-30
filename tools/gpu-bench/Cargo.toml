@@ -1,0 +1,20 @@
+# Its own workspace root: wgpu must never enter the shipping workspace's
+# lockfile or dependency graph. Nothing in crates/ depends on this.
+[workspace]
+
+[package]
+name = "gpu-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Minimal wgpu compute benchmark: dispatch latency, host<->device transfer, and batched small-matrix LU, for docs/scale-parallelism.md."
+
+[dependencies]
+wgpu = "30"
+pollster = "1"
+bytemuck = { version = "1", features = ["derive"] }
+rayon = "1"
+sim-math = { path = "../../crates/sim-math" }
+
+[profile.release]
+opt-level = 3
