@@ -12,6 +12,7 @@
 //   click                 select part / probe flag;  drag on empty = marquee
 //   drag from a pin       draw wire (pins must overlap to connect)
 //   ⌘/Ctrl+C, ⌘/Ctrl+V    copy selection / paste bound to cursor
+//   ⌘/Ctrl+Z, +Shift, ^Y  undo / redo — this player's own edits only
 //   Q                     rotate placement ghost, paste ghost, or selection
 //   1 / 2                 voltage probe / current clamp at hover
 //   0                     set selected V-probe's reference (differential)
@@ -31,6 +32,7 @@ import {
   type Point,
 } from './circuit';
 import { CATALOG, makePins, searchParts, type PartDef } from './catalog';
+import { History, isTypingTarget } from './history';
 import { connect } from './net';
 import { DotFlow, drawElement, hitTest, type Camera } from './render';
 import { probeColor, renderScope, renderScopeInto, TraceStore, type Probe } from './scope';
@@ -197,7 +199,11 @@ function interact(e: ElementSpec, op: InteractOp) {
   else localSim.interact(e.id, op);
 }
 
+/** Local undo/redo: every edit this player makes funnels through editDoc. */
+const history = new History(editDoc);
+
 function editDoc(op: DocOp) {
+  history.record(op, elements); // before applyDoc: captures the prior state
   applyDoc(op); // optimistic
   if (online) net.sendEdit(op);
   else localSim.setElements(elements);
@@ -459,10 +465,12 @@ function rotateSelection() {
   }
   const cx = Math.round(sx / n);
   const cy = Math.round(sy / n);
+  history.begin(sel, sel.length > 1 ? `rotate ${sel.length} parts` : 'rotate part');
   for (const e of sel) {
     const pins = e.pins.map(([x, y]) => [cx - (y - cy), cy + (x - cx)] as Point);
     editDoc({ t: 'Move', id: e.id, pins });
   }
+  history.end();
 }
 
 function copySelection() {
@@ -489,6 +497,7 @@ function copySelection() {
 function commitPaste(at: Point) {
   if (!pasting) return;
   const ids: number[] = [];
+  history.begin(); // the whole paste undoes as one step
   for (const item of pasting) {
     const id = newId();
     ids.push(id);
@@ -501,6 +510,7 @@ function commitPaste(at: Point) {
       },
     });
   }
+  history.end();
   selectedIds = new Set(ids);
   selectedProbe = null;
   pasting = null;
@@ -702,6 +712,9 @@ canvas.addEventListener('pointerdown', (ev) => {
     return;
   }
   const startMove = (ids: number[]) => {
+    // Seed the pre-drag specs: pins are mutated in place during the drag, so
+    // by the time the final Move reaches editDoc the live "before" is stale.
+    history.begin(ids.map((id) => elements.find((x) => x.id === id)));
     moveDrag = {
       items: ids
         .map((id) => elements.find((x) => x.id === id))
@@ -877,13 +890,13 @@ canvas.addEventListener('pointerup', (ev) => {
     if (moveDrag.moved) {
       for (const item of moveDrag.items) {
         const e = elements.find((x) => x.id === item.id);
-        if (e && online) net.sendEdit({ t: 'Move', id: e.id, pins: e.pins });
+        if (e) editDoc({ t: 'Move', id: e.id, pins: e.pins });
       }
-      if (!online) localSim.setElements(elements);
     } else {
       selectedIds = new Set([moveDrag.clickTarget]);
       selectedProbe = null;
     }
+    history.end(); // one undo entry per drag gesture
     moveDrag = null;
     return;
   }
@@ -912,6 +925,11 @@ window.addEventListener('keydown', (ev) => {
         canvas.style.cursor = 'crosshair';
       }
       ev.preventDefault();
+    } else if (!isTypingTarget(ev) && (ev.key === 'z' || ev.key === 'Z' || ev.key === 'y')) {
+      // ⌘/Ctrl+Z undo, ⌘/Ctrl+Shift+Z or Ctrl+Y redo — MY edits only.
+      if (ev.key === 'y' || ev.shiftKey) history.redo(elements);
+      else history.undo(elements);
+      ev.preventDefault();
     }
     return;
   }
@@ -939,7 +957,9 @@ window.addEventListener('keydown', (ev) => {
   if (ev.key === 'Delete' || ev.key === 'Backspace' || ev.key === 'x') {
     const e = mouse ? elementAt(mouse.x, mouse.y) : undefined;
     if (selectedIds.size > 0) {
+      history.begin(); // a group delete undoes as one step
       for (const id of [...selectedIds]) editDoc({ t: 'Remove', id });
+      history.end();
     } else if (e) {
       editDoc({ t: 'Remove', id: e.id });
     }
@@ -1363,10 +1383,12 @@ function frame(now: number) {
       : selectedIds.size > 1
         ? `${selectedIds.size} selected (drag moves, Q rotates, ⌘C copies, X deletes)`
         : '';
+  const note = history.note();
   hud.textContent =
     `EE Game   sim t = ${simTime.toFixed(2)} s   ` +
     (online ? `● ONLINE — ${population} player${population === 1 ? '' : 's'}` : '○ offline (local sim)') +
     (mode ? `   ${mode}` : '') +
+    (note ? `   ${note}` : '') +
     `\nparts: R C L W G V D N P M A U S B T Z E F I · Q rotate · drag pin = wire · drag empty = select · ⌘C/⌘V copy/paste · 1/2 probe · 0 ref · O scope · X delete · / search`;
 
   requestAnimationFrame(frame);
