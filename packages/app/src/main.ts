@@ -1664,14 +1664,11 @@ window.addEventListener('keydown', (ev) => {
     return;
   }
   if (ev.key === 'Delete' || ev.key === 'Backspace' || ev.key === 'x') {
-    // A selected probe — or a hovered flag when nothing else is selected —
-    // deletes that probe and nothing else.
+    // Probes win over the part selection: pointing at a flag and pressing X
+    // must never delete the parts you happen to have selected elsewhere.
     const pr =
-      selectedProbe !== null
-        ? probes.find((p) => p.pid === selectedProbe)
-        : selectedIds.size === 0 && mouse
-          ? probeAt(mouse.x, mouse.y)
-          : undefined;
+      (mouse ? probeAt(mouse.x, mouse.y) : undefined) ??
+      (selectedProbe !== null ? probes.find((p) => p.pid === selectedProbe) : undefined);
     if (pr) {
       deleteProbe(pr);
       return;
