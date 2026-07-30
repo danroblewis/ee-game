@@ -20,14 +20,28 @@
 //     source is a listen probe fed one sample per animation frame (~60 Hz):
 //     expect a rumble that tracks the envelope, not the tone. Speakers are
 //     SILENT offline, and the HUD says so rather than playing aliased mush.
+//   • Samples are produced on the server's SIM clock and consumed on the
+//     sound card's WALL clock, and those never agree exactly (a dilated sim,
+//     network jitter, crystal drift). The worklet rate-matches to hold
+//     TARGET_BUF_S of buffer, which costs that much latency and reports its
+//     own depth/underruns back here as `status().buf` so the dock can show
+//     it. `status().ratio` is the server's own dilation figure, so "the sim
+//     is at 0.6x" and "my network hiccuped" are distinguishable.
 
 import {
+  DEPTH_TAU_S,
   FADE_S,
   HP_HZ,
-  LATENCY_S,
   REF_VOLTS,
   RING,
+  STALL_S,
+  STATS_HZ,
+  TARGET_BUF_S,
   TARGET_FS,
+  TRIM_DEADBAND_S,
+  TRIM_KP,
+  TRIM_MAX,
+  TRIM_TAU_S,
   WORKLET_SRC,
 } from './audio-worklet';
 import { lsFlag, lsNum, lsSet } from './store';
@@ -38,6 +52,15 @@ const OFFLINE_BATCH = 4;
 const QUIET = 0.004;
 /** A level reading older than this is stale — the stream stopped. */
 const LEVEL_TTL_S = 0.5;
+/** Telemetry older than this is not worth showing (context parked, worklet
+ * dead): the readout says "—" rather than a frozen depth. */
+const STATS_TTL_MS = 1000;
+/** An underrun this recently is still "happening" as far as the UI cares —
+ * long enough to be seen at 10 Hz, short enough not to nag forever. */
+const UNDERRUN_RECENT_MS = 5000;
+/** The server's realtime ratio goes stale this long after the last audio
+ * message (socket closed, room went quiet). */
+const RATIO_TTL_MS = 2000;
 
 const VOL_KEY = 'ee.audio.vol';
 const MUTE_KEY = 'ee.audio.mute';
@@ -67,6 +90,45 @@ export interface AudioControls {
   status(): AudioStatus;
 }
 
+/** What the worklet reports about one source's ring buffer, or about the mix
+ * (the mix is only as healthy as its thinnest source). Every field is
+ * measured in the audio thread — none of it is inferred on the main thread,
+ * where a stalled rAF would lie about time. */
+export interface AudioBufferHealth {
+  /** Buffered audio ahead of the read cursor, in milliseconds. */
+  ms: number;
+  /** Min/max of `ms` over the last ~1 s of reports. */
+  minMs: number;
+  maxMs: number;
+  /** Depth the rate matcher is holding, in ms — as REPORTED by the worklet
+   * (TARGET_BUF_S), so the readout cannot disagree with the loop. */
+  targetMs: number;
+  /** Starvation events since the session started (see `recent`). */
+  underruns: number;
+  /** Total audio time lost to starvation, in ms. Capped per event at
+   * STALL_S — beyond that the producer is stalled, not late, and `stalled`
+   * says so instead. */
+  underrunMs: number;
+  /** Ring overflows: the producer ran so far ahead that oldest audio had to
+   * be discarded. Normal over-fill is drained by the rate matcher instead. */
+  drops: number;
+  /** True while a source has been starved past STALL_S: the producer stopped
+   * rather than fell behind. */
+  stalled: boolean;
+  /** Applied playback-rate trim, e.g. -0.012 = playing 1.2 % slow to refill.
+   * |trim| <= TRIM_MAX always. */
+  trim: number;
+  /** True when an underrun happened within the last few seconds. */
+  recent: boolean;
+  /** Sources included in this summary. */
+  sources: number;
+  /** Sources still filling their FIRST buffer (a new speaker, a re-prime
+   * after a time gap). `ms` is the minimum across sources, so one priming
+   * source pulls it to near zero: that is by design, not a warning, and the
+   * readout must say "priming" rather than cry glitch. */
+  priming: number;
+}
+
 export interface AudioStatus {
   /** Speaker sources currently streaming. */
   speakers: number;
@@ -76,6 +138,42 @@ export interface AudioStatus {
   sounding: boolean;
   /** True when audio is ready but the browser is waiting for a gesture. */
   needsGesture: boolean;
+  /** Mix buffer health, or null before the first report / when stale. */
+  buf: AudioBufferHealth | null;
+  /** The SERVER's sim-seconds-per-wall-second, from the audio message, or
+   * null offline / when stale. Below 1 the sim is dilated and audio
+   * physically cannot keep up — a different problem from network jitter,
+   * and the only way the player can tell the two apart. */
+  ratio: number | null;
+}
+
+/** Raw per-source telemetry as the worklet sends it. */
+interface SrcStats {
+  ms: number;
+  minMs: number;
+  maxMs: number;
+  underruns: number;
+  underrunMs: number;
+  drops: number;
+  droppedMs: number;
+  stalled: boolean;
+  armed: boolean;
+  priming: boolean;
+  trim: number;
+}
+
+interface MixStats {
+  sources: number;
+  priming: number;
+  ms: number;
+  minMs: number;
+  maxMs: number;
+  underruns: number;
+  underrunMs: number;
+  drops: number;
+  stalled: boolean;
+  trim: number;
+  target: number;
 }
 
 /**
@@ -103,6 +201,22 @@ export class AudioPlayer implements AudioControls {
   private pts = new Map<string, number[]>();
   private vol = Math.min(1, Math.max(0, lsNum(VOL_KEY, 0.8)));
   private mute = lsFlag(MUTE_KEY);
+  /** Latest worklet telemetry, and when it landed. */
+  private mix: MixStats | null = null;
+  private srcStats = new Map<string, SrcStats>();
+  private statsAt = 0;
+  /** Session totals. The worklet's counters die with their source (a deleted
+   * speaker takes its history with it), so the deltas are accumulated here:
+   * "3 underruns this session" is what a player can act on. */
+  private totUnder = 0;
+  private totUnderMs = 0;
+  private totDrops = 0;
+  private lastUnderAt = -Infinity;
+  /** Per-source counter values already folded into the totals above. */
+  private counted = new Map<string, { u: number; ms: number; d: number }>();
+  /** Server dilation from the audio message: sim seconds per wall second. */
+  private rt = 0;
+  private rtAt = -Infinity;
 
   /** True once the page has had a real user gesture. An AudioContext CREATED
    * before that is permanently "blocked" in Chrome — later resume() calls on
@@ -235,6 +349,22 @@ export class AudioPlayer implements AudioControls {
     this.pushMaster();
   }
 
+  /**
+   * The server's realtime ratio, straight off the audio message. Called for
+   * every audio chunk; the last value wins and goes stale on its own so a
+   * closed socket stops claiming to know.
+   */
+  setRealtimeRatio(r: number | null | undefined) {
+    if (typeof r !== 'number' || !Number.isFinite(r) || r < 0) return;
+    this.rt = r;
+    this.rtAt = performance.now();
+  }
+
+  /** Buffer health for one speaker, for a per-speaker readout. */
+  speakerBuffer(elem: number): AudioBufferHealth | null {
+    return this.healthOf(this.srcStats.get(speakerKey(elem)));
+  }
+
   status(): AudioStatus {
     let sounding = false;
     for (const key of this.srcs.keys()) {
@@ -243,12 +373,16 @@ export class AudioPlayer implements AudioControls {
         break;
       }
     }
+    const now = performance.now();
+    const fresh = this.mix !== null && now - this.statsAt <= STATS_TTL_MS;
     return {
       speakers: this.speakers.size,
       listening: this.src !== null,
       sounding: sounding && !this.mute,
       needsGesture:
         this.srcs.size > 0 && (!this.activated || this.ctx?.state === 'suspended'),
+      buf: fresh ? this.healthOf(this.mix) : null,
+      ratio: now - this.rtAt <= RATIO_TTL_MS ? this.rt : null,
     };
   }
 
@@ -344,6 +478,59 @@ export class AudioPlayer implements AudioControls {
     this.node?.port.postMessage({ t: 'master', gain: this.vol, mute: this.mute });
   }
 
+  /** Worklet telemetry, ~10 Hz. Cheap: a handful of numbers per source. */
+  private onStats(m: { t?: string; mix?: MixStats; s?: Record<string, SrcStats> }) {
+    if (m.t !== 'stats' || !m.mix) return;
+    this.mix = m.mix;
+    this.statsAt = performance.now();
+    const srcs = m.s ?? {};
+    this.srcStats.clear();
+    for (const [id, st] of Object.entries(srcs)) {
+      this.srcStats.set(id, st);
+      // Counters only ever grow within one source's life; a key reused after
+      // a delete restarts at zero, so a negative delta means "new source",
+      // not "un-underrun".
+      const prev = this.counted.get(id);
+      const du = prev ? Math.max(0, st.underruns - prev.u) : st.underruns;
+      const dms = prev ? Math.max(0, st.underrunMs - prev.ms) : st.underrunMs;
+      const dd = prev ? Math.max(0, st.drops - prev.d) : st.drops;
+      this.counted.set(id, { u: st.underruns, ms: st.underrunMs, d: st.drops });
+      this.totUnder += du;
+      this.totUnderMs += dms;
+      this.totDrops += dd;
+      if (du > 0) this.lastUnderAt = this.statsAt;
+    }
+    for (const id of [...this.counted.keys()]) {
+      if (!(id in srcs)) this.counted.delete(id);
+    }
+  }
+
+  /** Shape either telemetry record into the UI's view of buffer health. The
+   * mix carries the SESSION totals (sources come and go); a single source
+   * carries its own. */
+  private healthOf(s: MixStats | SrcStats | null | undefined): AudioBufferHealth | null {
+    if (!s) return null;
+    const isMix = 'sources' in s;
+    const recent = performance.now() - this.lastUnderAt <= UNDERRUN_RECENT_MS;
+    return {
+      ms: s.ms,
+      minMs: s.minMs,
+      maxMs: s.maxMs,
+      // The worklet reports the depth it is actually holding; trust that over
+      // the constant, so a stale bundle can never show a target it is not
+      // servoing (they are the same number when everything is in sync).
+      targetMs: isMix ? (s as MixStats).target : TARGET_BUF_S * 1000,
+      underruns: isMix ? this.totUnder : s.underruns,
+      underrunMs: isMix ? this.totUnderMs : s.underrunMs,
+      drops: isMix ? this.totDrops : s.drops,
+      stalled: s.stalled,
+      trim: s.trim,
+      recent,
+      sources: isMix ? (s as MixStats).sources : 1,
+      priming: isMix ? (s as MixStats).priming : (s as SrcStats).priming ? 1 : 0,
+    };
+  }
+
   private levelOf(key: string): number {
     const s = this.srcs.get(key);
     if (!s) return 0;
@@ -416,11 +603,21 @@ export class AudioPlayer implements AudioControls {
           ringSize: RING,
           target: TARGET_FS,
           refV: REF_VOLTS,
-          latencySec: LATENCY_S,
+          targetSec: TARGET_BUF_S,
           fadeSec: FADE_S,
           hpHz: HP_HZ,
+          trimMax: TRIM_MAX,
+          deadbandSec: TRIM_DEADBAND_S,
+          kp: TRIM_KP,
+          trimTauSec: TRIM_TAU_S,
+          depthTauSec: DEPTH_TAU_S,
+          statsHz: STATS_HZ,
+          stallSec: STALL_S,
         },
       });
+      node.port.onmessage = (ev: MessageEvent) => {
+        this.onStats(ev.data as { t?: string; mix?: MixStats; s?: Record<string, SrcStats> });
+      };
       node.connect(ctx.destination);
       this.ctx = ctx;
       this.node = node;
@@ -437,6 +634,8 @@ export class AudioPlayer implements AudioControls {
       this.node = null;
       this.srcs.clear();
       this.src = null;
+      this.mix = null;
+      this.srcStats.clear();
     });
     return this.booting;
   }
