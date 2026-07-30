@@ -12,6 +12,12 @@
 //   click                 select part / probe flag;  drag on empty = marquee
 //   probe flag            X deletes it; right-click = delete/reference/listen
 //   drag a part body      move it (whole selection if it is in one)
+//   drag a machine        the freight hoist moves as one assembly — grab the
+//                         bar across the top of its cabinet (or any cabinet
+//                         chrome clear of its terminals); its four fixtures
+//                         travel with it and ⌘Z undoes the whole gesture.
+//                         Its pins still draw wires and its children still
+//                         select individually; shift+drag still marquees.
 //   double-click a part   floating property editor next to it
 //   right-click           cascading context menu — on a part:
 //                         edit/rotate/delete/probe/listen/copy; on empty
@@ -58,7 +64,7 @@ import {
 import { AudioPlayer } from './audio';
 import { CATALOG, CATEGORIES, makePins, partsInCategory, type PartDef } from './catalog';
 import { History, isTypingTarget } from './history';
-import { createHoist } from './hoist';
+import { createHoist, type MachineRect } from './hoist';
 import { connect } from './net';
 import {
   applyPanelOp,
@@ -182,6 +188,11 @@ function syncSpeakers() {
 
 let selectedIds = new Set<number>();
 let selectedProbe: number | null = null;
+/** Third selection flavour, beside parts and probe flags: the machine
+ * assembly. Deliberately not faked as an element — it has no id in the
+ * document, and pretending otherwise would put a phantom into every path that
+ * walks `selectedIds`. */
+let selectedMachine = false;
 
 /** Copy/paste: kinds + pins relative to the selection centroid. */
 type ClipItem = { kind: ElementKind; pins: Point[] };
@@ -245,9 +256,81 @@ const newId = () => (myId > 0 ? myId : 999) * 1_000_000 + idCounter++;
 const hoist = createHoist(document.body, { reset: () => net.sendMachineReset() });
 
 /** Ids 900..999 are the server's machine fixtures: players wire to them but
- * cannot move, rotate, retype or delete them. The server rejects those ops, so
- * applying one locally would only desync this client. */
+ * cannot move, rotate, retype or delete them INDIVIDUALLY. The server rejects
+ * those ops, so applying one locally would only desync this client. The whole
+ * assembly moves together through the machine op below. */
 const isFixtureId = (id: number) => id >= 900 && id <= 999;
+
+// ------------------------------------------------------ the machine assembly
+//
+// The freight hoist behaves like a part: click its cabinet to select it, drag
+// the cabinet (or the grab bar across its top) to move it. It is NOT an
+// element — the four fixtures bolted inside it are, and the server owns them —
+// so the move travels as its own op and translates the footprint and all four
+// children atomically, without touching the mechanism (height, velocity, hold
+// timer and landing count all survive a move; it is a translation, not a
+// reset).
+//
+// SEAM, client side. A future generic `Container` part would need exactly four
+// things, and everything below is written against only these:
+//   * children()   — the element ids the container owns (here: the reserved id
+//                    range, since this room has exactly one machine);
+//   * footprint()  — its rect in grid units (here: hoist.rect(), server state);
+//   * a move op    — one per instance (here: net.sendMachineMove, room-scoped
+//                    because there is one machine; a Container needs an id);
+//   * zone hit-tests that always YIELD to pins and to child elements (here:
+//     hoist.zoneAt, consulted only after pinAt/elementAt come up empty).
+// Per-instance world state (here: the one Hoist mechanism) rides along with the
+// footprint on the server and needs no client involvement.
+
+/** The elements the machine owns. */
+const machineChildren = (): ElementSpec[] => elements.filter((e) => isFixtureId(e.id));
+
+/** World range the server will accept for the machine (server/main.rs
+ * `WORLD_LIMIT`). Mirrored here so a drag can never produce an op the server
+ * refuses: a refused op would leave this client's optimistic placement
+ * permanently ahead of the room. */
+const MACHINE_WORLD_LIMIT = 1_000_000;
+/** Largest single move the server accepts (server/main.rs `MAX_MACHINE_STEP`).
+ * No gesture can reach it — the pointer would have to leave the window — but
+ * mirroring it makes "this client never issues an op the server refuses" a
+ * property of the code instead of a property of the zoom range. */
+const MACHINE_MAX_STEP = 100_000;
+
+/** The largest part of (dx, dy) that keeps the whole footprint in range. */
+function clampMachineDelta(r: MachineRect, dx: number, dy: number): [number, number] {
+  const lim = (v: number, span: number) =>
+    Math.min(Math.max(v, -MACHINE_WORLD_LIMIT), MACHINE_WORLD_LIMIT - span);
+  return [
+    lim(r[0] + dx, r[2] - r[0]) - r[0],
+    lim(r[1] + dy, r[3] - r[1]) - r[1],
+  ];
+}
+
+/** Translate the assembly by an integer grid delta: footprint, chrome and
+ * children together, optimistically here and authoritatively on the server.
+ * Used by undo/redo (with the gesture's delta negated); the drag itself places
+ * from its own snapshot so a long gesture cannot accumulate rounding. */
+function moveMachineBy(dx: number, dy: number) {
+  const r = hoist.rect();
+  if (!r || (dx === 0 && dy === 0)) return;
+  const [cx, cy] = clampMachineDelta(r, dx, dy);
+  if (cx === 0 && cy === 0) return;
+  // Refuse exactly what the server would refuse, rather than moving locally
+  // and desyncing: better a dead undo than a machine only this client can see.
+  if (Math.abs(cx) > MACHINE_MAX_STEP || Math.abs(cy) > MACHINE_MAX_STEP) return;
+  // One-shot placement: claim it, then immediately hand the footprint back to
+  // the server's next broadcast (no pointer is holding it).
+  hoist.setLocalRect([r[0] + cx, r[1] + cy, r[2] + cx, r[3] + cy]);
+  hoist.endLocalDrag();
+  for (const c of machineChildren()) {
+    c.pins = c.pins.map(([x, y]) => [x + cx, y + cy] as Point);
+    space.update(c);
+  }
+  docVersion++;
+  if (online) net.sendMachineMove(cx, cy);
+  else localSim.setElements(elements); // offline: the local netlist follows
+}
 
 let firstHello = true;
 const net = connect({
@@ -284,6 +367,11 @@ const net = connect({
     if (e) applyOp(e, op);
   },
   onDoc(op) {
+    // While THIS client drags the machine it owns the children's geometry: the
+    // server's echo of a throttled increment lags the pointer by up to 60 ms,
+    // and applying it would rubber-band the terminals against the chrome.
+    // The final op on release reconciles everything.
+    if (machineDrag && op.t === 'Move' && isFixtureId(op.id)) return;
     applyDoc(op); // idempotent for our own echoes
   },
   onProbes(list) {
@@ -699,6 +787,7 @@ function openPropsDialog(target: ElementSpec) {
   dlgFor = target.id;
   selectedIds = new Set([target.id]);
   selectedProbe = null;
+  selectedMachine = false;
   propsDlg.style.display = 'block';
   propsDlg.style.left = '0px';
   propsDlg.style.top = '0px';
@@ -831,6 +920,7 @@ const copySelection = () => copyElements(elements.filter((e) => selectedIds.has(
 function selectAll() {
   selectedIds = new Set(elements.map((e) => e.id));
   selectedProbe = null;
+  selectedMachine = false;
 }
 
 function commitPaste(at: Point) {
@@ -852,6 +942,7 @@ function commitPaste(at: Point) {
   history.end();
   selectedIds = new Set(ids);
   selectedProbe = null;
+  selectedMachine = false;
   pasting = null;
 }
 
@@ -1198,6 +1289,7 @@ function probeMenu(p: Probe): MenuItem[] {
             run: () => {
               selectedProbe = p.pid;
               selectedIds.clear();
+              selectedMachine = false;
             },
           },
       {
@@ -1240,6 +1332,24 @@ let moveDrag: {
 } | null = null;
 let scopeDrag: { s: FloatScope; dx: number; dy: number } | null = null;
 let scopeResize: { s: FloatScope } | null = null;
+/** Dragging the whole machine assembly. Its own gesture, not moveDrag: the
+ * machine is not an element, and its children are locked against the document
+ * Move op that moveDrag issues. */
+interface MachineDrag {
+  /** Grid point where the cabinet was grabbed. */
+  start: Point;
+  /** Footprint and children as they were at that moment: the drag places from
+   * this snapshot, so 300 pointer moves cannot drift from 1 move of 300. */
+  rect0: MachineRect;
+  items: { id: number; startPins: Point[] }[];
+  dx: number;
+  dy: number;
+  lastSent: number;
+  /** Delta already sent; ops carry increments, so this is the high-water mark. */
+  sentX: number;
+  sentY: number;
+}
+let machineDrag: MachineDrag | null = null;
 /** Momentary pushbutton held down by the pointer (closed until release). */
 let buttonHeld: ElementSpec | null = null;
 /** J tool: dragging out a new control-panel region. */
@@ -1265,6 +1375,82 @@ let panelResize: {
 } | null = null;
 let spaceHeld = false;
 let lastCursorSent = 0;
+
+/** Grab the machine: select it and snapshot what has to travel together. */
+function startMachineDrag(x: number, y: number) {
+  const r = hoist.rect();
+  if (!r) return;
+  selectedIds.clear();
+  selectedProbe = null;
+  selectedMachine = true;
+  hoist.setHot(true);
+  canvas.style.cursor = 'grabbing';
+  machineDrag = {
+    start: snap(x, y),
+    rect0: r,
+    items: machineChildren().map((c) => ({
+      id: c.id,
+      startPins: c.pins.map((p) => [...p] as Point),
+    })),
+    dx: 0,
+    dy: 0,
+    lastSent: 0,
+    sentX: 0,
+    sentY: 0,
+  };
+}
+
+/** Put the whole assembly at the drag's current delta, THIS frame: footprint
+ * and all four children from the same snapshot, so the chrome and the terminals
+ * can never rubber-band against each other. */
+function placeMachineDrag(d: MachineDrag) {
+  hoist.setLocalRect([
+    d.rect0[0] + d.dx,
+    d.rect0[1] + d.dy,
+    d.rect0[2] + d.dx,
+    d.rect0[3] + d.dy,
+  ]);
+  for (const it of d.items) {
+    const c = elemById(it.id);
+    if (!c) continue;
+    c.pins = it.startPins.map(([x, y]) => [x + d.dx, y + d.dy] as Point);
+    space.update(c); // the drag edits pins in place: re-bucket as it goes
+  }
+  // Deliberately NOT bumping docVersion: pins move, kinds do not, so the
+  // speaker set cannot have changed — and a 60 Hz rescan of a 50k-part
+  // document would be the most expensive thing in the drag (same reason the
+  // part drag above leaves it alone).
+}
+
+/** Send what the server has not seen yet, as an increment. */
+function flushMachineDrag(d: MachineDrag) {
+  const ix = d.dx - d.sentX;
+  const iy = d.dy - d.sentY;
+  if (ix === 0 && iy === 0) return;
+  d.sentX = d.dx;
+  d.sentY = d.dy;
+  if (online) net.sendMachineMove(ix, iy);
+  else localSim.setElements(elements);
+}
+
+/** Release (or lose) the machine: the final op always goes out, and the whole
+ * gesture becomes ONE undo entry — exactly like moving a group of parts. */
+function endMachineDrag() {
+  const d = machineDrag;
+  if (!d) return;
+  machineDrag = null;
+  hoist.setHot(false);
+  canvas.style.cursor = 'default';
+  flushMachineDrag(d); // never let the 60 ms throttle eat the last move
+  hoist.endLocalDrag(); // hold the placement until the server's answer lands
+  if (d.dx === 0 && d.dy === 0) return; // a click, not a drag: just selected
+  const [dx, dy] = [d.dx, d.dy];
+  history.pushAction({
+    label: 'move machine',
+    undo: () => moveMachineBy(-dx, -dy),
+    redo: () => moveMachineBy(dx, dy),
+  });
+}
 
 canvas.addEventListener('wheel', (ev) => {
   ev.preventDefault();
@@ -1381,6 +1567,7 @@ canvas.addEventListener('pointerdown', (ev) => {
   if (pr) {
     selectedProbe = pr.pid;
     selectedIds.clear();
+    selectedMachine = false;
     return;
   }
   // Pins take priority: dragging from any terminal draws a wire.
@@ -1392,6 +1579,16 @@ canvas.addEventListener('pointerdown', (ev) => {
     }
   }
   const e = elementAt(ev.clientX, ev.clientY);
+  // The machine assembly comes LAST, after pins and after parts: a pointer on
+  // a fixture terminal still starts a wire, and a pointer on a child part
+  // still selects and drags that part. Only the cabinet's own chrome — the
+  // grab bar, the frame, empty faceplate away from the children — picks up the
+  // whole machine. Shift+drag stays a marquee, so a selection can still be
+  // swept across the cabinet.
+  if (!e && !ev.shiftKey && hoist.zoneAt(cam, ev.clientX, ev.clientY)) {
+    startMachineDrag(ev.clientX, ev.clientY);
+    return;
+  }
   if (!e) {
     marquee = {
       x0: ev.clientX,
@@ -1409,8 +1606,10 @@ canvas.addEventListener('pointerdown', (ev) => {
     return;
   }
   const startMove = (all: number[]) => {
+    selectedMachine = false; // grabbing a part is not grabbing the machine
     // Machine fixtures are selectable and probe-able but bolted down: leaving
     // them out of the drag keeps a mixed selection dragging everything else.
+    // (They move only with their whole assembly — see startMachineDrag.)
     const ids = all.filter((id) => !isFixtureId(id));
     // Seed the pre-drag specs: pins are mutated in place during the drag, so
     // by the time the final Move reaches editDoc the live "before" is stale.
@@ -1433,6 +1632,7 @@ canvas.addEventListener('pointerdown', (ev) => {
     buttonHeld = e;
     selectedIds = new Set([e.id]);
     selectedProbe = null;
+    selectedMachine = false;
     return;
   }
   // Dragging any part body moves it; a member of a multi-selection drags the
@@ -1515,6 +1715,25 @@ canvas.addEventListener('pointermove', (ev) => {
     wireDrag.b = snap(ev.clientX, ev.clientY);
     return;
   }
+  if (machineDrag) {
+    const here = snap(ev.clientX, ev.clientY);
+    const [dx, dy] = clampMachineDelta(
+      machineDrag.rect0,
+      here[0] - machineDrag.start[0],
+      here[1] - machineDrag.start[1],
+    );
+    if (dx !== machineDrag.dx || dy !== machineDrag.dy) {
+      machineDrag.dx = dx;
+      machineDrag.dy = dy;
+      placeMachineDrag(machineDrag); // live, snapped, chrome + children as one
+    }
+    // Same ~60 ms cadence as a part drag: the pointer never waits on the wire.
+    if (now - machineDrag.lastSent > 60) {
+      machineDrag.lastSent = now;
+      flushMachineDrag(machineDrag);
+    }
+    return;
+  }
   if (moveDrag) {
     const here = snap(ev.clientX, ev.clientY);
     const dx = here[0] - moveDrag.start[0];
@@ -1544,6 +1763,11 @@ canvas.addEventListener('pointermove', (ev) => {
   const pz = z ? null : panelZoneAt(cam, panels, ev.clientX, ev.clientY);
   const over = z || pz ? undefined : elementAt(ev.clientX, ev.clientY);
   const onPin = !z && !pz && !!pinAt(ev.clientX, ev.clientY);
+  // The machine is hit-tested last here too, so the cursor promises exactly
+  // what pointerdown will do.
+  const mz =
+    z || pz || over || onPin ? null : hoist.zoneAt(cam, ev.clientX, ev.clientY);
+  hoist.setHot(mz === 'grab');
   canvas.style.cursor = placing || pasting || panelTool
     ? 'crosshair'
     : spaceHeld
@@ -1568,7 +1792,11 @@ canvas.addEventListener('pointermove', (ev) => {
               ? 'pointer'
               : over
                 ? 'move' // plain drag moves any part
-                : 'default';
+                : mz === 'grab'
+                  ? 'grab' // the machine's title strip: pick the whole thing up
+                  : mz
+                    ? 'move' // its cabinet drags the assembly too
+                    : 'default';
 });
 
 canvas.addEventListener('pointerup', (ev) => {
@@ -1606,6 +1834,10 @@ canvas.addEventListener('pointerup', (ev) => {
     panelResize = null;
     return;
   }
+  if (machineDrag) {
+    endMachineDrag();
+    return;
+  }
   if (marquee) {
     const [gx0, gy0] = toGrid(Math.min(marquee.x0, marquee.x1), Math.min(marquee.y0, marquee.y1));
     const [gx1, gy1] = toGrid(Math.max(marquee.x0, marquee.x1), Math.max(marquee.y0, marquee.y1));
@@ -1613,6 +1845,7 @@ canvas.addEventListener('pointerup', (ev) => {
     if (!marquee.add) {
       selectedIds.clear();
       selectedProbe = null;
+      selectedMachine = false;
     }
     if (dragged) {
       for (const e of space.query(gx0, gy0, gx1, gy1)) {
@@ -1633,6 +1866,7 @@ canvas.addEventListener('pointerup', (ev) => {
     editDoc({ t: 'Add', spec: { id, kind, pins: makePins(kind, a, b) } });
     selectedIds = new Set([id]);
     selectedProbe = null;
+    selectedMachine = false;
     placeDrag = null;
     return; // tool stays armed (Falstad-style); Esc exits
   }
@@ -1655,6 +1889,7 @@ canvas.addEventListener('pointerup', (ev) => {
       if (t && t.kind.t === 'Switch') interact(t, { t: 'SetSwitch', closed: !t.kind.closed });
       selectedIds = new Set([moveDrag.clickTarget]);
       selectedProbe = null;
+      selectedMachine = false;
     }
     history.end(); // one undo entry per drag gesture
     moveDrag = null;
@@ -1668,6 +1903,9 @@ canvas.addEventListener('pointercancel', () => {
     interact(buttonHeld, { t: 'SetSwitch', closed: false });
     buttonHeld = null;
   }
+  // A lost pointer must not leave the machine half-moved and un-undoable:
+  // commit where it actually got to, as one entry.
+  endMachineDrag();
 });
 
 window.addEventListener('keydown', (ev) => {
@@ -1725,6 +1963,7 @@ window.addEventListener('keydown', (ev) => {
     panelDrag = null;
     selectedIds.clear();
     selectedProbe = null;
+    selectedMachine = false;
     canvas.style.cursor = 'default';
     return;
   }
@@ -2030,6 +2269,27 @@ function drawSelectionBoxes(view: ViewRect) {
   ctx.setLineDash([]);
 }
 
+/** The machine assembly drawn as a selected object, in exactly the language
+ * the schematic uses for a selected part (drawSelectionBoxes' dashed box) —
+ * sized to the footprint the server broadcast, so it tracks a drag frame by
+ * frame and follows another player's move too. */
+function drawMachineSelection() {
+  if (!selectedMachine && !machineDrag) return;
+  const r = hoist.rect();
+  if (!r) return;
+  const pad = 0.35 * cam.scale;
+  ctx.strokeStyle = '#5a8cff';
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([5, 4]);
+  ctx.strokeRect(
+    cam.ox + r[0] * cam.scale - pad,
+    cam.oy + r[1] * cam.scale - pad,
+    (r[2] - r[0]) * cam.scale + pad * 2,
+    (r[3] - r[1]) * cam.scale + pad * 2,
+  );
+  ctx.setLineDash([]);
+}
+
 /** Little sine-in-a-screen glyph for the placeholder badge. */
 function drawScopeGlyph(x: number, y: number, w: number, h: number) {
   ctx.lineWidth = 1;
@@ -2308,6 +2568,7 @@ function frame(now: number) {
   }
 
   drawSelectionBoxes(view);
+  drawMachineSelection();
   drawProbeMarkers();
   drawFloatScopes();
   drawCursors(now);
@@ -2342,9 +2603,13 @@ function frame(now: number) {
       ? `pasting ${pasting.length} parts (Q rotates, click places, Esc cancels)`
       : placing
         ? `placing: ${placing.name} (click or drag, Q rotates, Esc exits)`
-        : selectedIds.size > 1
-          ? `${selectedIds.size} selected (drag moves, Q rotates, ⌘C copies, X deletes)`
-          : '';
+        : machineDrag
+          ? 'moving the FREIGHT HOIST — release to place it (⌘Z undoes the whole move)'
+          : selectedMachine
+            ? 'FREIGHT HOIST selected — drag its top bar (or its cabinet) to move the whole machine; its terminals come with it'
+            : selectedIds.size > 1
+              ? `${selectedIds.size} selected (drag moves, Q rotates, ⌘C copies, X deletes)`
+              : '';
   const note = history.note();
   // Sound needs a user gesture before the browser will play anything: say so
   // once, only while it is actually blocking audio, and never once running.
@@ -2361,7 +2626,7 @@ function frame(now: number) {
     (mode ? `   ${mode}` : '') +
     (note ? `   ${note}` : '') +
     sound +
-    `\nparts: R C L W G V D N P M A U 5 S B T Z E F I · drag part = move · dbl-click = edit values · right-click = menu` +
+    `\nparts: R C L W G V D N P M A U 5 S B T Z E F I · drag part = move · drag the hoist cabinet = move the machine · dbl-click = edit values · right-click = menu` +
     `\ndrag pin = wire · drag empty = select · Q rotate · ⌘Z undo · ⌘C/⌘V copy/paste · 1/2 probe · 3 listen · 0 ref · O scope · \` dock · J panel · X delete · / parts menu` +
     `\nH home district · shift+H fit everything · wheel = zoom (0.4–200 px/unit) · pan: middle / ctrl+drag / space+drag`;
 

@@ -22,6 +22,12 @@
 // Because ops are pre-filtered with the server's rules, an undo can never be
 // rejected server-side, which is what would leave the optimistic client
 // desynced. Nothing here throws; dropped entries never enter the redo stack.
+//
+// One edit in the game is not a DocOp at all: dragging a MACHINE ASSEMBLY (the
+// freight hoist) moves server-owned fixtures that the document path refuses by
+// design, so it travels as its own op. `pushAction` takes such a gesture as an
+// inverse/replay thunk pair with a label, and it shares this stack so ⌘Z walks
+// back through part edits and machine moves in the order the player made them.
 
 import type { DocOp, ElementSpec } from './circuit';
 
@@ -87,13 +93,41 @@ export function isTypingTarget(ev: KeyboardEvent): boolean {
   return false;
 }
 
-interface Entry {
+/**
+ * An undoable edit that is NOT a DocOp — today: dragging a machine assembly,
+ * which the server applies through its own op because the fixture ids are
+ * locked against document edits. Rather than contorting such a move into
+ * DocOps (the client is not allowed to issue them and the server would refuse
+ * them), the gesture hands the history a pair of thunks and a label.
+ *
+ * The contract, and the reason this stays a two-line extension:
+ *   * `undo`/`redo` must be idempotent-safe to call at any later time — they
+ *     re-issue an edit through the same path the gesture used, exactly like a
+ *     replayed DocOp does, so the server validates it like any other op;
+ *   * they must not throw, and must be no-ops when their target is gone
+ *     (there is no `viable` pre-filter for them: only the issuer knows).
+ */
+export interface UndoableAction {
+  label: string;
+  undo(): void;
+  redo(): void;
+}
+
+interface OpEntry {
   label: string;
   /** Forward ops, in application order. */
   redo: DocOp[];
   /** Inverse ops, already in application order (reverse of `redo`). */
   undo: DocOp[];
+  act?: undefined;
 }
+
+interface ActEntry {
+  label: string;
+  act: UndoableAction;
+}
+
+type Entry = OpEntry | ActEntry;
 
 interface Group {
   label?: string;
@@ -154,10 +188,30 @@ export class History {
     if (!this.group) this.commit(g);
   }
 
+  /**
+   * Record a whole non-DocOp gesture as ONE undo entry (see UndoableAction).
+   * The action is already applied when this is called — like `record`, this
+   * only remembers how to take it back. Closes any open op group first, so a
+   * machine drag and a part drag can never end up in the same entry.
+   */
+  pushAction(act: UndoableAction): void {
+    if (this.replaying) return;
+    this.end();
+    this.redoStack.length = 0; // a new edit invalidates the redo branch
+    this.undoStack.push({ label: act.label, act });
+    if (this.undoStack.length > MAX_ENTRIES) this.undoStack.shift();
+  }
+
   undo(elements: ElementSpec[]): void {
     this.end();
     while (this.undoStack.length > 0) {
       const entry = this.undoStack.pop()!;
+      if (entry.act) {
+        this.runAction(() => entry.act.undo());
+        this.redoStack.push(entry);
+        this.flash(`undo: ${entry.label}`);
+        return;
+      }
       const ops = entry.undo.filter((op) => viable(op, elements));
       if (ops.length === 0) continue; // stale: nothing of it survives
       this.run(ops);
@@ -172,6 +226,12 @@ export class History {
     this.end();
     while (this.redoStack.length > 0) {
       const entry = this.redoStack.pop()!;
+      if (entry.act) {
+        this.runAction(() => entry.act.redo());
+        this.undoStack.push(entry);
+        this.flash(`redo: ${entry.label}`);
+        return;
+      }
       const ops = entry.redo.filter((op) => viable(op, elements));
       if (ops.length === 0) continue;
       this.run(ops);
@@ -205,6 +265,17 @@ export class History {
       // Clone on the way out too: a re-Added spec is pushed into `elements`
       // by reference and would then be mutated in place by the next drag.
       for (const op of ops) this.apply(clone(op));
+    } finally {
+      this.replaying = false;
+    }
+  }
+
+  /** Same replay guard as `run`: whatever an action's thunk does — including
+   * calling `editDoc` — must not enter the history as a fresh edit. */
+  private runAction(thunk: () => void): void {
+    this.replaying = true;
+    try {
+      thunk();
     } finally {
       this.replaying = false;
     }
