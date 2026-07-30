@@ -104,13 +104,22 @@ export class AudioPlayer implements AudioControls {
   private vol = Math.min(1, Math.max(0, lsNum(VOL_KEY, 0.8)));
   private mute = lsFlag(MUTE_KEY);
 
+  /** True once the page has had a real user gesture. An AudioContext CREATED
+   * before that is permanently "blocked" in Chrome — later resume() calls on
+   * it are refused and log an autoplay warning every time. So we do not build
+   * one until this flips, and then we build it INSIDE the gesture handler,
+   * where a fresh context starts already running. */
+  private activated = false;
+
   constructor() {
-    // Autoplay policy: a context created before any user gesture starts
-    // suspended. '3' is itself a gesture, but a speaker can start sounding
-    // with no gesture at all (it is just a part in the document), so any
-    // click or key wakes the context up.
     const kick = () => {
-      if (this.srcs.size > 0) this.wake();
+      this.activated = true;
+      if (this.srcs.size === 0) return;
+      // First gesture with audio waiting: create the context here, in the
+      // gesture's own task (boot() constructs it synchronously before its
+      // first await). Otherwise just un-park an existing one.
+      if (!this.ctx) void this.boot();
+      else this.wake();
     };
     window.addEventListener('pointerdown', kick);
     window.addEventListener('keydown', kick);
@@ -238,7 +247,8 @@ export class AudioPlayer implements AudioControls {
       speakers: this.speakers.size,
       listening: this.src !== null,
       sounding: sounding && !this.mute,
-      needsGesture: this.srcs.size > 0 && this.ctx?.state === 'suspended',
+      needsGesture:
+        this.srcs.size > 0 && (!this.activated || this.ctx?.state === 'suspended'),
     };
   }
 
@@ -310,6 +320,7 @@ export class AudioPlayer implements AudioControls {
   /** Wake a parked context. A no-op while the browser is still waiting for a
    * user gesture — `status().needsGesture` is what asks for one. */
   private wake() {
+    if (!this.activated) return;
     if (this.ctx?.state === 'suspended') {
       void this.ctx.resume().catch(() => {
         /* autoplay policy: stay suspended until a gesture */
@@ -382,6 +393,9 @@ export class AudioPlayer implements AudioControls {
 
   private boot(): Promise<void> {
     if (this.dead) return Promise.resolve();
+    // Pre-gesture: stay silent and quiet. Samples arriving now are dropped
+    // (a few ms), and the HUD asks for the click that gets us here again.
+    if (!this.activated) return Promise.resolve();
     if (this.booting) {
       if (this.srcs.size > 0) this.wake();
       return this.booting;
