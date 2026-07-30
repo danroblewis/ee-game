@@ -5,7 +5,7 @@
 mod engine;
 mod netlist;
 
-pub use engine::{AdvanceReport, ElemFrame, Engine, GMIN};
+pub use engine::{AdvanceReport, ElemFrame, ElemTap, Engine, GMIN};
 pub use netlist::{DocOp, ElementKind, ElementSpec, InteractOp, Point, MAX_PINS};
 
 #[cfg(test)]
@@ -90,6 +90,54 @@ mod tests {
         // Exact up to the GMIN leak (1e-12 S per node pulls ~nV-µV level).
         let v_mid = eng.voltage_at((4, 0)).unwrap();
         assert!((v_mid - 7.5).abs() < 1e-6, "divider mid {v_mid}");
+    }
+
+    /// The audio tap must read the same terminal difference `pin_voltage`
+    /// reports, in O(1), and must survive a stale handle without panicking.
+    #[test]
+    fn tap_reads_speaker_coil_drive() {
+        // 5 V peak 440 Hz across an 8 Ω speaker in series with 8 Ω: the coil
+        // sees exactly half the source, and the tap sees the coil.
+        let ac = ElementKind::VoltageSource {
+            dc: 0.0,
+            amp: 5.0,
+            hz: 440.0,
+            phase: 0.0,
+        };
+        let elems = vec![
+            ElementSpec::two(1, ac, (0, 0), (0, 8)),
+            ElementSpec::two(2, ElementKind::Resistor { ohms: 8.0 }, (0, 0), (4, 0)),
+            ElementSpec::two(3, ElementKind::Speaker { ohms: 8.0 }, (4, 0), (0, 8)),
+            ElementSpec::ground(4, (0, 8)),
+        ];
+        let mut eng = Engine::new(20e-6);
+        eng.set_elements(&elems);
+        let tap = eng.tap(3).expect("speaker exists");
+        assert_eq!(eng.tap_id(tap), Some(3));
+
+        // A quarter period in: the source is at its peak, so the coil is at
+        // half of it. Sample through the tap and cross-check pin_voltage.
+        let mut peak = 0.0f64;
+        for _ in 0..114 {
+            eng.advance(1);
+            let d = eng.tap_delta(tap, 0, 1);
+            let slow = eng.pin_voltage(3, 0).unwrap() - eng.pin_voltage(3, 1).unwrap();
+            assert_eq!(d, slow, "tap must agree with pin_voltage bit for bit");
+            if d.abs() > peak.abs() {
+                peak = d;
+            }
+        }
+        assert!(
+            (peak.abs() - 2.5).abs() < 0.02,
+            "coil should see half of a 5 V source, got {peak}"
+        );
+
+        // Out-of-range pins and a handle whose element is gone read 0.
+        assert_eq!(eng.tap_delta(tap, 0, 5), eng.pin_voltage(3, 0).unwrap());
+        eng.set_elements(&[]);
+        assert_eq!(eng.tap_delta(tap, 0, 1), 0.0);
+        assert_eq!(eng.tap_id(tap), None);
+        assert!(eng.tap(3).is_none());
     }
 
     #[test]

@@ -3,8 +3,15 @@
 //! M4-lite protocol (JSON over WebSocket, upgraded to the three-class
 //! binary transport in M4/M5):
 //!   server -> client: hello{you, elements}, frame{time, e}, op{id, op},
-//!                     presence{n}, cursor{who, x, y}
+//!                     presence{n}, cursor{who, x, y},
+//!                     samples{t0, dts, s} (probe scopes, 3.125 kHz),
+//!                     audio{t0, dts, s}   (speaker taps, 12.5 kHz)
 //!   client -> server: interact{id, op}, cursor{x, y}
+//!
+//! `samples` and `audio` are both best-effort: they ride the same broadcast
+//! channel as `frame`, so a lagged consumer skips chunks. A dropped chunk
+//! costs a few milliseconds of a trace or of silence and desyncs nothing —
+//! the next chunk carries its own absolute `t0`.
 
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
@@ -267,6 +274,17 @@ fn demo_room_circuit() -> Vec<ElementSpec> {
         spec(182, r(470.0), (46, 42), (49, 42)),
         spec(183, K::Led { color: 3 }, (49, 42), (49, 44)),
         gnd(184, (49, 44)),
+        // ---- J: concert A. A 440 Hz source through a series 8 Ω into an
+        // 8 Ω speaker: close the switch and you HEAR it, because the server
+        // streams the coil's own terminal voltage at 12.5 kHz. The switch
+        // starts open so joining a room is quiet.
+        spec(200, sine(5.0, 440.0), (2, 52), (2, 60)),
+        spec(201, K::Wire, (2, 52), (5, 52)),
+        spec(202, K::Switch { closed: false }, (5, 52), (8, 52)),
+        spec(203, r(8.0), (8, 52), (11, 52)),
+        spec(204, K::Speaker { ohms: 8.0 }, (11, 52), (11, 60)),
+        spec(205, K::Wire, (11, 60), (2, 60)),
+        gnd(206, (2, 60)),
     ]
 }
 
@@ -292,6 +310,67 @@ struct Probe {
 /// effective sample rate per probe.
 const SAMPLE_EVERY: u32 = 16;
 const MAX_PROBES: usize = 8;
+
+/// Sim substeps between SPEAKER samples: dt=20 µs × 4 → 12.5 kHz, i.e. a
+/// 6.25 kHz Nyquist limit. Speakers get their own, four-times-faster
+/// cadence than probes because the probe rate is a scope rate, not an audio
+/// rate: 3.125 kHz gives a 440 Hz tone only ~7 samples per cycle, which the
+/// worklet's linear interpolation turns into a buzzsaw. At 12.5 kHz the same
+/// tone gets 28.4 samples per cycle and everything a small speaker can
+/// actually reproduce below 6 kHz survives.
+///
+/// Must divide SAMPLE_EVERY: the tick advances in AUDIO_EVERY-sized chunks
+/// and takes a probe sample every `SAMPLE_EVERY / AUDIO_EVERY` of them, so
+/// both streams stay exactly aligned to sim time (no label drift).
+///
+/// Cost, measured on the showcase room (136 elements, 1667 steps/tick,
+/// release build): the solver alone is 12.66 ms/tick; adding 4 speaker taps
+/// — 416 chunks x 4 taps x 2 pin reads = 3328 O(1) reads, plus the finer
+/// `advance` chunking — takes it to 12.73 ms. That is 0.6 % of the tick and
+/// ~2 % of the 33 ms wall budget. The same reads through `pin_voltage`'s id
+/// scan cost 1.9 us here but grow with the document: ~0.7 ms/tick at 50k
+/// elements, which is why `Engine::tap` exists.
+const AUDIO_EVERY: u32 = 4;
+/// Simultaneously streamed speakers. There is no server-side notion of
+/// "nearest to a listener" (the camera is a client concept), so this is
+/// simply the first N Speaker elements by element id — deterministic, stable
+/// across ticks, and the same set for every client in the room.
+const MAX_AUDIO_TAPS: usize = 4;
+
+/// Element ids of the speakers this tick will stream: the lowest
+/// MAX_AUDIO_TAPS Speaker ids in the document. O(elements) with a tiny
+/// constant, and only called when somebody is listening.
+fn audio_tap_ids(elements: &[ElementSpec]) -> Vec<u32> {
+    let mut ids: Vec<u32> = Vec::with_capacity(MAX_AUDIO_TAPS + 1);
+    for e in elements {
+        if !matches!(e.kind, sim_core::ElementKind::Speaker { .. }) {
+            continue;
+        }
+        let at = ids.partition_point(|&x| x < e.id);
+        if at >= MAX_AUDIO_TAPS {
+            continue;
+        }
+        ids.insert(at, e.id);
+        ids.truncate(MAX_AUDIO_TAPS);
+    }
+    ids
+}
+
+/// Wire-safe sample: quantized to 0.1 mV (a ~94 dB noise floor under a 5 V
+/// peak, well below anything a player can hear) and never NaN/±inf — a
+/// quarantined solver must produce silence, not a `null` the client has to
+/// defend against.
+///
+/// f64, deliberately: serde_json widens f32 to f64 before printing, so an
+/// f32 sample serializes as its exact binary value ("1.2345999479293823",
+/// 18 characters) and triples the stream. Quantizing in f64 keeps the short
+/// decimal the quantization was for — measured 4x smaller on the wire.
+fn wire_sample(v: f64) -> f64 {
+    if !v.is_finite() {
+        return 0.0;
+    }
+    (v * 10_000.0).round() / 10_000.0
+}
 
 /// A control panel: a dotted region of the schematic that gets a
 /// mission-control window on every client. Room-scoped like probes, so a
@@ -455,6 +534,23 @@ fn checkpoint(room: &Room) {
     }
 }
 
+/// `{"t":"audio", t0, dts, s:{elemId: [...]}}` — one speaker chunk per tap.
+/// Keyed by ELEMENT id (not pid): speaker audio exists whether or not anyone
+/// probed the part, which is the whole point of this stream.
+fn audio_message(
+    t0: f64,
+    dts: f64,
+    taps: &[(u32, sim_core::ElemTap)],
+    bufs: Vec<Vec<f64>>,
+) -> String {
+    let s: serde_json::Map<String, serde_json::Value> = taps
+        .iter()
+        .zip(bufs)
+        .map(|((id, _), b)| (id.to_string(), serde_json::json!(b)))
+        .collect();
+    json!({"t": "audio", "t0": t0, "dts": dts, "s": s}).to_string()
+}
+
 /// The sim task: sole owner of the Engine. Ops apply between ticks —
 /// the "tick boundary" rule from the plan, at demo scale.
 async fn sim_task(room: Arc<Room>, mut cmds: mpsc::UnboundedReceiver<Cmd>) {
@@ -576,18 +672,57 @@ async fn sim_task(room: Arc<Room>, mut cmds: mpsc::UnboundedReceiver<Cmd>) {
             }
         }
 
-        // Advance the tick — chunked when probes exist so waveforms are
-        // sampled between substeps, not once per tick.
+        // Advance the tick — chunked when probes or speakers exist so
+        // waveforms are sampled between substeps, not once per tick.
         let probes = room.probes.lock().unwrap().clone();
+        // Nobody subscribed = no audio work at all: a room full of speakers
+        // with an empty gallery must cost exactly what a silent one costs.
+        let listeners = room.events.receiver_count() > 0;
+        let taps: Vec<(u32, sim_core::ElemTap)> = if listeners {
+            // Resolved once per tick (after the edit drain, so the handles
+            // match the netlist this tick will actually step).
+            audio_tap_ids(&room.elements.lock().unwrap())
+                .into_iter()
+                .filter_map(|id| eng.tap(id).map(|t| (id, t)))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let budget = steps_per_tick.min(MAX_STEPS_PER_TICK);
-        if probes.is_empty() {
+        if probes.is_empty() && taps.is_empty() {
             eng.advance(budget);
         } else {
             let t0 = eng.time();
-            let chunks = (budget / SAMPLE_EVERY).max(1);
-            let mut bufs: Vec<Vec<f32>> = vec![Vec::with_capacity(chunks as usize); probes.len()];
-            for _ in 0..chunks {
-                eng.advance(SAMPLE_EVERY);
+            // The finest cadence anyone needs this tick, and how many of
+            // those chunks fall between two probe samples.
+            let step = if taps.is_empty() {
+                SAMPLE_EVERY
+            } else {
+                AUDIO_EVERY
+            };
+            let per_probe = SAMPLE_EVERY / step;
+            // Keeping the chunk count a whole number of probe periods is
+            // what makes `t0 + k * dts` the true sample time forever: a
+            // ragged tail would leak a few substeps of drift every tick.
+            let chunks = if probes.is_empty() {
+                (budget / step).max(1)
+            } else {
+                (budget / SAMPLE_EVERY).max(1) * per_probe
+            };
+            let probe_chunks = (chunks / per_probe) as usize;
+            let mut bufs: Vec<Vec<f32>> = vec![Vec::with_capacity(probe_chunks); probes.len()];
+            let mut abufs: Vec<Vec<f64>> = vec![Vec::with_capacity(chunks as usize); taps.len()];
+            for c in 0..chunks {
+                eng.advance(step);
+                // Speakers: the drive ACROSS the coil, v(pin0) - v(pin1),
+                // which is what a voltage-driven cone follows. Read through
+                // the O(1) tap — frame() is O(elements) and runs KCL.
+                for (buf, (_, tap)) in abufs.iter_mut().zip(taps.iter()) {
+                    buf.push(wire_sample(eng.tap_delta(*tap, 0, 1)));
+                }
+                if probes.is_empty() || (c + 1) % per_probe != 0 {
+                    continue;
+                }
                 // Wire currents come from KCL propagation (frame-only).
                 let need_frame = probes
                     .iter()
@@ -611,7 +746,7 @@ async fn sim_task(room: Arc<Room>, mut cmds: mpsc::UnboundedReceiver<Cmd>) {
                     buf.push(v.unwrap_or(0.0) as f32);
                 }
             }
-            if room.events.receiver_count() > 0 {
+            if listeners && !probes.is_empty() {
                 let s: serde_json::Map<String, serde_json::Value> = probes
                     .iter()
                     .zip(bufs)
@@ -626,6 +761,15 @@ async fn sim_task(room: Arc<Room>, mut cmds: mpsc::UnboundedReceiver<Cmd>) {
                     })
                     .to_string(),
                 );
+            }
+            // A separate message type so scope decimation and speaker audio
+            // never have to agree on a cadence. Best-effort like `frame`: a
+            // lagged consumer skips chunks, which costs a few ms of silence
+            // and desyncs nothing (the client re-primes on the time gap).
+            if !taps.is_empty() {
+                let _ = room
+                    .events
+                    .send(audio_message(t0, DT * AUDIO_EVERY as f64, &taps, abufs));
             }
         }
 
@@ -1126,6 +1270,130 @@ mod tests {
             t555_flips >= 20,
             "555 astable only flipped {t555_flips} times in 30 s (expect ~60)"
         );
+    }
+
+    /// A 440 Hz AC source driving a speaker: the tap stream must carry the
+    /// coil's real waveform at the audio cadence, and the two cadences must
+    /// stay locked to sim time (no drift in the `t0 + k*dts` labels).
+    #[test]
+    fn speaker_tap_streams_the_coil_waveform() {
+        use sim_core::ElementKind as K;
+        use sim_golden::{gnd, r, spec};
+        let elems = vec![
+            spec(
+                1,
+                K::VoltageSource {
+                    dc: 0.0,
+                    amp: 5.0,
+                    hz: 440.0,
+                    phase: 0.0,
+                },
+                (0, 0),
+                (0, 8),
+            ),
+            spec(2, r(8.0), (0, 0), (4, 0)),
+            spec(3, K::Speaker { ohms: 8.0 }, (4, 0), (0, 8)),
+            gnd(4, (0, 8)),
+        ];
+        let mut eng = Engine::new(DT);
+        eng.set_elements(&elems);
+        let taps: Vec<(u32, sim_core::ElemTap)> = audio_tap_ids(&elems)
+            .into_iter()
+            .filter_map(|id| eng.tap(id).map(|t| (id, t)))
+            .collect();
+        assert_eq!(taps.len(), 1, "one speaker, one tap");
+        assert_eq!(taps[0].0, 3);
+
+        // One tick's worth of audio chunks, exactly as sim_task does it.
+        let steps_per_tick = ((1.0 / TICK_HZ) / DT).round() as u32;
+        let budget = steps_per_tick.min(MAX_STEPS_PER_TICK);
+        let chunks = (budget / AUDIO_EVERY).max(1);
+        let t0 = eng.time();
+        let mut buf: Vec<f64> = Vec::with_capacity(chunks as usize);
+        for _ in 0..chunks {
+            eng.advance(AUDIO_EVERY);
+            buf.push(wire_sample(eng.tap_delta(taps[0].1, 0, 1)));
+        }
+        let dts = DT * AUDIO_EVERY as f64;
+
+        // The labels must be the truth: the last sample's stated time is the
+        // engine's own time, to within one sample.
+        let stated_end = t0 + buf.len() as f64 * dts;
+        assert!(
+            (stated_end - eng.time()).abs() < dts * 0.5,
+            "sample clock drifted: stated {stated_end}, engine {}",
+            eng.time()
+        );
+
+        // 12.5 kHz on a 440 Hz tone: ~28 samples per cycle, and the coil sees
+        // half the 5 V source across the 8+8 Ω divider.
+        assert!((dts * 440.0).recip() > 20.0, "too few samples per cycle");
+        let peak = buf.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        assert!(
+            (peak - 2.5).abs() < 0.05,
+            "coil peak should be ~2.5 V, got {peak}"
+        );
+        // Zero crossings confirm the frequency survived the decimation:
+        // 13.3 ms of 440 Hz is ~11.7 cycles, so ~23 crossings.
+        let crossings = buf
+            .windows(2)
+            .filter(|w| (w[0] < 0.0) != (w[1] < 0.0))
+            .count();
+        let cycles = buf.len() as f64 * dts * 440.0;
+        assert!(
+            (crossings as f64 - 2.0 * cycles).abs() < 3.0,
+            "expected ~{:.0} zero crossings for {cycles:.1} cycles, got {crossings}",
+            2.0 * cycles
+        );
+        assert!(buf.iter().all(|v| v.is_finite()), "no NaN on the wire");
+
+        // Honest bandwidth number, asserted so it cannot silently balloon.
+        // Measured: ~94 kB/s per speaker (0.75 Mbit/s), 4 taps => ~375 kB/s.
+        // That is the price of the M4-lite JSON transport; the binary
+        // transport (M4/M5) carries the same 12.5 kHz f32 stream in 50 kB/s.
+        let msg = audio_message(t0, dts, &taps, vec![buf.clone()]);
+        let per_sec = msg.len() as f64 * TICK_HZ;
+        assert!(
+            per_sec < 110_000.0,
+            "one speaker costs {:.0} kB/s of JSON",
+            per_sec / 1000.0
+        );
+        let v: serde_json::Value = serde_json::from_str(&msg).unwrap();
+        assert_eq!(v["t"], "audio");
+        assert_eq!(v["dts"].as_f64().unwrap(), dts);
+        assert_eq!(v["s"]["3"].as_array().unwrap().len(), buf.len());
+    }
+
+    /// The tap set is the first N speakers by element id — deterministic, and
+    /// capped whatever order the document happens to be in.
+    #[test]
+    fn audio_taps_are_the_first_n_speakers_by_id() {
+        use sim_core::ElementKind as K;
+        use sim_golden::{r, spec};
+        let mut elems = vec![spec(500, r(100.0), (0, 0), (2, 0))];
+        // Deliberately out of order, and more speakers than the cap.
+        for id in [90, 12, 77, 3, 41, 55] {
+            elems.push(spec(id, K::Speaker { ohms: 8.0 }, (0, 0), (2, 0)));
+        }
+        assert_eq!(audio_tap_ids(&elems), vec![3, 12, 41, 55]);
+        assert_eq!(audio_tap_ids(&elems).len(), MAX_AUDIO_TAPS);
+        // No speakers, no stream.
+        assert!(audio_tap_ids(&[spec(1, r(1.0), (0, 0), (1, 0))]).is_empty());
+        // The cadences must stay commensurate or the sample labels drift.
+        assert_eq!(SAMPLE_EVERY % AUDIO_EVERY, 0);
+    }
+
+    /// The wire never carries a non-finite sample, whatever the solver did.
+    #[test]
+    fn wire_samples_are_finite_and_quantized() {
+        assert_eq!(wire_sample(f64::NAN), 0.0);
+        assert_eq!(wire_sample(f64::INFINITY), 0.0);
+        assert_eq!(wire_sample(f64::NEG_INFINITY), 0.0);
+        assert_eq!(wire_sample(0.0), 0.0);
+        // 0.1 mV quantization: below a 5 V peak that is a ~94 dB noise floor.
+        assert_eq!(wire_sample(1.234_561_7), 1.2346);
+        assert_eq!(wire_sample(-1.234_561_7), -1.2346);
+        assert!((wire_sample(2.5) - 2.5).abs() < 1e-6);
     }
 
     #[test]

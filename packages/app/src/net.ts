@@ -19,6 +19,10 @@ export interface NetHandlers {
   onProbes(list: Probe[]): void;
   onPanels(list: Panel[]): void;
   onSamples(t0: number, dts: number, s: Record<string, number[]>): void;
+  /** Speaker audio taps, keyed by ELEMENT id. A separate stream from
+   * `samples` so scope decimation and speaker audio never fight over a
+   * cadence; best-effort, so a dropped chunk is a blip of silence. */
+  onAudio(t0: number, dts: number, s: Record<string, number[]>): void;
   onPresence(n: number): void;
   onCursor(who: number, x: number, y: number): void;
   onClose(): void;
@@ -77,6 +81,9 @@ export function connect(h: NetHandlers): Net {
         break;
       case 'samples':
         h.onSamples(m.t0, m.dts, m.s);
+        break;
+      case 'audio':
+        h.onAudio(m.t0, m.dts, m.s ?? {});
         break;
       case 'presence':
         h.onPresence(m.n);

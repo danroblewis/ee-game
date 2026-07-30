@@ -33,6 +33,22 @@
       #scopebar:hover { color: #c9c9d4; }
       #scopecaret { color: #c9c9d4; flex: none; }
       #scopesum { display: flex; gap: 14px; overflow: hidden; }
+      /* Global sound controls: mute + volume, parked at the right end of the
+         same strip. Their own cursor, because the strip's is ns-resize. */
+      #scopeaudio {
+        display: none; align-items: center; gap: 8px; flex: none;
+        margin-left: auto; cursor: default;
+      }
+      #audiomute {
+        background: #22222c; color: #c9c9d4; border: 1px solid #3a3a48;
+        border-radius: 4px; font: 11px/1 ui-monospace, monospace; padding: 3px 6px;
+        cursor: pointer; min-width: 74px;
+      }
+      #audiomute:hover { background: #2e2e3c; }
+      #audiomute.off { border-color: #6a3a3a; background: #2a1c1c; }
+      #audiovol { width: 74px; accent-color: #8ee7ff; cursor: pointer; }
+      #audiolabel { color: #6e6e7e; flex: none; }
+      #audiolabel.warn { color: #ffd66b; }
       #scopecv { width: 100%; height: calc(100% - 24px); display: block; }
       #scope.collapsed #scopecv { display: none; }
       #props, #propsdlg {
@@ -208,7 +224,17 @@
     <div id="hud"></div>
     <div id="tip"></div>
     <div id="scope" class="collapsed">
-      <div id="scopebar"><span id="scopecaret">scope ▴</span><span id="scopesum"></span></div>
+      <div id="scopebar"><span id="scopecaret">scope ▴</span><span id="scopesum"></span><span
+          id="scopeaudio"
+        ><button id="audiomute" type="button" title="mute all sound">sound ◂</button><input
+            id="audiovol"
+            type="range"
+            min="0"
+            max="100"
+            step="1"
+            title="volume"
+            aria-label="volume"
+          /><span id="audiolabel"></span></span></div>
       <canvas id="scopecv"></canvas>
     </div>
     <div id="props"></div>

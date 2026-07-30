@@ -102,6 +102,14 @@ pub struct AdvanceReport {
     pub quarantined: bool,
 }
 
+/// An O(1) handle to one compiled element, for callers that sample the same
+/// element far more often than once per tick (audio taps). Obtained from
+/// [`Engine::tap`]; invalidated by [`Engine::set_elements`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ElemTap {
+    slot: usize,
+}
+
 /// Per-element view of the live simulation for rendering: everything the
 /// client paints comes from here and nowhere else.
 #[derive(Clone, Copy, Debug, Default)]
@@ -1054,6 +1062,39 @@ impl Engine {
             return None;
         }
         Some(self.xv(e.node[pin]))
+    }
+
+    /// Resolve an element id to a handle for repeated sampling. `pin_voltage`
+    /// scans the document per call, which is fine once a tick and ruinous at
+    /// audio rates (hundreds of samples per tick per tap), so a high-rate
+    /// sampler resolves once and then reads through the handle.
+    ///
+    /// The handle is INVALIDATED by `set_elements` — resolve it again after
+    /// any document edit. A stale handle reads 0, it never panics.
+    pub fn tap(&self, id: u32) -> Option<ElemTap> {
+        let slot = self.elems.iter().position(|e| e.spec.id == id)?;
+        Some(ElemTap { slot })
+    }
+
+    /// `v(pin a) - v(pin b)` at a tap, from the last accepted step, in O(1).
+    /// This is the quantity a voltage-driven device follows: the drive across
+    /// a loudspeaker's voice coil is exactly its terminal difference.
+    /// Out-of-range slots/pins read 0 so a tap on a deleted element goes
+    /// silent instead of panicking.
+    pub fn tap_delta(&self, t: ElemTap, a: usize, b: usize) -> f64 {
+        let Some(e) = self.elems.get(t.slot) else {
+            return 0.0;
+        };
+        let n = e.spec.pins.len();
+        let va = if a < n { self.xv(e.node[a]) } else { 0.0 };
+        let vb = if b < n { self.xv(e.node[b]) } else { 0.0 };
+        va - vb
+    }
+
+    /// The element id a tap currently points at, for callers that want to
+    /// confirm a handle still means what they resolved it from.
+    pub fn tap_id(&self, t: ElemTap) -> Option<u32> {
+        self.elems.get(t.slot).map(|e| e.spec.id)
     }
 
     /// Current into one pin of an element, from the last accepted step.

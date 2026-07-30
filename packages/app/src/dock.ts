@@ -4,7 +4,15 @@
 // clicking the header strip or pressing backquote. While collapsed the
 // waveform draw is skipped entirely and only the ~10 Hz text summary runs.
 // Open/closed state and the expanded height persist in localStorage.
+//
+// The bar is also where the global sound controls live (mute + volume): it is
+// the one strip that is already there, already the "instruments" chrome, and
+// already persisted — inventing a second floating widget for two controls
+// would be worse. The bar therefore stays visible when audio is live even if
+// nothing is probed.
 
+import type { AudioControls } from './audio';
+import { lsGet as read, lsSet as write } from './store';
 import { probeColor, renderScope, type Probe, type TraceStore, type ScopeSettings } from './scope';
 
 const BAR_PX = 24;
@@ -14,22 +22,6 @@ const DEFAULT_H = 190;
 const OPEN_KEY = 'ee.dock.open';
 const HEIGHT_KEY = 'ee.dock.h';
 const SUMMARY_MS = 100; // ~10 Hz — the collapsed bar does not need 60 fps
-
-// localStorage throws in private/blocked contexts; the dock must still work.
-const read = (k: string): string | null => {
-  try {
-    return localStorage.getItem(k);
-  } catch {
-    return null;
-  }
-};
-const write = (k: string, v: string) => {
-  try {
-    localStorage.setItem(k, v);
-  } catch {
-    /* ignore */
-  }
-};
 
 const clampH = (h: number) => Math.min(MAX_H, Math.max(MIN_H, h));
 
@@ -53,24 +45,73 @@ export interface Dock {
   isOpen(): boolean;
   setOpen(v: boolean): void;
   toggle(): void;
-  /** Per-frame: hides the dock when unprobed, draws waveforms only if open. */
+  /** Per-frame: hides the dock when there is nothing to show (no probes and
+   * no audio), draws waveforms only if open. */
   update(now: number, probes: Probe[], traces: TraceStore, set: ScopeSettings): void;
 }
 
-export function createDock(root: HTMLElement, cv: HTMLCanvasElement): Dock {
+export function createDock(root: HTMLElement, cv: HTMLCanvasElement, audio: AudioControls): Dock {
   const bar = root.querySelector('#scopebar') as HTMLDivElement;
   const caret = root.querySelector('#scopecaret') as HTMLSpanElement;
   const sumEl = root.querySelector('#scopesum') as HTMLSpanElement;
+  const audioEl = root.querySelector('#scopeaudio') as HTMLSpanElement;
+  const muteBtn = root.querySelector('#audiomute') as HTMLButtonElement;
+  const volEl = root.querySelector('#audiovol') as HTMLInputElement;
+  const audioLbl = root.querySelector('#audiolabel') as HTMLSpanElement;
+
+  // The bar's own pointerdown toggles/resizes the dock: the controls must
+  // swallow their events or every mute click would also collapse the scope.
+  for (const el of [muteBtn, volEl]) {
+    el.addEventListener('pointerdown', (ev) => ev.stopPropagation());
+    el.addEventListener('pointerup', (ev) => ev.stopPropagation());
+  }
+  muteBtn.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    audio.setMuted(!audio.muted);
+    syncAudio(true);
+  });
+  volEl.addEventListener('input', () => {
+    audio.setVolume(Number(volEl.value) / 100);
+    syncAudio(true);
+  });
+  volEl.value = String(Math.round(audio.volume * 100));
+
+  let audioKey = '';
+  /** Mirror the player's state into the bar. `force` skips the change check
+   * (used right after a click, whose effect is instant). */
+  function syncAudio(force = false) {
+    const st = audio.status();
+    const live = st.speakers > 0 || st.listening;
+    const key = `${live}|${st.speakers}|${st.listening}|${audio.muted}|${st.sounding}|${st.needsGesture}`;
+    if (!force && key === audioKey) return live;
+    audioKey = key;
+    audioEl.style.display = live ? 'flex' : 'none';
+    if (!live) return live;
+    muteBtn.textContent = audio.muted ? 'sound off' : st.sounding ? 'sound ◂))' : 'sound ◂';
+    muteBtn.title = audio.muted ? 'unmute (all sound is off)' : 'mute all sound';
+    muteBtn.classList.toggle('off', audio.muted);
+    const parts: string[] = [];
+    if (st.speakers > 0) parts.push(`${st.speakers} speaker${st.speakers === 1 ? '' : 's'}`);
+    if (st.listening) parts.push('listening');
+    audioLbl.textContent = st.needsGesture ? 'click to enable sound' : parts.join(' · ');
+    audioLbl.classList.toggle('warn', st.needsGesture);
+    return live;
+  }
 
   let open = read(OPEN_KEY) === '1'; // collapsed unless explicitly opened before
   let height = clampH(Number(read(HEIGHT_KEY)) || DEFAULT_H);
   let lastSumT = -Infinity;
   let sumKey = '';
+  /** With nothing probed there is no waveform to expand into, so the bar is
+   * audio-only: it stays a strip however the open flag is stored. */
+  let hasProbes = false;
 
   function apply() {
-    root.classList.toggle('collapsed', !open);
-    root.style.height = `${open ? height : BAR_PX}px`;
-    caret.textContent = open ? 'scope ▾' : 'scope ▴';
+    const showTraces = open && hasProbes;
+    root.classList.toggle('collapsed', !showTraces);
+    root.style.height = `${showTraces ? height : BAR_PX}px`;
+    caret.style.display = hasProbes ? '' : 'none';
+    caret.textContent = showTraces ? 'scope ▾' : 'scope ▴';
   }
 
   function setOpen(v: boolean) {
@@ -109,6 +150,13 @@ export function createDock(root: HTMLElement, cv: HTMLCanvasElement): Dock {
 
   /** Probe count plus each channel's latest value in its probe colour. */
   function updateSummary(probes: Probe[], traces: TraceStore) {
+    if (probes.length === 0) {
+      if (sumKey !== '') {
+        sumKey = '';
+        sumEl.textContent = '';
+      }
+      return;
+    }
     const labels = probes.map((p) => {
       const v = latest(traces, p.pid);
       const name = `${p.kind.toUpperCase()}${p.pid}${p.r ? 'Δ' : ''}`;
@@ -130,12 +178,19 @@ export function createDock(root: HTMLElement, cv: HTMLCanvasElement): Dock {
   }
 
   function update(now: number, probes: Probe[], traces: TraceStore, set: ScopeSettings) {
-    if (probes.length === 0) {
+    // Audio state is cheap to read but not free to reflect into the DOM, so
+    // it rides the same ~10 Hz budget as the channel summary.
+    const audioLive = now - lastSumT >= SUMMARY_MS ? syncAudio() : audioEl.style.display !== 'none';
+    if (hasProbes !== probes.length > 0) {
+      hasProbes = probes.length > 0;
+      apply();
+    }
+    if (probes.length === 0 && !audioLive) {
       root.style.display = 'none';
       return;
     }
     root.style.display = 'block';
-    if (open) renderScope(cv, traces, probes, set.timebase, set);
+    if (open && hasProbes) renderScope(cv, traces, probes, set.timebase, set);
     if (now - lastSumT >= SUMMARY_MS) {
       lastSumT = now;
       updateSummary(probes, traces);
@@ -143,5 +198,6 @@ export function createDock(root: HTMLElement, cv: HTMLCanvasElement): Dock {
   }
 
   apply();
+  syncAudio(true);
   return { isOpen: () => open, setOpen, toggle: () => setOpen(!open), update };
 }

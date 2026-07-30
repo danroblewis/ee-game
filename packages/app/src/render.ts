@@ -119,6 +119,11 @@ interface DrawCtx {
   live?: ElemLive;
   dots: DotFlow;
   dtSec: number;
+  /** Speakers only: what this part is doing to the player's ears, from the
+   * audio tap. `level` is the 0..1 amplitude of the stream that actually
+   * reached the sound card (the 30 Hz render frame cannot see a 440 Hz
+   * waveform; the 12.5 kHz tap can). Absent = not streamed at all. */
+  sound?: { level: number; muted: boolean };
 }
 
 function stroke(ctx: CanvasRenderingContext2D, color: string, path: Px[]) {
@@ -507,6 +512,24 @@ export function drawElement(d: DrawCtx, e: ElementSpec) {
       // Classic loudspeaker: the voice coil as a circle on the lead axis,
       // the cone flaring off one face.
       const r = s * 0.22;
+      const ang = Math.atan2(n[1], n[0]);
+      // What is reaching the ears, from the 12.5 kHz audio tap. `undefined`
+      // means this speaker is not streamed (offline, or past the server's
+      // simultaneous-tap cap) — then it draws plainly idle, which is the
+      // truth: it is making no sound you can hear.
+      const heard = d.sound && !d.sound.muted ? d.sound.level : 0;
+      // Halo behind everything: the "this one is audible" cue, and the only
+      // thing here that knows about the audio band.
+      if (heard > 0.01) {
+        const rad = r + s * (0.55 + heard * 0.7);
+        const g = ctx.createRadialGradient(mid[0], mid[1], r * 0.5, mid[0], mid[1], rad);
+        g.addColorStop(0, `rgba(142,231,255,${Math.min(0.5, 0.12 + heard * 0.5)})`);
+        g.addColorStop(1, 'rgba(142,231,255,0)');
+        ctx.fillStyle = g;
+        ctx.beginPath();
+        ctx.arc(mid[0], mid[1], rad, 0, Math.PI * 2);
+        ctx.fill();
+      }
       stroke(ctx, voltageColor(v(0)), [A, add(mid, u, -r)]);
       stroke(ctx, voltageColor(v(1)), [add(mid, u, r), B]);
       ctx.fillStyle = '#181820';
@@ -523,19 +546,34 @@ export function drawElement(d: DrawCtx, e: ElementSpec) {
       ctx.lineTo(...add(mouth, u, s * 0.42));
       ctx.lineTo(...add(throat, u, r * 0.7));
       ctx.stroke();
-      // Radiating arcs: amplitude is the solver's own terminal voltage, so
-      // a silent circuit draws a silent speaker.
+      // Radiating arcs. One set, and its COLOUR is the whole message:
+      //   cyan  — audible, amplitude from the 12.5 kHz tap (what you hear)
+      //   amber — driven but not reaching your ears (muted, offline, or past
+      //           the server's tap cap), amplitude from the solver frame
+      // A speaker doing nothing electrically draws neither, so a silent
+      // circuit draws a silent speaker exactly as before.
       const drive = Math.min(1, Math.abs(v(0) - v(1)) / 5);
-      if (drive > 0.02) {
-        const ang = Math.atan2(n[1], n[0]);
-        ctx.strokeStyle = '#ffe95e';
-        for (let k = 0; k < 2; k++) {
-          ctx.globalAlpha = Math.max(0, drive - k * 0.3);
+      const audible = heard > 0.01;
+      const amp = audible ? Math.min(1, heard * 1.6) : drive;
+      if (amp > 0.02) {
+        ctx.strokeStyle = audible ? '#8ee7ff' : '#ffe95e';
+        for (let k = 0; k < (audible ? 3 : 2); k++) {
+          ctx.globalAlpha = Math.max(0, amp - k * 0.3);
           ctx.beginPath();
           ctx.arc(mid[0], mid[1], s * (0.75 + k * 0.2), ang - 0.55, ang + 0.55);
           ctx.stroke();
         }
         ctx.globalAlpha = 1;
+      }
+      if (d.sound?.muted) {
+        // Muted at the mixer: a slash across the arcs. Plainly not sounding,
+        // and plainly not sounding ON PURPOSE — the amber arcs still show the
+        // coil is being driven.
+        ctx.lineWidth = Math.max(1.4, s * 0.05);
+        const c = add(mid, n, r + s * 0.62);
+        const q = s * 0.19;
+        stroke(ctx, '#ff8f8f', [add(add(c, u, -q), n, -q), add(add(c, u, q), n, q)]);
+        ctx.lineWidth = Math.max(2, s * 0.07);
       }
       twoPinDots();
       break;

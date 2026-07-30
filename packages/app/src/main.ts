@@ -24,6 +24,10 @@
 //   Q                     rotate placement ghost, paste ghost, or selection
 //   1 / 2                 voltage probe / current clamp at hover
 //   3                     listen: play that node's waveform (WebAudio)
+//                         — Speakers need no probe: every Speaker element in
+//                         the document is streamed to the mixer on its own
+//                         12.5 kHz tap, muted/soloed from its right-click
+//                         menu, with global mute + volume in the scope bar
 //   0                     set selected V-probe's reference (differential)
 //   O                     drop an in-place oscilloscope;  X delete
 //   ` (backquote)         collapse/expand the bottom scope dock (starts collapsed)
@@ -143,13 +147,37 @@ let localPidCounter = 1;
 /** Docked-panel instrument settings (timebase, y-scale, trigger). */
 const dockScope = defaultScopeSettings(5);
 
-/** '3' listens to one probe's stream; online the pid arrives with the
- * server's probe list, so remember what we asked to hear. */
+/** Sound. Two kinds of source, mixed in one worklet: every Speaker element
+ * in the document (the server streams their coil voltage at 12.5 kHz), and
+ * the '3'-listen probe. Online the listen pid arrives with the server's probe
+ * list, so remember what we asked to hear. */
 const audio = new AudioPlayer();
 // Exposed for end-to-end tests (like __cam): headless runs cannot hear, so
 // they assert on pid/level instead.
 (window as unknown as { __audio: AudioPlayer }).__audio = audio;
 let listenWanted: { elem: number; pin: number } | null = null;
+
+/** Bumped by every change to `elements`. Deriving the speaker set is an O(n)
+ * scan and the document can hold 50k parts, so it is re-derived when the
+ * document changes, not once per frame. */
+let docVersion = 0;
+let speakerVersion = -1;
+let speakerOnline = false;
+let speakerIds: number[] = [];
+
+/** Keep AudioPlayer's source set equal to the document's Speaker set: a
+ * speaker that appears starts streaming, one that is deleted fades out.
+ * Offline it is deliberately EMPTY — the local WASM sim has no substep
+ * sampler, so a speaker there has no waveform to play and pretending
+ * otherwise would mean playing 60 Hz aliasing mush. The HUD says so. */
+function syncSpeakers() {
+  if (docVersion === speakerVersion && online === speakerOnline) return;
+  speakerVersion = docVersion;
+  speakerOnline = online;
+  speakerIds = [];
+  for (const e of elements) if (e.kind.t === 'Speaker') speakerIds.push(e.id);
+  audio.setSpeakers(online ? speakerIds : []);
+}
 
 let selectedIds = new Set<number>();
 let selectedProbe: number | null = null;
@@ -182,6 +210,7 @@ function applyOp(e: ElementSpec, op: InteractOp) {
 }
 
 function applyDoc(op: DocOp) {
+  docVersion++;
   if (op.t === 'Add') {
     if (!space.get(op.spec.id)) {
       elements.push(op.spec);
@@ -215,6 +244,7 @@ const net = connect({
     online = true;
     myId = you;
     elements = serverElements;
+    docVersion++;
     space.rebuild(elements);
     probes = serverProbes;
     panels = serverPanels;
@@ -265,6 +295,13 @@ const net = connect({
     for (const [pid, samples] of Object.entries(s)) {
       traces.appendChunk(Number(pid), t0, dts, samples);
       audio.pushChunk(Number(pid), t0, dts, samples);
+    }
+  },
+  onAudio(t0, dts, s) {
+    // Speaker taps, keyed by element id. Not a trace: these never reach the
+    // TraceStore, so a 12.5 kHz stream cannot swamp the scopes.
+    for (const [elem, samples] of Object.entries(s)) {
+      audio.pushSpeakerChunk(Number(elem), t0, dts, samples);
     }
   },
   onPresence(n) {
@@ -754,6 +791,7 @@ function deleteIds(ids: number[]) {
     if (online) net.sendEdit({ t: 'Remove', id }); // the server still sees every op
   }
   elements = elements.filter((e) => !gone.has(e.id));
+  docVersion++; // the bulk path bypasses applyDoc, so bump it by hand
   if (!online) localSim.setElements(elements);
   history.end();
 }
@@ -1092,6 +1130,24 @@ function partMenu(e: ElementSpec, x: number, y: number): MenuItem[] {
       { label: 'Probe voltage', hint: '1', run: () => toggleProbe(e.id, nearestPin(e, x, y), 'v') },
       { label: 'Probe current', hint: '2', run: () => toggleProbe(e.id, 0, 'i') },
       { label: 'Listen', hint: '3', run: () => toggleListen(e.id, nearestPin(e, x, y)) },
+    );
+  }
+  if (e.kind.t === 'Speaker' && audio.speakerStreamed(e.id)) {
+    // A speaker needs no probe to be heard, so its own mixer controls live
+    // here rather than on a probe flag.
+    // "Muted" covers being silenced by another speaker's solo, and unmuting
+    // then ends that solo — which is what the player means by the click.
+    const muted = audio.speakerMuted(e.id);
+    items.push(
+      { sep: true },
+      {
+        label: muted ? 'Unmute this speaker' : 'Mute this speaker',
+        run: () => audio.muteSpeaker(e.id, !muted),
+      },
+      {
+        label: audio.isSoloed(e.id) ? 'Unsolo' : 'Solo this speaker',
+        run: () => audio.soloSpeaker(e.id),
+      },
     );
   }
   items.push(
@@ -1817,7 +1873,7 @@ scopeCv.addEventListener('pointerdown', (ev) => {
 scopeCv.addEventListener('pointermove', (ev) => {
   scopeCv.style.cursor = dockCtrlAt(ev) ? 'pointer' : 'default';
 });
-const dock = createDock(scopeDiv, scopeCv);
+const dock = createDock(scopeDiv, scopeCv, audio);
 
 /** Blue highlight over an element: its pin-chain plus dots on every pin
  * (pins must overlap exactly to connect — make them visible). */
@@ -2096,6 +2152,10 @@ function frame(now: number) {
   const wallDt = Math.min(0.1, (now - lastT) / 1000);
   lastT = now;
 
+  // Speakers are sources of sound the moment they exist in the document.
+  // No-op unless the document actually changed since the last frame.
+  syncSpeakers();
+
   if (!online) {
     simDebt += wallDt / DT;
     const want = Math.floor(simDebt);
@@ -2142,7 +2202,13 @@ function frame(now: number) {
 
   if (cam.scale >= LOD_FULL) {
     for (const e of visible) {
-      drawElement({ ctx, cam, live: live.get(e.id), dots, dtSec: wallDt }, e);
+      // Speakers get their audio state alongside the solver frame: a
+      // sounding one glows, a muted or unstreamed one looks plainly idle.
+      const sound =
+        e.kind.t === 'Speaker' && audio.speakerStreamed(e.id)
+          ? { level: audio.speakerLevel(e.id), muted: audio.speakerMuted(e.id) }
+          : undefined;
+      drawElement({ ctx, cam, live: live.get(e.id), dots, dtSec: wallDt, sound }, e);
     }
   } else {
     // Too small for symbols: conductors only, colored by the solver frame.
@@ -2253,12 +2319,21 @@ function frame(now: number) {
           ? `${selectedIds.size} selected (drag moves, Q rotates, ⌘C copies, X deletes)`
           : '';
   const note = history.note();
+  // Sound needs a user gesture before the browser will play anything: say so
+  // once, only while it is actually blocking audio, and never once running.
+  const snd = audio.status();
+  const sound = snd.needsGesture
+    ? '  ⚠ click to enable sound'
+    : speakerIds.length > 0 && !online
+      ? `  ${speakerIds.length} speaker${speakerIds.length === 1 ? '' : 's'} silent offline (no substep sampler in the local sim)`
+      : '';
   hud.textContent =
     `EE Game   sim t = ${simTime.toFixed(2)} s   ` +
     (online ? `● ONLINE — ${population} player${population === 1 ? '' : 's'}` : '○ offline (local sim)') +
     `   ${perf.drawn}/${perf.total} parts drawn @ ${cam.scale.toFixed(1)} px/unit (cull ${perf.cull.toFixed(2)} ms)` +
     (mode ? `   ${mode}` : '') +
     (note ? `   ${note}` : '') +
+    sound +
     `\nparts: R C L W G V D N P M A U 5 S B T Z E F I · drag part = move · dbl-click = edit values · right-click = menu` +
     `\ndrag pin = wire · drag empty = select · Q rotate · ⌘Z undo · ⌘C/⌘V copy/paste · 1/2 probe · 3 listen · 0 ref · O scope · \` dock · J panel · X delete · / parts menu` +
     `\nH home district · shift+H fit everything · wheel = zoom (0.4–200 px/unit) · pan: middle / ctrl+drag / space+drag`;

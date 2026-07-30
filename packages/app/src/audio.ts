@@ -1,226 +1,271 @@
-// Real-time audio for "listen" probes (press 3 over an element).
+// Real-time audio: speakers, plus "listen" probes (press 3 over an element).
 //
 // Nothing in here synthesizes sound. The samples are the solver's own
-// waveform — the exact chunks the oscilloscope draws — handed to an
-// AudioWorklet that keeps a ring buffer and linearly upsamples from the sim
-// sample rate to the AudioContext rate. If you hear a tone, the circuit is
-// oscillating; if you hear nothing, it isn't (design pillar: every number a
-// player perceives comes from the solver).
+// waveform — a Speaker element's terminal voltage, or the exact chunks the
+// oscilloscope draws for a probe — handed to an AudioWorklet that keeps one
+// ring buffer PER SOURCE, resamples each to the AudioContext rate, sums them
+// and limits the sum. If you hear a tone, the circuit is oscillating; if you
+// hear nothing, it isn't (design pillar: every number a player perceives
+// comes from the solver).
 //
-// Honest limits of v1: online, probe chunks arrive at dt=20 µs × 16 = 320 µs
-// per sample, i.e. a 3.125 kHz source rate, so only content below ~1.5 kHz
-// is real — anything faster was already aliased by the server's decimation
-// and folds down into the audible band. Offline we feed one sample per
-// animation frame (~60 Hz), which is far coarser still: expect a rumble that
-// tracks the envelope, not the tone.
+// Honest limits:
+//   • Speakers stream on the server's dedicated audio cadence: dt=20 µs × 4
+//     = 12.5 kHz, so a 6.25 kHz Nyquist ceiling. A 440 Hz tone arrives with
+//     28 samples per cycle and sounds like a 440 Hz tone; content above
+//     6.25 kHz was already aliased by the server's decimation and folds down.
+//   • Listen probes ride the SCOPE cadence (dt × 16 = 3.125 kHz, ~1.5 kHz of
+//     real bandwidth) — 7 samples per cycle at 440 Hz, which is why speakers
+//     got their own faster stream instead of borrowing this one.
+//   • Offline (local WASM sim) there is no substep sampler, so the only
+//     source is a listen probe fed one sample per animation frame (~60 Hz):
+//     expect a rumble that tracks the envelope, not the tone. Speakers are
+//     SILENT offline, and the HUD says so rather than playing aliased mush.
 
-/** Peak volts that maps to `TARGET_FS` of full scale. */
-const REF_VOLTS = 5;
-/** Full-scale target for a REF_VOLTS-peak signal. */
-const TARGET_FS = 0.2;
-/** Buffer depth the worklet builds before it starts playing, in seconds. */
-const LATENCY_S = 0.06;
-/** Click-free fade in/out at start, stop and underrun. */
-const FADE_S = 0.006;
-/** DC blocker corner: a cone cannot follow DC, and neither do we. */
-const HP_HZ = 20;
-/** Ring capacity in source samples (~5 s at 3.125 kHz). */
-const RING = 1 << 14;
+import {
+  FADE_S,
+  HP_HZ,
+  LATENCY_S,
+  REF_VOLTS,
+  RING,
+  TARGET_FS,
+  WORKLET_SRC,
+} from './audio-worklet';
+import { lsFlag, lsNum, lsSet } from './store';
+
 /** Offline: animation-frame samples batched per message. */
 const OFFLINE_BATCH = 4;
+/** Level below which a source counts as silent (for the HUD and the glow). */
+const QUIET = 0.004;
+/** A level reading older than this is stale — the stream stopped. */
+const LEVEL_TTL_S = 0.5;
 
-/** The worklet, inlined so no extra file has to be served. */
-const WORKLET_SRC = `
-class SimAudioProcessor extends AudioWorkletProcessor {
-  constructor(options) {
-    super();
-    const o = (options && options.processorOptions) || {};
-    this.size = o.ringSize || 16384;
-    this.ring = new Float32Array(this.size);
-    this.target = o.target || 0.2;
-    this.refV = o.refV || 5;
-    this.latency = o.latencySec || 0.06;
-    this.fadeInc = 1 / Math.max(1, (o.fadeSec || 0.006) * sampleRate);
-    this.hpCoef = 1 - (2 * Math.PI * (o.hpHz || 20)) / sampleRate;
-    this.w = 0;      // absolute write count
-    this.r = 0;      // absolute read cursor (fractional)
-    this.step = 0;   // source samples consumed per output frame
-    this.prime = 0;  // source samples buffered before playback starts
-    this.armed = false;
-    this.fade = 0;
-    this.gain = 0;
-    this.peak = 0;
-    this.last = 0;
-    this.hpX = 0;
-    this.hpY = 0;
-    this.port.onmessage = (ev) => {
-      const m = ev.data;
-      if (m.t === 'chunk') {
-        this.setRate(m.dts);
-        this.write(m.s);
-      } else if (m.t === 'reset') {
-        this.w = 0;
-        this.r = 0;
-        this.step = 0;
-        this.armed = false;
-        this.peak = 0;
-        this.gain = 0;
-        this.last = 0;
-        this.hpX = 0;
-        this.hpY = 0;
-      }
-    };
-  }
+const VOL_KEY = 'ee.audio.vol';
+const MUTE_KEY = 'ee.audio.mute';
 
-  setRate(dts) {
-    if (!(dts > 0)) return;
-    const step = 1 / (dts * sampleRate);
-    if (Math.abs(step - this.step) < 1e-12) return;
-    this.step = step;
-    this.prime = Math.max(4, Math.min(this.size >> 1, Math.round(this.latency / dts)));
-  }
+/** Worklet-side key for each kind of source. Speakers are element ids and
+ * probes are pids; the two id spaces overlap, so they get separate prefixes. */
+const speakerKey = (elem: number) => `s${elem}`;
+const probeKey = (pid: number) => `p${pid}`;
 
-  write(s) {
-    for (let k = 0; k < s.length; k++) {
-      this.ring[this.w % this.size] = s[k];
-      this.w++;
-    }
-    // Drift control: if the reader falls too far behind (slow start, tab
-    // throttled, a burst of catch-up chunks) skip forward rather than let
-    // the writer lap it. The fade keeps the jump from clicking.
-    if (this.w - this.r > Math.min(this.size - 2, this.prime * 4)) {
-      this.r = this.w - this.prime;
-    }
-  }
-
-  process(_inputs, outputs) {
-    const ch = outputs[0];
-    const out = ch && ch[0];
-    if (!out) return true;
-    for (let k = 0; k < out.length; k++) {
-      let s = this.last;
-      if (this.armed) {
-        if (this.w - this.r > 1) {
-          const i = Math.floor(this.r);
-          const f = this.r - i;
-          const a = this.ring[i % this.size];
-          const b = this.ring[(i + 1) % this.size];
-          s = a + (b - a) * f;
-          this.r += this.step;
-          this.last = s;
-          this.fade = Math.min(1, this.fade + this.fadeInc);
-        } else {
-          this.armed = false; // underrun: coast, fade to silence
-          this.fade = Math.max(0, this.fade - this.fadeInc);
-        }
-      } else {
-        this.fade = Math.max(0, this.fade - this.fadeInc);
-        if (this.fade <= 0 && this.step > 0 && this.w - this.r >= this.prime) {
-          this.r = this.w - this.prime;
-          this.armed = true;
-        }
-      }
-      // DC block: a biased node (speaker across a rail) must not eat the
-      // headroom or thump when you start listening.
-      const y = s - this.hpX + this.hpCoef * this.hpY;
-      this.hpX = s;
-      this.hpY = y;
-      // Soft normalization: REF_VOLTS peak -> TARGET_FS. Louder signals are
-      // pulled down; quieter ones stay quiet (loudness is information).
-      const mag = y < 0 ? -y : y;
-      this.peak = mag > this.peak ? mag : this.peak * 0.99995 + mag * 0.00005;
-      const want = this.target / Math.max(this.refV, this.peak);
-      // Limiter glide: duck fast (~2 ms) so a sudden 100 V rail does not sit
-      // on the clipper, recover slowly (~25 ms) so it does not pump.
-      this.gain += (want - this.gain) * (want < this.gain ? 0.01 : 0.0008);
-      const v = y * this.gain * this.fade;
-      out[k] = v > 1 ? 1 : v < -1 ? -1 : v;
-    }
-    for (let c = 1; c < ch.length; c++) ch[c].set(out);
-    return true;
-  }
+/** Main-thread bookkeeping for one streamed source. The samples themselves
+ * live only in the worklet; this is what the UI needs to draw. */
+interface Source {
+  /** Expected sample-clock time of the next chunk (gap detection). */
+  nextT: number | null;
+  /** 0..1 peak level of the most recent chunks (REF_VOLTS peak = 1). */
+  lvl: number;
+  /** performance.now() of the last chunk, so a dead stream reads 0. */
+  lvlAt: number;
 }
-registerProcessor('sim-audio', SimAudioProcessor);
-`;
+
+/** The slice of the player the scope dock's audio controls need. */
+export interface AudioControls {
+  readonly muted: boolean;
+  readonly volume: number;
+  setMuted(v: boolean): void;
+  setVolume(v: number): void;
+  status(): AudioStatus;
+}
+
+export interface AudioStatus {
+  /** Speaker sources currently streaming. */
+  speakers: number;
+  /** True while a '3' listen probe is latched. */
+  listening: boolean;
+  /** True when some source is actually above the noise floor. */
+  sounding: boolean;
+  /** True when audio is ready but the browser is waiting for a gesture. */
+  needsGesture: boolean;
+}
 
 /**
- * Plays ONE probe's waveform. `listen(pid)` selects the source (switching is
- * a re-prime, not a crossfade), `stop()` silences it. Feed it with
- * `pushChunk` online or `pushPoint` offline; both are no-ops for any pid
- * that is not the current source, so callers can pipe every probe in.
+ * Mixes N solver streams to the sound card. Sources are added by
+ * `setSpeakers` (one per Speaker element in the document) and by `listen`
+ * (the '3' probe). Feed them with `pushSpeakerChunk` / `pushChunk` online or
+ * `pushPoint` offline; every push is a no-op for a source that does not
+ * exist, so callers can pipe everything in without filtering.
  */
-export class AudioPlayer {
+export class AudioPlayer implements AudioControls {
   private ctx: AudioContext | null = null;
   private node: AudioWorkletNode | null = null;
   private booting: Promise<void> | null = null;
   private dead = false;
+  /** pid of the '3'-listen probe, or null. */
   private src: number | null = null;
-  /** Expected sample-clock time of the next chunk (gap detection). */
-  private nextT: number | null = null;
-  /** Offline batching buffer: [t, v, t, v, ...]. */
-  private pts: number[] = [];
-  private lvl = 0;
-  private lvlAt = 0;
+  /** Live sources by worklet key. */
+  private srcs = new Map<string, Source>();
+  /** Speaker element ids currently streamed (mirrors the document). */
+  private speakers = new Set<number>();
+  /** Per-speaker mute, and solo (which mutes every other speaker). */
+  private mutedSpeakers = new Set<number>();
+  private soloed: number | null = null;
+  /** Offline batching buffer, per source key: [t, v, t, v, ...]. */
+  private pts = new Map<string, number[]>();
+  private vol = Math.min(1, Math.max(0, lsNum(VOL_KEY, 0.8)));
+  private mute = lsFlag(MUTE_KEY);
 
   constructor() {
     // Autoplay policy: a context created before any user gesture starts
-    // suspended. '3' is itself a gesture, but if the browser suspends us
-    // later (or the first attempt raced the policy) any click or key wakes
-    // it back up.
+    // suspended. '3' is itself a gesture, but a speaker can start sounding
+    // with no gesture at all (it is just a part in the document), so any
+    // click or key wakes the context up.
     const kick = () => {
-      if (this.src !== null && this.ctx && this.ctx.state === 'suspended') void this.ctx.resume();
+      if (this.srcs.size > 0) this.wake();
     };
     window.addEventListener('pointerdown', kick);
     window.addEventListener('keydown', kick);
   }
 
-  /** pid of the probe being listened to, or null when silent. */
+  // ------------------------------------------------------------ listen probe
+
+  /** pid of the probe being listened to, or null when not listening. */
   get pid(): number | null {
     return this.src;
   }
 
-  /** 0..1 loudness of the live stream (REF_VOLTS peak = 1), for the glyph. */
+  /** 0..1 loudness of the '3'-listen stream (REF_VOLTS peak = 1), for the
+   * listen glyph. Unchanged meaning from the single-source version. */
   get level(): number {
-    if (this.src === null) return 0;
-    return (performance.now() - this.lvlAt) / 1000 > 0.5 ? 0 : this.lvl;
+    return this.src === null ? 0 : this.levelOf(probeKey(this.src));
   }
 
   listen(pid: number) {
     if (this.src === pid) return;
+    if (this.src !== null) this.remove(probeKey(this.src));
     this.src = pid;
-    this.nextT = null;
-    this.pts.length = 0;
-    this.node?.port.postMessage({ t: 'reset' });
+    this.add(probeKey(pid));
     void this.boot();
   }
 
   stop() {
+    if (this.src === null) return;
+    this.remove(probeKey(this.src));
     this.src = null;
-    this.nextT = null;
-    this.pts.length = 0;
-    this.lvl = 0;
-    this.node?.port.postMessage({ t: 'reset' });
-    void this.ctx?.suspend();
+    this.idle();
   }
 
-  /** Server waveform chunk: `samples[k]` is the value at `t0 + k * dts`. */
-  pushChunk(pid: number, t0: number, dts: number, samples: ArrayLike<number>) {
-    if (pid !== this.src || samples.length === 0 || !(dts > 0)) return;
-    // A jump in the sample clock means continuity is gone (lagged socket,
-    // room restart): re-prime instead of splicing a discontinuity in.
-    if (this.nextT !== null && Math.abs(t0 - this.nextT) > dts * 4) {
-      this.node?.port.postMessage({ t: 'reset' });
+  // --------------------------------------------------------------- speakers
+
+  /** Reconcile the streamed speaker set with the document. Speakers that
+   * appeared start silent and fade in; ones that vanished fade out (a delete
+   * must not click). Cheap enough to call whenever the document changes. */
+  setSpeakers(ids: Iterable<number>) {
+    const want = ids instanceof Set ? ids : new Set(ids);
+    for (const id of this.speakers) {
+      if (!want.has(id)) {
+        this.remove(speakerKey(id));
+        this.speakers.delete(id);
+        this.mutedSpeakers.delete(id);
+        if (this.soloed === id) this.soloed = null;
+      }
     }
-    this.nextT = t0 + samples.length * dts;
-    const buf = new Float32Array(samples.length);
-    for (let k = 0; k < samples.length; k++) buf[k] = samples[k] ?? 0;
-    this.send(dts, buf);
+    for (const id of want) {
+      if (this.speakers.has(id)) continue;
+      this.speakers.add(id);
+      this.add(speakerKey(id));
+    }
+    if (this.srcs.size === 0) this.idle();
+  }
+
+  /** 0..1 of what this speaker is putting into the player's EARS, for the
+   * schematic glow: 0 when it is not streamed (offline, or past the server's
+   * tap cap), when its own stream is silent, or when sound is muted. The
+   * glyph means audible, not merely driven — the yellow arcs the renderer
+   * draws from the solver frame already mean driven. */
+  speakerLevel(elem: number): number {
+    if (this.mute) return 0;
+    return this.levelOf(speakerKey(elem));
+  }
+
+  /** True when this speaker exists as a source and is audible right now. */
+  speakerStreamed(elem: number): boolean {
+    return this.speakers.has(elem);
+  }
+
+  speakerMuted(elem: number): boolean {
+    return this.gainOf(elem) === 0;
+  }
+
+  muteSpeaker(elem: number, mute: boolean) {
+    if (mute) this.mutedSpeakers.add(elem);
+    else this.mutedSpeakers.delete(elem);
+    // Un-muting the soloed-out speaker is a request to end the solo.
+    if (!mute && this.soloed !== null && this.soloed !== elem) this.soloed = null;
+    this.pushGains();
+  }
+
+  /** Solo this speaker (every other one goes quiet); again to clear. */
+  soloSpeaker(elem: number) {
+    this.soloed = this.soloed === elem ? null : elem;
+    this.pushGains();
+  }
+
+  isSoloed(elem: number): boolean {
+    return this.soloed === elem;
+  }
+
+  // ----------------------------------------------------------------- global
+
+  get muted(): boolean {
+    return this.mute;
+  }
+
+  setMuted(v: boolean) {
+    this.mute = v;
+    lsSet(MUTE_KEY, v ? '1' : '0');
+    this.pushMaster();
+  }
+
+  get volume(): number {
+    return this.vol;
+  }
+
+  setVolume(v: number) {
+    this.vol = Math.min(1, Math.max(0, v));
+    lsSet(VOL_KEY, String(this.vol));
+    this.pushMaster();
+  }
+
+  status(): AudioStatus {
+    let sounding = false;
+    for (const key of this.srcs.keys()) {
+      if (this.levelOf(key) > QUIET) {
+        sounding = true;
+        break;
+      }
+    }
+    return {
+      speakers: this.speakers.size,
+      listening: this.src !== null,
+      sounding: sounding && !this.mute,
+      needsGesture: this.srcs.size > 0 && this.ctx?.state === 'suspended',
+    };
+  }
+
+  // ------------------------------------------------------------------ feeds
+
+  /** Server speaker chunk: `samples[k]` is the coil voltage at
+   * `t0 + k * dts`. Ignored for an element that is not a live source. */
+  pushSpeakerChunk(elem: number, t0: number, dts: number, samples: ArrayLike<number>) {
+    this.chunk(speakerKey(elem), t0, dts, samples, this.gainOf(elem));
+  }
+
+  /** Server probe chunk: `samples[k]` is the value at `t0 + k * dts`. */
+  pushChunk(pid: number, t0: number, dts: number, samples: ArrayLike<number>) {
+    if (pid !== this.src) return;
+    this.chunk(probeKey(pid), t0, dts, samples, 1);
   }
 
   /** Offline path: one sample per animation frame, batched. */
   pushPoint(pid: number, t: number, v: number) {
     if (pid !== this.src) return;
-    const pts = this.pts;
+    const key = probeKey(pid);
+    if (!this.srcs.has(key)) return;
+    let pts = this.pts.get(key);
+    if (!pts) {
+      pts = [];
+      this.pts.set(key, pts);
+    }
     if (pts.length && t <= pts[pts.length - 2]!) pts.length = 0; // sim restarted
     pts.push(t, v);
     if (pts.length < OFFLINE_BATCH * 2) return;
@@ -229,26 +274,116 @@ export class AudioPlayer {
     const buf = new Float32Array(n);
     for (let k = 0; k < n; k++) buf[k] = pts[k * 2 + 1]!;
     pts.length = 0;
-    if (dts > 0) this.send(dts, buf);
+    if (dts > 0) this.send(key, dts, buf, 1);
   }
 
-  private send(dts: number, buf: Float32Array) {
+  // --------------------------------------------------------------- internals
+
+  private add(key: string) {
+    if (this.srcs.has(key)) return;
+    this.srcs.set(key, { nextT: null, lvl: 0, lvlAt: 0 });
+    // The context may have been parked by `idle()` after the last source
+    // went away. A context that has run once resumes without a new gesture,
+    // so wake it here or a fresh speaker would be silent AND would make the
+    // HUD ask for a click the player already gave.
+    this.wake();
+    // A key can come back before the worklet finished fading out the last
+    // one (stop-then-listen, delete-then-undo): start it from a clean ring
+    // rather than splicing onto a stale read cursor.
+    this.node?.port.postMessage({ t: 'reset', id: key });
+  }
+
+  /** Remove a source: the worklet fades it out and drops it, so a deleted
+   * speaker or a stopped listen never clicks. */
+  private remove(key: string) {
+    this.srcs.delete(key);
+    this.pts.delete(key);
+    this.node?.port.postMessage({ t: 'drop', id: key });
+  }
+
+  /** Nothing left to play: park the context so the tab stops burning an
+   * audio thread. `add` and any user gesture wake it again. */
+  private idle() {
+    if (this.srcs.size === 0) void this.ctx?.suspend();
+  }
+
+  /** Wake a parked context. A no-op while the browser is still waiting for a
+   * user gesture — `status().needsGesture` is what asks for one. */
+  private wake() {
+    if (this.ctx?.state === 'suspended') {
+      void this.ctx.resume().catch(() => {
+        /* autoplay policy: stay suspended until a gesture */
+      });
+    }
+  }
+
+  /** Effective gain for a speaker: solo beats per-speaker mute. */
+  private gainOf(elem: number): number {
+    if (this.soloed !== null) return this.soloed === elem ? 1 : 0;
+    return this.mutedSpeakers.has(elem) ? 0 : 1;
+  }
+
+  private pushGains() {
+    for (const elem of this.speakers) {
+      this.node?.port.postMessage({ t: 'gain', id: speakerKey(elem), gain: this.gainOf(elem) });
+    }
+  }
+
+  private pushMaster() {
+    this.node?.port.postMessage({ t: 'master', gain: this.vol, mute: this.mute });
+  }
+
+  private levelOf(key: string): number {
+    const s = this.srcs.get(key);
+    if (!s) return 0;
+    return (performance.now() - s.lvlAt) / 1000 > LEVEL_TTL_S ? 0 : s.lvl;
+  }
+
+  private chunk(
+    key: string,
+    t0: number,
+    dts: number,
+    samples: ArrayLike<number>,
+    gain: number,
+  ) {
+    const s = this.srcs.get(key);
+    if (!s || samples.length === 0 || !(dts > 0)) return;
+    // A jump in the sample clock means continuity is gone (lagged socket,
+    // dropped chunk, room restart): re-prime that ONE source instead of
+    // splicing a discontinuity in. The other sources keep playing.
+    if (s.nextT !== null && Math.abs(t0 - s.nextT) > dts * 4) {
+      this.node?.port.postMessage({ t: 'reset', id: key });
+    }
+    s.nextT = t0 + samples.length * dts;
+    const buf = new Float32Array(samples.length);
+    for (let k = 0; k < samples.length; k++) buf[k] = samples[k] ?? 0;
+    this.send(key, dts, buf, gain);
+  }
+
+  private send(key: string, dts: number, buf: Float32Array, gain: number) {
+    const s = this.srcs.get(key);
+    if (!s) return;
     let peak = 0;
     for (const v of buf) {
       const a = v < 0 ? -v : v;
       if (a > peak) peak = a;
     }
     const l = Math.min(1, peak / REF_VOLTS);
-    this.lvl = l > this.lvl ? l : this.lvl * 0.7 + l * 0.3;
-    this.lvlAt = performance.now();
-    // Dropped while the worklet is still loading: a few frames of silence.
-    this.node?.port.postMessage({ t: 'chunk', dts, s: buf }, [buf.buffer]);
+    s.lvl = l > s.lvl ? l : s.lvl * 0.7 + l * 0.3;
+    s.lvlAt = performance.now();
+    if (!this.node) {
+      // First chunk of the session: the worklet is still loading (or has not
+      // been started). Boot it and drop this chunk — a few ms of silence.
+      void this.boot();
+      return;
+    }
+    this.node.port.postMessage({ t: 'chunk', id: key, dts, gain, s: buf }, [buf.buffer]);
   }
 
   private boot(): Promise<void> {
     if (this.dead) return Promise.resolve();
     if (this.booting) {
-      if (this.ctx?.state === 'suspended') void this.ctx.resume();
+      if (this.srcs.size > 0) this.wake();
       return this.booting;
     }
     this.booting = (async () => {
@@ -275,15 +410,18 @@ export class AudioPlayer {
       node.connect(ctx.destination);
       this.ctx = ctx;
       this.node = node;
-      // Stopped while the module was still loading: idle instead of running.
-      if (this.src === null) await ctx.suspend();
+      this.pushMaster();
+      // Everything stopped while the module was loading: idle instead of
+      // running an audio thread for silence.
+      if (this.srcs.size === 0) await ctx.suspend();
       else await ctx.resume();
     })().catch((err: unknown) => {
       // No AudioWorklet (or the page refuses to make noise): stay silent
-      // forever rather than retrying on every keypress.
-      console.warn('listen: audio unavailable', err);
+      // forever rather than retrying on every chunk.
+      console.warn('audio unavailable', err);
       this.dead = true;
       this.node = null;
+      this.srcs.clear();
       this.src = null;
     });
     return this.booting;
