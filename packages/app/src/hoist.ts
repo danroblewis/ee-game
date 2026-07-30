@@ -372,13 +372,19 @@ export function createHoist(root: HTMLElement, opts: { reset: () => void }): Hoi
     card.onState(mm, now, performance.now() - lastMsgAt > STALE_MS);
     advance(Math.min(0.1, dtSec));
 
-    const [gx0, gy0, gx1, gy1] = mm.rect;
+    // Normalised corners: a rect sent as [x1, y1, x0, y0] still stands up the
+    // right way instead of silently drawing nothing.
+    const gx0 = Math.min(mm.rect[0], mm.rect[2]);
+    const gx1 = Math.max(mm.rect[0], mm.rect[2]);
+    const gy0 = Math.min(mm.rect[1], mm.rect[3]);
+    const gy1 = Math.max(mm.rect[1], mm.rect[3]);
     const X0 = cam.ox + gx0 * cam.scale;
     const X1 = cam.ox + gx1 * cam.scale;
     const Y0 = cam.oy + gy0 * cam.scale;
     const Y1 = cam.oy + gy1 * cam.scale;
     const W = X1 - X0;
     const H = Y1 - Y0;
+    if (!Number.isFinite(W) || !Number.isFinite(H)) return;
     if (!(W > 2 && H > 2)) return; // degenerate or absurdly zoomed out
     if (X1 < 0 || Y1 < 0 || X0 > window.innerWidth || Y0 > window.innerHeight) return;
 
