@@ -10,6 +10,7 @@
 //                         B lamp, T pot) — click places (Q rotates first),
 //                         drag places with drag orientation, Esc exits
 //   click                 select part / probe flag;  drag on empty = marquee
+//   probe flag            X deletes it; right-click = delete/reference/listen
 //   drag a part body      move it (whole selection if it is in one)
 //   double-click a part   floating property editor next to it
 //   right-click           cascading context menu — on a part:
@@ -50,10 +51,15 @@ import {
   drawPanelGhost,
   drawPanelRegions,
   normPanelRect,
+  PANEL_HANDLE_CURSOR,
   PanelHost,
+  panelHotAt,
   panelZoneAt,
+  resizePanelRect,
   type Panel,
+  type PanelHandle,
   type PanelOp,
+  type PanelRect,
 } from './panel';
 import { DotFlow, drawElement, hitTest, type Camera } from './render';
 import {
@@ -216,10 +222,7 @@ const net = connect({
   },
   onProbes(list) {
     probes = list;
-    const alive = new Set(list.map((p) => p.pid));
-    traces.prune(alive);
-    if (selectedProbe !== null && !alive.has(selectedProbe)) selectedProbe = null;
-    for (const s of floatScopes) if (s.pids) s.pids = s.pids.filter((pid) => alive.has(pid));
+    pruneProbeUsers();
     if (listenWanted) {
       const p = list.find(
         (x) => x.elem === listenWanted!.elem && x.pin === listenWanted!.pin && x.kind === 'v',
@@ -229,7 +232,6 @@ const net = connect({
         audio.listen(p.pid);
       }
     }
-    if (audio.pid !== null && !alive.has(audio.pid)) audio.stop();
   },
   onPanels(list) {
     panels = list;
@@ -266,6 +268,19 @@ function editDoc(op: DocOp) {
   else localSim.setElements(elements);
 }
 
+/** Drop everything that pointed at a probe that no longer exists: its trace,
+ * the probe selection, float-scope channel lists and the audio source.
+ * Online this runs on every server probe list, offline after a local toggle
+ * (a probe's differential reference is a [elem, pin] node, not another
+ * probe, so deleting a probe never invalidates one). */
+function pruneProbeUsers() {
+  const alive = new Set(probes.map((p) => p.pid));
+  traces.prune(alive);
+  if (selectedProbe !== null && !alive.has(selectedProbe)) selectedProbe = null;
+  for (const s of floatScopes) if (s.pids) s.pids = s.pids.filter((pid) => alive.has(pid));
+  if (audio.pid !== null && !alive.has(audio.pid)) audio.stop();
+}
+
 function toggleProbe(elem: number, pin: number, kind: 'v' | 'i') {
   if (online) {
     net.sendProbe(elem, pin, kind);
@@ -274,7 +289,14 @@ function toggleProbe(elem: number, pin: number, kind: 'v' | 'i') {
   const k = probes.findIndex((p) => p.elem === elem && p.pin === pin && p.kind === kind);
   if (k >= 0) probes.splice(k, 1);
   else if (probes.length < 8) probes.push({ pid: localPidCounter++, elem, pin, kind });
-  traces.prune(new Set(probes.map((p) => p.pid)));
+  pruneProbeUsers();
+}
+
+/** Delete one probe: the same toggle '1'/'2' use, aimed at a probe that
+ * exists, so the server (or the offline branch) removes it. */
+function deleteProbe(p: Probe) {
+  if (selectedProbe === p.pid) selectedProbe = null;
+  toggleProbe(p.elem, p.pin, p.kind);
 }
 
 /** '3': hear this node. The audio source is a normal voltage probe's sample
@@ -934,6 +956,39 @@ function partMenu(e: ElementSpec, x: number, y: number): MenuItem[] {
   return items;
 }
 
+/** Right-click on a probe flag. The flag floats above its pin, so this menu
+ * takes priority over the part underneath it. */
+function probeMenu(p: Probe): MenuItem[] {
+  const items: MenuItem[] = [
+    { head: `${p.kind === 'v' ? 'Voltage probe' : 'Current clamp'} ${p.pid}` },
+    { label: 'Delete probe', hint: 'X', run: () => deleteProbe(p) },
+  ];
+  if (p.kind === 'v') {
+    const r = p.r;
+    items.push(
+      { sep: true },
+      r
+        ? // Re-sending the same point clears the reference (back to ground).
+          { label: 'Clear reference', hint: '0', run: () => setProbeRef(p.pid, r[0], r[1]) }
+        : {
+            label: 'Set reference…',
+            hint: '0',
+            // '0' references whatever the cursor is over, for the selected probe.
+            run: () => {
+              selectedProbe = p.pid;
+              selectedIds.clear();
+            },
+          },
+      {
+        label: audio.pid === p.pid ? 'Stop listening' : 'Listen',
+        hint: '3',
+        run: () => toggleListen(p.elem, p.pin),
+      },
+    );
+  }
+  return items;
+}
+
 function canvasMenu(x: number, y: number): MenuItem[] {
   const items: MenuItem[] = [{ label: 'Add part', sub: partsMenu }];
   if (clipboard.length > 0) {
@@ -978,6 +1033,15 @@ let panelMove: {
   h: number;
   lastSent: number;
 } | null = null;
+/** Dragging one of a region's eight resize grips. `base` is the rect as it
+ * was when the grip was grabbed, so a flip past the opposite edge stays
+ * anchored to the edge the player is not holding. */
+let panelResize: {
+  plid: number;
+  handle: PanelHandle;
+  base: PanelRect;
+  lastSent: number;
+} | null = null;
 let spaceHeld = false;
 let lastCursorSent = 0;
 
@@ -1002,11 +1066,16 @@ canvas.addEventListener('contextmenu', (ev) => {
   // already started a pan, do not also pop the menu.
   if (panDrag || placing || pasting) return;
   if (scopeZoneAt(ev.clientX, ev.clientY)) return;
-  const e = elementAt(ev.clientX, ev.clientY);
+  const pr = probeAt(ev.clientX, ev.clientY);
+  const e = pr ? undefined : elementAt(ev.clientX, ev.clientY);
   openCtxMenu(
     ev.clientX,
     ev.clientY,
-    e ? partMenu(e, ev.clientX, ev.clientY) : canvasMenu(ev.clientX, ev.clientY),
+    pr
+      ? probeMenu(pr)
+      : e
+        ? partMenu(e, ev.clientX, ev.clientY)
+        : canvasMenu(ev.clientX, ev.clientY),
   );
 });
 
@@ -1065,11 +1134,15 @@ canvas.addEventListener('pointerdown', (ev) => {
     }
     return;
   }
-  // Panel name tabs: × deletes the region, the tab itself drags it.
+  // Panel name tabs: × deletes the region, the tab itself drags it; the
+  // eight grips on its border resize it.
   const pz = panelZoneAt(cam, panels, ev.clientX, ev.clientY);
   if (pz) {
     if (pz.zone === 'close') {
       panelOp({ t: 'remove', plid: pz.panel.plid });
+    } else if (pz.zone === 'resize') {
+      const { x0, y0, x1, y1 } = pz.panel;
+      panelResize = { plid: pz.panel.plid, handle: pz.handle, base: { x0, y0, x1, y1 }, lastSent: 0 };
     } else {
       const [gx, gy] = toGrid(ev.clientX, ev.clientY);
       panelMove = {
@@ -1191,6 +1264,17 @@ canvas.addEventListener('pointermove', (ev) => {
     }
     return;
   }
+  if (panelResize) {
+    const [gx, gy] = toGrid(ev.clientX, ev.clientY);
+    const rect = resizePanelRect(panelResize.base, panelResize.handle, gx, gy);
+    const p = panels.find((q) => q.plid === panelResize!.plid);
+    if (p) Object.assign(p, rect); // optimistic; the broadcast confirms
+    if (now - panelResize.lastSent > 60) {
+      panelResize.lastSent = now;
+      panelOp({ t: 'rect', plid: panelResize.plid, ...rect });
+    }
+    return;
+  }
   if (marquee) {
     marquee.x1 = ev.clientX;
     marquee.y1 = ev.clientY;
@@ -1225,8 +1309,11 @@ canvas.addEventListener('pointermove', (ev) => {
     return;
   }
   const z = scopeZoneAt(ev.clientX, ev.clientY);
-  const over = z ? undefined : elementAt(ev.clientX, ev.clientY);
-  const onPin = !z && !!pinAt(ev.clientX, ev.clientY);
+  // Panel tabs and grips are hit-tested before pins/parts on pointerdown, so
+  // the cursor has to agree with that order.
+  const pz = z ? null : panelZoneAt(cam, panels, ev.clientX, ev.clientY);
+  const over = z || pz ? undefined : elementAt(ev.clientX, ev.clientY);
+  const onPin = !z && !pz && !!pinAt(ev.clientX, ev.clientY);
   canvas.style.cursor = placing || pasting || panelTool
     ? 'crosshair'
     : spaceHeld
@@ -1239,13 +1326,19 @@ canvas.addEventListener('pointermove', (ev) => {
             : z.zone === 'ctrl' || z.zone === 'chan' || z.zone === 'close'
               ? 'pointer'
               : 'default'
-        : onPin
-          ? 'crosshair' // drag from a terminal draws a wire
-          : over?.kind.t === 'Switch' || over?.kind.t === 'Button'
-            ? 'pointer'
-            : over
-              ? 'move' // plain drag moves any part
-              : 'default';
+        : pz
+          ? pz.zone === 'resize'
+            ? PANEL_HANDLE_CURSOR[pz.handle]
+            : pz.zone === 'close'
+              ? 'pointer'
+              : 'move'
+          : onPin
+            ? 'crosshair' // drag from a terminal draws a wire
+            : over?.kind.t === 'Switch' || over?.kind.t === 'Button'
+              ? 'pointer'
+              : over
+                ? 'move' // plain drag moves any part
+                : 'default';
 });
 
 canvas.addEventListener('pointerup', (ev) => {
@@ -1275,10 +1368,12 @@ canvas.addEventListener('pointerup', (ev) => {
     }
     return;
   }
-  if (panelMove) {
-    const p = panels.find((q) => q.plid === panelMove!.plid);
+  if (panelMove || panelResize) {
+    const plid = panelMove?.plid ?? panelResize!.plid;
+    const p = panels.find((q) => q.plid === plid);
     if (p) panelOp({ t: 'rect', plid: p.plid, x0: p.x0, y0: p.y0, x1: p.x1, y1: p.y1 });
     panelMove = null;
+    panelResize = null;
     return;
   }
   if (marquee) {
@@ -1408,6 +1503,18 @@ window.addEventListener('keydown', (ev) => {
     return;
   }
   if (ev.key === 'Delete' || ev.key === 'Backspace' || ev.key === 'x') {
+    // A selected probe — or a hovered flag when nothing else is selected —
+    // deletes that probe and nothing else.
+    const pr =
+      selectedProbe !== null
+        ? probes.find((p) => p.pid === selectedProbe)
+        : selectedIds.size === 0 && mouse
+          ? probeAt(mouse.x, mouse.y)
+          : undefined;
+    if (pr) {
+      deleteProbe(pr);
+      return;
+    }
     const e = mouse ? elementAt(mouse.x, mouse.y) : undefined;
     if (selectedIds.size > 0) {
       for (const id of [...selectedIds]) editDoc({ t: 'Remove', id });
@@ -1788,8 +1895,14 @@ function frame(now: number) {
   }
 
   // Panel regions sit under the schematic: they frame parts, never hide them.
-  const pzHover = mouse ? panelZoneAt(cam, panels, mouse.x, mouse.y) : null;
-  drawPanelRegions(ctx, cam, panels, pzHover?.panel.plid ?? panelMove?.plid ?? null);
+  // The one under the pointer (or being dragged) shows its resize grips.
+  const hotPanel = mouse ? panelHotAt(cam, panels, mouse.x, mouse.y) : null;
+  drawPanelRegions(
+    ctx,
+    cam,
+    panels,
+    panelResize?.plid ?? panelMove?.plid ?? hotPanel?.plid ?? null,
+  );
   if (panelDrag) drawPanelGhost(ctx, cam, panelDrag.a, panelDrag.b);
 
   for (const e of elements) {

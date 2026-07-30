@@ -42,6 +42,14 @@ export type PanelOp =
 /** Smallest accepted region in grid units (mirrors the server's rule). */
 export const MIN_PANEL_SPAN = 1;
 
+/** Just the geometry of a region — what a resize drag works on. */
+export interface PanelRect {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
+
 /** Normalize a drag rectangle; null = too small / not finite (dropped). */
 export function normPanelRect(a: Point, b: Point): [number, number, number, number] | null {
   const x0 = Math.min(a[0], b[0]);
@@ -95,9 +103,73 @@ const TAB_FONT = '11px ui-monospace, monospace';
 const CHAR_W = 6.7;
 const CLOSE_W = 17;
 
+/** Resize grips: four corners plus four edge midpoints. */
+export type PanelHandle = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w';
+/** Corners first, so they win over an edge grip on a tiny region. */
+const HANDLES: PanelHandle[] = ['nw', 'ne', 'se', 'sw', 'n', 'e', 's', 'w'];
+/** Half the drawn grip square, and the (slightly larger) click radius. */
+const GRIP_R = 4.5;
+const GRIP_HIT = 7;
+
+export const PANEL_HANDLE_CURSOR: Record<PanelHandle, string> = {
+  nw: 'nwse-resize',
+  se: 'nwse-resize',
+  ne: 'nesw-resize',
+  sw: 'nesw-resize',
+  n: 'ns-resize',
+  s: 'ns-resize',
+  e: 'ew-resize',
+  w: 'ew-resize',
+};
+
 function tabRect(cam: Camera, p: Panel): [number, number, number, number] {
   const w = Math.max(72, p.name.length * CHAR_W + 18 + CLOSE_W);
   return [cam.ox + p.x0 * cam.scale, cam.oy + p.y0 * cam.scale - TAB_H - 3, w, TAB_H];
+}
+
+/** The region in screen pixels: [x, y, w, h]. */
+function regionPx(cam: Camera, p: Panel): [number, number, number, number] {
+  return [
+    cam.ox + p.x0 * cam.scale,
+    cam.oy + p.y0 * cam.scale,
+    (p.x1 - p.x0) * cam.scale,
+    (p.y1 - p.y0) * cam.scale,
+  ];
+}
+
+/** Where one grip sits, in screen pixels. */
+function gripPx(cam: Camera, p: Panel, h: PanelHandle): [number, number] {
+  const [X, Y, W, H] = regionPx(cam, p);
+  return [
+    h.includes('w') ? X : h.includes('e') ? X + W : X + W / 2,
+    h.includes('n') ? Y : h.includes('s') ? Y + H : Y + H / 2,
+  ];
+}
+
+/** Drag `handle` of `base` to grid point (gx, gy). Snapped to the integer
+ * grid, never thinner than MIN_PANEL_SPAN, and normalised: dragging an edge
+ * past its opposite flips the rectangle instead of inverting it. */
+export function resizePanelRect(
+  base: PanelRect,
+  handle: PanelHandle,
+  gx: number,
+  gy: number,
+): PanelRect {
+  // `back` = the dragged edge started on the low side of its anchor, which
+  // is the direction to push it when the drag lands exactly on the anchor.
+  const span = (anchor: number, moved: number, back: boolean): [number, number] => {
+    const d = moved - anchor;
+    const sign = d === 0 ? (back ? -1 : 1) : Math.sign(d);
+    const m = anchor + sign * Math.max(MIN_PANEL_SPAN, Math.abs(d));
+    return [Math.min(anchor, m), Math.max(anchor, m)];
+  };
+  let [x0, x1] = [base.x0, base.x1];
+  let [y0, y1] = [base.y0, base.y1];
+  if (handle.includes('w')) [x0, x1] = span(base.x1, Math.round(gx), true);
+  else if (handle.includes('e')) [x0, x1] = span(base.x0, Math.round(gx), false);
+  if (handle.includes('n')) [y0, y1] = span(base.y1, Math.round(gy), true);
+  else if (handle.includes('s')) [y0, y1] = span(base.y0, Math.round(gy), false);
+  return { x0, y0, x1, y1 };
 }
 
 function roundRectPath(
@@ -118,7 +190,8 @@ function roundRectPath(
   ctx.closePath();
 }
 
-/** Draw every panel region: dotted rounded rect plus its name tab. */
+/** Draw every panel region: dotted rounded rect plus its name tab. The hot
+ * one (pointer over it, or mid-drag) also shows its eight resize grips. */
 export function drawPanelRegions(
   ctx: CanvasRenderingContext2D,
   cam: Camera,
@@ -131,10 +204,7 @@ export function drawPanelRegions(
   ctx.textBaseline = 'middle';
   for (const p of panels) {
     const hot = p.plid === hoverPlid;
-    const X = cam.ox + p.x0 * cam.scale;
-    const Y = cam.oy + p.y0 * cam.scale;
-    const W = (p.x1 - p.x0) * cam.scale;
-    const H = (p.y1 - p.y0) * cam.scale;
+    const [X, Y, W, H] = regionPx(cam, p);
     roundRectPath(ctx, X, Y, W, H, Math.min(16, cam.scale * 0.5));
     ctx.fillStyle = hot ? '#4ad4ff12' : '#4ad4ff08';
     ctx.fill();
@@ -143,6 +213,19 @@ export function drawPanelRegions(
     ctx.strokeStyle = hot ? '#8ee7ff' : '#4a8ea8';
     ctx.stroke();
     ctx.setLineDash([]);
+
+    if (hot) {
+      ctx.lineWidth = 1.2;
+      for (const h of HANDLES) {
+        const [hx, hy] = gripPx(cam, p, h);
+        ctx.beginPath();
+        ctx.rect(hx - GRIP_R, hy - GRIP_R, GRIP_R * 2, GRIP_R * 2);
+        ctx.fillStyle = '#0d1c23';
+        ctx.fill();
+        ctx.strokeStyle = '#8ee7ff';
+        ctx.stroke();
+      }
+    }
 
     const [tx, ty, tw, th] = tabRect(cam, p);
     roundRectPath(ctx, tx, ty, tw, th, 5);
@@ -176,10 +259,12 @@ export function drawPanelGhost(ctx: CanvasRenderingContext2D, cam: Camera, a: Po
   ctx.restore();
 }
 
-export type PanelZone = { panel: Panel; zone: 'tab' | 'close' };
+export type PanelZone =
+  | { panel: Panel; zone: 'tab' | 'close' }
+  | { panel: Panel; zone: 'resize'; handle: PanelHandle };
 
-/** Hit-test the name tabs (the region body stays click-through so the
- * schematic underneath keeps working normally). */
+/** Hit-test the name tabs and the resize grips (the region body stays
+ * click-through so the schematic underneath keeps working normally). */
 export function panelZoneAt(
   cam: Camera,
   panels: Panel[],
@@ -192,6 +277,27 @@ export function panelZoneAt(
     if (x >= tx && x <= tx + tw && y >= ty && y <= ty + th) {
       return { panel: p, zone: x >= tx + tw - CLOSE_W ? 'close' : 'tab' };
     }
+    for (const h of HANDLES) {
+      const [hx, hy] = gripPx(cam, p, h);
+      if (Math.abs(x - hx) <= GRIP_HIT && Math.abs(y - hy) <= GRIP_HIT) {
+        return { panel: p, zone: 'resize', handle: h };
+      }
+    }
+  }
+  return null;
+}
+
+/** The region the pointer is working with — its tab, a grip, or anywhere
+ * inside it. Grips are drawn for this one, so every grip that can be hit is
+ * a grip the player can see (the hot area covers the whole grip ring). */
+export function panelHotAt(cam: Camera, panels: Panel[], x: number, y: number): Panel | null {
+  // Whatever a click would act on wins, so the grips drawn are the grips hit.
+  const z = panelZoneAt(cam, panels, x, y);
+  if (z) return z.panel;
+  for (let k = panels.length - 1; k >= 0; k--) {
+    const p = panels[k]!;
+    const [X, Y, W, H] = regionPx(cam, p);
+    if (x >= X && x <= X + W && y >= Y && y <= Y + H) return p;
   }
   return null;
 }
