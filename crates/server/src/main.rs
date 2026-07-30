@@ -5,7 +5,8 @@
 //!   server -> client: hello{you, elements}, frame{time, e}, op{id, op},
 //!                     presence{n}, cursor{who, x, y},
 //!                     samples{t0, dts, s} (probe scopes, 3.125 kHz),
-//!                     audio{t0, dts, s}   (speaker taps, 12.5 kHz)
+//!                     audio{t0, dts, rt, s} (speaker taps, 12.5 kHz; `rt` is
+//!                       sim seconds produced per wall second)
 //!   client -> server: interact{id, op}, cursor{x, y}
 //!
 //! `samples` and `audio` are both best-effort: they ride the same broadcast
@@ -708,12 +709,56 @@ fn checkpoint(room: &Room, hoist: &Hoist) {
     }
 }
 
-/// `{"t":"audio", t0, dts, s:{elemId: [...]}}` — one speaker chunk per tap.
+/// Smoothing for the realtime ratio: one EMA pole at 0.2 is ~5 ticks (170 ms),
+/// slow enough that one late tick does not flash a warning at the player, fast
+/// enough that flipping a heavy circuit on shows up immediately.
+const RT_ALPHA: f64 = 0.2;
+
+/// Sim seconds produced per wall second, smoothed — the server's own honesty
+/// about how dilated it is.
+///
+/// The tick advances at most `MAX_STEPS_PER_TICK` substeps and the loop never
+/// waits for more (Falstad's rule: a heavy circuit slows SIM time, never the
+/// loop). Speaker audio is generated on that sim clock and consumed by the
+/// client's sound card on the WALL clock, so this ratio IS the rate at which
+/// every listener's ring buffer drains: at 0.6x, six seconds of audio arrive
+/// for every ten seconds played, and no client-side buffering or resampling
+/// can fix that. Reported so the client can say "the circuit is too heavy"
+/// instead of "the sound is broken".
+///
+/// A quarantined solver advances no sim time at all, so this correctly falls
+/// to 0: there is no audio being produced.
+fn blend_realtime(prev: f64, advanced: f64, wall: f64) -> f64 {
+    // A wall gap of zero (or a clock that went backwards, or a sim time that
+    // did — a room reload) carries no information: keep the last estimate.
+    // NaN fails `is_finite`, so it takes this exit too rather than poisoning
+    // the EMA forever.
+    if !wall.is_finite() || wall <= 1e-6 || !advanced.is_finite() || advanced < 0.0 {
+        return prev;
+    }
+    let inst = (advanced / wall).clamp(0.0, 4.0);
+    let next = prev + (inst - prev) * RT_ALPHA;
+    if next.is_finite() {
+        next
+    } else {
+        1.0
+    }
+}
+
+/// `{"t":"audio", t0, dts, rt, s:{elemId: [...]}}` — one speaker chunk per tap.
 /// Keyed by ELEMENT id (not pid): speaker audio exists whether or not anyone
 /// probed the part, which is the whole point of this stream.
+///
+/// `rt` is `blend_realtime`'s ratio. It rides the AUDIO message rather than
+/// `frame` for three reasons: it is a property of this stream's production
+/// rate, so a client never has to correlate two messages to explain a chunk;
+/// it costs nothing in a room with no speakers, where nobody would read it;
+/// and `frame` is the per-element payload that becomes the binary transport
+/// in M4/M5, whose layout should not grow a scalar that belongs to audio.
 fn audio_message(
     t0: f64,
     dts: f64,
+    rt: f64,
     taps: &[(u32, sim_core::ElemTap)],
     bufs: Vec<Vec<f64>>,
 ) -> String {
@@ -722,7 +767,10 @@ fn audio_message(
         .zip(bufs)
         .map(|((id, _), b)| (id.to_string(), serde_json::json!(b)))
         .collect();
-    json!({"t": "audio", "t0": t0, "dts": dts, "s": s}).to_string()
+    // Three decimals: 0.001x of dilation is 1 ms of audio per second, far
+    // below anything the readout or the ear can act on.
+    let rt = (rt * 1000.0).round() / 1000.0;
+    json!({"t": "audio", "t0": t0, "dts": dts, "rt": rt, "s": s}).to_string()
 }
 
 /// The sim task: sole owner of the Engine. Ops apply between ticks —
@@ -741,9 +789,31 @@ async fn sim_task(room: Arc<Room>, mut cmds: mpsc::UnboundedReceiver<Cmd>, mut h
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let steps_per_tick = ((1.0 / TICK_HZ) / DT).round() as u32;
     let mut ticks_since_save: u32 = 0;
+    // Dilation tracking: sim time produced vs wall time spent. Measured at the
+    // TOP of the loop, so it includes everything a tick costs (solve, command
+    // drain, serialization, scheduler slip) — which is what a client's sound
+    // card experiences. `rt_ready` skips the first pass, where no sim time has
+    // been advanced yet and the ratio would read 0.
+    let mut rt = 1.0f64;
+    let mut rt_ready = false;
+    let mut last_wall = std::time::Instant::now();
+    let mut last_sim = eng.time();
 
     loop {
         interval.tick().await;
+
+        {
+            let now = std::time::Instant::now();
+            let wall = now.duration_since(last_wall).as_secs_f64();
+            last_wall = now;
+            let sim = eng.time();
+            let advanced = sim - last_sim;
+            last_sim = sim;
+            if rt_ready {
+                rt = blend_realtime(rt, advanced, wall);
+            }
+            rt_ready = true;
+        }
 
         // Checkpoint the document every ~5 s when it has changed.
         ticks_since_save += 1;
@@ -945,9 +1015,9 @@ async fn sim_task(room: Arc<Room>, mut cmds: mpsc::UnboundedReceiver<Cmd>, mut h
             // lagged consumer skips chunks, which costs a few ms of silence
             // and desyncs nothing (the client re-primes on the time gap).
             if !taps.is_empty() {
-                let _ = room
-                    .events
-                    .send(audio_message(t0, DT * AUDIO_EVERY as f64, &taps, abufs));
+                let _ =
+                    room.events
+                        .send(audio_message(t0, DT * AUDIO_EVERY as f64, rt, &taps, abufs));
             }
         }
 
@@ -2021,7 +2091,7 @@ mod tests {
         // Measured: ~94 kB/s per speaker (0.75 Mbit/s), 4 taps => ~375 kB/s.
         // That is the price of the M4-lite JSON transport; the binary
         // transport (M4/M5) carries the same 12.5 kHz f32 stream in 50 kB/s.
-        let msg = audio_message(t0, dts, &taps, vec![buf.clone()]);
+        let msg = audio_message(t0, dts, 0.6234, &taps, vec![buf.clone()]);
         let per_sec = msg.len() as f64 * TICK_HZ;
         assert!(
             per_sec < 110_000.0,
@@ -2032,6 +2102,49 @@ mod tests {
         assert_eq!(v["t"], "audio");
         assert_eq!(v["dts"].as_f64().unwrap(), dts);
         assert_eq!(v["s"]["3"].as_array().unwrap().len(), buf.len());
+        // The client needs the dilation figure on this message to tell "the
+        // sim is too slow to make audio" from "my socket hiccuped".
+        assert_eq!(v["rt"].as_f64().unwrap(), 0.623);
+    }
+
+    /// The realtime ratio must report what the wall clock actually saw: a tick
+    /// that advanced less sim time than wall time IS the audio producer
+    /// falling behind the sound card, and the client shows it as "sim 0.6x".
+    #[test]
+    fn realtime_ratio_tracks_sim_dilation() {
+        // Perfect realtime stays at 1.
+        let mut rt = 1.0;
+        for _ in 0..50 {
+            rt = blend_realtime(rt, 1.0 / TICK_HZ, 1.0 / TICK_HZ);
+        }
+        assert!((rt - 1.0).abs() < 1e-9, "realtime drifted to {rt}");
+
+        // A tick that takes 55 ms of wall to advance 33.3 ms of sim is 0.6x.
+        // The EMA has to converge there, not overshoot or stick.
+        for _ in 0..80 {
+            rt = blend_realtime(rt, 1.0 / TICK_HZ, 0.0555_556);
+        }
+        assert!(
+            (rt - 0.6).abs() < 0.01,
+            "expected ~0.6x under 1.67x load, got {rt}"
+        );
+        // ...and recovers when the load goes away.
+        for _ in 0..80 {
+            rt = blend_realtime(rt, 1.0 / TICK_HZ, 1.0 / TICK_HZ);
+        }
+        assert!((rt - 1.0).abs() < 0.01, "did not recover: {rt}");
+
+        // A quarantined solver advances no sim time: honest 0, not a stale 1.
+        for _ in 0..120 {
+            rt = blend_realtime(rt, 0.0, 1.0 / TICK_HZ);
+        }
+        assert!(rt < 0.01, "a stalled sim should read ~0, got {rt}");
+
+        // Garbage in (zero wall gap, negative sim step, NaN) never poisons it.
+        assert_eq!(blend_realtime(0.5, 0.033, 0.0), 0.5);
+        assert_eq!(blend_realtime(0.5, -0.1, 0.033), 0.5);
+        assert_eq!(blend_realtime(0.5, f64::NAN, 0.033), 0.5);
+        assert!(blend_realtime(1.0, 10.0, 1e-9).is_finite());
     }
 
     /// The tap set is the first N speakers by element id — deterministic, and

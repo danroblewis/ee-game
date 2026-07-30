@@ -311,9 +311,14 @@ const net = connect({
       audio.pushChunk(Number(pid), t0, dts, samples);
     }
   },
-  onAudio(t0, dts, s) {
+  onAudio(t0, dts, s, rt) {
     // Speaker taps, keyed by element id. Not a trace: these never reach the
     // TraceStore, so a 12.5 kHz stream cannot swamp the scopes.
+    //
+    // The server's realtime ratio comes with them: below 1 the sim is dilated
+    // and audio physically cannot keep up, which the dock reports as "sim
+    // 0.6x" instead of letting the player think the sound is broken.
+    audio.setRealtimeRatio(rt);
     for (const [elem, samples] of Object.entries(s)) {
       audio.pushSpeakerChunk(Number(elem), t0, dts, samples);
     }

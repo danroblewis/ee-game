@@ -55,6 +55,11 @@
       #audiovol { width: 74px; accent-color: #8ee7ff; cursor: pointer; }
       #audiolabel { color: #6e6e7e; flex: none; }
       #audiolabel.warn { color: #ffd66b; }
+      /* Buffer telemetry: dim while healthy, amber when thin or the sim is
+         dilated, red once audio was actually lost. */
+      #audiobuf { color: #5c5c6a; flex: none; font-variant-numeric: tabular-nums; }
+      #audiobuf.warn { color: #ffd66b; }
+      #audiobuf.bad { color: #ff8f8f; }
       #scopecv { width: 100%; height: calc(100% - 24px); display: block; }
       #scope.collapsed #scopecv { display: none; }
       #props, #propsdlg {
@@ -318,7 +323,7 @@
             step="1"
             title="volume"
             aria-label="volume"
-          /><span id="audiolabel"></span></span></div>
+          /><span id="audiolabel"></span><span id="audiobuf"></span></span></div>
       <canvas id="scopecv"></canvas>
     </div>
     <div id="props"></div>

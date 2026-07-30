@@ -24,8 +24,14 @@ export interface NetHandlers {
   onSamples(t0: number, dts: number, s: Record<string, number[]>): void;
   /** Speaker audio taps, keyed by ELEMENT id. A separate stream from
    * `samples` so scope decimation and speaker audio never fight over a
-   * cadence; best-effort, so a dropped chunk is a blip of silence. */
-  onAudio(t0: number, dts: number, s: Record<string, number[]>): void;
+   * cadence; best-effort, so a dropped chunk is a blip of silence.
+   *
+   * `rt` is the server's realtime ratio — sim seconds produced per wall
+   * second. It rides THIS message rather than `frame` because it is the
+   * production rate of these very samples: the client can attribute a
+   * dilation to the exact chunk without correlating two streams, and a room
+   * with no speakers pays nothing for a number nobody would read. */
+  onAudio(t0: number, dts: number, s: Record<string, number[]>, rt: number | null): void;
   onPresence(n: number): void;
   onCursor(who: number, x: number, y: number): void;
   onClose(): void;
@@ -91,7 +97,7 @@ export function connect(h: NetHandlers): Net {
         h.onSamples(m.t0, m.dts, m.s);
         break;
       case 'audio':
-        h.onAudio(m.t0, m.dts, m.s ?? {});
+        h.onAudio(m.t0, m.dts, m.s ?? {}, typeof m.rt === 'number' ? m.rt : null);
         break;
       case 'presence':
         h.onPresence(m.n);
