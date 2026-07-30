@@ -25,7 +25,9 @@
 //   0                     set selected V-probe's reference (differential)
 //   O                     drop an in-place oscilloscope;  X delete
 //   J                     drag a control-panel region around some parts
-//                         (its floating instrument window follows)
+//                         (its floating instrument window follows) — a scope
+//                         parked inside a region becomes a widget in that
+//                         panel's window; drag it out to detach it again
 //   wheel zoom (over a scope: timebase) · pan: middle-drag, ctrl+drag, space+drag
 
 import init, { Sim } from './wasm/sim_wasm';
@@ -51,6 +53,8 @@ import {
   normPanelRect,
   PanelHost,
   panelZoneAt,
+  roundRectPath,
+  scopeOwner,
   type Panel,
   type PanelOp,
 } from './panel';
@@ -61,11 +65,12 @@ import {
   probeColor,
   renderScope,
   renderScopeInto,
+  scopeChannels,
   scopeControlAt,
   TraceStore,
+  type FloatScope,
   type Probe,
   type ScopeControlId,
-  type ScopeSettings,
 } from './scope';
 
 const DT = 10e-6;
@@ -129,17 +134,8 @@ type ClipItem = { kind: ElementKind; pins: Point[] };
 let clipboard: ClipItem[] = [];
 let pasting: ClipItem[] | null = null;
 
-/** In-place oscilloscopes: world-anchored, per-player instruments. */
-interface FloatScope {
-  sid: number;
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-  /** Per-scope instrument settings; owns the timebase. */
-  set: ScopeSettings;
-  pids: number[] | null; // null = all probes
-}
+/** In-place oscilloscopes: world-anchored, per-player instruments (the shape
+ * lives in scope.ts because panel.ts renders the ones a region encloses). */
 let floatScopes: FloatScope[] = [];
 let sidCounter = 1;
 
@@ -321,12 +317,18 @@ function panelOp(op: PanelOp) {
 }
 
 /** The floating instrument windows. panel.ts owns all DOM and widget logic;
- * we only hand it the shared list, the document, the live frame and the
- * interact path. */
+ * we only hand it the shared list, the document, the live frame, the probe
+ * traces (for scopes a region encloses) and the interact path. The
+ * `floatScopes` array stays ours — panels borrow it, never own it. */
 const panelHost = new PanelHost({
   elements: () => elements,
   live: () => live,
   probes: () => probes,
+  traces: () => traces,
+  scopes: () => floatScopes,
+  removeScope: (sid) => {
+    floatScopes = floatScopes.filter((s) => s.sid !== sid);
+  },
   interact: (e, op) => interact(e, op),
   op: panelOp,
 });
@@ -763,11 +765,19 @@ function scopeBodyPx(s: FloatScope): [number, number, number, number] {
   return [X + 1, Y + SCOPE_TITLE_PX, W - 2, H - SCOPE_TITLE_PX - 1];
 }
 
+/** The control panel this scope belongs to (geometry only, re-derived per
+ * frame): while owned, the instrument is drawn in that panel's window. */
+const scopeOwnerOf = (s: FloatScope): Panel | null => scopeOwner(panels, s);
+
 function scopeZoneAt(x: number, y: number): ScopeZone | null {
   for (let k = floatScopes.length - 1; k >= 0; k--) {
     const s = floatScopes[k]!;
     const [X, Y, W, H] = scopeRectPx(s);
     if (x < X || x > X + W || y < Y || y > Y + H) continue;
+    // Panel-owned: the schematic shows a placeholder only, so every zone
+    // collapses into one drag handle — canvas input must not fight the widget
+    // (its title bar, controls and resize corner live in the panel window).
+    if (scopeOwnerOf(s)) return { s, zone: 'title' };
     if (y <= Y + SCOPE_TITLE_PX) {
       if (x >= X + W - 18) return { s, zone: 'close' };
       const dotStart = X + 64;
@@ -786,8 +796,7 @@ function scopeZoneAt(x: number, y: number): ScopeZone | null {
   return null;
 }
 
-const scopeProbes = (s: FloatScope): Probe[] =>
-  s.pids === null ? probes : probes.filter((p) => s.pids!.includes(p.pid));
+const scopeProbes = (s: FloatScope): Probe[] => scopeChannels(s, probes);
 
 // ------------------------------------------------------------ context menu
 // A cascading menu: #ctxmenu is a transparent full-viewport layer holding one
@@ -1677,8 +1686,52 @@ function drawSelectionBoxes() {
   ctx.setLineDash([]);
 }
 
+/** Little sine-in-a-screen glyph for the placeholder badge. */
+function drawScopeGlyph(x: number, y: number, w: number, h: number) {
+  ctx.lineWidth = 1;
+  ctx.strokeRect(Math.round(x) + 0.5, Math.round(y) + 0.5, w, h);
+  ctx.beginPath();
+  for (let k = 0; k <= w - 2; k++) {
+    const yy = y + h / 2 - Math.sin((k / (w - 2)) * Math.PI * 2) * (h / 2 - 1.5);
+    if (k === 0) ctx.moveTo(x + 1 + k, yy);
+    else ctx.lineTo(x + 1 + k, yy);
+  }
+  ctx.stroke();
+}
+
+/** A panel-owned scope is displayed in that panel's window, so the schematic
+ * keeps only a ghost of its rect: it shows where the instrument lives and stays
+ * draggable, and dragging it clear of the region hands the body straight back
+ * (ownership is pure geometry, re-derived next frame). */
+function drawScopePlaceholder(s: FloatScope, owner: Panel) {
+  const [X, Y, W, H] = scopeRectPx(s);
+  ctx.save();
+  roundRectPath(ctx, X, Y, W, H, Math.min(10, cam.scale * 0.35));
+  // Barely-there fill: the ghost marks the rect that has to leave the region
+  // to detach the scope, and must not hide the parts underneath it.
+  ctx.fillStyle = '#10141a55';
+  ctx.fill();
+  ctx.setLineDash([4, 5]);
+  ctx.lineWidth = 1.2;
+  ctx.strokeStyle = '#57808f';
+  ctx.stroke();
+  ctx.setLineDash([]);
+  const label = `scope ${s.sid} → ${owner.name}`;
+  ctx.font = '11px ui-monospace, monospace';
+  ctx.strokeStyle = '#8ee7ff';
+  ctx.fillStyle = '#8ee7ff';
+  if (W > 34 && H > 20) drawScopeGlyph(X + 8, Y + 7, 14, 10);
+  if (W > 30 + ctx.measureText(label).width && H > 20) ctx.fillText(label, X + 27, Y + 16);
+  ctx.restore();
+}
+
 function drawFloatScopes() {
   for (const s of floatScopes) {
+    const owner = scopeOwnerOf(s);
+    if (owner) {
+      drawScopePlaceholder(s, owner);
+      continue;
+    }
     const [X, Y, W, H] = scopeRectPx(s);
     ctx.fillStyle = '#101016f0';
     ctx.fillRect(X, Y, W, H);

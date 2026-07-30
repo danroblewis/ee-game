@@ -114,6 +114,27 @@ export interface ScopeSettings {
   auto: Map<number, AutoState>;
 }
 
+/** A world-anchored scope instrument: a rect in GRID units plus the settings
+ * and channel selection it carries. Client-local state (main.ts owns the
+ * array), but panel.ts needs the shape too — a scope whose rect sits inside a
+ * control-panel region is rendered as a widget in that panel's window. */
+export interface FloatScope {
+  sid: number;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  /** Per-scope instrument settings; owns the timebase. Shared by every
+   * surface that draws this scope, so the state follows the instrument. */
+  set: ScopeSettings;
+  /** Selected probe ids, or null for "every probe". */
+  pids: number[] | null;
+}
+
+/** The channels a scope displays, in probe order. */
+export const scopeChannels = (s: FloatScope, probes: Probe[]): Probe[] =>
+  s.pids === null ? probes : probes.filter((p) => s.pids!.includes(p.pid));
+
 export function defaultScopeSettings(timebase = 5): ScopeSettings {
   return {
     timebase,
