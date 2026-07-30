@@ -34,9 +34,9 @@ explicitly labelled an estimate. Two caveats, stated up front:
 cargo run --release -p sim-golden --bin scale
 ```
 
-~4 minutes: 500/1000/5000 elements, the LU kernel comparison, the real-time
-crossover search, and the islands and quiescence experiments. The exact
-invocations behind the tables below:
+67 s measured on this machine: 500/1000/5000 elements, the LU kernel
+comparison, the real-time crossover search, and the islands and quiescence
+experiments. The exact invocations behind the tables below:
 
 ```
 cargo run --release -p sim-golden --bin scale -- --sizes 500,1000,5000,20000 --max-n 6000
@@ -130,8 +130,15 @@ rows. Machine quiet for this run.
 | one-circuit | 4.7% of elements | **245 elements** (n=56, 1.035x) | 256 elements (n=59) → 0.936x |
 | one-circuit | none (linear) | **495 elements** (n=113, 1.027x) | 507 elements (n=115) → 0.991x |
 
+(One run, machine otherwise idle: `--skip sizes --skip kernel`.)
+
+The bisection is on element count, so its resolution is one bracket step and
+its result moves with machine noise. Across three runs the nonlinear boundary
+landed at 205, 205 and 226 elements, and the linear one at 311, 414 and 495 —
+so read these as **~200 and ~400**, not to three digits.
+
 **Plainly: on an Apple M4 in release, today's engine holds real time up to
-about 200 elements with a realistic nonlinear mix, and about 450–500 elements
+about 200 elements with a realistic nonlinear mix, and about 400 elements
 if the world is perfectly linear.** The existing demo world is ~150 elements,
 i.e. the shipping configuration is already within ~30% of its ceiling. The
 owner's "simple game" target of ~3,000 elements is roughly **15x** past it, and
@@ -271,6 +278,11 @@ So the answer to "one 5,000-unknown dense factor vs the sum of 50 independent
 100-unknown factors" is **58.6x on the factor and 68.4x on the whole substep**,
 for an electrically identical world. Partitioning also halves the NR iteration
 count for free, because convergence stops being all-or-nothing.
+
+Stability across four runs of this experiment: factor 56.7x / 58.6x / 61.5x /
+62.6x, whole substep 66.6x / 68.4x / 68.7x / 76.7x. The **45.5x** row-update
+ratio is identical every run because it is a count, not a timing — that one is
+exact.
 
 **But islands alone do not reach real time at 5,000 elements**: 0.0666x is
 still 15x short. See the recommendation.
