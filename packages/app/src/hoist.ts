@@ -63,11 +63,33 @@ export interface MachineMsg {
   joules: number;
 }
 
+/** Just enough of a fixture element to label its terminals. */
+export interface FixturePart {
+  id: number;
+  pins: [number, number][];
+}
+
+/** Terminal names per fixture id, in pin order. */
+const TERMINALS: Record<number, string[]> = {
+  900: ['M+', 'M−'],
+  901: ['SENSE A', 'SENSE W', 'SENSE B'],
+  902: ['LIM-TOP', ''],
+  903: ['LIM-BOT', ''],
+};
+
 export interface Hoist {
   /** One machine message from the net layer (or the dev mock). */
   onMachine(m: MachineMsg): void;
-  /** Once per animation frame, BEFORE the schematic pass: chrome + card. */
-  draw(ctx: CanvasRenderingContext2D, cam: Camera, now: number, dtSec: number): void;
+  /** Once per animation frame, BEFORE the schematic pass: chrome + card.
+   * `fixture` is the server's locked parts (ids 900-903) so their terminals
+   * can be labelled where they actually are, instead of on a nameplate. */
+  draw(
+    ctx: CanvasRenderingContext2D,
+    cam: Camera,
+    now: number,
+    dtSec: number,
+    fixture?: FixturePart[],
+  ): void;
   /** Latest state, or null before the first message (tests/debug). */
   state(): MachineMsg | null;
 }
@@ -366,7 +388,13 @@ export function createHoist(root: HTMLElement, opts: { reset: () => void }): Hoi
     if (dust.length > 0) dust = dust.filter((d) => d.age < d.life);
   }
 
-  function draw(ctx: CanvasRenderingContext2D, cam: Camera, now: number, dtSec: number) {
+  function draw(
+    ctx: CanvasRenderingContext2D,
+    cam: Camera,
+    now: number,
+    dtSec: number,
+    fixture: FixturePart[] = [],
+  ) {
     const mm = m;
     if (!mm) return;
     card.onState(mm, now, performance.now() - lastMsgAt > STALE_MS);
@@ -403,9 +431,12 @@ export function createHoist(root: HTMLElement, opts: { reset: () => void }): Hoi
     const pyOf = (y: number) => yBot - (clamp(y, 0, mm.h) / Math.max(1e-9, mm.h)) * (yBot - yTop);
 
     // ---- cabinet
+    // Translucent steel, deliberately NOT the .pwin palette: a machine
+    // standing in the world, not a dialog floating over it. The grid showing
+    // faintly through is what sells "this is on the map".
     const grad = ctx.createLinearGradient(X0, Y0, X0, Y1);
-    grad.addColorStop(0, '#232830');
-    grad.addColorStop(1, '#15181d');
+    grad.addColorStop(0, 'rgba(38, 46, 56, 0.88)');
+    grad.addColorStop(1, 'rgba(20, 25, 31, 0.88)');
     ctx.fillStyle = grad;
     ctx.fillRect(X0, Y0, W, H);
     // Inset by half the line width so even the outline is inside the rect.
@@ -582,10 +613,53 @@ export function createHoist(root: HTMLElement, opts: { reset: () => void }): Hoi
     ctx.fillStyle = '#2a323c';
     ctx.fillRect(sx0, pyOf(0) + Math.max(2, SLAB_H * H), sw, Math.max(1.5, H * 0.012));
 
-    // ---- faceplate nameplate: terminals + printed constants
+    // ---- faceplate: the printed constants only (terminal NAMES go on the
+    // terminals themselves, below, where they are actually useful)
     drawPlate(ctx, X0, Y0, W, H, mm);
 
+    // ---- terminals: a screw pad and a name beside every fixture pin, so the
+    // player can see what to wire without reading a legend.
+    drawTerminals(ctx, cam, fixture);
+
     ctx.restore();
+  }
+
+  /** A screw pad + name on every locked fixture pin. Drawn inside the
+   * cabinet clip, under the schematic pass, so the real element symbols and
+   * their pins still draw on top and stay grabbable. */
+  function drawTerminals(
+    ctx: CanvasRenderingContext2D,
+    cam: Camera,
+    fixture: FixturePart[],
+  ) {
+    if (fixture.length === 0) return;
+    const pad = Math.max(2.5, cam.scale * 0.17);
+    const font = Math.round(clamp(cam.scale * 0.34, 6, 13));
+    const withText = font >= MIN_TEXT_PX;
+    ctx.textBaseline = 'middle';
+    ctx.textAlign = 'right';
+    for (const part of fixture) {
+      const names = TERMINALS[part.id];
+      if (!names) continue;
+      part.pins.forEach((gp, k) => {
+        const x = cam.ox + gp[0] * cam.scale;
+        const y = cam.oy + gp[1] * cam.scale;
+        // Brass screw pad: unmistakably a place to attach a wire.
+        ctx.beginPath();
+        ctx.arc(x, y, pad, 0, Math.PI * 2);
+        ctx.fillStyle = '#3a4450';
+        ctx.fill();
+        ctx.lineWidth = Math.max(1, pad * 0.32);
+        ctx.strokeStyle = '#c9a86a';
+        ctx.stroke();
+        const name = names[k] ?? '';
+        if (withText && name) {
+          ctx.font = `${font}px ui-monospace, monospace`;
+          ctx.fillStyle = '#d6e2ec';
+          ctx.fillText(name, x - pad * 1.7, y);
+        }
+      });
+    }
   }
 
   /** The green band, from the message's own [lo, hi]; flashes on a win. */
@@ -678,10 +752,14 @@ export function createHoist(root: HTMLElement, opts: { reset: () => void }): Hoi
 
     // Engraved lines, most important first: whatever does not fit the plate at
     // a legible size is dropped rather than drawn as a clipped half-line.
+    // Short enough to survive the fit test at the default zoom. The old
+    // single terminal-legend line was ~52 chars and could never fit, so the
+    // whole plate silently rendered blank; the names now live on the
+    // terminals themselves and this plate carries the datasheet.
     const lines: [string, string][] = [
-      ['#8ea3b1', 'M+  M−   |   SENSE A W B   |   LIM-TOP   |   LIM-BOT'],
-      ['#6d7d89', 'R=2Ω  L=1.5mH  K=0.25 V·s/rad'],
-      ['#6d7d89', 'SENSE: 12.5 mV/mm'],
+      ['#cfe0ee', 'WIRE 12 V → M+ M−'],
+      ['#6d7d89', 'R=2Ω L=1.5mH K=0.25'],
+      ['#6d7d89', 'SENSE 12.5 mV/mm'],
     ];
     // Fit vertically (row height) AND horizontally (the longest line inside
     // the plate), then drop the text altogether if that lands below legible.

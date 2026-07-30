@@ -1265,6 +1265,16 @@ let panelResize: {
 } | null = null;
 let spaceHeld = false;
 let lastCursorSent = 0;
+/** The control-hint block. Collapsed by default after the first session: it is
+ * wide enough to sit in front of world objects (the hoist, panels, cards), and
+ * a returning player does not need the wall of text. '?' toggles it. */
+let hintsOpen = (() => {
+  try {
+    return localStorage.getItem('ee.hints') !== '0';
+  } catch {
+    return true;
+  }
+})();
 
 canvas.addEventListener('wheel', (ev) => {
   ev.preventDefault();
@@ -1699,6 +1709,16 @@ window.addEventListener('keydown', (ev) => {
 
   if (ev.key === ' ') {
     spaceHeld = true;
+    ev.preventDefault();
+    return;
+  }
+  if (ev.key === '?') {
+    hintsOpen = !hintsOpen;
+    try {
+      localStorage.setItem('ee.hints', hintsOpen ? '1' : '0');
+    } catch {
+      /* private mode: the toggle still works for this session */
+    }
     ev.preventDefault();
     return;
   }
@@ -2204,7 +2224,16 @@ function frame(now: number) {
   // Machine chrome (the hoist) is scenery: it goes down before the panel
   // regions and the schematic so its fixture parts stay visible and wire-able.
   // The same call refreshes the goal card overlay.
-  hoist.draw(ctx, cam, now, wallDt);
+  // The locked fixture parts, so the hoist can name its own terminals.
+  hoist.draw(
+    ctx,
+    cam,
+    now,
+    wallDt,
+    elements
+      .filter((e) => e.id >= 900 && e.id <= 903)
+      .map((e) => ({ id: e.id, pins: e.pins as [number, number][] })),
+  );
 
   // Panel regions sit under the schematic: they frame parts, never hide them.
   // The one under the pointer (or being dragged) shows its resize grips.
@@ -2354,6 +2383,11 @@ function frame(now: number) {
     : speakerIds.length > 0 && !online
       ? `  ${speakerIds.length} speaker${speakerIds.length === 1 ? '' : 's'} silent offline (no substep sampler in the local sim)`
       : '';
+  const hints = hintsOpen
+    ? `\nparts: R C L W G V D N P M A U 5 S B T Z E F I · drag part = move · dbl-click = edit values · right-click = menu` +
+      `\ndrag pin = wire · drag empty = select · Q rotate · ⌘Z undo · ⌘C/⌘V copy/paste · 1/2 probe · 3 listen · 0 ref · O scope · \` dock · J panel · X delete · / parts menu` +
+      `\nH home district · shift+H fit everything · wheel = zoom (0.4–200 px/unit) · pan: middle / ctrl+drag / space+drag`
+    : `\n? controls`;
   hud.textContent =
     `EE Game   sim t = ${simTime.toFixed(2)} s   ` +
     (online ? `● ONLINE — ${population} player${population === 1 ? '' : 's'}` : '○ offline (local sim)') +
@@ -2361,9 +2395,7 @@ function frame(now: number) {
     (mode ? `   ${mode}` : '') +
     (note ? `   ${note}` : '') +
     sound +
-    `\nparts: R C L W G V D N P M A U 5 S B T Z E F I · drag part = move · dbl-click = edit values · right-click = menu` +
-    `\ndrag pin = wire · drag empty = select · Q rotate · ⌘Z undo · ⌘C/⌘V copy/paste · 1/2 probe · 3 listen · 0 ref · O scope · \` dock · J panel · X delete · / parts menu` +
-    `\nH home district · shift+H fit everything · wheel = zoom (0.4–200 px/unit) · pan: middle / ctrl+drag / space+drag`;
+    hints;
 
   requestAnimationFrame(frame);
 }

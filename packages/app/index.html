@@ -8,10 +8,15 @@
     <style>
       html, body { margin: 0; height: 100%; background: #101014; overflow: hidden; }
       #canvas { display: block; width: 100vw; height: 100vh; cursor: default; }
+      /* The hint block used to be bare text over the world, so it smeared
+         across anything it happened to sit in front of. Give it its own
+         backdrop: chrome should read as chrome. */
       #hud {
-        position: fixed; top: 10px; left: 12px; color: #9a9aa5;
+        position: fixed; top: 8px; left: 8px; color: #9a9aa5;
         font: 12px/1.5 ui-monospace, monospace; pointer-events: none;
-        white-space: pre;
+        white-space: pre; padding: 4px 9px; border-radius: 6px;
+        background: #0d0d12d9; border: 1px solid #23232c;
+        max-width: calc(100vw - 320px); overflow: hidden;
       }
       #tip {
         position: fixed; display: none; color: #e8e8ef; background: #1c1c24e6;
