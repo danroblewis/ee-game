@@ -12,7 +12,7 @@
 //! - A constant current I into pin p stamps `b[p] -= I`.
 //! - A dependence dI_p/dV_n stamps `a[p][n] += g`.
 
-use crate::netlist::{ElementKind, ElementSpec, InteractOp, Point, MAX_PINS};
+use crate::netlist::{ElementKind, ElementSpec, InteractOp, ParamWrite, Point, MAX_PINS};
 use sim_math::DenseLu;
 
 pub const GMIN: f64 = 1e-12;
@@ -233,6 +233,56 @@ impl Engine {
         // invalidate the factorization. Recompiling handles both and is
         // cheap at current scale.
         self.compile();
+    }
+
+    /// Write a live element's parameter from a co-simulated machine, at the
+    /// cheapest correct cost (see `ParamWrite`). Returns false when the id
+    /// or the parameter/device pairing does not exist.
+    ///
+    /// This is deliberately NOT `interact()`: machine writes land at kHz
+    /// rates, and `interact()`/`compile()` both clear `quarantined` and
+    /// re-arm `be_steps`. Clearing quarantine that often would resurrect a
+    /// diverged circuit every 640 µs and hide the failure forever; re-arming
+    /// BE would silently keep the integrator in first order.
+    pub fn write_param(&mut self, id: u32, write: ParamWrite) -> bool {
+        let Some(e) = self.elems.iter_mut().find(|e| e.spec.id == id) else {
+            return false;
+        };
+        let mut invalidate = false;
+        let mut topology = false;
+        match (write, &mut e.spec.kind) {
+            (ParamWrite::Bemf { volts }, ElementKind::Motor { bemf, .. }) => {
+                // RHS only: `build()` rewrites b[branch] every step.
+                *bemf = volts;
+            }
+            (ParamWrite::Wiper { frac }, ElementKind::Potentiometer { wiper, .. }) => {
+                let new = frac.clamp(0.01, 0.99);
+                if *wiper != new {
+                    *wiper = new;
+                    invalidate = true;
+                }
+            }
+            (ParamWrite::Switch { closed }, ElementKind::Switch { closed: c }) => {
+                if *c != closed {
+                    *c = closed;
+                    topology = true;
+                }
+            }
+            _ => return false,
+        }
+        if invalidate {
+            self.factor_valid = false;
+        }
+        if topology {
+            // A branch appears/disappears: only the compile path can
+            // renumber the unknowns. Carry the solver's health flags across
+            // it untouched.
+            let (be_steps, quarantined) = (self.be_steps, self.quarantined);
+            self.compile();
+            self.be_steps = be_steps;
+            self.quarantined = quarantined;
+        }
+        true
     }
 
     /// Wire closure + node numbering + unknown layout.
@@ -545,6 +595,31 @@ impl Engine {
                         }
                     }
                     self.b[bi] = v;
+                }
+                ElementKind::Motor {
+                    ohms,
+                    henries,
+                    bemf,
+                } => {
+                    // v0 - v1 = R·i + L·di/dt + bemf with i the branch
+                    // unknown (current INTO pin 0). Backward Euler on the
+                    // inductive term — di/dt ≈ (i - i_prev)/h — gives the
+                    // row  v0 - v1 - (R + L/h)·i = bemf - (L/h)·i_prev.
+                    // BE unconditionally: the armature pole (L/R = 0.75 ms
+                    // for the shipped hoist motor) is stiff next to the
+                    // machine tick, and BE cannot ring against it.
+                    let bi = self.num_nodes + branch.ok_or(())?;
+                    let gl = henries / h;
+                    if need_factor {
+                        for (pin, sgn) in [(node[0], 1.0), (node[1], -1.0)] {
+                            if pin > 0 {
+                                self.a[bi * n + (pin - 1)] += sgn;
+                                self.a[(pin - 1) * n + bi] += sgn;
+                            }
+                        }
+                        self.a[bi * n + bi] -= ohms + gl;
+                    }
+                    self.b[bi] = bemf - gl * state.i_prev;
                 }
                 ElementKind::Switch { closed } | ElementKind::Button { closed } => {
                     if closed {
@@ -962,6 +1037,15 @@ impl Engine {
                 }
                 ElementKind::CurrentSource { amps } => two(amps),
                 ElementKind::VoltageSource { .. } => two(bi_val.unwrap_or(0.0)),
+                ElementKind::Motor { .. } => {
+                    // The armature current is the branch unknown; it is also
+                    // the inductive history for the next step (same slot the
+                    // plain inductor uses).
+                    let i = bi_val.unwrap_or(0.0);
+                    st.v_prev = v01;
+                    st.i_prev = i;
+                    two(i);
+                }
                 ElementKind::Switch { closed } | ElementKind::Button { closed } => {
                     two(if closed { bi_val.unwrap_or(0.0) } else { 0.0 })
                 }

@@ -1,0 +1,18 @@
+[package]
+name = "machine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Pure model: no I/O, no threads, no clocks, no random, no platform deps.
+# Plain f64 arithmetic only (no FMA, no transcendentals), so it compiles
+# bit-identically for the native server and wasm32.
+[dependencies]
+serde = { workspace = true, optional = true }
+
+[features]
+default = []
+serde = ["dep:serde"]
+
+[dev-dependencies]
+libm.workspace = true

@@ -304,6 +304,30 @@ pub fn timer555_astable() -> Vec<ElementSpec> {
     ]
 }
 
+/// DC motor armature (the hoist motor: 2 Ω, 1.5 mH) fed from 12 V through a
+/// 1 Ω feeder, with the rotor turning fast enough to generate 2 V of
+/// back-EMF. The armature is an RL branch with a series EMF, so
+/// i(t) = (12 - 2)/3 · (1 - e^(-t/τ)) with τ = L/R_loop = 0.5 ms and
+/// i_ss = 3.3333 A. (Back-EMF is an input here; the mechanism that produces
+/// it lives in the `machine` crate.)
+pub fn motor_step() -> Vec<ElementSpec> {
+    vec![
+        spec(1, dc(12.0), (0, 0), (0, 8)),
+        spec(2, r(1.0), (0, 0), (4, 0)),
+        spec(
+            3,
+            ElementKind::Motor {
+                ohms: 2.0,
+                henries: 1.5e-3,
+                bemf: 2.0,
+            },
+            (4, 0),
+            (0, 8),
+        ),
+        gnd(4, (0, 8)),
+    ]
+}
+
 /// LED through 330 Ω from 9 V: forward drop ≈ 2.1 V, I ≈ 21 mA.
 pub fn led_loop() -> Vec<ElementSpec> {
     vec![
@@ -333,5 +357,6 @@ pub fn all_golden() -> Vec<(&'static str, Vec<ElementSpec>)> {
         ("timer555_astable", timer555_astable()),
         ("pot_divider", pot_divider()),
         ("led_loop", led_loop()),
+        ("motor_step", motor_step()),
     ]
 }
