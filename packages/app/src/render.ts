@@ -720,6 +720,199 @@ export function drawElement(d: DrawCtx, e: ElementSpec) {
 
 const dot = (a: Px, b: Px) => a[0] * b[0] + a[1] * b[1];
 
+// -------------------------------------------------------------- LOD grid
+//
+// The background grid is what makes a far-out view a PLACE instead of a
+// void, so it must survive to the bottom of the zoom range — and it must do
+// it in a bounded number of primitives. The spacing is the coarsest decade
+// (1 / 10 / 100 / 1000 grid units) that still keeps dots or lines at least
+// GRID_MIN_PX apart; the decade below it is drawn faded so crossing a level
+// does not pop.
+
+/** On-screen spacing floor for the current grid level, px. */
+export const GRID_MIN_PX = 12;
+/** Faintest spacing worth drawing at all, px. */
+const GRID_FADE_PX = 4;
+/** Hard bound on the fine dot pass, whatever the window size. */
+const MAX_GRID_DOTS = 4500;
+
+/** Grid spacing in grid units for a zoom level: 1, 10, 100, 1000, 10000. */
+export function gridStep(scale: number): number {
+  let step = 1;
+  while (step < 10000 && step * scale < GRID_MIN_PX) step *= 10;
+  return step;
+}
+
+/** Grid lines at `step` grid units as one path; null when too dense to
+ * bother. Segment count is bounded by (W + H) / (step * scale). */
+function gridLines(cam: Camera, step: number, W: number, H: number): Path2D | null {
+  const sp = step * cam.scale;
+  if (sp < GRID_FADE_PX) return null;
+  const p = new Path2D();
+  const gx0 = Math.ceil(-cam.ox / cam.scale / step) * step;
+  const gy0 = Math.ceil(-cam.oy / cam.scale / step) * step;
+  for (let x = cam.ox + gx0 * cam.scale; x < W; x += sp) {
+    const xr = Math.round(x) + 0.5;
+    p.moveTo(xr, 0);
+    p.lineTo(xr, H);
+  }
+  for (let y = cam.oy + gy0 * cam.scale; y < H; y += sp) {
+    const yr = Math.round(y) + 0.5;
+    p.moveTo(0, yr);
+    p.lineTo(W, yr);
+  }
+  return p;
+}
+
+/** The background: Falstad dots close in, faded decade lines far out. */
+export function drawGrid(ctx: CanvasRenderingContext2D, cam: Camera, W: number, H: number) {
+  const step = gridStep(cam.scale);
+  const sp = step * cam.scale;
+
+  if (step === 1) {
+    const gx0 = Math.ceil(-cam.ox / cam.scale);
+    const gy0 = Math.ceil(-cam.oy / cam.scale);
+    const px0 = cam.ox + gx0 * cam.scale;
+    const py0 = cam.oy + gy0 * cam.scale;
+    const cols = Math.floor((W - px0) / sp) + 1;
+    const rows = Math.floor((H - py0) / sp) + 1;
+    if (cols <= 0 || rows <= 0) return;
+    if (cols * rows <= MAX_GRID_DOTS) {
+      ctx.fillStyle = '#1c1c22';
+      for (let c = 0; c < cols; c++) {
+        const x = px0 + c * sp - 1;
+        for (let r = 0; r < rows; r++) ctx.fillRect(x, py0 + r * sp - 1, 2, 2);
+      }
+      return;
+    }
+    // A big window at 12-20 px/unit would need more dots than the budget
+    // allows: fall through and draw the same pitch as lines instead.
+  }
+
+  ctx.save();
+  ctx.lineWidth = 1;
+  if (step > 1) {
+    const sub = gridLines(cam, step / 10, W, H);
+    const fade = Math.min(1, Math.max(0, (sp / 10 - GRID_FADE_PX) / (GRID_MIN_PX - GRID_FADE_PX)));
+    if (sub && fade > 0.02) {
+      ctx.globalAlpha = fade;
+      ctx.strokeStyle = '#191920';
+      ctx.stroke(sub);
+      ctx.globalAlpha = 1;
+    }
+  }
+  const minor = gridLines(cam, step, W, H);
+  if (minor) {
+    ctx.strokeStyle = '#191920';
+    ctx.stroke(minor);
+  }
+  const major = gridLines(cam, step * 10, W, H);
+  if (major) {
+    ctx.strokeStyle = '#26262f';
+    ctx.stroke(major);
+  }
+  ctx.restore();
+}
+
+// ------------------------------------------------------- zoomed-out LOD pass
+//
+// Below a few px per grid unit a full symbol is sub-pixel noise: the zigzag,
+// the current dots and the pin labels all land inside one or two pixels and
+// cost more than they show. These passes draw the same conductors as plain
+// segments, colored by the SOLVER's own pin voltage (quantized to a fixed
+// ramp only so thousands of elements collapse into a handful of stroke
+// calls — the value still comes from the frame, never from the UI).
+
+/** Voltage buckets in the LOD ramp (odd, so 0 V lands exactly in the middle). */
+const LOD_STEPS = 17;
+
+const LOD_RAMP: string[] = Array.from({ length: LOD_STEPS }, (_, k) =>
+  voltageColor(((k / (LOD_STEPS - 1)) * 2 - 1) * V_FULL),
+);
+
+function lodBucket(v: number): number {
+  const t = Math.max(-1, Math.min(1, v / V_FULL));
+  return Math.round(((t + 1) / 2) * (LOD_STEPS - 1));
+}
+
+/** Draw a whole (already culled) element list without symbol detail.
+ * `single` collapses each element to one segment, first pin to last —
+ * for the far zoom band where even the pin chain is a smudge. */
+export function drawElementsLod(
+  ctx: CanvasRenderingContext2D,
+  cam: Camera,
+  elems: ElementSpec[],
+  live: Map<number, ElemLive>,
+  single: boolean,
+) {
+  const paths: (Path2D | undefined)[] = new Array<Path2D | undefined>(LOD_STEPS);
+  const tick = Math.max(1, cam.scale * 0.3);
+  for (const e of elems) {
+    const P = e.pins;
+    if (P.length === 0) continue;
+    const l = live.get(e.id);
+    const k = lodBucket(l?.v[0] ?? 0);
+    let path = paths[k];
+    if (!path) {
+      path = new Path2D();
+      paths[k] = path;
+    }
+    const ax = cam.ox + P[0]![0] * cam.scale;
+    const ay = cam.oy + P[0]![1] * cam.scale;
+    if (P.length === 1) {
+      // Single-pin parts (ground) get a stub so they are not invisible.
+      path.moveTo(ax - tick, ay);
+      path.lineTo(ax + tick, ay);
+      continue;
+    }
+    path.moveTo(ax, ay);
+    if (single) {
+      const last = P[P.length - 1]!;
+      path.lineTo(cam.ox + last[0] * cam.scale, cam.oy + last[1] * cam.scale);
+      continue;
+    }
+    if (P.length > 4) {
+      // Packages (the 555) are boxes, not chains: a polyline through DIP
+      // pins would read as a scribble. Outline the pin bbox instead.
+      let x0 = Infinity;
+      let y0 = Infinity;
+      let x1 = -Infinity;
+      let y1 = -Infinity;
+      for (const p of P) {
+        if (p[0] < x0) x0 = p[0];
+        if (p[0] > x1) x1 = p[0];
+        if (p[1] < y0) y0 = p[1];
+        if (p[1] > y1) y1 = p[1];
+      }
+      const px0 = cam.ox + x0 * cam.scale;
+      const py0 = cam.oy + y0 * cam.scale;
+      path.moveTo(px0, py0);
+      path.lineTo(cam.ox + x1 * cam.scale, py0);
+      path.lineTo(cam.ox + x1 * cam.scale, cam.oy + y1 * cam.scale);
+      path.lineTo(px0, cam.oy + y1 * cam.scale);
+      path.lineTo(px0, py0);
+      continue;
+    }
+    for (let i = 1; i < P.length; i++) {
+      path.lineTo(cam.ox + P[i]![0] * cam.scale, cam.oy + P[i]![1] * cam.scale);
+    }
+    // Three-pin parts close the triangle so a transistor still reads as one.
+    if (P.length === 3) {
+      path.moveTo(ax, ay);
+      path.lineTo(cam.ox + P[2]![0] * cam.scale, cam.oy + P[2]![1] * cam.scale);
+    }
+  }
+  ctx.lineWidth = Math.max(1, cam.scale * 0.12);
+  ctx.lineCap = 'butt';
+  for (let k = 0; k < LOD_STEPS; k++) {
+    const path = paths[k];
+    if (!path) continue;
+    ctx.strokeStyle = LOD_RAMP[k]!;
+    ctx.stroke(path);
+  }
+  ctx.lineCap = 'round';
+}
+
 /** Distance in px from (x, y) to the element (nearest pin-chain segment;
  * 3-pin parts also count their body around the centroid, packages their
  * whole pin bounding box). */

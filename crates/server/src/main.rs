@@ -308,7 +308,14 @@ struct Panel {
     name: String,
 }
 
-const MAX_PANELS: usize = 32;
+/// Document budget. The world is meant to hold enormous circuits (whole
+/// districts), so this is a guard against a runaway client, not a design
+/// limit. NOTE: the sim is the real ceiling long before this — sim-core
+/// still factors a DENSE matrix (O(n³)); the fixed-pattern sparse LU is
+/// spike S3 and is not built yet.
+const MAX_ELEMENTS: usize = 50_000;
+
+const MAX_PANELS: usize = 256;
 const MAX_PANEL_NAME: usize = 28;
 /// Smallest accepted region in grid units: a stray click must not make one.
 const MIN_PANEL_SPAN: f64 = 1.0;
@@ -688,7 +695,7 @@ fn apply_doc_op(room: &Room, op: &DocOp) -> bool {
         DocOp::Add { spec } => {
             if spec.pins.len() != spec.kind.pin_count()
                 || elems.iter().any(|e| e.id == spec.id)
-                || elems.len() >= 2000
+                || elems.len() >= MAX_ELEMENTS
             {
                 return false;
             }
@@ -999,6 +1006,79 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A room with no sim task behind it, for exercising op validation.
+    fn test_room(elements: Vec<ElementSpec>) -> Room {
+        let (cmds, _rx) = mpsc::unbounded_channel();
+        let (events, _) = broadcast::channel(8);
+        Room {
+            cmds,
+            events,
+            elements: std::sync::Mutex::new(elements),
+            probes: std::sync::Mutex::new(Vec::new()),
+            panels: std::sync::Mutex::new(Vec::new()),
+            next_client: AtomicU32::new(1),
+            next_pid: AtomicU32::new(1),
+            next_plid: AtomicU32::new(1),
+            population: AtomicU32::new(0),
+            dirty: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// The world is big now (50k parts), but the budget is still a hard wall
+    /// and malformed specs are still refused.
+    #[test]
+    fn document_cap_is_big_and_still_validates() {
+        use sim_core::ElementKind as K;
+        let full: Vec<ElementSpec> = (0..MAX_ELEMENTS as u32)
+            .map(|k| ElementSpec {
+                id: k + 1,
+                kind: K::Wire,
+                pins: vec![(0, 0), (1, 0)],
+            })
+            .collect();
+        let room = test_room(full);
+        let wire = |id: u32| DocOp::Add {
+            spec: ElementSpec {
+                id,
+                kind: K::Wire,
+                pins: vec![(2, 2), (3, 2)],
+            },
+        };
+        // At the cap the op is dropped, not applied.
+        assert!(!apply_doc_op(&room, &wire(900_001)));
+        assert_eq!(room.elements.lock().unwrap().len(), MAX_ELEMENTS);
+        // One slot free: the same op lands, and only once.
+        room.elements.lock().unwrap().pop();
+        assert!(apply_doc_op(&room, &wire(900_001)));
+        assert!(!apply_doc_op(&room, &wire(900_001)), "duplicate id");
+        // Pin-count validation survives the raised cap (checked before it).
+        assert!(!apply_doc_op(
+            &room,
+            &DocOp::Add {
+                spec: ElementSpec {
+                    id: 900_002,
+                    kind: K::Wire,
+                    pins: vec![(0, 0)],
+                },
+            }
+        ));
+        assert!(!apply_doc_op(
+            &room,
+            &DocOp::Move {
+                id: 900_001,
+                pins: vec![(0, 0)],
+            }
+        ));
+        assert!(apply_doc_op(
+            &room,
+            &DocOp::Move {
+                id: 900_001,
+                pins: vec![(4, 4), (5, 4)],
+            }
+        ));
+        assert!(!apply_doc_op(&room, &DocOp::Remove { id: 12_345_678 }));
+    }
 
     #[test]
     fn showcase_room_never_quarantines() {
