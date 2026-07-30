@@ -45,6 +45,11 @@ export interface Net {
   sendPanel(op: PanelOp): void;
   /** Lower the crate to the floor, zero the hold and re-arm the goal. */
   sendMachineReset(): void;
+  /** Drag the whole machine assembly by an integer GRID delta. The server
+   * translates the footprint and its four fixture children together at a tick
+   * boundary — it is the only op that moves them, and it never touches the
+   * mechanism (height, hold timer, landings survive a move). */
+  sendMachineMove(dx: number, dy: number): void;
   sendCursor(x: number, y: number): void;
 }
 
@@ -120,6 +125,10 @@ export function connect(h: NetHandlers): Net {
     sendProbeRef: (pid, elem, pin) => send({ t: 'proberef', pid, elem, pin }),
     sendPanel: (op) => send({ t: 'panel', op }),
     sendMachineReset: () => send({ t: 'machinereset' }),
+    // Integers only: the server takes i32 grid units and drops the message
+    // outright if it cannot parse them.
+    sendMachineMove: (dx, dy) =>
+      send({ t: 'machinemove', dx: Math.round(dx), dy: Math.round(dy) }),
     sendCursor: (x, y) => send({ t: 'cursor', x, y }),
   };
 }

@@ -18,13 +18,20 @@
 // angle (a running integral of the server's `vel`) and the dust particles a
 // landing throws (seeded from the server's `impact`).
 //
-// This module owns two things:
-//   * the canvas CHROME (shaft, rails, drum, cable, crate, band, nameplate),
-//     drawn BEHIND the schematic pass so the four fixture elements the server
-//     owns (ids 900..903) stay visible, selectable, probe-able and wire-able —
-//     they are ordinary elements and this file never draws or hides them;
+// This module owns three things:
+//   * the canvas CHROME (shaft, rails, drum, cable, crate, band, nameplate,
+//     grab bar), drawn BEHIND the schematic pass so the four fixture elements
+//     the server owns (ids 900..903) stay visible, selectable, probe-able and
+//     wire-able — they are ordinary elements and this file never draws or
+//     hides them;
 //   * the GOAL CARD, an HTML overlay in the same visual language as the
-//     control-panel windows (.pwin) in index.html.
+//     control-panel windows (.pwin) in index.html;
+//   * the machine's FOOTPRINT as a hit-testable object: `rect()` is the box in
+//     grid units, `zoneAt()` says whether a pointer is on the cabinet, and
+//     `setLocalRect()` lets a drag in main.ts place the whole assembly
+//     optimistically at 60 fps while the server catches up. That is the entire
+//     client-side seam for "this machine is a draggable part" — main.ts owns
+//     the pointer gesture and the four child elements, this file owns the box.
 //
 // Dev mock: with no server half in reach, `?hoistmock` in the URL (or calling
 // window.__hoistMock() from the console) synthesises machine messages from a
@@ -63,6 +70,7 @@ export interface MachineMsg {
   joules: number;
 }
 
+<<<<<<< HEAD
 /** Just enough of a fixture element to label its terminals. */
 export interface FixturePart {
   id: number;
@@ -76,6 +84,21 @@ const TERMINALS: Record<number, string[]> = {
   902: ['LIM-TOP', ''],
   903: ['LIM-BOT', ''],
 };
+=======
+/** Footprint in grid units, corners normalized: [x0, y0, x1, y1]. */
+export type MachineRect = [number, number, number, number];
+
+/**
+ * What a pointer inside the footprint is over:
+ *   'grab' — the title strip along the top of the faceplate: the visible
+ *            affordance that the machine is one draggable object;
+ *   'body' — the cabinet's own chrome anywhere else (frame, shaft, plate).
+ * Callers must hit-test PINS and CHILD ELEMENTS first: a terminal still starts
+ * a wire and a child part still drags on its own, or the machine would be a
+ * trap that swallows every click aimed at what is bolted to it.
+ */
+export type MachineZone = 'grab' | 'body';
+>>>>>>> wf/hoist-drag
 
 export interface Hoist {
   /** One machine message from the net layer (or the dev mock). */
@@ -92,6 +115,22 @@ export interface Hoist {
   ): void;
   /** Latest state, or null before the first message (tests/debug). */
   state(): MachineMsg | null;
+  /** The footprint being drawn right now — the server's, or this client's
+   * optimistic one mid-drag. Null before the first machine message (offline:
+   * there is no machine, so there is nothing to hit-test or drag). */
+  rect(): MachineRect | null;
+  /** Which part of the cabinet a screen point is over; null = not on it. */
+  zoneAt(cam: Camera, x: number, y: number): MachineZone | null;
+  /** Place the assembly locally, ahead of the server, while dragging. Held
+   * until `endLocalDrag` plus one round trip, then the server's rect wins
+   * again — so a peer moving the same machine mid-drag can never leave this
+   * client stuck on a placement the room does not share. */
+  setLocalRect(r: MachineRect): void;
+  /** The pointer let go: keep the local placement just long enough for the
+   * server's answer to arrive, then defer to it. */
+  endLocalDrag(): void;
+  /** Light up the grab bar (pointer is over it, or a drag is in progress). */
+  setHot(hot: boolean): void;
 }
 
 // ------------------------------------------------------------------ layout
@@ -110,6 +149,10 @@ const TRAVEL_TOP = 0.28;
 const TRAVEL_BOT = 0.76;
 /** Top edge of the engraved nameplate strip. */
 const PLATE_TOP = 0.8;
+/** The grab bar: the top strip of the faceplate, right of the shaft (so it
+ * never covers the travel scale or the crate). Height as a fraction of the
+ * rect; the machine's engraved name is printed inside it. */
+const GRAB_H = 0.1;
 /** Crate height. */
 const CRATE_H = 0.1;
 /** Platform slab thickness. */
@@ -144,8 +187,24 @@ const LAND_FULL = 2.0;
 const VEL_FULL = 0.35;
 /** No machine message for this long = the link is gone, not the machine. */
 const STALE_MS = 1500;
+/** How long a released drag's placement outlives the gesture, waiting for the
+ * server's answer. One server tick is 33 ms; this is a generous ceiling that
+ * still guarantees the authoritative rect wins in bounded time. */
+const LOCAL_GRACE_MS = 1000;
 
 const clamp = (v: number, lo: number, hi: number) => (v < lo ? lo : v > hi ? hi : v);
+
+/** Corners in min/max order: a rect sent as [x1, y1, x0, y0] still stands up
+ * the right way instead of silently drawing (and hit-testing) nothing. */
+const normRect = (r: MachineRect): MachineRect => [
+  Math.min(r[0], r[2]),
+  Math.min(r[1], r[3]),
+  Math.max(r[0], r[2]),
+  Math.max(r[1], r[3]),
+];
+
+const sameRect = (a: MachineRect, b: MachineRect) =>
+  a[0] === b[0] && a[1] === b[1] && a[2] === b[2] && a[3] === b[3];
 
 // -------------------------------------------------------------- goal card
 
@@ -245,7 +304,8 @@ function buildCard(root: HTMLElement, reset: () => void): Card {
   const hint = div('goal-hint', body);
   hint.textContent =
     'M+/M− drive the drum · SENSE-W reads height (12.5 mV/mm) · a constant\n' +
-    'voltage cannot hold a position — close the loop.';
+    'voltage cannot hold a position — close the loop.\n' +
+    'drag the cabinet (or its top bar) to move the whole machine · ⌘Z undoes it.';
 
   let open = readLS(OPEN_KEY) !== '0'; // starts expanded; choice is remembered
   const apply = () => {
@@ -341,9 +401,25 @@ export function createHoist(root: HTMLElement, opts: { reset: () => void }): Hoi
   /** Wall clock of the last message: the card must not pass a frozen state
    * off as live if the socket drops. */
   let lastMsgAt = -Infinity;
+  /** This client's optimistic footprint while it drags the assembly. The
+   * server's rect is the truth; this only covers the round trip so the machine
+   * tracks the pointer instead of the network. */
+  let localRect: MachineRect | null = null;
+  /** True while the pointer owns the placement (between setLocalRect and
+   * endLocalDrag). */
+  let localHeld = false;
+  /** When the placement was last claimed, for the post-release grace window. */
+  let localAt = 0;
+  /** Grab bar highlight (hover or active drag). */
+  let hot = false;
 
   function onMachine(next: MachineMsg) {
     lastMsgAt = performance.now();
+    // The server has caught up with our optimistic placement: hand the
+    // footprint straight back to it, with no wait for the grace window.
+    // Comparing rects rather than counting acknowledgements means a move by
+    // ANOTHER player also lands cleanly.
+    if (!localHeld && localRect && sameRect(localRect, normRect(next.rect))) localRect = null;
     if (m && !m.win && next.win) winAge = 0;
     if (!m) winAge = next.win ? 0 : Infinity;
     if (next.impact > 0) {
@@ -388,6 +464,7 @@ export function createHoist(root: HTMLElement, opts: { reset: () => void }): Hoi
     if (dust.length > 0) dust = dust.filter((d) => d.age < d.life);
   }
 
+<<<<<<< HEAD
   function draw(
     ctx: CanvasRenderingContext2D,
     cam: Camera,
@@ -395,17 +472,47 @@ export function createHoist(root: HTMLElement, opts: { reset: () => void }): Hoi
     dtSec: number,
     fixture: FixturePart[] = [],
   ) {
+=======
+  /** The footprint in play: this client's optimistic one while it drags the
+   * assembly (and for one round trip after), the server's otherwise.
+   *
+   * The grace window is what makes the optimism safe. Without it a release
+   * would rubber-band for a tick; with it *unbounded*, a peer moving the same
+   * machine mid-drag would leave this client stuck on a placement the room
+   * never agreed to, since the awaited rect would never arrive. */
+  function rect(): MachineRect | null {
+    if (localRect && (localHeld || performance.now() - localAt < LOCAL_GRACE_MS)) {
+      return localRect;
+    }
+    localRect = null;
+    return m ? normRect(m.rect) : null;
+  }
+
+  function zoneAt(cam: Camera, x: number, y: number): MachineZone | null {
+    const r = rect();
+    if (!r) return null;
+    const X0 = cam.ox + r[0] * cam.scale;
+    const X1 = cam.ox + r[2] * cam.scale;
+    const Y0 = cam.oy + r[1] * cam.scale;
+    const Y1 = cam.oy + r[3] * cam.scale;
+    if (x < X0 || x > X1 || y < Y0 || y > Y1) return null;
+    const onBar = x >= X0 + SHAFT_X1 * (X1 - X0) && y <= Y0 + GRAB_H * (Y1 - Y0);
+    return onBar ? 'grab' : 'body';
+  }
+
+  function draw(ctx: CanvasRenderingContext2D, cam: Camera, now: number, dtSec: number) {
+>>>>>>> wf/hoist-drag
     const mm = m;
-    if (!mm) return;
+    const r = rect();
+    if (!mm || !r) return;
     card.onState(mm, now, performance.now() - lastMsgAt > STALE_MS);
     advance(Math.min(0.1, dtSec));
 
-    // Normalised corners: a rect sent as [x1, y1, x0, y0] still stands up the
-    // right way instead of silently drawing nothing.
-    const gx0 = Math.min(mm.rect[0], mm.rect[2]);
-    const gx1 = Math.max(mm.rect[0], mm.rect[2]);
-    const gy0 = Math.min(mm.rect[1], mm.rect[3]);
-    const gy1 = Math.max(mm.rect[1], mm.rect[3]);
+    // The footprint comes from `rect()`, so mid-drag the whole machine is
+    // drawn at the pointer's placement — chrome and children stay glued
+    // together because main.ts translates the children by the same delta on
+    // the same frame.
+    const [gx0, gy0, gx1, gy1] = r;
     const X0 = cam.ox + gx0 * cam.scale;
     const X1 = cam.ox + gx1 * cam.scale;
     const Y0 = cam.oy + gy0 * cam.scale;
@@ -784,6 +891,43 @@ export function createHoist(root: HTMLElement, opts: { reset: () => void }): Hoi
       }
     }
 
+    // ---- grab bar: a raised title strip across the top of the faceplate,
+    // clear of the shaft. Same idiom as a control-panel window's title bar,
+    // and the same promise: this strip is the handle for the whole object.
+    // main.ts hit-tests it as the 'grab' zone (GRAB_H / SHAFT_X1 are shared).
+    const bx = X0 + SHAFT_X1 * W;
+    const bw = X0 + W - bx;
+    const bh = GRAB_H * H;
+    const bar = ctx.createLinearGradient(bx, Y0, bx, Y0 + bh);
+    bar.addColorStop(0, hot ? '#37455a' : '#28313d');
+    bar.addColorStop(1, hot ? '#222b38' : '#1b222b');
+    ctx.fillStyle = bar;
+    ctx.fillRect(bx, Y0, bw, bh);
+    ctx.strokeStyle = hot ? '#7d9ec4' : '#3c4653';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(bx, Math.round(Y0 + bh) + 0.5);
+    ctx.lineTo(X0 + W, Math.round(Y0 + bh) + 0.5);
+    ctx.stroke();
+    // Grip dots at the strip's left end — the "you can pick this up" cue.
+    const dr = Math.max(0.6, Math.min(bh * 0.07, W * 0.008));
+    if (bh > 6 * dr && bw > 14 * dr) {
+      ctx.fillStyle = hot ? '#9fbcdc' : '#556373';
+      for (let row = 0; row < 2; row++) {
+        for (let col = 0; col < 4; col++) {
+          ctx.beginPath();
+          ctx.arc(
+            bx + bw * 0.03 + col * 4 * dr,
+            Y0 + bh * 0.5 + (row - 0.5) * 4 * dr,
+            dr,
+            0,
+            Math.PI * 2,
+          );
+          ctx.fill();
+        }
+      }
+    }
+
     // Machine name + objective, engraved along the top of the cabinet clear of
     // the shaft; shortened, then dropped, when the rect is too narrow for it.
     const tf = Math.round(clamp(H * 0.045, 4, 18));
@@ -804,7 +948,23 @@ export function createHoist(root: HTMLElement, opts: { reset: () => void }): Hoi
     }
   }
 
-  const hoist: Hoist = { onMachine, draw, state: () => m };
+  const hoist: Hoist = {
+    onMachine,
+    draw,
+    state: () => m,
+    rect,
+    zoneAt,
+    setLocalRect: (r) => {
+      localRect = normRect(r);
+      localHeld = true;
+      localAt = performance.now();
+    },
+    endLocalDrag: () => {
+      localHeld = false;
+      localAt = performance.now();
+    },
+    setHot: (v) => (hot = v),
+  };
 
   // ---- dev mock (see the file header): URL flag or console call.
   const params = new URLSearchParams(location.search);

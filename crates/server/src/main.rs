@@ -14,7 +14,8 @@
 //! costs a few milliseconds of a trace or of silence and desyncs nothing —
 //! the next chunk carries its own absolute `t0`.
 //!                     presence{n}, cursor{who, x, y}, machine{...}
-//!   client -> server: interact{id, op}, cursor{x, y}, machinereset{}
+//!   client -> server: interact{id, op}, cursor{x, y}, machinereset{},
+//!                     machinemove{dx, dy}
 
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
@@ -313,9 +314,43 @@ fn demo_room_circuit() -> Vec<ElementSpec> {
 // position sensor. There is no quest log and nothing to accept: the goal
 // is measured from solver quantities and nothing else.
 
-/// The hoist's footprint in GRID units, broadcast to clients as `rect`.
-/// All hoist chrome is drawn inside it; the geometry lives here only.
-const HOIST_RECT: [i32; 4] = [46, 2, 64, 24];
+/// The hoist's footprint SIZE in grid units. Fixed: the assembly MOVES (a
+/// player drags the cabinet, see `move_machine`), it does not resize.
+const HOIST_W: i32 = 18;
+const HOIST_H: i32 = 22;
+
+/// The footprint of a hoist whose top-left corner is at (x0, y0), in GRID
+/// units — broadcast to clients as `rect`. All hoist chrome is drawn inside
+/// it and every fixture pin is derived from it, so the box and its terminals
+/// can never drift apart.
+const fn hoist_rect(x0: i32, y0: i32) -> [i32; 4] {
+    [x0, y0, x0 + HOIST_W, y0 + HOIST_H]
+}
+
+/// Where a fresh room stands the hoist: its own district east of the showcase
+/// vignettes (which occupy x <= 40). The live footprint is room STATE from
+/// here on (persisted in `SaveFile::hoist_rect`), not a constant.
+const HOIST_RECT: [i32; 4] = hoist_rect(46, 2);
+
+/// Grid coordinates the machine may occupy. The world is meant to be huge, so
+/// this is a guard against a runaway client (or a corrupt save) parking the
+/// machine at 1e9 where no player could ever find it again — not a design
+/// limit on where a machine may live.
+const WORLD_LIMIT: i32 = 1_000_000;
+
+/// Largest single assembly move accepted, in grid units. A drag sends small
+/// increments; one undo sends the whole gesture back. Anything past this is a
+/// malformed client, not a player.
+const MAX_MACHINE_STEP: i32 = 100_000;
+
+/// Force a footprint back onto its invariants: normalized corners, the fixed
+/// size, origin inside the world range. Used on load (a save may predate the
+/// field, or be hand-edited) and on every move.
+fn sane_rect(r: [i32; 4]) -> [i32; 4] {
+    let x0 = r[0].min(r[2]).clamp(-WORLD_LIMIT, WORLD_LIMIT - HOIST_W);
+    let y0 = r[1].min(r[3]).clamp(-WORLD_LIMIT, WORLD_LIMIT - HOIST_H);
+    hoist_rect(x0, y0)
+}
 
 /// The four locked fixture elements. Players wire to their terminals but
 /// cannot move, edit or delete them: ids 900-999 are server-owned and every
@@ -334,15 +369,19 @@ fn reserved_id(id: u32) -> bool {
     (900..=999).contains(&id)
 }
 
-/// The fixture, laid out on the faceplate inside `HOIST_RECT`:
+/// The fixture, laid out on the faceplate inside the footprint:
 ///   900 Motor         [M+, M-]
 ///   901 Potentiometer [SENSE-A, SENSE-W, SENSE-B]  (the position sensor)
 ///   902 Switch        [LIM-TOP-a, LIM-TOP-b]
 ///   903 Switch        [LIM-BOT-a, LIM-BOT-b]
 /// The shaft itself takes the left of the rect; the terminal column sits on
 /// the right so wires can reach it without crossing the crate.
-fn hoist_fixture() -> Vec<ElementSpec> {
-    let [x0, y0, ..] = HOIST_RECT;
+///
+/// EVERY pin is derived from the rect's origin — this function is the whole
+/// "terminal map" of the assembly, and the reason a move cannot separate a
+/// terminal from its machine.
+fn hoist_fixture_at(rect: [i32; 4]) -> Vec<ElementSpec> {
+    let [x0, y0, ..] = rect;
     let (a, b) = (x0 + 11, x0 + 15); // terminal column
     vec![
         ElementSpec::two(
@@ -382,23 +421,89 @@ fn hoist_fixture() -> Vec<ElementSpec> {
     ]
 }
 
-/// Inject any missing fixture element — a checkpoint written before the
-/// hoist existed has none of them, and they can never be removed after.
-/// Persisted pins and values survive when the part is already the right kind
-/// (a restored wiper or limit-switch position is real state).
-fn ensure_fixture(elems: &mut Vec<ElementSpec>) {
-    for spec in hoist_fixture() {
-        match elems.iter_mut().find(|e| e.id == spec.id) {
+/// The fixture on the default footprint. Test-only: the live room always has a
+/// rect to derive from, and reaching for the default in the running server is
+/// exactly the drift this refactor removed.
+#[cfg(test)]
+fn hoist_fixture() -> Vec<ElementSpec> {
+    hoist_fixture_at(HOIST_RECT)
+}
+
+/// Stand the fixture up inside `rect`: inject anything missing — a checkpoint
+/// written before the hoist existed has none of it, and it can never be
+/// removed after — and put every surviving child's pins where the rect says
+/// they go. Persisted VALUES survive (a restored wiper or limit-switch
+/// position is real state); pin GEOMETRY is always re-derived, which is what
+/// keeps the footprint and its terminals in lockstep across a move and across
+/// a reload.
+///
+/// Returns (id, pins) for each child, ready to broadcast as `DocOp::Move`.
+fn ensure_fixture(
+    elems: &mut Vec<ElementSpec>,
+    rect: [i32; 4],
+) -> Vec<(u32, Vec<sim_core::Point>)> {
+    let mut moved = Vec::with_capacity(4);
+    for spec in hoist_fixture_at(rect) {
+        let (id, pins) = (spec.id, spec.pins.clone());
+        match elems.iter_mut().find(|e| e.id == id) {
             // A save written before ids 900-999 were reserved could hold a
             // player's part on a fixture id. The fixture wins: the machine
             // would otherwise be writing back-EMF into someone's resistor.
             Some(e) if std::mem::discriminant(&e.kind) != std::mem::discriminant(&spec.kind) => {
                 *e = spec;
             }
-            Some(_) => {}
+            Some(e) => e.pins = pins.clone(),
             None => elems.push(spec),
         }
+        moved.push((id, pins));
     }
+    moved
+}
+
+/// Move the whole hoist assembly by an integer grid delta: the footprint AND
+/// all four child fixtures, together, in one shot. This is the ONLY way any
+/// of them moves — `apply_doc_op` refuses a client `DocOp::Move` on a
+/// reserved id — so a player can never separate a terminal from its machine.
+/// Returns the children's new pins for the broadcast, or None when the move is
+/// refused (no-op, absurd step, or a destination outside the world range).
+///
+/// SEAM — this is the whole assembly abstraction, deliberately hard-wired to
+/// THIS machine. A future generic `Container` part would need, per instance:
+///   * a CHILD LIST (here: the four reserved ids, implied by `hoist_fixture_at`);
+///   * a FOOTPRINT (here: the room's single `hoist_rect`);
+///   * a TERMINAL MAP from child pins to footprint-relative offsets (here:
+///     `hoist_fixture_at`, which derives every pin from the rect's origin);
+///   * PER-INSTANCE WORLD STATE carried along untouched (here: the one
+///     `Hoist`) — a translation is not a reset.
+///
+/// Everything else in this function is generic already.
+fn move_machine(
+    elems: &mut Vec<ElementSpec>,
+    rect: &mut [i32; 4],
+    dx: i32,
+    dy: i32,
+) -> Option<Vec<(u32, Vec<sim_core::Point>)>> {
+    if dx == 0 && dy == 0 {
+        return None; // nothing to broadcast, nothing to checkpoint
+    }
+    // `unsigned_abs`, not `abs`: a client is free to send i32::MIN, and
+    // negating that panics in debug and wraps in release.
+    let step = MAX_MACHINE_STEP.unsigned_abs();
+    if dx.unsigned_abs() > step || dy.unsigned_abs() > step {
+        return None;
+    }
+    // Checked arithmetic for the same reason — a hostile delta must be a
+    // dropped message, never a panicking sim task.
+    let (x0, y0) = (rect[0].checked_add(dx)?, rect[1].checked_add(dy)?);
+    // Every corner of the box (and therefore every derived pin) has to land
+    // somewhere a player could plausibly follow it to.
+    if !(-WORLD_LIMIT..=WORLD_LIMIT - HOIST_W).contains(&x0)
+        || !(-WORLD_LIMIT..=WORLD_LIMIT - HOIST_H).contains(&y0)
+    {
+        return None;
+    }
+    *rect = hoist_rect(x0, y0);
+    Some(ensure_fixture(elems, *rect))
 }
 
 /// Ids of the document's sources, cached for the energy meter.
@@ -618,6 +723,12 @@ enum Cmd {
     },
     /// Lower the crate to the floor and re-arm the hoist's goal.
     MachineReset,
+    /// Drag the whole hoist assembly by an integer grid delta (the player has
+    /// the cabinet in hand). Applied at a tick boundary like every other op.
+    MachineMove {
+        dx: i32,
+        dy: i32,
+    },
     Join,
     Leave,
 }
@@ -658,6 +769,16 @@ struct SaveFile {
     /// hoist existed still load (crate on the floor, goal armed).
     #[serde(default)]
     hoist: Hoist,
+    /// Where the hoist stands, in GRID units. Defaulted so saves written
+    /// before the machine could be dragged still load, landing it on the
+    /// original constant — exactly where those saves' fixture pins already
+    /// are. Sanitized through `sane_rect` on load.
+    #[serde(default = "default_hoist_rect")]
+    hoist_rect: [i32; 4],
+}
+
+fn default_hoist_rect() -> [i32; 4] {
+    HOIST_RECT
 }
 
 #[derive(serde::Serialize, Deserialize)]
@@ -679,9 +800,10 @@ fn load_room() -> Option<SaveFile> {
     serde_json::from_str(&data).ok()
 }
 
-fn checkpoint(room: &Room, hoist: &Hoist) {
+fn checkpoint(room: &Room, hoist: &Hoist, hoist_rect: [i32; 4]) {
     let save = SaveFile {
         hoist: *hoist,
+        hoist_rect,
         elements: room.elements.lock().unwrap().clone(),
         probes: room
             .probes
@@ -775,7 +897,14 @@ fn audio_message(
 
 /// The sim task: sole owner of the Engine. Ops apply between ticks —
 /// the "tick boundary" rule from the plan, at demo scale.
-async fn sim_task(room: Arc<Room>, mut cmds: mpsc::UnboundedReceiver<Cmd>, mut hoist: Hoist) {
+async fn sim_task(
+    room: Arc<Room>,
+    mut cmds: mpsc::UnboundedReceiver<Cmd>,
+    mut hoist: Hoist,
+    // The hoist's footprint: owned here, beside the mechanism it belongs to,
+    // so a move and a machine tick can never interleave.
+    mut hoist_rect: [i32; 4],
+) {
     let mut eng = Engine::new(DT);
     let mut sources;
     {
@@ -819,9 +948,11 @@ async fn sim_task(room: Arc<Room>, mut cmds: mpsc::UnboundedReceiver<Cmd>, mut h
         ticks_since_save += 1;
         if ticks_since_save >= 150 && room.dirty.swap(false, Ordering::Relaxed) {
             ticks_since_save = 0;
-            checkpoint(&room, &hoist);
+            checkpoint(&room, &hoist, hoist_rect);
         }
 
+        // Assembly moves arriving this tick, summed and applied once below.
+        let mut pending_move = (0i32, 0i32);
         while let Ok(cmd) = cmds.try_recv() {
             match cmd {
                 Cmd::Interact { id, op } => {
@@ -839,6 +970,15 @@ async fn sim_task(room: Arc<Room>, mut cmds: mpsc::UnboundedReceiver<Cmd>, mut h
                 Cmd::MachineReset => {
                     hoist.reset();
                     room.dirty.store(true, Ordering::Relaxed);
+                }
+                Cmd::MachineMove { dx, dy } => {
+                    // Coalesced, not applied here: a drag sends ~2 ops per
+                    // tick and translation is additive, so summing them costs
+                    // one netlist recompile per tick instead of one per op.
+                    // Saturating, because the sum of hostile deltas must be a
+                    // refused move rather than a panic.
+                    pending_move.0 = pending_move.0.saturating_add(dx);
+                    pending_move.1 = pending_move.1.saturating_add(dy);
                 }
                 Cmd::Edit { op } => {
                     if apply_doc_op(&room, &op) {
@@ -924,6 +1064,33 @@ async fn sim_task(room: Arc<Room>, mut cmds: mpsc::UnboundedReceiver<Cmd>, mut h
                     let _ = room
                         .events
                         .send(json!({"t": "presence", "n": n}).to_string());
+                }
+            }
+        }
+
+        // The assembly move, applied once at this tick boundary: one atomic
+        // translation of the footprint AND its four children. The mechanism
+        // (height, velocity, hold timer, landing count) is deliberately
+        // untouched — dragging the box is a move, not a reset.
+        if pending_move != (0, 0) {
+            let moved = {
+                let mut elems = room.elements.lock().unwrap();
+                move_machine(&mut elems, &mut hoist_rect, pending_move.0, pending_move.1)
+            };
+            if let Some(children) = moved {
+                room.dirty.store(true, Ordering::Relaxed);
+                // The children's pins moved, so the netlist's geometry did:
+                // recompile (continuous state survives by id). `sources`
+                // cannot change — a move touches no element's kind.
+                let elems = room.elements.lock().unwrap().clone();
+                eng.set_elements(&elems);
+                // The children reach every client through the ordinary doc
+                // path, and the new footprint rides this tick's `machine`
+                // message — so a client that never sent the op is consistent
+                // within one tick.
+                for (id, pins) in children {
+                    let op = DocOp::Move { id, pins };
+                    let _ = room.events.send(json!({"t": "doc", "op": op}).to_string());
                 }
             }
         }
@@ -1069,7 +1236,7 @@ async fn sim_task(room: Arc<Room>, mut cmds: mpsc::UnboundedReceiver<Cmd>, mut h
             // The hoist, once per tick alongside the frame.
             let _ = room
                 .events
-                .send(machine_msg(&hoist, motor_i, impact).to_string());
+                .send(machine_msg(&hoist, hoist_rect, motor_i, impact).to_string());
         }
         // A win is worth a checkpoint even if nobody edited anything.
         if hoist.win && !won_before {
@@ -1083,14 +1250,15 @@ async fn sim_task(room: Arc<Room>, mut cmds: mpsc::UnboundedReceiver<Cmd>, mut h
 /// Every number in it is a solver quantity or an integral of one: `i` is the
 /// motor's branch unknown, `y`/`vel` are integrals of `i`, `hold` is measured
 /// from `y`, and `joules` integrates source power. Nothing here is asserted.
-/// `rect` is the footprint in GRID units so the client can draw all hoist
-/// chrome without hardcoding geometry; `impact` is non-zero only on the tick
-/// a landing happened.
-fn machine_msg(hoist: &Hoist, motor_i: f64, impact: f64) -> serde_json::Value {
+/// `rect` is the LIVE footprint in GRID units — room state now, since the
+/// assembly is draggable — so the client can draw all hoist chrome (and
+/// hit-test the cabinet) without hardcoding geometry; `impact` is non-zero
+/// only on the tick a landing happened.
+fn machine_msg(hoist: &Hoist, rect: [i32; 4], motor_i: f64, impact: f64) -> serde_json::Value {
     json!({
         "t": "machine",
         "id": MOTOR_ID,
-        "rect": HOIST_RECT,
+        "rect": rect,
         "h": machine::SHAFT_H,
         "band": [machine::BAND_LO, machine::BAND_HI],
         "y": hoist.y,
@@ -1328,6 +1496,13 @@ enum ClientMsg {
     },
     /// Lower the crate and re-arm the hoist's goal.
     MachineReset,
+    /// Move the whole hoist assembly by an integer grid delta. Deltas, not an
+    /// absolute rect: a drag is a stream of small increments and one undo is
+    /// the negated total, so nothing has to agree on a coordinate system.
+    MachineMove {
+        dx: i32,
+        dy: i32,
+    },
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(room): State<Arc<Room>>) -> impl IntoResponse {
@@ -1391,6 +1566,9 @@ async fn client_session(mut socket: WebSocket, room: Arc<Room>) {
                         Ok(ClientMsg::MachineReset) => {
                             let _ = room.cmds.send(Cmd::MachineReset);
                         }
+                        Ok(ClientMsg::MachineMove { dx, dy }) => {
+                            let _ = room.cmds.send(Cmd::MachineMove { dx, dy });
+                        }
                         Ok(ClientMsg::Cursor { x, y }) => {
                             let _ = room.events.send(
                                 json!({"t": "cursor", "who": me, "x": x, "y": y}).to_string(),
@@ -1416,7 +1594,7 @@ async fn main() {
     // Restore the room from the last checkpoint; fresh rooms start with
     // the showcase circuit.
     let saved = load_room();
-    let (mut elements, probes, next_pid, panels, next_plid, hoist) = match saved {
+    let (mut elements, probes, next_pid, panels, next_plid, hoist, hoist_rect) = match saved {
         Some(s) => {
             tracing::info!(
                 "restored room from {} ({} elements)",
@@ -1446,6 +1624,7 @@ async fn main() {
                 s.panels,
                 next_plid,
                 s.hoist,
+                sane_rect(s.hoist_rect),
             )
         }
         None => (
@@ -1455,10 +1634,14 @@ async fn main() {
             Vec::new(),
             1,
             Hoist::default(),
+            HOIST_RECT,
         ),
     };
-    // The hoist fixture is not optional: a room without it has no goal.
-    ensure_fixture(&mut elements);
+    // The hoist fixture is not optional: a room without it has no goal. This
+    // also re-derives the children's pins from the restored footprint, so a
+    // save whose fixture pins were edited by hand cannot leave a terminal
+    // stranded outside the box.
+    ensure_fixture(&mut elements, hoist_rect);
 
     let room = Arc::new(Room {
         cmds: cmd_tx,
@@ -1472,7 +1655,7 @@ async fn main() {
         population: AtomicU32::new(0),
         dirty: std::sync::atomic::AtomicBool::new(false),
     });
-    tokio::spawn(sim_task(room.clone(), cmd_rx, hoist));
+    tokio::spawn(sim_task(room.clone(), cmd_rx, hoist, hoist_rect));
 
     let dist = std::env::var("EE_DIST").unwrap_or_else(|_| "packages/app/dist".into());
     let static_files =
@@ -1515,6 +1698,10 @@ mod tests {
         eng: Engine,
         hoist: Hoist,
         sources: Vec<u32>,
+        /// The whole document, so a test can drag the assembly the way
+        /// `sim_task` does.
+        elems: Vec<ElementSpec>,
+        rect: [i32; 4],
     }
 
     impl HoistRun {
@@ -1528,7 +1715,28 @@ mod tests {
                 eng,
                 hoist: Hoist::default(),
                 sources,
+                elems,
+                rect: HOIST_RECT,
             }
+        }
+
+        /// Drag the assembly, exactly the way the sim task does it: one
+        /// `move_machine`, then recompile the netlist. The player's own parts
+        /// are NOT part of the assembly, so the test slides them along itself
+        /// — otherwise the machine would simply walk out from under its wires.
+        fn drag_machine(&mut self, dx: i32, dy: i32) -> Vec<(u32, Vec<sim_core::Point>)> {
+            for e in self.elems.iter_mut() {
+                if reserved_id(e.id) {
+                    continue;
+                }
+                for p in e.pins.iter_mut() {
+                    *p = (p.0 + dx, p.1 + dy);
+                }
+            }
+            let moved = move_machine(&mut self.elems, &mut self.rect, dx, dy)
+                .expect("the move must be accepted");
+            self.eng.set_elements(&self.elems);
+            moved
         }
 
         /// Returns the armature current the machine just used (A).
@@ -1620,13 +1828,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn comparator_feedback_holds_the_crate_in_the_band() {
-        // The discovery this goal exists to force: close the loop.
-        //   sensor pot (SENSE-A to +4 V, SENSE-B to ground) -> wiper voltage
-        //   4·y/H, compared against a 3.2 V reference (= band centre 0.32 m).
-        //   The op-amp comparator drives the motor: +5 V lifts, -5 V lowers.
-        // Bang-bang, and the 3× hold drain is sized to let it win.
+    /// The winning wiring, as a player would draw it — shared by the goal test
+    /// and the assembly-move test (which needs a live control loop to prove a
+    /// move does not disturb one).
+    ///
+    ///   sensor pot (SENSE-A to +4 V, SENSE-B to ground) -> wiper voltage
+    ///   4·y/H, compared against a 3.2 V reference (= band centre 0.32 m).
+    ///   The op-amp comparator drives the motor: +5 V lifts, -5 V lowers.
+    /// Bang-bang, and the 3× hold drain is sized to let it win.
+    fn comparator_feedback_circuit() -> Vec<ElementSpec> {
         let (mp, mm) = motor_pins();
         let sensor = hoist_fixture()
             .into_iter()
@@ -1640,7 +1850,7 @@ mod tests {
             (sa.0 - 9, sa.1 + 2),
             (sa.0 - 5, sa.1 + 5),
         );
-        let mut run = HoistRun::new(vec![
+        vec![
             // Sensor excitation: 4 V across SENSE-A .. SENSE-B.
             spec(1, dc(4.0), sup_p, sup_n),
             gnd(2, sup_n),
@@ -1656,7 +1866,13 @@ mod tests {
             spec(10, K::Wire, out, mp),
             spec(11, K::Wire, mm, (mm.0 - 5, mm.1)),
             gnd(12, (mm.0 - 5, mm.1)),
-        ]);
+        ]
+    }
+
+    #[test]
+    fn comparator_feedback_holds_the_crate_in_the_band() {
+        // The discovery this goal exists to force: close the loop.
+        let mut run = HoistRun::new(comparator_feedback_circuit());
 
         let mut peak = 0.0f64;
         let mut entered = f64::NAN;
@@ -1740,7 +1956,7 @@ mod tests {
         let (cmd_tx, _rx) = mpsc::unbounded_channel();
         let (event_tx, _ev) = broadcast::channel(4);
         let mut elements = demo_room_circuit();
-        ensure_fixture(&mut elements);
+        ensure_fixture(&mut elements, HOIST_RECT);
         let room = Room {
             cmds: cmd_tx,
             events: event_tx,
@@ -1804,7 +2020,7 @@ mod tests {
         hoist.hold = 2.5;
         hoist.landings = 3;
         hoist.joules = 12.5;
-        let v = machine_msg(&hoist, 0.94, 1.75);
+        let v = machine_msg(&hoist, HOIST_RECT, 0.94, 1.75);
         assert_eq!(v["t"], "machine");
         assert_eq!(v["id"], MOTOR_ID);
         assert_eq!(v["rect"], json!([46, 2, 64, 24]));
@@ -1850,18 +2066,263 @@ mod tests {
     }
 
     #[test]
+    fn machine_move_is_accepted_on_the_wire() {
+        let msg: ClientMsg = serde_json::from_str(r#"{"t":"machinemove","dx":3,"dy":-2}"#).unwrap();
+        let ClientMsg::MachineMove { dx, dy } = msg else {
+            panic!("expected a machinemove message")
+        };
+        assert_eq!((dx, dy), (3, -2));
+        // Grid units are integers: a fractional drag is not a move at all.
+        assert!(
+            serde_json::from_str::<ClientMsg>(r#"{"t":"machinemove","dx":0.5,"dy":0}"#).is_err()
+        );
+        assert!(
+            serde_json::from_str::<ClientMsg>(r#"{"t":"machinemove","dx":"3","dy":0}"#).is_err()
+        );
+    }
+
+    /// The invariant the whole feature rests on: the footprint the client draws
+    /// from and the terminals the player wires to move as ONE thing.
+    #[test]
+    fn machine_move_keeps_the_rect_and_the_children_in_lockstep() {
+        let mut elems = demo_room_circuit();
+        let mut rect = HOIST_RECT;
+        ensure_fixture(&mut elems, rect);
+
+        for (dx, dy) in [(7, 5), (-3, 0), (0, -11), (120, 340)] {
+            let before = rect;
+            let moved = move_machine(&mut elems, &mut rect, dx, dy).expect("accepted");
+            // The rect translated by exactly the delta, and kept its size.
+            assert_eq!(
+                rect,
+                [
+                    before[0] + dx,
+                    before[1] + dy,
+                    before[2] + dx,
+                    before[3] + dy
+                ]
+            );
+            assert_eq!((rect[2] - rect[0], rect[3] - rect[1]), (HOIST_W, HOIST_H));
+            // Every child sits exactly where a fixture derived from the new
+            // rect would sit — that is the lockstep, not an approximation of it.
+            let want = hoist_fixture_at(rect);
+            assert_eq!(moved.len(), want.len());
+            for w in &want {
+                let live = elems.iter().find(|e| e.id == w.id).expect("child present");
+                assert_eq!(live.pins, w.pins, "child {} drifted from the rect", w.id);
+                assert!(moved
+                    .iter()
+                    .any(|(id, pins)| *id == w.id && *pins == w.pins));
+                // And inside the box, so the client can draw its screw pads.
+                for (px, py) in &live.pins {
+                    assert!(
+                        (rect[0]..=rect[2]).contains(px) && (rect[1]..=rect[3]).contains(py),
+                        "child {} pin ({px},{py}) outside rect {rect:?}",
+                        w.id
+                    );
+                }
+            }
+        }
+        // The player's own parts are never touched by an assembly move.
+        let showcase = demo_room_circuit();
+        for e in &showcase {
+            let live = elems.iter().find(|x| x.id == e.id).unwrap();
+            assert_eq!(live.pins, e.pins, "element {} was dragged along", e.id);
+        }
+    }
+
+    #[test]
+    fn machine_move_refuses_nonsense() {
+        let mut elems = demo_room_circuit();
+        let mut rect = HOIST_RECT;
+        ensure_fixture(&mut elems, rect);
+        let pins_before: Vec<Vec<sim_core::Point>> = hoist_fixture_at(rect)
+            .iter()
+            .map(|e| e.pins.clone())
+            .collect();
+
+        for (dx, dy) in [
+            (0, 0),                     // not a move at all
+            (MAX_MACHINE_STEP + 1, 0),  // past the per-op step cap
+            (0, -MAX_MACHINE_STEP - 1), // same, negative
+            (WORLD_LIMIT, 0),           // a jump the size of the world
+            (0, WORLD_LIMIT),           //
+            (-WORLD_LIMIT * 2, 0),      // twice the world, westward
+            (i32::MIN, i32::MAX),       // overflow bait: `abs` would panic here
+        ] {
+            assert!(
+                move_machine(&mut elems, &mut rect, dx, dy).is_none(),
+                "must refuse ({dx},{dy})"
+            );
+            // A refused move changes nothing at all.
+            assert_eq!(rect, HOIST_RECT);
+            for (e, want) in hoist_fixture_at(rect).iter().zip(&pins_before) {
+                let live = elems.iter().find(|x| x.id == e.id).unwrap();
+                assert_eq!(&live.pins, want);
+            }
+        }
+        // Walking east forever hits a wall rather than falling off the end of
+        // the world: the last accepted move leaves the whole box in range, and
+        // the next one is simply refused.
+        let mut steps = 0;
+        while move_machine(&mut elems, &mut rect, MAX_MACHINE_STEP, 0).is_some() {
+            steps += 1;
+            assert!(steps < 1000, "the range must be a wall, not a treadmill");
+        }
+        assert!(rect[0] > HOIST_RECT[0], "it did travel east");
+        assert!(
+            rect[2] <= WORLD_LIMIT && rect[0] >= -WORLD_LIMIT,
+            "the box stayed inside the world: {rect:?}"
+        );
+        // Still in lockstep out there.
+        for w in hoist_fixture_at(rect) {
+            let live = elems.iter().find(|e| e.id == w.id).unwrap();
+            assert_eq!(live.pins, w.pins);
+        }
+    }
+
+    /// Dragging the cabinet is a TRANSLATION: the crate does not teleport to
+    /// the floor, the hold timer does not restart, the landing count does not
+    /// clear. The whole point of putting the footprint in state rather than
+    /// rebuilding the machine.
+    #[test]
+    fn machine_move_does_not_disturb_the_mechanism() {
+        let mut run = HoistRun::new(comparator_feedback_circuit());
+        // Long enough to be genuinely airborne, in the band, banking hold.
+        for _ in 0..(2.5 / MACHINE_H) as u32 {
+            run.step();
+        }
+        assert!(
+            run.hoist.in_band() && run.hoist.hold > 0.5,
+            "setup: expected a live hold, got y={} hold={}",
+            run.hoist.y,
+            run.hoist.hold
+        );
+        let before = run.hoist; // Hoist is Copy: a full snapshot
+        let t_before = run.eng.time();
+        let hold_before = run.hoist.hold;
+
+        let moved = run.drag_machine(5, 3);
+        assert_eq!(moved.len(), 4, "all four children moved");
+        assert_eq!(run.rect, hoist_rect(51, 5));
+
+        // Not one mechanical or goal quantity changed: height, velocity, the
+        // hold timer, the landing count, the energy meter.
+        assert_eq!(run.hoist, before, "a move must not disturb the mechanism");
+        assert_eq!(run.hoist.y, before.y);
+        assert_eq!(run.hoist.velocity(), before.velocity());
+        assert_eq!(run.hoist.hold, hold_before);
+        assert_eq!(run.hoist.landings, before.landings);
+        assert_eq!(run.eng.time(), t_before, "sim time does not rewind");
+        assert!(
+            !run.eng.is_quarantined(),
+            "the move must not break the solve"
+        );
+
+        // And the loop the player built still works at the new address: the
+        // hold carries on from where it was and reaches the win.
+        for _ in 0..(4.0 / MACHINE_H) as u32 {
+            run.step();
+            if run.hoist.win {
+                break;
+            }
+        }
+        assert!(
+            run.hoist.win,
+            "the control loop must survive the move: hold={:.3} y={:.4}",
+            run.hoist.hold, run.hoist.y
+        );
+        assert_eq!(run.hoist.landings, 0, "and must not have dropped the crate");
+        eprintln!(
+            "moved mid-hold at {t_before:.3} s (hold {hold_before:.3} s), won at {:.3} s",
+            run.eng.time()
+        );
+    }
+
+    /// A client can only move the machine through the assembly op. Direct
+    /// document ops on a fixture stay refused, which is what stops a player
+    /// dragging the motor out of its own cabinet.
+    #[test]
+    fn a_direct_move_of_a_fixture_is_still_refused() {
+        let mut elements = demo_room_circuit();
+        ensure_fixture(&mut elements, HOIST_RECT);
+        let room = test_room(elements);
+        let before: Vec<Vec<sim_core::Point>> =
+            hoist_fixture().iter().map(|e| e.pins.clone()).collect();
+
+        for id in [MOTOR_ID, SENSOR_ID, LIM_TOP_ID, LIM_BOT_ID] {
+            let pins = room
+                .elements
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|e| e.id == id)
+                .unwrap()
+                .pins
+                .clone();
+            let shifted: Vec<sim_core::Point> = pins.iter().map(|(x, y)| (x + 1, *y)).collect();
+            assert!(
+                !apply_doc_op(&room, &DocOp::Move { id, pins: shifted }),
+                "a direct Move on {id} must be refused"
+            );
+        }
+        let elems = room.elements.lock().unwrap();
+        for (e, want) in hoist_fixture().iter().zip(&before) {
+            assert_eq!(&elems.iter().find(|x| x.id == e.id).unwrap().pins, want);
+        }
+    }
+
+    #[test]
     fn old_saves_load_without_hoist_state() {
         let save: SaveFile = serde_json::from_str(r#"{"elements":[]}"#).unwrap();
         assert_eq!(save.hoist, Hoist::default());
         assert_eq!(save.hoist.y, 0.0);
         assert!(!save.hoist.win);
+        // A save written before the machine could be dragged lands on the
+        // original footprint — which is where its fixture pins already are.
+        assert_eq!(save.hoist_rect, HOIST_RECT);
+        assert_eq!(sane_rect(save.hoist_rect), HOIST_RECT);
+    }
+
+    #[test]
+    fn a_saved_footprint_survives_a_restart_and_is_sanitized() {
+        // Round trip: the rect a drag left behind comes back byte-identical.
+        let mut elements = vec![spec(1, K::Wire, (0, 0), (0, 4))];
+        let mut rect = HOIST_RECT;
+        ensure_fixture(&mut elements, rect);
+        move_machine(&mut elements, &mut rect, -20, 40).unwrap();
+        let json = serde_json::to_string(&SaveFile {
+            elements: elements.clone(),
+            probes: Vec::new(),
+            next_pid: 1,
+            panels: Vec::new(),
+            next_plid: 1,
+            hoist: Hoist::default(),
+            hoist_rect: rect,
+        })
+        .unwrap();
+        let back: SaveFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.hoist_rect, rect);
+        // Reloading re-derives the children from the restored rect, so the
+        // save and the fixture cannot come back disagreeing.
+        let mut restored = back.elements;
+        ensure_fixture(&mut restored, sane_rect(back.hoist_rect));
+        for w in hoist_fixture_at(rect) {
+            assert_eq!(restored.iter().find(|e| e.id == w.id).unwrap().pins, w.pins);
+        }
+        // A hand-edited or corrupt rect is forced back onto the invariants:
+        // normalized corners, fixed size, inside the world.
+        assert_eq!(sane_rect([64, 24, 46, 2]), HOIST_RECT);
+        let far = sane_rect([i32::MAX, i32::MIN, 0, 0]);
+        assert_eq!((far[2] - far[0], far[3] - far[1]), (HOIST_W, HOIST_H));
+        assert!(far[2] <= WORLD_LIMIT && far[1] >= -WORLD_LIMIT, "{far:?}");
     }
 
     #[test]
     fn ensure_fixture_repairs_old_rooms() {
         // A pre-hoist save: no fixture at all.
         let mut elems = vec![spec(1, K::Wire, (0, 0), (0, 4))];
-        ensure_fixture(&mut elems);
+        ensure_fixture(&mut elems, HOIST_RECT);
         assert_eq!(elems.len(), 5);
         // Idempotent, and persisted state survives a reload.
         if let Some(e) = elems.iter_mut().find(|e| e.id == SENSOR_ID) {
@@ -1870,7 +2331,7 @@ mod tests {
                 wiper: 0.25,
             };
         }
-        ensure_fixture(&mut elems);
+        ensure_fixture(&mut elems, HOIST_RECT);
         assert_eq!(elems.len(), 5);
         let sensor = elems.iter().find(|e| e.id == SENSOR_ID).unwrap();
         assert!(matches!(
@@ -1880,7 +2341,7 @@ mod tests {
         // A save from before the ids were reserved, with a player's part
         // squatting on a fixture id: the fixture takes it back.
         let mut squatted = vec![spec(MOTOR_ID, K::Resistor { ohms: 100.0 }, (0, 0), (0, 4))];
-        ensure_fixture(&mut squatted);
+        ensure_fixture(&mut squatted, HOIST_RECT);
         let motor = squatted.iter().find(|e| e.id == MOTOR_ID).unwrap();
         assert!(matches!(motor.kind, K::Motor { .. }), "fixture must win");
         assert_eq!(motor.pins, motor_pins_vec());
