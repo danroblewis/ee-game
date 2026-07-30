@@ -24,6 +24,7 @@
 //   3                     listen: play that node's waveform (WebAudio)
 //   0                     set selected V-probe's reference (differential)
 //   O                     drop an in-place oscilloscope;  X delete
+//   ` (backquote)         collapse/expand the bottom scope dock (starts collapsed)
 //   J                     drag a control-panel region around some parts
 //                         (its floating instrument window follows)
 //   wheel zoom (over a scope: timebase) · pan: middle-drag, ctrl+drag, space+drag
@@ -59,7 +60,6 @@ import {
   applyScopeControl,
   defaultScopeSettings,
   probeColor,
-  renderScope,
   renderScopeInto,
   scopeControlAt,
   TraceStore,
@@ -67,6 +67,7 @@ import {
   type ScopeControlId,
   type ScopeSettings,
 } from './scope';
+import { createDock } from './dock';
 
 const DT = 10e-6;
 const MAX_STEPS_PER_FRAME = 4000; // local-mode wall budget
@@ -1429,6 +1430,11 @@ window.addEventListener('keydown', (ev) => {
     }
     return;
   }
+  if (ev.key === '`' || ev.key === '~') {
+    dock.toggle();
+    ev.preventDefault();
+    return;
+  }
   if (ev.key === 'o' && mouse) {
     addFloatScope(snap(mouse.x, mouse.y));
     return;
@@ -1546,6 +1552,7 @@ scopeCv.addEventListener('pointerdown', (ev) => {
 scopeCv.addEventListener('pointermove', (ev) => {
   scopeCv.style.cursor = dockCtrlAt(ev) ? 'pointer' : 'default';
 });
+const dock = createDock(scopeDiv, scopeCv);
 
 /** Blue highlight over an element: its pin-chain plus dots on every pin
  * (pins must overlap exactly to connect — make them visible). */
@@ -1863,12 +1870,7 @@ function frame(now: number) {
   // widget from this frame's solver values.
   panelHost.tick(panels);
 
-  if (probes.length > 0) {
-    scopeDiv.style.display = 'block';
-    renderScope(scopeCv, traces, probes, dockScope.timebase, dockScope);
-  } else {
-    scopeDiv.style.display = 'none';
-  }
+  dock.update(now, probes, traces, dockScope);
 
   if (hover && mouse && !placing && !pasting && !wireDrag && !moveDrag) {
     const l = live.get(hover.id);
@@ -1901,7 +1903,7 @@ function frame(now: number) {
     (online ? `● ONLINE — ${population} player${population === 1 ? '' : 's'}` : '○ offline (local sim)') +
     (mode ? `   ${mode}` : '') +
     `\nparts: R C L W G V D N P M A U 5 S B T Z E F I · drag part = move · dbl-click = edit values · right-click = menu` +
-    `\ndrag pin = wire · drag empty = select · Q rotate · ⌘C/⌘V copy/paste · 1/2 probe · 3 listen · 0 ref · O scope · J panel · X delete · / parts menu · pan: middle / ctrl+drag / space+drag`;
+    `\ndrag pin = wire · drag empty = select · Q rotate · ⌘C/⌘V copy/paste · 1/2 probe · 3 listen · 0 ref · O scope · \` dock · J panel · X delete · / parts menu · pan: middle / ctrl+drag / space+drag`;
 
   requestAnimationFrame(frame);
 }
