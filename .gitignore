@@ -1,4 +1,7 @@
 /target
+# The standalone measurement crates (docs/scale-parallelism.md) are their
+# own workspaces, so each has its own target dir.
+tools/*/target/
 node_modules/
 dist/
 *.wasm.d.ts

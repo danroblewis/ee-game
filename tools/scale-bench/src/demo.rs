@@ -1,5 +1,5 @@
 //! Verbatim copy of `demo_room_circuit` from crates/server/src/main.rs at
-//! commit 51b1f4d, so "today's demo world" is measured on the real thing
+//! commit 976ec43, so "today's demo world" is measured on the real thing
 //! rather than a lookalike.
 
 use sim_core::ElementSpec;
@@ -201,5 +201,54 @@ pub fn demo_room_circuit() -> Vec<ElementSpec> {
         spec(149, r(100_000.0), (29, 38), (29, 44)),
         spec(150, K::Wire, (29, 44), (6, 44)),
         spec(151, K::Wire, (6, 44), (6, 40)),
+        // ---- I: 555 astable blinking an LED at ~1 Hz. RA = RB = 100k,
+        // C = 4.7 µF -> f = 1.44/((RA + 2·RB)·C) ≈ 1.0 Hz, duty ≈ 67 %.
+        // The cap charges through RA+RB to 2/3 Vcc, then DIS saturates and
+        // it drains through RB to 1/3 Vcc. Hold the pushbutton to ground
+        // TRIG: the trigger comparator wins, so the output pins high and
+        // the LED stays lit until you let go.
+        spec(160, dc(9.0), (34, 36), (34, 48)),
+        gnd(161, (34, 48)),
+        spec(162, K::Wire, (34, 36), (34, 34)),
+        spec(163, K::Wire, (34, 34), (52, 34)), // rail, routed over the chip
+        spec(164, K::Wire, (34, 36), (40, 36)), // rail -> VCC pin
+        // pins: [vcc, gnd, trig, thr, out, dis]
+        ElementSpec {
+            id: 165,
+            kind: K::Timer555,
+            pins: vec![(40, 36), (40, 44), (40, 38), (40, 42), (46, 42), (46, 38)],
+        },
+        spec(166, r(100_000.0), (52, 34), (52, 38)), // RA: rail -> DIS
+        spec(167, K::Wire, (52, 38), (46, 38)),
+        spec(168, r(100_000.0), (52, 38), (52, 42)), // RB: DIS -> THR/TRIG
+        spec(169, K::Wire, (52, 42), (52, 46)),
+        spec(170, K::Wire, (52, 46), (38, 46)), // routed under the chip
+        spec(171, K::Wire, (38, 46), (38, 42)),
+        spec(172, K::Wire, (38, 42), (40, 42)), // -> THR pin
+        spec(173, K::Wire, (38, 42), (38, 38)),
+        spec(174, K::Wire, (38, 38), (40, 38)), // -> TRIG pin (tied to THR)
+        spec(175, K::Capacitor { farads: 4.7e-6 }, (38, 46), (38, 48)),
+        gnd(176, (38, 48)),
+        spec(177, K::Wire, (40, 44), (36, 44)), // GND pin
+        gnd(178, (36, 44)),
+        // Manual retrigger: hold to short TRIG to ground.
+        spec(179, K::Wire, (38, 38), (36, 38)),
+        spec(180, K::Button { closed: false }, (36, 38), (36, 40)),
+        gnd(181, (36, 40)),
+        // Blinker on OUT.
+        spec(182, r(470.0), (46, 42), (49, 42)),
+        spec(183, K::Led { color: 3 }, (49, 42), (49, 44)),
+        gnd(184, (49, 44)),
+        // ---- J: concert A. A 440 Hz source through a series 8 Ω into an
+        // 8 Ω speaker: close the switch and you HEAR it, because the server
+        // streams the coil's own terminal voltage at 12.5 kHz. The switch
+        // starts open so joining a room is quiet.
+        spec(200, sine(5.0, 440.0), (2, 52), (2, 60)),
+        spec(201, K::Wire, (2, 52), (5, 52)),
+        spec(202, K::Switch { closed: false }, (5, 52), (8, 52)),
+        spec(203, r(8.0), (8, 52), (11, 52)),
+        spec(204, K::Speaker { ohms: 8.0 }, (11, 52), (11, 60)),
+        spec(205, K::Wire, (11, 60), (2, 60)),
+        gnd(206, (2, 60)),
     ]
 }

@@ -25,7 +25,10 @@ fn main() {
     );
     println!("# dt={DT}s tick={TICK_HZ}Hz substeps/tick={}", substeps());
     match arg.as_str() {
-        "lu" => bench_dense_lu(),
+        "lu" => {
+            bench_dense_lu();
+            bench_state_copy();
+        }
         "multirate" => bench_multirate(),
         "demo" => bench_demo_repeat(),
         "world" => bench_world(),
@@ -33,6 +36,7 @@ fn main() {
         "sparse" => bench_sparse(),
         "all" => {
             bench_dense_lu();
+            bench_state_copy();
             bench_world();
             bench_islands();
             bench_multirate();
@@ -111,7 +115,7 @@ fn circuit_shaped_dense(n: usize, seed: u64) -> Vec<f64> {
 fn bench_dense_lu() {
     println!("\n## dense LU (sim-math::DenseLu), one thread");
     println!("n      factor_us   solve_us   factor_GFLOPs   reps");
-    for n in [8usize, 16, 32, 64, 128, 256, 512, 1024, 2048] {
+    for n in [3usize, 4, 5, 6, 7, 8, 16, 32, 64, 128, 256, 512, 1024, 2048] {
         let a = circuit_shaped_dense(n, 0x1234 + n as u64);
         let mut lu = sim_math::DenseLu::new(n);
         let (tf, rf) = bench(
@@ -138,6 +142,32 @@ fn bench_dense_lu() {
             ts * 1e6,
             gf
         );
+    }
+}
+
+/// The per-substep state snapshot `Engine::step` takes for the rescue
+/// ladder (`let saved: Vec<ElemState> = ...`) is a fresh heap allocation
+/// plus a copy of every element's state, every substep. ElemState is 13
+/// f64 + padding; this measures what that costs at world scale.
+fn bench_state_copy() {
+    println!("\n## cost of one Vec<ElemState>-shaped snapshot per substep");
+    println!("elems   snapshot_us  us_per_element");
+    for e in [113usize, 565, 1130, 2260, 4520] {
+        let src: Vec<[f64; 13]> = vec![[1.0; 13]; e];
+        let (t, _) = bench(
+            || {
+                // Deliberately `iter().copied().collect()`, matching
+                // engine.rs's `self.elems.iter().map(|e| e.state).collect()`.
+                // `to_vec()` is faster, which is exactly why it would not
+                // measure what the engine actually pays.
+                #[allow(clippy::iter_cloned_collect)]
+                let v: Vec<[f64; 13]> = src.iter().copied().collect();
+                std::hint::black_box(&v);
+            },
+            0.3,
+            200_000,
+        );
+        println!("{e:<7} {:<12.3} {:<.4}", t * 1e6, t * 1e6 / e as f64);
     }
 }
 
@@ -432,6 +462,8 @@ fn bench_islands() {
         ha.len(),
         if ha == hb { "IDENTICAL" } else { "DIFFER" }
     );
+
+    equivalence_check();
 
     // How many islands are quiescent (nothing measurably moving)?
     let w = world::replicate(1);

@@ -47,9 +47,9 @@ pub fn replicate(copies: usize) -> World {
     let mut idx = 0u32;
     for c in 0..copies {
         for (name, elems) in golden.iter() {
-            // 1000 grid units apart in x, 1000 per copy in y: no accidental
-            // coincident endpoints, so no accidental merging.
-            let d = ((idx as i32 % 16) * 1000, (c as i32) * 1000);
+            // Unique 1000x1000 cell per island for every idx, so no two
+            // islands can share a coordinate and merge by accident.
+            let d = ((idx as i32 % 64) * 1000, (idx as i32 / 64) * 1000);
             islands.push(Island {
                 name: format!("{name}#{c}"),
                 elems: offset(elems, idx * 1000, d),
@@ -72,7 +72,7 @@ pub fn replicate_linear(copies: usize) -> World {
     let mut idx = 0u32;
     for c in 0..copies {
         for (name, elems) in golden.iter() {
-            let d = ((idx as i32 % 16) * 1000, (c as i32) * 1000);
+            let d = ((idx as i32 % 64) * 1000, (idx as i32 / 64) * 1000);
             islands.push(Island {
                 name: format!("{name}#{c}"),
                 elems: offset(elems, idx * 1000, d),
