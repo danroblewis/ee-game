@@ -6,6 +6,7 @@ members = [
     "crates/sim-golden",
     "crates/sim-wasm",
     "crates/machine",
+    "crates/damage",
     "crates/server",
 ]
 

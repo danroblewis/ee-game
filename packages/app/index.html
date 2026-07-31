@@ -298,6 +298,31 @@
         margin-top: 7px; color: #6d7d89; font-size: 11px; line-height: 1.35;
         white-space: pre-line;
       }
+      /* Motor current over its nameplate rating: the number that explains
+         why the motor is about to die. */
+      .goal-cell span.over { color: #ff8f6a; font-weight: 600; }
+
+      /* ---- damage toasts: "R7 released its magic smoke" (main.ts owns
+         the elements; this is only their look). Bottom-left, above the
+         scope dock, never in the way of the goal card. */
+      #toasts {
+        position: fixed; left: 12px; bottom: 36px; z-index: 25;
+        display: flex; flex-direction: column; gap: 6px;
+        pointer-events: none; max-width: 430px;
+      }
+      .toast {
+        color: #ffd8c2; background: linear-gradient(#2a1f1c, #1d1614);
+        border: 1px solid #7a4030; border-left: 3px solid #ff6a3d;
+        border-radius: 6px; padding: 6px 10px;
+        font: 12px/1.45 ui-monospace, monospace;
+        box-shadow: 0 8px 24px #000a;
+        animation: toastin 180ms ease-out;
+      }
+      @keyframes toastin {
+        from { opacity: 0; transform: translateY(6px); }
+        to { opacity: 1; transform: none; }
+      }
+
       /* Win: the card goes gold (the band flashes on the canvas). */
       .goalcard.win {
         border-color: #c9a34a;

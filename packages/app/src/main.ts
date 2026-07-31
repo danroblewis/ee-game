@@ -37,6 +37,10 @@
 //   0                     set selected V-probe's reference (differential)
 //   O                     drop an in-place oscilloscope;  X delete
 //   ` (backquote)         collapse/expand the bottom scope dock (starts collapsed)
+//   K                     repair tool: the wrench cursor; click a charred
+//                         part to put it back into service (parts break when
+//                         you overload them — the server decides, from the
+//                         solver, and says so with a toast)
 //   J                     drag a control-panel region around some parts
 //                         (its floating instrument window follows) — a scope
 //                         parked inside a region becomes a widget in that
@@ -83,7 +87,15 @@ import {
   type PanelOp,
   type PanelRect,
 } from './panel';
-import { DotFlow, drawElement, drawElementsLod, drawGrid, hitTest, type Camera } from './render';
+import {
+  DotFlow,
+  drawElement,
+  drawElementsLod,
+  drawGrid,
+  hitTest,
+  type Camera,
+  type DamageState,
+} from './render';
 import { SpatialIndex } from './spatial';
 import {
   applyScopeControl,
@@ -144,6 +156,16 @@ let online = false;
 let population = 0;
 let myId = -1;
 const cursors = new Map<number, { x: number; y: number; seen: number }>();
+
+/** Server-computed damage, keyed by element id: how hot each part is running
+ * and whether it has let go. Every value here is authoritative — the client
+ * never decides that something is overloaded, it only draws what the room
+ * tells it (see the `damage` snapshot in net.ts). Offline there is no damage
+ * model at all, so this stays empty and nothing can break. */
+let damage = new Map<number, DamageState>();
+/** True once the first snapshot has landed: parts that were already dead when
+ * we joined must not each fire a magic-smoke burst and a toast. */
+let damageSeen = false;
 
 let probes: Probe[] = [];
 /** Shared control-panel regions (room-scoped, like probes). */
@@ -343,6 +365,11 @@ const net = connect({
     probes = serverProbes;
     panels = serverPanels;
     live = new Map();
+    // Damage is room state: forget the old room's, and treat whatever the
+    // first snapshot carries as history, not as news (no toast, no pop for
+    // parts that were already dead when we joined).
+    damage = new Map();
+    damageSeen = false;
     if (firstHello) {
       firstHello = false;
       fitHome();
@@ -393,6 +420,23 @@ const net = connect({
   onMachine(m) {
     hoist.onMachine(m);
   },
+  onDamage(parts) {
+    // A full snapshot replaces the map: anything absent is healthy again
+    // (repaired, cooled off, or deleted).
+    const next = new Map<number, DamageState>();
+    for (const [id, stress, broken] of parts) {
+      const was = damage.get(id);
+      const dead = broken !== 0;
+      // The pop is a one-shot: remember when THIS client first saw it, and
+      // never fire it for parts that were already dead when we joined.
+      const poppedAt =
+        dead && damageSeen && !was?.broken ? performance.now() : was?.poppedAt;
+      next.set(id, { stress, broken: dead, poppedAt });
+      if (dead && damageSeen && !was?.broken) magicSmoke(id);
+    }
+    damage = next;
+    damageSeen = true;
+  },
   onSamples(t0, dts, s) {
     for (const [pid, samples] of Object.entries(s)) {
       traces.appendChunk(Number(pid), t0, dts, samples);
@@ -421,9 +465,72 @@ const net = connect({
     if (online) {
       online = false;
       localSim.setElements(elements);
+      // The local sim has no damage model, so keeping the last snapshot
+      // would leave parts drawn as broken that are now conducting.
+      damage = new Map();
+      damageSeen = false;
+      repairing = false;
     }
   },
 });
+
+// ------------------------------------------------------- damage + repair
+//
+// Nothing here decides that a part is overloaded: the server does, from
+// solver output, and sends a `damage` snapshot. The client announces the
+// failure, draws the wreckage, and offers the wrench.
+
+/** Transient announcements, newest at the bottom. */
+const toastBox = document.createElement('div');
+toastBox.id = 'toasts';
+document.body.appendChild(toastBox);
+
+function toast(text: string) {
+  const el = document.createElement('div');
+  el.className = 'toast';
+  el.textContent = text;
+  toastBox.appendChild(el);
+  while (toastBox.childElementCount > 4) toastBox.firstElementChild?.remove();
+  setTimeout(() => el.remove(), 7000);
+}
+
+/** The oldest joke in electronics, and the clearest possible failure notice. */
+function magicSmoke(id: number) {
+  const e = elemById(id);
+  toast(`${e ? e.kind.t : 'Part'} #${id} released its magic smoke — press K, then click it to repair`);
+}
+
+/** K: the repair tool. A wrench-shaped cursor; click a broken part to put it
+ * back into service. */
+let repairing = false;
+const WRENCH_SVG =
+  '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">' +
+  '<path d="M21 4.5a5.5 5.5 0 0 1-7.2 6.9L6.4 18.8a2 2 0 0 1-2.8-2.8l7.4-7.4A5.5 5.5 0 0 1 17.9 1.4' +
+  'l-3.3 3.3 2.7 2.7 3.3-3.3c.3.4.4.9.4 1.4z" fill="#ffd66b" stroke="#101014" stroke-width="1.4" ' +
+  'stroke-linejoin="round"/></svg>';
+const REPAIR_CURSOR = `url("data:image/svg+xml,${encodeURIComponent(WRENCH_SVG)}") 4 20, cell`;
+
+const isBroken = (id: number): boolean => damage.get(id)?.broken === true;
+
+/** Ask the server to repair a part. Deliberately NOT an editDoc call: a
+ * repair is a world event, not a document edit, so it never enters the undo
+ * history (⌘Z must not un-repair anything) and it is allowed on the
+ * server-owned hoist fixture that refuses every document op. */
+function repair(id: number) {
+  if (!isBroken(id) || !online) return;
+  net.sendRepair(id);
+}
+
+function armRepair() {
+  repairing = true;
+  placing = null;
+  pasting = null;
+  panelTool = false;
+  canvas.style.cursor = REPAIR_CURSOR;
+  // Offline there is no damage model at all, so there is never anything to
+  // repair — say so rather than leaving the wrench clicking on nothing.
+  if (!online) toast('offline: the local sim has no damage model — nothing can break, or be fixed');
+}
 
 function interact(e: ElementSpec, op: InteractOp) {
   applyOp(e, op); // optimistic; server echo confirms
@@ -656,6 +763,7 @@ function placeEnd(a: Point): Point {
 function choosePart(p: PartDef) {
   placing = p;
   pasting = null;
+  repairing = false;
   closeCtxMenu();
   canvas.style.cursor = 'crosshair';
 }
@@ -1235,10 +1343,16 @@ function partMenu(e: ElementSpec, x: number, y: number): MenuItem[] {
   const many = n > 1 ? ` (${n})` : '';
   const items: MenuItem[] = [
     { head: `${e.kind.t} #${e.id}` },
+  ];
+  if (isBroken(e.id)) {
+    // Top of the menu on a dead part: it is the only thing you want here.
+    items.push({ label: 'Repair this part', hint: 'K', run: () => repair(e.id) }, { sep: true });
+  }
+  items.push(
     { label: 'Edit…', run: () => openPropsDialog(e) },
     { label: `Rotate${many}`, hint: 'Q', run: () => rotateElements(groupOf(e)) },
     { label: `Delete${many}`, hint: 'X', run: () => deleteElements(groupOf(e)) },
-  ];
+  );
   if (e.kind.t !== 'Ground') {
     items.push(
       { sep: true },
@@ -1524,6 +1638,13 @@ canvas.addEventListener('pointerdown', (ev) => {
     panDrag = { x: ev.clientX, y: ev.clientY, ox: cam.ox, oy: cam.oy };
     return;
   }
+  if (repairing) {
+    // One click, one repair; the tool stays armed so a district full of dead
+    // parts can be walked through without re-arming.
+    const e = elementAt(ev.clientX, ev.clientY);
+    if (e) repair(e.id);
+    return;
+  }
   if (panelTool) {
     const p = snap(ev.clientX, ev.clientY);
     panelDrag = { a: p, b: p };
@@ -1783,7 +1904,9 @@ canvas.addEventListener('pointermove', (ev) => {
   const mz =
     z || pz || over || onPin ? null : hoist.zoneAt(cam, ev.clientX, ev.clientY);
   hoist.setHot(mz === 'grab');
-  canvas.style.cursor = placing || pasting || panelTool
+  canvas.style.cursor = repairing
+    ? REPAIR_CURSOR
+    : placing || pasting || panelTool
     ? 'crosshair'
     : spaceHeld
       ? 'grab'
@@ -1986,6 +2109,7 @@ window.addEventListener('keydown', (ev) => {
     pasting = null;
     panelTool = false;
     panelDrag = null;
+    repairing = false;
     selectedIds.clear();
     selectedProbe = null;
     selectedMachine = false;
@@ -1999,12 +2123,19 @@ window.addEventListener('keydown', (ev) => {
     else fitHome();
     return;
   }
+  if (ev.key === 'k' || ev.key === 'K') {
+    // The repair tool. Broken parts are found by eye (they are charred, and
+    // they keep a marker when zoomed out) and fixed by clicking them.
+    armRepair();
+    return;
+  }
   if (ev.key === 'j' || ev.key === 'J') {
     // Arm the panel tool: drag a region around the parts you want on a
     // control panel. Its window appears as soon as the region exists.
     panelTool = true;
     placing = null;
     pasting = null;
+    repairing = false;
     canvas.style.cursor = 'crosshair';
     return;
   }
@@ -2529,11 +2660,15 @@ function frame(now: number) {
         e.kind.t === 'Speaker' && audio.speakerStreamed(e.id)
           ? { level: audio.speakerLevel(e.id), muted: audio.speakerMuted(e.id) }
           : undefined;
-      drawElement({ ctx, cam, live: live.get(e.id), dots, dtSec: wallDt, sound }, e);
+      drawElement(
+        { ctx, cam, live: live.get(e.id), dots, dtSec: wallDt, sound, dmg: damage.get(e.id), time: now },
+        e,
+      );
     }
   } else {
-    // Too small for symbols: conductors only, colored by the solver frame.
-    drawElementsLod(ctx, cam, visible, live, cam.scale < LOD_CHAIN);
+    // Too small for symbols: conductors only, colored by the solver frame —
+    // plus a marker on every dead part, because finding them IS the repair.
+    drawElementsLod(ctx, cam, visible, live, cam.scale < LOD_CHAIN, damage);
   }
 
   // Hover highlight (blue element + pin dots), Falstad-style.
@@ -2621,17 +2756,28 @@ function frame(now: number) {
     tip.style.top = `${mouse.y + 14}px`;
     const val = describeValue(hover);
     const labels = pinLabels(hover.kind);
+    // The heat line is the teaching line: it says how close this part is to
+    // its own limit, and it is the server's number, not a guess.
+    const d = damage.get(hover.id);
+    const heat = d?.broken
+      ? '\nBROKEN — released its magic smoke (K = repair)'
+      : d && d.stress > 0.05
+        ? `\nheat ${(d.stress * 100).toFixed(0)}% of its limit${d.stress > 0.7 ? ' — SMOKING' : ''}`
+        : '';
     tip.textContent =
       `${hover.kind.t}${val ? '  ' + val : ''}\n` +
       (l
         ? labels.map((lb, p) => `${lb}: ${fmt(l.v[p] ?? 0, 'V')} ${fmt(l.i[p] ?? 0, 'A')}`).join('\n') +
           `\nP ${fmt(l.power, 'W')}`
-        : '');
+        : '') +
+      heat;
   } else {
     tip.style.display = 'none';
   }
 
-  const mode = panelTool
+  const mode = repairing
+    ? 'repair tool: click a charred part to put it back into service (Esc exits)'
+    : panelTool
     ? 'control panel: drag a region around the parts you want on it (Esc cancels)'
     : pasting
       ? `pasting ${pasting.length} parts (Q rotates, click places, Esc cancels)`
@@ -2645,6 +2791,20 @@ function frame(now: number) {
               ? `${selectedIds.size} selected (drag moves, Q rotates, ⌘C copies, X deletes)`
               : '';
   const note = history.note();
+  // A standing count of the damage, so somebody working at the other end of
+  // the world still knows the room has a dead part in it.
+  let dead = 0;
+  let hottest = 0;
+  for (const d of damage.values()) {
+    if (d.broken) dead++;
+    else if (d.stress > hottest) hottest = d.stress;
+  }
+  const harm =
+    dead > 0
+      ? `   ⚠ ${dead} part${dead === 1 ? '' : 's'} broken (K = repair tool)`
+      : hottest > 0.7
+        ? `   ⚠ something is smoking (${(hottest * 100) | 0}% of its limit)`
+        : '';
   // Sound needs a user gesture before the browser will play anything: say so
   // once, only while it is actually blocking audio, and never once running.
   const snd = audio.status();
@@ -2655,7 +2815,7 @@ function frame(now: number) {
       : '';
   const hints = hintsOpen
     ? `\nparts: R C L W G V D N P M A U 5 S B T Z E F I · drag part = move · drag the hoist cabinet = move the machine · dbl-click = edit values · right-click = menu` +
-      `\ndrag pin = wire · drag empty = select · Q rotate · ⌘Z undo · ⌘C/⌘V copy/paste · 1/2 probe · 3 listen · 0 ref · O scope · \` dock · J panel · X delete · / parts menu` +
+      `\ndrag pin = wire · drag empty = select · Q rotate · ⌘Z undo · ⌘C/⌘V copy/paste · 1/2 probe · 3 listen · 0 ref · O scope · \` dock · J panel · K repair · X delete · / parts menu` +
       `\nH home district · shift+H fit everything · wheel = zoom (0.4–200 px/unit) · pan: middle / ctrl+drag / space+drag`
     : `\n? controls`;
   hud.textContent =
@@ -2664,6 +2824,7 @@ function frame(now: number) {
     `   ${perf.drawn}/${perf.total} parts drawn @ ${cam.scale.toFixed(1)} px/unit (cull ${perf.cull.toFixed(2)} ms)` +
     (mode ? `   ${mode}` : '') +
     (note ? `   ${note}` : '') +
+    harm +
     sound +
     hints;
 

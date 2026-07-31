@@ -13,9 +13,15 @@
 //! channel as `frame`, so a lagged consumer skips chunks. A dropped chunk
 //! costs a few milliseconds of a trace or of silence and desyncs nothing —
 //! the next chunk carries its own absolute `t0`.
-//!                     presence{n}, cursor{who, x, y}, machine{...}
+//!                     presence{n}, cursor{who, x, y}, machine{...},
+//!                     damage{parts:[[id, stress, broken], ...]}
 //!   client -> server: interact{id, op}, cursor{x, y}, machinereset{},
-//!                     machinemove{dx, dy}
+//!                     machinemove{dx, dy}, repair{id}
+//!
+//! `damage` is a lossy SNAPSHOT, not a delta: each message lists everything
+//! worth drawing (dead parts first), so a client replaces its whole damage
+//! map from it and a dropped message costs one frame of staleness. A room
+//! with nothing stressed sends none at all.
 
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
@@ -24,6 +30,7 @@ use axum::{
     routing::get,
     Router,
 };
+use damage::DamageModel;
 use machine::Hoist;
 use serde::Deserialize;
 use serde_json::json;
@@ -52,11 +59,27 @@ const MAX_STEPS_PER_TICK: u32 = 8000;
 const MACHINE_SUBSTEPS: u32 = 32;
 const MACHINE_H: f64 = MACHINE_SUBSTEPS as f64 * DT;
 
+/// Most parts listed in one `damage` snapshot. The message is lossy by
+/// design (see the header): dead parts take the slots first, because those
+/// are the ones a player has to go and find.
+///
+/// Cost: a row is ~22 bytes of JSON, so a fully wrecked room caps out around
+/// 11 kB/tick (340 kB/s) — the same order as one speaker's audio tap, and
+/// only while hundreds of parts are actually broken. A healthy room sends
+/// nothing at all.
+const MAX_DAMAGE_REPORT: usize = 512;
+
 /// The showcase room: four vignettes on one shared simulation.
 ///   A: battery -> switch -> lamp (click me)
 ///   B: potentiometer -> NPN emitter follower dimming a lamp (drag me)
 ///   C: slow sine gate on an NMOS switching a lamp, cap softening the edges
 ///   D: op-amp comparator on a slow sine alternately blinking two LEDs
+///
+/// Lamp nameplates here are sized for what their own vignette actually
+/// drives them with, which matters now that ratings have teeth: vignette B at
+/// full brightness and vignette C fully switched on both put ~1.15 W into
+/// their bulb, so a 0.4 W nameplate would have meant the showcase burned
+/// itself out the first time someone dragged the dimmer to the top.
 fn demo_room_circuit() -> Vec<ElementSpec> {
     use sim_core::ElementKind as K;
     use sim_golden::{dc, gnd, r, sine, spec, spec3};
@@ -93,7 +116,7 @@ fn demo_room_circuit() -> Vec<ElementSpec> {
         spec(14, r(1000.0), (28, 5), (31, 5)),
         // pins: [base, collector, emitter]
         spec3(15, K::Npn { beta: 100.0 }, (31, 5), (33, 2), (33, 6)),
-        spec(16, lamp(60.0, 0.4), (33, 6), (33, 8)),
+        spec(16, lamp(60.0, 1.2), (33, 6), (33, 8)),
         spec(17, K::Wire, (33, 8), (26, 8)),
         spec(18, K::Wire, (26, 8), (24, 8)),
         gnd(19, (24, 8)),
@@ -101,7 +124,7 @@ fn demo_room_circuit() -> Vec<ElementSpec> {
         // ---- C: NMOS slow switch with capacitor fade (bottom-left)
         spec(30, dc(9.0), (2, 12), (2, 18)),
         spec(31, K::Wire, (2, 12), (6, 12)),
-        spec(32, lamp(60.0, 0.6), (6, 12), (10, 12)),
+        spec(32, lamp(60.0, 1.2), (6, 12), (10, 12)),
         spec(33, K::Wire, (10, 12), (12, 12)),
         spec(34, K::Wire, (12, 12), (12, 13)),
         // pins: [gate, drain, source]
@@ -179,7 +202,7 @@ fn demo_room_circuit() -> Vec<ElementSpec> {
             95,
             K::Lamp {
                 ohms: 60.0,
-                rated_watts: 0.3,
+                rated_watts: 0.6,
             },
             (29, 22),
             (29, 26),
@@ -429,6 +452,25 @@ fn hoist_fixture() -> Vec<ElementSpec> {
     hoist_fixture_at(HOIST_RECT)
 }
 
+/// The hoist motor's nameplate current (A), read from the damage table so
+/// the faceplate can never disagree with the model that enforces it.
+///
+/// Design note, and the reason the goal card no longer says "wire 12 V to
+/// M+/M−": at 12 V the armature draws V/R = 6 A whenever the rotor is not
+/// turning — at start, and forever once the crate parks against the head
+/// stop. That is twice this rating, so an uncontrolled 12 V lead cooks the
+/// motor in a couple of seconds. Running current is ~0.94 A and a controlled
+/// drive's switching transients average well under the rating, so the
+/// intended solution survives indefinitely.
+fn motor_i_max() -> f64 {
+    let motor = ElementKind::Motor {
+        ohms: machine::R_ARM,
+        henries: machine::L_ARM,
+        bemf: 0.0,
+    };
+    damage::rating(&motor).map(|r| r.limit).unwrap_or(0.0)
+}
+
 /// Stand the fixture up inside `rect`: inject anything missing — a checkpoint
 /// written before the hoist existed has none of it, and it can never be
 /// removed after — and put every surviving child's pins where the rect says
@@ -539,6 +581,21 @@ fn source_watts(eng: &Engine, ids: &[u32]) -> f64 {
         }
     }
     watts
+}
+
+/// Put a broken part back into service: clear the bookkeeping, then tell the
+/// solver to stamp it again. Returns false when the id was not broken, so a
+/// stale click from a client costs nothing.
+///
+/// Both halves matter and they must stay together: clearing only the model
+/// would leave a part that reads healthy and conducts nothing, and clearing
+/// only the engine would leave one that conducts and reads dead.
+fn apply_repair(damage: &mut DamageModel, eng: &mut Engine, id: u32) -> bool {
+    if !damage.repair(id) {
+        return false;
+    }
+    eng.set_broken(id, false);
+    true
 }
 
 /// One machine tick: read the motor's armature current out of the solver,
@@ -729,6 +786,10 @@ enum Cmd {
         dx: i32,
         dy: i32,
     },
+    /// Fix a part that released its magic smoke (the repair tool).
+    Repair {
+        id: u32,
+    },
     Join,
     Leave,
 }
@@ -775,6 +836,10 @@ struct SaveFile {
     /// are. Sanitized through `sane_rect` on load.
     #[serde(default = "default_hoist_rect")]
     hoist_rect: [i32; 4],
+    /// Accumulated thermal stress and the broken set. Defaulted, so a save
+    /// written before parts could break still loads (everything healthy).
+    #[serde(default)]
+    damage: DamageModel,
 }
 
 fn default_hoist_rect() -> [i32; 4] {
@@ -800,10 +865,11 @@ fn load_room() -> Option<SaveFile> {
     serde_json::from_str(&data).ok()
 }
 
-fn checkpoint(room: &Room, hoist: &Hoist, hoist_rect: [i32; 4]) {
+fn checkpoint(room: &Room, hoist: &Hoist, hoist_rect: [i32; 4], damage: &DamageModel) {
     let save = SaveFile {
         hoist: *hoist,
         hoist_rect,
+        damage: damage.clone(),
         elements: room.elements.lock().unwrap().clone(),
         probes: room
             .probes
@@ -904,6 +970,7 @@ async fn sim_task(
     // The hoist's footprint: owned here, beside the mechanism it belongs to,
     // so a move and a machine tick can never interleave.
     mut hoist_rect: [i32; 4],
+    mut damage: DamageModel,
 ) {
     let mut eng = Engine::new(DT);
     let mut sources;
@@ -911,7 +978,18 @@ async fn sim_task(
         let elems = room.elements.lock().unwrap().clone();
         sources = source_ids(&elems);
         eng.set_elements(&elems);
+        // Restored damage: the ratings are re-derived from the document (they
+        // are never persisted) and every part that was dead when the server
+        // stopped is dead again before the first step runs.
+        damage.set_document(&elems);
+        for id in damage.broken_ids() {
+            eng.set_broken(id, true);
+        }
     }
+    // Was the last damage snapshot non-empty? One empty snapshot is sent
+    // after the room goes quiet, so clients clear their overlays; after that,
+    // silence costs nothing.
+    let mut damage_shown = false;
 
     let tick = std::time::Duration::from_secs_f64(1.0 / TICK_HZ);
     let mut interval = tokio::time::interval(tick);
@@ -948,7 +1026,7 @@ async fn sim_task(
         ticks_since_save += 1;
         if ticks_since_save >= 150 && room.dirty.swap(false, Ordering::Relaxed) {
             ticks_since_save = 0;
-            checkpoint(&room, &hoist, hoist_rect);
+            checkpoint(&room, &hoist, hoist_rect, &damage);
         }
 
         // Assembly moves arriving this tick, summed and applied once below.
@@ -980,13 +1058,29 @@ async fn sim_task(
                     pending_move.0 = pending_move.0.saturating_add(dx);
                     pending_move.1 = pending_move.1.saturating_add(dy);
                 }
+                Cmd::Repair { id } => {
+                    // Deliberately NOT a document op: a repair is a world
+                    // event, so it is allowed on the server-owned hoist
+                    // fixture (ids 900-999) and it never enters anyone's undo
+                    // history. The next tick's snapshot tells every client.
+                    if apply_repair(&mut damage, &mut eng, id) {
+                        room.dirty.store(true, Ordering::Relaxed);
+                        tracing::info!("part #{id} repaired");
+                    }
+                }
                 Cmd::Edit { op } => {
                     if apply_doc_op(&room, &op) {
                         room.dirty.store(true, Ordering::Relaxed);
                         let elems = room.elements.lock().unwrap().clone();
                         sources = source_ids(&elems);
                         eng.set_elements(&elems); // continuous state survives by id
-                                                  // Probes on a removed element die with it.
+                                                  // Ratings follow the document (a SetKind can change
+                                                  // them); stress and the broken set follow the id, so
+                                                  // moving a dead part does not repair it. An
+                                                  // InteractOp cannot change a rating, so knob drags
+                                                  // deliberately skip this.
+                        damage.set_document(&elems);
+                        // Probes on a removed element die with it.
                         if let DocOp::Remove { id } = &op {
                             let mut probes = room.probes.lock().unwrap();
                             let before = probes.len();
@@ -1123,6 +1217,11 @@ async fn sim_task(
         // The machine's last write-back this tick, mirrored into the stored
         // document after the loop (the consumer is outside this scope).
         let mut writes: Option<machine::Writes> = None;
+        // Sim time at the top of the tick: the damage model integrates over
+        // the time the solver ACTUALLY advanced, so a budget-limited or
+        // quarantined tick cooks less (or nothing) rather than pretending a
+        // full 33 ms passed.
+        let tick_t0 = eng.time();
         {
             // Finest cadence anyone needs this tick (the machine always runs).
             let step = if !taps.is_empty() {
@@ -1203,11 +1302,34 @@ async fn sim_task(
             }
         }
 
+        // ---- damage: one frame per tick, shared with the broadcast below.
+        //
+        // The document is swept ONCE here. A quarantined solver publishes no
+        // new numbers, so nothing accumulates stress from stale ones — a
+        // frozen circuit cannot cook a part.
+        let fr = eng.frame();
+        if !eng.is_quarantined() {
+            for b in damage.tick(&fr, eng.time() - tick_t0) {
+                // The mechanism: sim-core now stamps this part as an open
+                // circuit. Everything else about the failure lives outside it.
+                eng.set_broken(b.id, true);
+                room.dirty.store(true, Ordering::Relaxed);
+                tracing::info!(
+                    "{} #{} released its magic smoke ({:.1}x its limit)",
+                    b.kind,
+                    b.id,
+                    b.load
+                );
+            }
+        }
+
         if room.events.receiver_count() > 0 {
+            if let Some(msg) = damage_msg(&damage, &mut damage_shown) {
+                let _ = room.events.send(msg);
+            }
             // Same flat layout as the WASM facade:
             // [id, npins, v0..v5, i0..i5, power].
-            let e: Vec<[f64; 15]> = eng
-                .frame()
+            let e: Vec<[f64; 15]> = fr
                 .iter()
                 .map(|f| {
                     [
@@ -1236,7 +1358,7 @@ async fn sim_task(
             // The hoist, once per tick alongside the frame.
             let _ = room
                 .events
-                .send(machine_msg(&hoist, hoist_rect, motor_i, impact).to_string());
+                .send(machine_msg(&hoist, hoist_rect, motor_i, impact, motor_i_max()).to_string());
         }
         // A win is worth a checkpoint even if nobody edited anything.
         if hoist.win && !won_before {
@@ -1253,9 +1375,19 @@ async fn sim_task(
 /// `rect` is the LIVE footprint in GRID units — room state now, since the
 /// assembly is draggable — so the client can draw all hoist chrome (and
 /// hit-test the cabinet) without hardcoding geometry; `impact` is non-zero
-/// only on the tick a landing happened.
-fn machine_msg(hoist: &Hoist, rect: [i32; 4], motor_i: f64, impact: f64) -> serde_json::Value {
+/// only on the tick a landing happened. `imax` is the motor's nameplate
+/// current from the damage table — the client engraves it on the faceplate
+/// rather than hardcoding a number that could drift from the model that
+/// enforces it.
+fn machine_msg(
+    hoist: &Hoist,
+    rect: [i32; 4],
+    motor_i: f64,
+    impact: f64,
+    i_max: f64,
+) -> serde_json::Value {
     json!({
+        "imax": i_max,
         "t": "machine",
         "id": MOTOR_ID,
         "rect": rect,
@@ -1271,6 +1403,22 @@ fn machine_msg(hoist: &Hoist, rect: [i32; 4], motor_i: f64, impact: f64) -> serd
         "win": hoist.win,
         "joules": hoist.joules,
     })
+}
+
+/// This tick's `damage` broadcast, or `None` when there is nothing to say.
+///
+/// The message is a full SNAPSHOT, so a client can rebuild its whole damage
+/// overlay from any one of them — which is also why exactly one EMPTY
+/// snapshot follows the last repair: without it, a client that had drawn a
+/// broken part would keep drawing it forever. `shown` carries that one bit of
+/// state across ticks.
+fn damage_msg(damage: &DamageModel, shown: &mut bool) -> Option<String> {
+    let report = damage.report(MAX_DAMAGE_REPORT);
+    if report.is_empty() && !*shown {
+        return None; // a quiet room costs nothing at all
+    }
+    *shown = !report.is_empty();
+    Some(json!({"t": "damage", "parts": report}).to_string())
 }
 
 /// Push one sample per probe into its buffer, from the last solved step.
@@ -1503,6 +1651,10 @@ enum ClientMsg {
         dx: i32,
         dy: i32,
     },
+    /// The repair tool: put a broken part back into service.
+    Repair {
+        id: u32,
+    },
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(room): State<Arc<Room>>) -> impl IntoResponse {
@@ -1569,6 +1721,9 @@ async fn client_session(mut socket: WebSocket, room: Arc<Room>) {
                         Ok(ClientMsg::MachineMove { dx, dy }) => {
                             let _ = room.cmds.send(Cmd::MachineMove { dx, dy });
                         }
+                        Ok(ClientMsg::Repair { id }) => {
+                            let _ = room.cmds.send(Cmd::Repair { id });
+                        }
                         Ok(ClientMsg::Cursor { x, y }) => {
                             let _ = room.events.send(
                                 json!({"t": "cursor", "who": me, "x": x, "y": y}).to_string(),
@@ -1594,7 +1749,8 @@ async fn main() {
     // Restore the room from the last checkpoint; fresh rooms start with
     // the showcase circuit.
     let saved = load_room();
-    let (mut elements, probes, next_pid, panels, next_plid, hoist, hoist_rect) = match saved {
+    let (mut elements, probes, next_pid, panels, next_plid, hoist, hoist_rect, damage) = match saved
+    {
         Some(s) => {
             tracing::info!(
                 "restored room from {} ({} elements)",
@@ -1625,6 +1781,7 @@ async fn main() {
                 next_plid,
                 s.hoist,
                 sane_rect(s.hoist_rect),
+                s.damage,
             )
         }
         None => (
@@ -1635,6 +1792,7 @@ async fn main() {
             1,
             Hoist::default(),
             HOIST_RECT,
+            DamageModel::new(),
         ),
     };
     // The hoist fixture is not optional: a room without it has no goal. This
@@ -1655,7 +1813,7 @@ async fn main() {
         population: AtomicU32::new(0),
         dirty: std::sync::atomic::AtomicBool::new(false),
     });
-    tokio::spawn(sim_task(room.clone(), cmd_rx, hoist, hoist_rect));
+    tokio::spawn(sim_task(room.clone(), cmd_rx, hoist, hoist_rect, damage));
 
     let dist = std::env::var("EE_DIST").unwrap_or_else(|_| "packages/app/dist".into());
     let static_files =
@@ -1691,9 +1849,83 @@ mod tests {
     use sim_core::ElementKind as K;
     use sim_golden::{dc, gnd, r, spec, spec3};
 
+    /// Substeps in one room tick, exactly as `sim_task` budgets them.
+    fn steps_per_tick() -> u32 {
+        (((1.0 / TICK_HZ) / DT).round() as u32).min(MAX_STEPS_PER_TICK)
+    }
+
+    /// The damage half of the room loop: sweep the frame ONCE, integrate
+    /// stress over the sim time that actually elapsed, and stamp whatever
+    /// broke as open — the same order, and the same single sweep, as the
+    /// tick in `sim_task`.
+    fn damage_tick(eng: &mut Engine, dmg: &mut DamageModel, t0: f64, broke: &mut Vec<(f64, u32)>) {
+        if eng.is_quarantined() {
+            return; // no new numbers: a frozen circuit cooks nothing
+        }
+        let fr = eng.frame();
+        for b in dmg.tick(&fr, eng.time() - t0) {
+            eng.set_broken(b.id, true);
+            broke.push((eng.time(), b.id));
+        }
+    }
+
+    /// A plain circuit driven through the room loop's damage cadence.
+    struct DamageRun {
+        eng: Engine,
+        dmg: DamageModel,
+        /// (sim time, id) for every part that broke, in order.
+        broke: Vec<(f64, u32)>,
+    }
+
+    impl DamageRun {
+        fn new(elems: &[ElementSpec]) -> Self {
+            let mut eng = Engine::new(DT);
+            eng.set_elements(elems);
+            let mut dmg = DamageModel::new();
+            dmg.set_document(elems);
+            DamageRun {
+                eng,
+                dmg,
+                broke: Vec::new(),
+            }
+        }
+
+        /// One room tick.
+        fn tick(&mut self) {
+            let t0 = self.eng.time();
+            self.eng.advance(steps_per_tick());
+            damage_tick(&mut self.eng, &mut self.dmg, t0, &mut self.broke);
+        }
+
+        /// Run for `secs` of sim time, stopping early once `id` breaks.
+        /// Returns the sim time it broke at.
+        fn run_until_break(&mut self, id: u32, secs: f64) -> Option<f64> {
+            let ticks = (secs * TICK_HZ).round() as u32;
+            for _ in 0..ticks {
+                self.tick();
+                if let Some((t, _)) = self.broke.iter().find(|(_, b)| *b == id) {
+                    return Some(*t);
+                }
+            }
+            None
+        }
+
+        fn run(&mut self, secs: f64) {
+            let ticks = (secs * TICK_HZ).round() as u32;
+            for _ in 0..ticks {
+                self.tick();
+            }
+        }
+
+        fn current(&self, id: u32) -> f64 {
+            self.eng.pin_current(id, 0).unwrap_or(f64::NAN)
+        }
+    }
+
     /// The hoist fixture plus a player circuit, driven exactly the way
     /// `sim_task` drives it: MACHINE_SUBSTEPS of solver, then one machine
-    /// tick that reads the motor's branch current and writes back.
+    /// tick that reads the motor's branch current and writes back — with the
+    /// damage sweep landing on the room's 30 Hz tick, not the machine's.
     struct HoistRun {
         eng: Engine,
         hoist: Hoist,
@@ -1702,6 +1934,12 @@ mod tests {
         /// `sim_task` does.
         elems: Vec<ElementSpec>,
         rect: [i32; 4],
+        dmg: DamageModel,
+        /// Sim time owed to the next damage sweep.
+        owed: f64,
+        last_sweep: f64,
+        /// (sim time, id) for every part that broke, in order.
+        broke: Vec<(f64, u32)>,
     }
 
     impl HoistRun {
@@ -1711,12 +1949,18 @@ mod tests {
             let sources = source_ids(&elems);
             let mut eng = Engine::new(DT);
             eng.set_elements(&elems);
+            let mut dmg = DamageModel::new();
+            dmg.set_document(&elems);
             HoistRun {
                 eng,
                 hoist: Hoist::default(),
                 sources,
                 elems,
                 rect: HOIST_RECT,
+                dmg,
+                owed: 0.0,
+                last_sweep: 0.0,
+                broke: Vec::new(),
             }
         }
 
@@ -1750,7 +1994,22 @@ mod tests {
             );
             let i = self.eng.pin_current(MOTOR_ID, 0).unwrap();
             machine_step(&mut self.eng, &mut self.hoist, &self.sources);
+            self.owed += MACHINE_H;
+            if self.owed >= 1.0 / TICK_HZ {
+                self.owed = 0.0;
+                let t0 = self.last_sweep;
+                self.last_sweep = self.eng.time();
+                damage_tick(&mut self.eng, &mut self.dmg, t0, &mut self.broke);
+            }
             i
+        }
+
+        fn motor_broken(&self) -> bool {
+            self.dmg.is_broken(MOTOR_ID)
+        }
+
+        fn motor_stress(&self) -> f64 {
+            self.dmg.stress(MOTOR_ID)
         }
     }
 
@@ -2020,8 +2279,20 @@ mod tests {
         hoist.hold = 2.5;
         hoist.landings = 3;
         hoist.joules = 12.5;
-        let v = machine_msg(&hoist, HOIST_RECT, 0.94, 1.75);
+        let v = machine_msg(&hoist, HOIST_RECT, 0.94, 1.75, motor_i_max());
         assert_eq!(v["t"], "machine");
+        // The nameplate current the faceplate engraves comes from the damage
+        // table, and it has to bracket the motor's two operating points: the
+        // ~0.94 A it runs at must be safe, the 6 A it stalls at on a bare
+        // 12 V lead must not be.
+        assert_eq!(v["imax"], 3.0);
+        let i_stall = 12.0 / machine::R_ARM;
+        assert!(
+            machine::HOLD_CURRENT < 3.0 && 3.0 < i_stall,
+            "rating {} must sit between hold {} A and stall {i_stall} A",
+            3.0,
+            machine::HOLD_CURRENT
+        );
         assert_eq!(v["id"], MOTOR_ID);
         assert_eq!(v["rect"], json!([46, 2, 64, 24]));
         assert_eq!(v["h"], 0.40);
@@ -2299,6 +2570,7 @@ mod tests {
             next_plid: 1,
             hoist: Hoist::default(),
             hoist_rect: rect,
+            damage: DamageModel::new(),
         })
         .unwrap();
         let back: SaveFile = serde_json::from_str(&json).unwrap();
@@ -2767,6 +3039,615 @@ mod tests {
             serde_json::from_str(r#"{"elements":[],"probes":[],"next_pid":3}"#).unwrap();
         assert!(s.panels.is_empty());
         assert_eq!(s.next_plid, 0);
+    }
+
+    // ---------------------------------------------------------------- damage
+    //
+    // The teaching contract, measured end to end: solver output -> thermal
+    // stress -> failure -> an open circuit -> repair. Every number these
+    // tests assert on comes out of the engine.
+
+    /// THE first lesson in electronics, and it has to bite immediately: an
+    /// LED with nothing limiting its current dies, the same LED behind a
+    /// proper resistor lives, and the dead one stops conducting.
+    ///
+    /// The "no series resistor" circuit carries 1 Ω of lead resistance, which
+    /// is both realistic and necessary: an IDEAL voltage source straight
+    /// across sim-core's ideal exponential junction is a singular DC problem
+    /// (the node voltage is pinned, so the diode current is whatever
+    /// `Is·exp(9/0.05)` says — 1e60 A), and NR cannot converge on it however
+    /// far the rescue ladder halves the step. That case quarantines the
+    /// solver instead of breaking the LED — see the assertion at the end of
+    /// this test. Fixing it needs source/gmin stepping inside sim-core, which
+    /// is a numerics change and therefore its own pass.
+    #[test]
+    fn an_led_without_a_series_resistor_releases_its_magic_smoke() {
+        let bare = vec![
+            spec(1, dc(9.0), (0, 0), (0, 8)),
+            spec(5, r(1.0), (0, 0), (2, 0)), // lead/contact resistance
+            spec(2, K::Led { color: 0 }, (2, 0), (4, 0)),
+            spec(3, K::Wire, (4, 0), (0, 8)),
+            gnd(4, (0, 8)),
+        ];
+        let mut run = DamageRun::new(&bare);
+        // The solver's own verdict on a diode with nothing to limit it, read
+        // before the damage sweep gets a chance to kill it.
+        run.eng.advance(200);
+        assert!(!run.eng.is_quarantined(), "the solver must survive it");
+        let i = run.current(2);
+        let limit = damage::rating(&K::Led { color: 0 }).unwrap().limit;
+        assert!(
+            i.abs() > 10.0 * limit,
+            "a bare LED must be wildly over its {limit} A rating, got {i} A"
+        );
+        // One tick, i.e. under 40 ms of simulated time. There is no ramp to
+        // watch here and there should not be one.
+        let t = run
+            .run_until_break(2, 1.0)
+            .expect("a bare LED must not survive");
+        assert!(t <= 0.1, "it should die at once, not at t={t}");
+        assert_eq!(run.broke[0].1, 2, "the LED dies first, and alone");
+        // The 1 Ω lead was dissipating 43 W into a half-watt rating and is
+        // left badly scorched — it only survives because the LED opened the
+        // circuit first. That is exactly what happens on a bench, and it is
+        // worth asserting so the model is not quietly forgiving.
+        assert!(
+            run.dmg.stress(5) > 0.3,
+            "the lead resistance should be scorched: {}",
+            run.dmg.stress(5)
+        );
+        // ...and it is now an open circuit, not a dim LED.
+        run.run(0.5);
+        assert_eq!(run.current(2), 0.0);
+        assert!(run.eng.is_broken(2));
+        assert!(!run.eng.is_quarantined());
+
+        // The same LED, driven the way the textbook says: 9 V - 2.1 V over
+        // 330 Ω is ~21 mA against a 40 mA rating. It never breaks, and the
+        // closed form says it never will however long the room runs.
+        let proper = vec![
+            spec(1, dc(9.0), (0, 0), (0, 8)),
+            spec(2, r(330.0), (0, 0), (4, 0)),
+            spec(3, K::Led { color: 0 }, (4, 0), (0, 8)),
+            gnd(4, (0, 8)),
+        ];
+        let mut run = DamageRun::new(&proper);
+        run.run(5.0);
+        let i = run.current(3);
+        assert!(
+            (0.015..0.025).contains(&i.abs()),
+            "expected ~21 mA through the LED, got {i} A"
+        );
+        assert!(run.broke.is_empty(), "a properly driven LED must survive");
+        assert!(!run.dmg.is_broken(3));
+        let rating = damage::rating(&K::Led { color: 0 }).unwrap();
+        let load = i.abs() / rating.limit;
+        assert_eq!(
+            damage::time_to_break(damage::heat(rating.metric, load), rating.tau),
+            None,
+            "at {load:.2}x its rating it must never break, not merely survive 5 s"
+        );
+        assert!(
+            run.dmg.stress(3) < 0.35,
+            "and it must not even read as stressed: {}",
+            run.dmg.stress(3)
+        );
+
+        // The fully ideal version of the same mistake, documented rather than
+        // papered over: with literally nothing in series, the solver gives up
+        // (and the damage model correctly refuses to cook a part from numbers
+        // that were never accepted). The room freezes until somebody edits it.
+        let ideal = vec![
+            spec(1, dc(9.0), (0, 0), (0, 8)),
+            spec(2, K::Led { color: 0 }, (0, 0), (4, 0)),
+            spec(3, K::Wire, (4, 0), (0, 8)),
+            gnd(4, (0, 8)),
+        ];
+        let mut run = DamageRun::new(&ideal);
+        run.run(0.5);
+        assert!(
+            run.eng.is_quarantined(),
+            "an ideal source across an ideal junction is singular; if this \
+             ever converges, delete this branch and assert the LED breaks"
+        );
+        assert!(
+            run.broke.is_empty() && run.dmg.stress(2) == 0.0,
+            "a quarantined solver must not cook anything: stale numbers are \
+             not evidence"
+        );
+    }
+
+    /// The overload budget is thermal, not a trip: 2× rated cooks a resistor
+    /// in seconds, 80 % of rated runs it hot forever.
+    #[test]
+    fn a_resistor_cooks_at_twice_its_rating_and_lives_at_eighty_percent() {
+        let rating = damage::rating(&K::Resistor { ohms: 100.0 }).unwrap();
+        // 10 V across 100 Ω = 1.0 W into a half-watt part.
+        let hot = vec![
+            spec(1, dc(10.0), (0, 0), (0, 8)),
+            spec(2, r(100.0), (0, 0), (4, 0)),
+            spec(3, K::Wire, (4, 0), (0, 8)),
+            gnd(4, (0, 8)),
+        ];
+        let mut run = DamageRun::new(&hot);
+        run.tick();
+        let p = run.eng.frame().iter().find(|f| f.id == 2).unwrap().power;
+        assert!((p - 1.0).abs() < 1e-6, "solver says {p} W");
+        assert!((p / rating.limit - 2.0).abs() < 1e-6, "that is 2x rated");
+        let t = run
+            .run_until_break(2, 10.0)
+            .expect("2x rated power must cook it");
+        // Closed form: tau·ln(2) = 4.16 s. Seconds — long enough to watch it
+        // discolour and smoke, short enough to be a lesson.
+        let want = damage::time_to_break(2.0, rating.tau).unwrap();
+        assert!(
+            (t - want).abs() < 0.1,
+            "broke at {t} s, closed form {want} s"
+        );
+        assert!((1.0..8.0).contains(&t), "'in seconds' means {t}");
+        assert_eq!(run.current(2), 0.0, "and it is open afterwards");
+
+        // 10 V across 250 Ω = 0.4 W = 80 % of the same rating.
+        let warm = vec![
+            spec(1, dc(10.0), (0, 0), (0, 8)),
+            spec(2, r(250.0), (0, 0), (4, 0)),
+            spec(3, K::Wire, (4, 0), (0, 8)),
+            gnd(4, (0, 8)),
+        ];
+        let mut run = DamageRun::new(&warm);
+        run.run(20.0);
+        let p = run.eng.frame().iter().find(|f| f.id == 2).unwrap().power;
+        assert!(
+            (p / rating.limit - 0.8).abs() < 1e-6,
+            "{p} W is 80 % of rated"
+        );
+        assert!(run.broke.is_empty(), "80 % of rated must never break");
+        // Never, not just "not in 20 s": a resistor at 80 % of rated
+        // dissipation settles at 0.8 of its failure temperature.
+        assert_eq!(
+            damage::time_to_break(damage::heat(rating.metric, 0.8), rating.tau),
+            None
+        );
+        let s = run.dmg.stress(2);
+        assert!(
+            (0.75..0.81).contains(&s),
+            "it should read plainly hot and stay there: {s}"
+        );
+        assert!((run.current(2) - 0.04).abs() < 1e-9, "still conducting");
+    }
+
+    /// A broken part is a gap in the circuit, not a hole in the netlist: its
+    /// neighbours keep working and a repair puts it back.
+    #[test]
+    fn a_broken_part_is_open_and_a_repair_restores_it() {
+        // Two lamps in parallel on one 9 V supply.
+        let elems = vec![
+            spec(1, dc(9.0), (0, 0), (0, 8)),
+            spec(
+                2,
+                K::Lamp {
+                    ohms: 90.0,
+                    rated_watts: 1.0,
+                },
+                (0, 0),
+                (4, 0),
+            ),
+            spec(3, K::Wire, (4, 0), (0, 8)),
+            spec(
+                4,
+                K::Lamp {
+                    ohms: 45.0,
+                    rated_watts: 5.0,
+                },
+                (0, 0),
+                (4, 4),
+            ),
+            spec(5, K::Wire, (4, 4), (0, 8)),
+            gnd(6, (0, 8)),
+        ];
+        let mut run = DamageRun::new(&elems);
+        run.run(0.2);
+        assert!((run.current(2) - 0.1).abs() < 1e-6);
+        assert!((run.current(4) - 0.2).abs() < 1e-6);
+
+        // Break the 90 Ω lamp the way the room loop does.
+        run.dmg.force_break(2);
+        run.eng.set_broken(2, true);
+        run.run(0.2);
+        assert_eq!(run.current(2), 0.0, "dead lamp draws nothing");
+        let f = run.eng.frame();
+        let dead = f.iter().find(|e| e.id == 2).unwrap();
+        assert_eq!(dead.power, 0.0, "and dissipates nothing");
+        assert!(
+            (run.current(4) - 0.2).abs() < 1e-6,
+            "the healthy lamp beside it is untouched"
+        );
+        assert_eq!(run.dmg.report(64), vec![[2.0, 1.0, 1.0]]);
+
+        // Repair through the server's own path.
+        assert!(apply_repair(&mut run.dmg, &mut run.eng, 2));
+        assert!(!apply_repair(&mut run.dmg, &mut run.eng, 2), "idempotent");
+        assert!(!apply_repair(&mut run.dmg, &mut run.eng, 999), "unknown id");
+        assert_eq!(run.dmg.stress(2), 0.0, "a repaired part starts cold");
+        assert!(run.dmg.report(64).is_empty(), "nothing left to draw");
+        run.run(0.2);
+        assert!((run.current(2) - 0.1).abs() < 1e-6, "conducting again");
+        assert!(
+            run.dmg.stress(2) < 0.05,
+            "and it is barely warm at 0.9 W of its 2 W limit: {}",
+            run.dmg.stress(2)
+        );
+        assert!(!run.eng.is_quarantined());
+    }
+
+    /// THE HOIST, half one: the reason this feature exists. A 12 V supply
+    /// straight across the motor leads parks the crate on the head stop,
+    /// where the rotor stops turning, the back-EMF vanishes and the armature
+    /// sits at V/R = 6 A — twice its rating. It cooks, and the crate drops.
+    #[test]
+    fn bare_twelve_volts_across_the_motor_cooks_it() {
+        let (mp, mm) = motor_pins();
+        let (sp, sm) = ((mp.0 - 9, mp.1), (mm.0 - 9, mm.1));
+        let mut run = HoistRun::new(vec![
+            spec(1, dc(12.0), sp, sm),
+            spec(2, K::Wire, sp, mp),
+            spec(3, K::Wire, sm, mm),
+            gnd(4, sm),
+        ]);
+
+        let mut i_running = 0.0;
+        let mut t_break = f64::NAN;
+        let mut reached_top = false;
+        let mut stress_at_top = 0.0;
+        for _ in 0..(8.0 / MACHINE_H) as u32 {
+            let i = run.step();
+            if !reached_top {
+                if run.hoist.y >= machine::SHAFT_H {
+                    reached_top = true;
+                    stress_at_top = run.motor_stress();
+                } else if run.hoist.y > 0.05 {
+                    i_running = i;
+                }
+            }
+            if run.motor_broken() && t_break.is_nan() {
+                t_break = run.eng.time();
+                break;
+            }
+        }
+
+        assert!(reached_top, "it should lift the crate first");
+        assert!(
+            stress_at_top < 1.0 && i_running.abs() < motor_i_max(),
+            "the LIFT is not what kills it: {i_running:.3} A while travelling, \
+             stress {stress_at_top:.3} at the head stop"
+        );
+        assert!(
+            !t_break.is_nan(),
+            "a bare 12 V lead must cook the motor (stress {:.3})",
+            run.motor_stress()
+        );
+        // The stall current is the killer, and it takes a couple of seconds:
+        // long enough to see the motor heat up and smoke, short enough that
+        // the lesson lands.
+        let i_stall = 12.0 / machine::R_ARM;
+        let rating = damage::rating(&K::Motor {
+            ohms: machine::R_ARM,
+            henries: machine::L_ARM,
+            bemf: 0.0,
+        })
+        .unwrap();
+        let want = damage::time_to_break(
+            damage::heat(rating.metric, i_stall / rating.limit),
+            rating.tau,
+        )
+        .unwrap();
+        assert!(
+            (0.5..5.0).contains(&t_break),
+            "broke at {t_break} s (stall {i_stall} A alone would take {want} s)"
+        );
+        // Consequences: no torque, so the freight comes back down.
+        assert_eq!(run.eng.pin_current(MOTOR_ID, 0).unwrap(), 0.0);
+        let y_at_break = run.hoist.y;
+        for _ in 0..(1.0 / MACHINE_H) as u32 {
+            run.step();
+        }
+        assert!(
+            run.hoist.y < y_at_break,
+            "a dead motor cannot hold the crate: {} -> {}",
+            y_at_break,
+            run.hoist.y
+        );
+        assert!(!run.hoist.win);
+        eprintln!(
+            "bare 12 V: {i_running:.3} A travelling, broke at {t_break:.3} s, \
+             crate fell {:.3} -> {:.3} m",
+            y_at_break, run.hoist.y
+        );
+    }
+
+    /// THE HOIST, half two: the intended solution must be immortal. The same
+    /// comparator loop that wins the goal never overheats the motor — its
+    /// bang-bang chatter averages far below the nameplate current, which is
+    /// exactly the lesson (control the current, do not just apply volts).
+    #[test]
+    fn a_controlled_drive_holds_the_band_without_cooking_the_motor() {
+        let (mp, mm) = motor_pins();
+        let sensor = hoist_fixture()
+            .into_iter()
+            .find(|e| e.id == SENSOR_ID)
+            .unwrap();
+        let (sa, sw, sb) = (sensor.pins[0], sensor.pins[1], sensor.pins[2]);
+        let (sup_p, sup_n) = ((sa.0 - 17, sa.1), (sb.0 - 17, sb.1));
+        let (ref_p, ref_n) = ((sa.0 - 17, sa.1 + 8), (sa.0 - 17, sa.1 + 12));
+        let (in_p, in_m, out) = (
+            (sa.0 - 9, sa.1 + 8),
+            (sa.0 - 9, sa.1 + 2),
+            (sa.0 - 5, sa.1 + 5),
+        );
+        let mut run = HoistRun::new(vec![
+            spec(1, dc(4.0), sup_p, sup_n),
+            gnd(2, sup_n),
+            spec(3, K::Wire, sup_p, sa),
+            spec(4, K::Wire, sup_n, sb),
+            spec(5, dc(3.2), ref_p, ref_n),
+            gnd(6, ref_n),
+            spec(7, K::Wire, ref_p, in_p),
+            spec3(8, K::OpAmp { rail: 5.0 }, in_p, in_m, out),
+            spec(9, K::Wire, in_m, sw),
+            spec(10, K::Wire, out, mp),
+            spec(11, K::Wire, mm, (mm.0 - 5, mm.1)),
+            gnd(12, (mm.0 - 5, mm.1)),
+        ]);
+
+        // 20 s: ~1.3 s to climb in, 5 s to win, and then 14 s more of holding
+        // — over two motor thermal time constants (tau = 6 s), so the stress
+        // has converged and "indefinitely" is measured, not hoped for.
+        let mut won_at = f64::NAN;
+        let mut peak_stress = 0.0f64;
+        let mut peak_i = 0.0f64;
+        for _ in 0..(20.0 / MACHINE_H) as u32 {
+            let i = run.step();
+            peak_i = peak_i.max(i.abs());
+            peak_stress = peak_stress.max(run.motor_stress());
+            if run.hoist.win && won_at.is_nan() {
+                won_at = run.eng.time();
+            }
+            assert!(
+                !run.motor_broken(),
+                "the intended solution must never break the motor \
+                 (t={:.2} s, stress {:.3}, peak {peak_i:.2} A)",
+                run.eng.time(),
+                run.motor_stress()
+            );
+        }
+
+        assert!(!won_at.is_nan(), "and it still has to win the goal");
+        assert!(run.hoist.in_band(), "still in the band: y={}", run.hoist.y);
+        assert!(
+            run.broke.is_empty(),
+            "nothing at all may break: {:?}",
+            run.broke
+        );
+        // Converged well clear of failure: the switching transients peak
+        // above the rating but their heat integral does not come close.
+        assert!(
+            peak_stress < 0.75,
+            "motor stress peaked at {peak_stress:.3} (peak current {peak_i:.2} A)"
+        );
+        eprintln!(
+            "controlled drive: won at {won_at:.2} s, peak {peak_i:.2} A, \
+             peak motor stress {peak_stress:.3} (rating {} A)",
+            motor_i_max()
+        );
+    }
+
+    /// Break and repair are the room's state, so they have to survive a
+    /// restart — and a save written before parts could break must still load.
+    #[test]
+    fn stress_and_broken_survive_a_save_round_trip() {
+        let elems = vec![
+            spec(1, r(100.0), (0, 0), (4, 0)),
+            spec(2, K::Led { color: 0 }, (4, 0), (8, 0)),
+        ];
+        let mut dmg = DamageModel::new();
+        dmg.set_document(&elems);
+        dmg.force_break(2);
+        // A warm-but-alive part, from the model's own integrator.
+        let mut warm = DamageRun::new(&[
+            spec(1, dc(7.0), (0, 0), (0, 8)),
+            spec(2, r(100.0), (0, 0), (4, 0)),
+            spec(3, K::Wire, (4, 0), (0, 8)),
+            gnd(4, (0, 8)),
+        ]);
+        warm.run(3.0);
+        let hot = warm.dmg.stress(2);
+        assert!(hot > REPORT_STRESS_FLOOR, "need a warm part: {hot}");
+
+        let save = SaveFile {
+            elements: elems.clone(),
+            probes: Vec::new(),
+            next_pid: 1,
+            panels: Vec::new(),
+            next_plid: 1,
+            hoist: Hoist::default(),
+            hoist_rect: HOIST_RECT,
+            damage: warm.dmg.clone(),
+        };
+        let json = serde_json::to_string(&save).unwrap();
+        let back: SaveFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.damage.stress(2), hot, "stress must survive verbatim");
+
+        let mut dead = DamageModel::new();
+        dead.set_document(&elems);
+        dead.force_break(2);
+        let json = serde_json::to_string(&SaveFile {
+            elements: elems.clone(),
+            probes: Vec::new(),
+            next_pid: 1,
+            panels: Vec::new(),
+            next_plid: 1,
+            hoist: Hoist::default(),
+            hoist_rect: HOIST_RECT,
+            damage: dead,
+        })
+        .unwrap();
+        let mut back: SaveFile = serde_json::from_str(&json).unwrap();
+        assert!(back.damage.is_broken(2), "the broken set must survive");
+        // Ratings are derived, never persisted: they come back from the
+        // document, and the restored broken set still applies.
+        back.damage.set_document(&back.elements);
+        assert!(back.damage.rating_of(2).is_some());
+        assert_eq!(back.damage.broken_ids(), vec![2]);
+
+        // Pre-damage saves load as a healthy room.
+        let old: SaveFile = serde_json::from_str(r#"{"elements":[]}"#).unwrap();
+        assert!(old.damage.parts().is_empty());
+        assert!(old.damage.broken_ids().is_empty());
+    }
+
+    /// Mirror of `damage::REPORT_AT`, so the test above states its own floor.
+    const REPORT_STRESS_FLOOR: f64 = damage::REPORT_AT;
+
+    /// The wire contract for damage, and the client's half of the loop. Both
+    /// halves of the protocol are written independently, so both get pinned.
+    #[test]
+    fn damage_snapshot_and_repair_match_the_contract() {
+        let elems = vec![
+            spec(7, r(100.0), (0, 0), (4, 0)),
+            spec(9, K::Led { color: 0 }, (4, 0), (8, 0)),
+            spec(11, K::Wire, (8, 0), (12, 0)),
+        ];
+        let mut dmg = DamageModel::new();
+        dmg.set_document(&elems);
+        // Nothing stressed: nothing on the wire at all.
+        assert!(dmg.report(MAX_DAMAGE_REPORT).is_empty());
+
+        dmg.force_break(9);
+        let msg = json!({"t": "damage", "parts": dmg.report(MAX_DAMAGE_REPORT)}).to_string();
+        let v: serde_json::Value = serde_json::from_str(&msg).unwrap();
+        assert_eq!(v["t"], "damage");
+        let parts = v["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        let row = parts[0].as_array().unwrap();
+        assert_eq!(row.len(), 3, "[id, stress, broken]");
+        assert_eq!(row[0], 9.0);
+        assert_eq!(row[1], 1.0);
+        assert_eq!(row[2], 1.0);
+        // Wires and grounds never appear: they do not break in this pass.
+        assert!(dmg.rating_of(11).is_none());
+
+        // What every client in the room actually receives, tick by tick: a
+        // break reaches them on the next tick, a repair on the tick after it,
+        // and a quiet room stops talking entirely.
+        let mut dmg = DamageModel::new();
+        dmg.set_document(&elems);
+        let mut shown = false;
+        assert_eq!(damage_msg(&dmg, &mut shown), None, "quiet room, no traffic");
+        dmg.force_break(9);
+        let msg = damage_msg(&dmg, &mut shown).expect("a break must be broadcast");
+        assert!(msg.contains(r#""t":"damage""#) && msg.contains("[9.0,1.0,1.0]"));
+        assert!(shown);
+        // Repeated every tick while it is dead: a late joiner sees it too.
+        assert!(damage_msg(&dmg, &mut shown).is_some());
+        assert!(dmg.repair(9));
+        let cleared = damage_msg(&dmg, &mut shown).expect("the repair must clear it");
+        assert!(cleared.contains(r#""parts":[]"#), "{cleared}");
+        assert!(!shown);
+        assert_eq!(damage_msg(&dmg, &mut shown), None, "and then silence again");
+
+        // Client -> server: the repair verb, including on a locked fixture id
+        // (a repair is not a document op, so the 900-999 lock does not apply).
+        let msg: ClientMsg = serde_json::from_str(r#"{"t":"repair","id":900}"#).unwrap();
+        let ClientMsg::Repair { id } = msg else {
+            panic!("expected a repair message")
+        };
+        assert_eq!(id, MOTOR_ID);
+        assert!(reserved_id(id), "and it is a server-owned fixture");
+        assert!(!apply_doc_op(
+            &test_room(hoist_fixture()),
+            &DocOp::Remove { id: MOTOR_ID }
+        ));
+
+        // The whole fixture is repairable through the normal path.
+        let fixture = hoist_fixture();
+        let mut dmg = DamageModel::new();
+        dmg.set_document(&fixture);
+        let mut eng = Engine::new(DT);
+        eng.set_elements(&fixture);
+        for id in [MOTOR_ID, SENSOR_ID, LIM_TOP_ID, LIM_BOT_ID] {
+            dmg.force_break(id);
+            eng.set_broken(id, true);
+            assert!(eng.is_broken(id));
+            assert!(apply_repair(&mut dmg, &mut eng, id), "#{id} must repair");
+            assert!(!eng.is_broken(id));
+        }
+        assert!(dmg.report(MAX_DAMAGE_REPORT).is_empty());
+    }
+
+    /// The showcase room is a demo, not a trap: nothing in it may sit at or
+    /// over its rating anywhere in its own operating range, or the gallery
+    /// would burn itself down unattended.
+    ///
+    /// Asserted on LOAD, not on accumulated stress: load < 1 is exactly the
+    /// closed-form condition for "never breaks, however long it runs", so a
+    /// few seconds of simulation proves an unbounded claim (and the suite does
+    /// not have to sit through several thermal time constants of a
+    /// 136-element room).
+    #[test]
+    fn the_showcase_room_never_cooks_itself() {
+        let mut elems = demo_room_circuit();
+        ensure_fixture(&mut elems, HOIST_RECT);
+        // Worst case a visitor can reach without wiring anything new: every
+        // switch closed and both pots wound to the end that dissipates most.
+        for e in elems.iter_mut() {
+            if reserved_id(e.id) {
+                continue; // the machine owns its own fixture positions
+            }
+            match &mut e.kind {
+                K::Switch { closed } | K::Button { closed } => *closed = true,
+                K::Potentiometer { wiper: w, .. } => *w = 0.98,
+                _ => {}
+            }
+        }
+        let mut run = DamageRun::new(&elems);
+        // Mean heat input per part over the run. For anything periodic (the
+        // 440 Hz speaker vignette, the 0.3 Hz gate sweep) that mean IS the
+        // temperature the accumulator converges to, so it is the honest
+        // quantity to compare against 1.
+        let mut sum: Vec<(u32, f64, u32)> = Vec::new();
+        let ticks = (4.0 * TICK_HZ) as u32;
+        for _ in 0..ticks {
+            run.tick();
+            for f in run.eng.frame() {
+                let Some(rt) = run.dmg.rating_of(f.id) else {
+                    continue;
+                };
+                let hot = damage::heat(rt.metric, damage::load(&rt, &f));
+                match sum.iter_mut().find(|(id, _, _)| *id == f.id) {
+                    Some(e) => {
+                        e.1 += hot;
+                        e.2 += 1;
+                    }
+                    None => sum.push((f.id, hot, 1)),
+                }
+            }
+        }
+        assert!(run.broke.is_empty(), "the showcase broke {:?}", run.broke);
+        let worst = sum
+            .iter()
+            .map(|(id, s, n)| (*id, s / *n as f64))
+            .fold((0u32, 0.0f64), |m, e| if e.1 > m.1 { e } else { m });
+        assert!(
+            worst.1 < 0.9,
+            "part #{} settles at {:.2} of its failure temperature — too close \
+             to the edge for a demo room",
+            worst.0,
+            worst.1
+        );
+        eprintln!(
+            "showcase worst case: part #{} settles at {:.2} of failure",
+            worst.0, worst.1
+        );
     }
 
     #[test]

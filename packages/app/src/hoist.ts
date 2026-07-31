@@ -5,12 +5,16 @@
 // wire-able terminals. The player has to hold the crate inside a painted green
 // band for five continuous seconds. A constant voltage lifts it but cannot
 // hold it (voltage buys speed, not position), so the goal is only reachable by
-// wiring feedback off the position sensor.
+// wiring feedback off the position sensor — and since parts have safety limits
+// now, a bare supply across M+/M− does not merely fail, it burns the motor out
+// (a stalled armature draws V/R). The nameplate and the goal card say so, and
+// the rating they print is the server's own.
 //
 // NOTHING in here simulates the machine. The server integrates the crate from
 // the SOLVER's motor current and broadcasts one "machine" message per tick:
 //
-//   {t, id, rect, h, band, y, vel, i, hold, need, impact, landings, win, joules}
+//   {t, id, rect, h, band, y, vel, i, imax, hold, need, impact, landings, win,
+//    joules}
 //
 // Every number this module draws or prints comes out of that message (design
 // pillar: no faked electrical behaviour). The two exceptions are purely
@@ -68,6 +72,10 @@ export interface MachineMsg {
   win: boolean;
   /** Energy delivered by the player's sources, joules. */
   joules: number;
+  /** The motor's nameplate current, amps — its safety limit, straight from
+   * the server's damage table. Optional so a server from before parts could
+   * break still renders (the faceplate then just omits the rating). */
+  imax?: number;
 }
 
 /** Just enough of a fixture element to label its terminals. */
@@ -234,6 +242,32 @@ function fmtSI(v: number, unit: string): string {
   return `0 ${unit}`;
 }
 
+/** The motor's nameplate current as text ("3.0 A"), or a placeholder when the
+ * server has not told us (a build from before parts could break). */
+function ratedA(m: MachineMsg | null): string {
+  return m && m.imax !== undefined && m.imax > 0 ? `${m.imax.toFixed(1)} A` : '—';
+}
+
+/** The instruction on the goal card.
+ *
+ * It used to read "wire a constant voltage to M+/M−", which is now the way to
+ * destroy the machine: a stalled armature draws V/R (12 V across 2 Ω is 6 A),
+ * so a bare supply cooks the motor within seconds of the crate reaching the
+ * head stop. The card therefore asks for a CONTROLLED drive and names the two
+ * numbers that make the point — the nameplate current, and where the stall
+ * current comes from. Both are the machine's own constants; the live current
+ * beside it is the solver's. */
+function hintText(m: MachineMsg | null): string {
+  return (
+    `M+/M− drive the drum — ${ratedA(m)} max, and a stalled rotor draws V/R\n` +
+    'SENSE-W reads height (12.5 mV/mm) · LIM-TOP / LIM-BOT are end stops\n' +
+    'A constant voltage buys speed, not position: it cannot hold the band,\n' +
+    'and parked against a stop it burns the motor out. Close the loop and\n' +
+    'keep the current inside the nameplate.\n' +
+    'drag the cabinet (or its top bar) to move the whole machine · ⌘Z undoes it.'
+  );
+}
+
 const div = (cls: string, parent?: HTMLElement): HTMLDivElement => {
   const el = document.createElement('div');
   el.className = cls;
@@ -300,10 +334,9 @@ function buildCard(root: HTMLElement, reset: () => void): Card {
   row.append(btn);
 
   const hint = div('goal-hint', body);
-  hint.textContent =
-    'M+/M− drive the drum · SENSE-W reads height (12.5 mV/mm) · a constant\n' +
-    'voltage cannot hold a position — close the loop.\n' +
-    'drag the cabinet (or its top bar) to move the whole machine · ⌘Z undoes it.';
+  hint.textContent = hintText(null);
+  /** The `imax` the hint text was last written for. */
+  let hintFor: number | undefined;
 
   let open = readLS(OPEN_KEY) !== '0'; // starts expanded; choice is remembered
   const apply = () => {
@@ -348,6 +381,17 @@ function buildCard(root: HTMLElement, reset: () => void): Card {
       vHeight.textContent = `${(m.y * 1000).toFixed(1)} mm`;
       vVel.textContent = `${(m.vel * 1000).toFixed(0)} mm/s`;
       vCur.textContent = fmtSI(m.i, 'A');
+      // Over the nameplate current is exactly the moment worth flagging:
+      // both numbers come from the message, and the comparison is the whole
+      // lesson (the motor is now cooking).
+      const over = m.imax !== undefined && m.imax > 0 && Math.abs(m.i) > m.imax;
+      vCur.className = over ? 'over' : '';
+      // The hint names the nameplate current, so it is rewritten only when
+      // that number actually arrives (or changes) — not 16 times a second.
+      if (m.imax !== hintFor) {
+        hintFor = m.imax;
+        hint.textContent = hintText(m);
+      }
       vJoule.textContent = `${m.joules.toFixed(1)} J`;
       vLand.textContent = String(m.landings);
       vBand.textContent = `${(m.band[0] * 1000).toFixed(0)}–${(m.band[1] * 1000).toFixed(0)} mm`;
@@ -853,12 +897,16 @@ export function createHoist(root: HTMLElement, opts: { reset: () => void }): Hoi
 
     // Engraved lines, most important first: whatever does not fit the plate at
     // a legible size is dropped rather than drawn as a clipped half-line.
-    // Short enough to survive the fit test at the default zoom. The old
-    // single terminal-legend line was ~52 chars and could never fit, so the
-    // whole plate silently rendered blank; the names now live on the
-    // terminals themselves and this plate carries the datasheet.
+    // Short enough to survive the fit test at the default zoom — a line
+    // that cannot fit at a legible size makes the WHOLE plate render blank
+    // (that bug shipped once already: a ~52-char terminal legend). Terminal
+    // names live on the screw pads themselves; the plate carries the
+    // datasheet, led by the rating line — deliberately loud, because it is
+    // the difference between a working hoist and a dead motor. `imax` comes
+    // from the server's damage table, so the plate can never promise a
+    // limit the model does not enforce.
     const lines: [string, string][] = [
-      ['#cfe0ee', 'WIRE 12 V → M+ M−'],
+      ['#e8a04a', `MOTOR ${ratedA(mm)} MAX — STALL = V/R`],
       ['#6d7d89', 'R=2Ω L=1.5mH K=0.25'],
       ['#6d7d89', 'SENSE 12.5 mV/mm'],
     ];
@@ -1064,6 +1112,7 @@ function startMock(onMachine: (m: MachineMsg) => void, arg: string | null): Mock
       rect,
       h: H,
       band: BAND,
+      imax: 3.0, // mirrors the server's damage table, for chrome review only
       y,
       vel: r * omega,
       i,

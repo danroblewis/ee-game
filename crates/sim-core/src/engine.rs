@@ -92,6 +92,16 @@ struct CompiledElem {
     /// Index into the branch-current unknowns for branch devices.
     branch: Option<usize>,
     state: ElemState,
+    /// The part has failed OPEN: it stamps nothing, owns no branch unknown
+    /// and carries no current. Its pins remain junction points, so anything
+    /// else wired to them keeps working — a dead part is a gap, not a hole
+    /// in the netlist.
+    ///
+    /// This is the ONLY damage mechanism inside sim-core. Ratings, thermal
+    /// accumulators and the decision to break live outside the solve path
+    /// (see `crates/damage`), because none of that is numerics and none of
+    /// it may perturb the golden state hashes.
+    broken: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -243,28 +253,65 @@ impl Engine {
     }
 
     /// Replace the document and recompile. Continuous state (cap voltage,
-    /// inductor current) survives for elements whose id persists.
+    /// inductor current) and the broken flag survive for elements whose id
+    /// persists: moving a dead resistor does not repair it.
     pub fn set_elements(&mut self, specs: &[ElementSpec]) {
-        let old_state: Vec<(u32, ElemState)> =
-            self.elems.iter().map(|e| (e.spec.id, e.state)).collect();
+        let old_state: Vec<(u32, ElemState, bool)> = self
+            .elems
+            .iter()
+            .map(|e| (e.spec.id, e.state, e.broken))
+            .collect();
         self.elems.clear();
         for s in specs {
             if s.pins.len() != s.kind.pin_count() {
                 continue; // malformed element: drop rather than panic
             }
-            let state = old_state
+            let (state, broken) = old_state
                 .iter()
-                .find(|(id, _)| *id == s.id)
-                .map(|(_, st)| *st)
+                .find(|(id, _, _)| *id == s.id)
+                .map(|(_, st, b)| (*st, *b))
                 .unwrap_or_default();
             self.elems.push(CompiledElem {
                 spec: s.clone(),
                 node: [0; MAX_PINS],
                 branch: None,
                 state,
+                broken,
             });
         }
         self.compile();
+    }
+
+    /// Break a part open, or repair it. Returns false when the id is unknown.
+    ///
+    /// A break/repair is a world EVENT, not a numeric write: it changes the
+    /// unknown count (a broken source or switch loses its branch) so it goes
+    /// through the full compile path exactly like a switch flip, which also
+    /// re-arms the post-event backward-Euler steps and clears `quarantined`.
+    /// That is correct for both directions: the circuit really did change, and
+    /// a solver that diverged on the old topology deserves a fresh start on
+    /// the new one. (Contrast `write_param`, which fires at kHz rates and must
+    /// therefore carry those flags across untouched.)
+    ///
+    /// The part's continuous state is reset both ways: a part that has just
+    /// released its magic smoke has no charge or flux left, and a repaired one
+    /// is a new part out of the drawer.
+    pub fn set_broken(&mut self, id: u32, broken: bool) -> bool {
+        let Some(e) = self.elems.iter_mut().find(|e| e.spec.id == id) else {
+            return false;
+        };
+        if e.broken == broken {
+            return true; // idempotent, and free: no recompile
+        }
+        e.broken = broken;
+        e.state = ElemState::default();
+        self.compile();
+        true
+    }
+
+    /// Has this part failed open? Unknown ids read false.
+    pub fn is_broken(&self, id: u32) -> bool {
+        self.elems.iter().any(|e| e.spec.id == id && e.broken)
     }
 
     pub fn interact(&mut self, id: u32, op: InteractOp) {
@@ -411,7 +458,9 @@ impl Engine {
             for (i, j) in je.iter().enumerate() {
                 e.node[i] = node_of_junction[*j];
             }
-            e.branch = e.spec.kind.is_branch().then(|| {
+            // A broken part owns no unknown: it is an open circuit that
+            // happens to still be drawn on the schematic.
+            e.branch = (!e.broken && e.spec.kind.is_branch()).then(|| {
                 num_branches += 1;
                 num_branches - 1
             });
@@ -429,7 +478,13 @@ impl Engine {
         self.b.resize(self.n, 0.0);
         self.x.resize(self.n, 0.0);
         self.lu.resize(self.n);
-        self.linear = !self.elems.iter().any(|e| e.spec.kind.is_nonlinear());
+        // A broken nonlinear device stamps nothing, so it cannot make the
+        // system nonlinear: the last dead LED in a room hands the solver its
+        // single-pass linear path back.
+        self.linear = !self
+            .elems
+            .iter()
+            .any(|e| !e.broken && e.spec.kind.is_nonlinear());
         self.factor_valid = false;
         self.quarantined = false;
         self.be_steps = BE_STEPS_AFTER_EVENT;
@@ -585,10 +640,13 @@ impl Engine {
         }
 
         for ei in 0..self.elems.len() {
-            let (kind, node, branch, state) = {
+            let (kind, node, branch, state, broken) = {
                 let e = &self.elems[ei];
-                (e.spec.kind, e.node, e.branch, e.state)
+                (e.spec.kind, e.node, e.branch, e.state, e.broken)
             };
+            if broken {
+                continue; // failed open: stamps nothing at all
+            }
             let n = self.n;
             match kind {
                 ElementKind::Wire | ElementKind::Ground => {}
@@ -889,10 +947,13 @@ impl Engine {
         let mut converged = true;
         let close = |a: f64, b: f64| (a - b).abs() < NR_ABSTOL + NR_RELTOL * a.abs().max(b.abs());
         for ei in 0..self.elems.len() {
-            let (kind, node) = {
+            let (kind, node, broken) = {
                 let e = &self.elems[ei];
-                (e.spec.kind, e.node)
+                (e.spec.kind, e.node, e.broken)
             };
+            if broken {
+                continue; // no operating point to iterate: it stamps nothing
+            }
             match kind {
                 ElementKind::Diode | ElementKind::Led { .. } | ElementKind::Zener { .. } => {
                     let (is, nvt, voff) = diode_params(&kind);
@@ -1041,10 +1102,19 @@ impl Engine {
     /// Commit device history and pin currents from the solved unknowns.
     fn accept(&mut self, h: f64, be: bool) {
         for ei in 0..self.elems.len() {
-            let (kind, node, branch) = {
+            let (kind, node, branch, broken) = {
                 let e = &self.elems[ei];
-                (e.spec.kind, e.node, e.branch)
+                (e.spec.kind, e.node, e.branch, e.broken)
             };
+            if broken {
+                // Carries nothing, stores nothing. Reported as exactly zero so
+                // no display can show a stale current for a dead part.
+                let st = &mut self.elems[ei].state;
+                st.pin_i = [0.0; MAX_PINS];
+                st.v_prev = 0.0;
+                st.i_prev = 0.0;
+                continue;
+            }
             let v01 = self.xv(node[0]) - self.xv(node[1]);
             let bi_val = branch.map(|b| self.x[self.num_nodes + b]);
             let mut vs = [0.0; MAX_PINS];
@@ -1357,6 +1427,14 @@ impl Engine {
             for p in 0..MAX_PINS {
                 put(e.state.lastv[p]);
                 put(e.state.pin_i[p]);
+            }
+            // Broken parts are discrete state and must reach the digest — but
+            // only when one EXISTS. An unconditional field would feed one more
+            // f64 per element into the hash and change every golden hash in
+            // the S1 cross-target harness, for a feature no golden circuit
+            // uses. Nothing broken => not one byte differs.
+            if e.broken {
+                put(e.spec.id as f64);
             }
         }
         h.digest()

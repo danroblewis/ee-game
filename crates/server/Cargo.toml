@@ -8,6 +8,7 @@ license.workspace = true
 sim-core = { path = "../sim-core", features = ["serde"] }
 sim-golden = { path = "../sim-golden" }
 machine = { path = "../machine", features = ["serde"] }
+damage = { path = "../damage", features = ["serde"] }
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
 tower-http = { version = "0.6", features = ["fs", "set-header"] }
