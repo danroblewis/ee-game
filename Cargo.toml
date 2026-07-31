@@ -9,6 +9,13 @@ members = [
     "crates/damage",
     "crates/server",
 ]
+# Standalone measurement crates (docs/scale-parallelism.md). Excluded on
+# purpose: their dependencies (rayon, wgpu) must never reach a shipping
+# crate or the workspace lockfile.
+exclude = [
+    "tools/scale-bench",
+    "tools/gpu-bench",
+]
 
 [workspace.package]
 edition = "2021"

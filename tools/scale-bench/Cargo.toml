@@ -1,0 +1,21 @@
+# Its own workspace root: this crate is deliberately NOT a member of the
+# repo workspace, so `cargo test --workspace` and the shipping lockfile
+# never see rayon.
+[workspace]
+
+[package]
+name = "scale-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Standalone scaling/parallelism measurements for the EE-game solver. NOT part of the shipping workspace: nothing here is a dependency of sim-core, sim-math or server."
+
+[dependencies]
+sim-core = { path = "../../crates/sim-core" }
+sim-math = { path = "../../crates/sim-math" }
+sim-golden = { path = "../../crates/sim-golden" }
+rayon = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
