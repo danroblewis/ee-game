@@ -21,6 +21,11 @@ export interface NetHandlers {
   onPanels(list: Panel[]): void;
   /** Machine state (the hoist), broadcast once per tick beside "frame". */
   onMachine(m: MachineMsg): void;
+  /** Damage SNAPSHOT: `[id, stress01, broken01]` for every part worth
+   * drawing, dead ones first. Authoritative and complete — replace the whole
+   * damage map from it — and only sent while something is stressed or
+   * broken, plus one empty message when the room goes quiet again. */
+  onDamage(parts: [number, number, number][]): void;
   onSamples(t0: number, dts: number, s: Record<string, number[]>): void;
   /** Speaker audio taps, keyed by ELEMENT id. A separate stream from
    * `samples` so scope decimation and speaker audio never fight over a
@@ -39,6 +44,10 @@ export interface Net {
   sendPanel(op: PanelOp): void;
   /** Lower the crate to the floor, zero the hold and re-arm the goal. */
   sendMachineReset(): void;
+  /** The repair tool: put a broken part back into service. Not a document
+   * edit — it is a world event, so it never enters the undo history and it
+   * is allowed on the server-owned hoist fixture. */
+  sendRepair(id: number): void;
   sendCursor(x: number, y: number): void;
 }
 
@@ -87,6 +96,9 @@ export function connect(h: NetHandlers): Net {
       case 'machine':
         h.onMachine(m as MachineMsg);
         break;
+      case 'damage':
+        h.onDamage(m.parts ?? []);
+        break;
       case 'samples':
         h.onSamples(m.t0, m.dts, m.s);
         break;
@@ -114,6 +126,7 @@ export function connect(h: NetHandlers): Net {
     sendProbeRef: (pid, elem, pin) => send({ t: 'proberef', pid, elem, pin }),
     sendPanel: (op) => send({ t: 'panel', op }),
     sendMachineReset: () => send({ t: 'machinereset' }),
+    sendRepair: (id) => send({ t: 'repair', id }),
     sendCursor: (x, y) => send({ t: 'cursor', x, y }),
   };
 }

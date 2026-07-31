@@ -211,6 +211,137 @@ mod tests {
         assert!(!eng.is_quarantined());
     }
 
+    /// The damage mechanism, from sim-core's side of the fence: a broken part
+    /// is an open circuit whose pins are still junctions, and repairing it
+    /// puts the current back. WHEN a part breaks is not decided here.
+    #[test]
+    fn a_broken_part_fails_open_and_repair_restores_it() {
+        // Two resistors in parallel across 9 V: 90 Ω and 45 Ω.
+        let elems = vec![
+            ElementSpec::two(
+                1,
+                ElementKind::VoltageSource {
+                    dc: 9.0,
+                    amp: 0.0,
+                    hz: 0.0,
+                    phase: 0.0,
+                },
+                (0, 0),
+                (0, 8),
+            ),
+            ElementSpec::two(2, ElementKind::Resistor { ohms: 90.0 }, (0, 0), (4, 0)),
+            ElementSpec::two(3, ElementKind::Wire, (4, 0), (0, 8)),
+            ElementSpec::two(4, ElementKind::Resistor { ohms: 45.0 }, (0, 0), (4, 4)),
+            ElementSpec::two(5, ElementKind::Wire, (4, 4), (0, 8)),
+            ElementSpec::ground(6, (0, 8)),
+        ];
+        let mut eng = Engine::new(10e-6);
+        eng.set_elements(&elems);
+        eng.advance(10);
+        assert!((eng.pin_current(2, 0).unwrap() - 0.1).abs() < 1e-9);
+        assert!((eng.pin_current(4, 0).unwrap() - 0.2).abs() < 1e-9);
+
+        assert!(eng.set_broken(2, true));
+        assert!(eng.is_broken(2));
+        assert!(!eng.set_broken(999, true), "unknown id");
+        eng.advance(10);
+        // Dead branch: exactly zero, and no power reported.
+        assert_eq!(eng.pin_current(2, 0).unwrap(), 0.0);
+        let f = eng.frame();
+        let dead = f.iter().find(|e| e.id == 2).unwrap();
+        assert_eq!(dead.power, 0.0);
+        // Its pins are still junctions: pin 1 sits on the ground node.
+        assert_eq!(eng.pin_voltage(2, 0).unwrap(), 9.0);
+        assert!(eng.pin_voltage(2, 1).unwrap().abs() < 1e-6);
+        // And the healthy branch beside it never noticed.
+        assert!((eng.pin_current(4, 0).unwrap() - 0.2).abs() < 1e-9);
+
+        // A document edit must not resurrect it (state survives by id).
+        eng.set_elements(&elems);
+        eng.advance(10);
+        assert!(eng.is_broken(2));
+        assert_eq!(eng.pin_current(2, 0).unwrap(), 0.0);
+
+        assert!(eng.set_broken(2, false));
+        eng.advance(10);
+        assert!(!eng.is_broken(2));
+        assert!((eng.pin_current(2, 0).unwrap() - 0.1).abs() < 1e-9);
+        assert!(!eng.is_quarantined());
+    }
+
+    /// Breaking a branch device (its unknown disappears) must renumber the
+    /// system without disturbing anything else, and a broken nonlinear device
+    /// hands back the linear fast path.
+    #[test]
+    fn breaking_a_branch_device_renumbers_the_unknowns() {
+        // 9 V through a closed switch into an LED + 330 Ω, plus a plain 90 Ω
+        // load straight across the supply.
+        let elems = vec![
+            ElementSpec::two(
+                1,
+                ElementKind::VoltageSource {
+                    dc: 9.0,
+                    amp: 0.0,
+                    hz: 0.0,
+                    phase: 0.0,
+                },
+                (0, 0),
+                (0, 8),
+            ),
+            ElementSpec::two(2, ElementKind::Switch { closed: true }, (0, 0), (4, 0)),
+            ElementSpec::two(3, ElementKind::Resistor { ohms: 330.0 }, (4, 0), (8, 0)),
+            ElementSpec::two(4, ElementKind::Led { color: 0 }, (8, 0), (0, 8)),
+            ElementSpec::two(5, ElementKind::Resistor { ohms: 90.0 }, (0, 0), (0, 8)),
+            ElementSpec::ground(6, (0, 8)),
+        ];
+        let mut eng = Engine::new(10e-6);
+        eng.set_elements(&elems);
+        eng.advance(200);
+        let i_led = eng.pin_current(4, 0).unwrap();
+        assert!(i_led > 0.015 && i_led < 0.03, "LED current {i_led}");
+
+        // Kill the switch: the LED branch goes dark, the 90 Ω load does not.
+        assert!(eng.set_broken(2, true));
+        eng.advance(200);
+        assert_eq!(eng.pin_current(2, 0).unwrap(), 0.0);
+        assert!(eng.pin_current(4, 0).unwrap().abs() < 1e-9);
+        assert!((eng.pin_current(5, 0).unwrap() - 0.1).abs() < 1e-9);
+        assert!(!eng.is_quarantined());
+
+        // Kill the LED too and the whole circuit is linear again; the
+        // remaining resistor still solves.
+        assert!(eng.set_broken(4, true));
+        eng.advance(200);
+        assert!((eng.pin_current(5, 0).unwrap() - 0.1).abs() < 1e-9);
+        assert!(!eng.is_quarantined());
+    }
+
+    /// The state digest must not grow when nothing is broken (the S1 golden
+    /// hashes are a fixed contract), and must move when something is.
+    #[test]
+    fn broken_state_reaches_the_hash_only_when_it_exists() {
+        let run = |break_id: Option<u32>| {
+            let mut eng = Engine::new(10e-6);
+            eng.set_elements(&demo_circuit(true));
+            if let Some(id) = break_id {
+                eng.set_broken(id, true);
+            }
+            eng.advance(200);
+            eng.state_hash()
+        };
+        assert_eq!(run(None), run(None));
+        assert_ne!(
+            run(None),
+            run(Some(4)),
+            "a dead lamp must change the digest"
+        );
+        assert_ne!(
+            run(Some(3)),
+            run(Some(4)),
+            "which part died must change the digest"
+        );
+    }
+
     #[test]
     fn state_hash_is_reproducible() {
         let run = || {

@@ -1,0 +1,19 @@
+[package]
+name = "damage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Safety limits and thermal stress bookkeeping. Deliberately OUTSIDE
+# sim-core: none of this is numerics, none of it may touch the solve path,
+# and none of it may perturb the golden state hashes. Pure model — no I/O,
+# no clocks, no random — and `libm` for the one transcendental it needs, so
+# it behaves identically on native and wasm32.
+[dependencies]
+sim-core = { path = "../sim-core" }
+libm.workspace = true
+serde = { workspace = true, optional = true }
+
+[features]
+default = []
+serde = ["dep:serde"]

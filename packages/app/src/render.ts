@@ -113,12 +113,160 @@ function drawDotsPath(
   }
 }
 
+// ------------------------------------------------------------------ damage
+//
+// Overload is a TEACHING tool, so it has to be legible long before anything
+// fails: a part discolours as it heats, smokes as it approaches its limit,
+// pops, and then stays visibly charred until somebody repairs it. Every
+// number behind this comes from the server's `damage` snapshot, which is
+// computed from solver output — the client only picks colours.
+
+/** Live damage for one part, from the server's `damage` snapshot. */
+export interface DamageState {
+  /** Normalised temperature, 0..1. 1 means it let go. */
+  stress: number;
+  broken: boolean;
+  /** `performance.now()` when this client saw it pop — drives the one-shot
+   * magic-smoke burst. Absent for parts that were already dead on arrival. */
+  poppedAt?: number;
+}
+
+/** Stress at which the heat tint becomes visible. */
+export const STRESS_WARM = 0.35;
+/** Stress at which the part starts smoking — the last warning. */
+export const STRESS_SMOKE = 0.7;
+/** Magic-smoke burst duration, ms. */
+const POP_MS = 1600;
+/** Scorch/char colour, and the "find me" colour when zoomed out. */
+const CHAR = '#1a1216';
+const BROKEN_MARK = '#ff6a3d';
+
+/** Cheap deterministic 0..1 from an integer — per-part smoke placement that
+ * does not shimmer between frames. */
+const hash01 = (n: number): number => {
+  const x = Math.sin(n * 12.9898 + 78.233) * 43758.5453;
+  return x - Math.floor(x);
+};
+
+/** Heat colour for a stress level: amber at the first warning, deep red at
+ * the edge of failure. */
+function heatColor(stress: number, alpha: number): string {
+  const t = Math.max(0, Math.min(1, (stress - STRESS_WARM) / (1 - STRESS_WARM)));
+  const r = 255;
+  const g = Math.round(190 - 130 * t);
+  const b = Math.round(90 - 80 * t);
+  return `rgba(${r},${g},${b},${alpha.toFixed(3)})`;
+}
+
+/** Centre of a part's pin chain, in px. */
+function centerOf(P: Px[]): Px {
+  let x = 0;
+  let y = 0;
+  for (const p of P) {
+    x += p[0];
+    y += p[1];
+  }
+  return [x / Math.max(1, P.length), y / Math.max(1, P.length)];
+}
+
+/** The heat glow behind a stressed part, and the wisps of smoke that come
+ * before the bang. Drawn UNDER the symbol so the schematic stays readable. */
+function drawStress(d: DrawCtx, e: ElementSpec, P: Px[], stress: number) {
+  const { ctx, cam } = d;
+  const s = cam.scale;
+  const c = centerOf(P);
+  const t = (stress - STRESS_WARM) / (1 - STRESS_WARM);
+  const rad = s * (0.7 + 0.5 * t);
+  const g = ctx.createRadialGradient(c[0], c[1], s * 0.1, c[0], c[1], rad);
+  g.addColorStop(0, heatColor(stress, 0.15 + 0.5 * t));
+  g.addColorStop(1, heatColor(stress, 0));
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.arc(c[0], c[1], rad, 0, Math.PI * 2);
+  ctx.fill();
+
+  if (stress < STRESS_SMOKE || d.time === undefined) return;
+  // Thin wisps: three puffs on a staggered 1.8 s cycle, rising and fading.
+  const k = (stress - STRESS_SMOKE) / (1 - STRESS_SMOKE);
+  ctx.fillStyle = '#c9c9d4';
+  for (let n = 0; n < 3; n++) {
+    const phase = ((d.time / 1800 + hash01(e.id * 7 + n)) % 1 + 1) % 1;
+    const a = (1 - phase) * (0.12 + 0.3 * k);
+    if (a <= 0.01) continue;
+    const dx = (hash01(e.id * 13 + n) - 0.5) * s * 0.5 * phase;
+    ctx.globalAlpha = a;
+    ctx.beginPath();
+    ctx.arc(c[0] + dx, c[1] - s * (0.35 + 1.1 * phase), s * (0.08 + 0.16 * phase), 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+/** A part that has let go: scorch mark, cracked body, and — for the first
+ * moment and a half — the blue smoke leaving it. */
+function drawBroken(d: DrawCtx, e: ElementSpec, P: Px[]) {
+  const { ctx, cam } = d;
+  const s = cam.scale;
+  const c = centerOf(P);
+
+  // Scorch: a sooty smudge that survives on the schematic until repair.
+  const g = ctx.createRadialGradient(c[0], c[1], s * 0.05, c[0], c[1], s * 0.95);
+  g.addColorStop(0, 'rgba(20,14,16,0.85)');
+  g.addColorStop(0.65, 'rgba(30,20,22,0.55)');
+  g.addColorStop(1, 'rgba(30,20,22,0)');
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.arc(c[0], c[1], s * 0.95, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Charred, crumpled body: a dark blob with two cracks through it.
+  ctx.fillStyle = CHAR;
+  ctx.beginPath();
+  ctx.arc(c[0], c[1], s * 0.3, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = BROKEN_MARK;
+  ctx.lineWidth = Math.max(1.5, s * 0.05);
+  for (const dir of [-1, 1]) {
+    ctx.beginPath();
+    ctx.moveTo(c[0] - s * 0.42 * dir, c[1] - s * 0.34);
+    ctx.lineTo(c[0] - s * 0.08 * dir, c[1] - s * 0.06);
+    ctx.lineTo(c[0] + s * 0.16 * dir, c[1] + s * 0.12);
+    ctx.lineTo(c[0] + s * 0.4 * dir, c[1] + s * 0.36);
+    ctx.stroke();
+  }
+
+  // The magic smoke, one shot, blue as tradition demands.
+  if (d.time === undefined || d.dmg?.poppedAt === undefined) return;
+  const age = (d.time - d.dmg.poppedAt) / POP_MS;
+  if (age < 0 || age > 1) return;
+  for (let n = 0; n < 6; n++) {
+    const phase = Math.min(1, age * (1.1 + 0.5 * hash01(e.id * 31 + n)));
+    const a = (1 - phase) * 0.6;
+    if (a <= 0.01) continue;
+    const dx = (hash01(e.id * 17 + n) - 0.5) * s * 1.1 * phase;
+    ctx.fillStyle = `rgba(120,170,255,${a.toFixed(3)})`;
+    ctx.beginPath();
+    ctx.arc(
+      c[0] + dx,
+      c[1] - s * (0.2 + 1.7 * phase),
+      s * (0.12 + 0.42 * phase),
+      0,
+      Math.PI * 2,
+    );
+    ctx.fill();
+  }
+}
+
 interface DrawCtx {
   ctx: CanvasRenderingContext2D;
   cam: Camera;
   live?: ElemLive;
   dots: DotFlow;
   dtSec: number;
+  /** Server-computed damage for this part, if it has any. */
+  dmg?: DamageState;
+  /** `performance.now()`, for the smoke animations. Absent for ghosts. */
+  time?: number;
   /** Speakers only: what this part is doing to the player's ears, from the
    * audio tap. `level` is the 0..1 amplitude of the stream that actually
    * reached the sound card (the 30 Hz render frame cannot see a 440 Hz
@@ -171,6 +319,12 @@ export function drawElement(d: DrawCtx, e: ElementSpec) {
   const { ctx, cam } = d;
   const s = cam.scale;
   const P = e.pins.map((p) => px(cam, p));
+  // Heat goes down first, so the symbol stays readable on top of it. A
+  // broken part still draws its symbol — you have to recognise WHAT died —
+  // and gets charred over afterwards.
+  if (d.dmg && !d.dmg.broken && d.dmg.stress > STRESS_WARM) {
+    drawStress(d, e, P, d.dmg.stress);
+  }
   const v = (i: number) => d.live?.v[i] ?? 0;
   const iPin = (i: number) => d.live?.i[i] ?? 0;
   const i0 = iPin(0);
@@ -754,6 +908,9 @@ export function drawElement(d: DrawCtx, e: ElementSpec) {
       break;
     }
   }
+
+  // Char goes on last: a dead part is recognisable but plainly ruined.
+  if (d.dmg?.broken) drawBroken(d, e, P);
 }
 
 const dot = (a: Px, b: Px) => a[0] * b[0] + a[1] * b[1];
@@ -882,9 +1039,28 @@ export function drawElementsLod(
   elems: ElementSpec[],
   live: Map<number, ElemLive>,
   single: boolean,
+  dmg?: Map<number, DamageState>,
 ) {
   const paths: (Path2D | undefined)[] = new Array<Path2D | undefined>(LOD_STEPS);
   const tick = Math.max(1, cam.scale * 0.3);
+  // Finding the dead part is the repair job, so a broken one keeps a marker
+  // that survives all the way out: at this zoom the symbol is a smudge, but
+  // the cross is still a cross.
+  const dead: Px[] = [];
+  for (const e of elems) {
+    if (dmg?.get(e.id)?.broken && e.pins.length > 0) {
+      let cx = 0;
+      let cy = 0;
+      for (const p of e.pins) {
+        cx += p[0];
+        cy += p[1];
+      }
+      dead.push([
+        cam.ox + (cx / e.pins.length) * cam.scale,
+        cam.oy + (cy / e.pins.length) * cam.scale,
+      ]);
+    }
+  }
   for (const e of elems) {
     const P = e.pins;
     if (P.length === 0) continue;
@@ -949,6 +1125,22 @@ export function drawElementsLod(
     ctx.stroke(path);
   }
   ctx.lineCap = 'round';
+  if (dead.length > 0) {
+    // One path for all of them: a district full of dead parts costs one
+    // stroke call, and each mark stays legible (screen-space size) however
+    // far out the camera is.
+    const r = Math.max(3, Math.min(7, cam.scale * 0.9));
+    const marks = new Path2D();
+    for (const [x, y] of dead) {
+      marks.moveTo(x - r, y - r);
+      marks.lineTo(x + r, y + r);
+      marks.moveTo(x + r, y - r);
+      marks.lineTo(x - r, y + r);
+    }
+    ctx.strokeStyle = BROKEN_MARK;
+    ctx.lineWidth = 2;
+    ctx.stroke(marks);
+  }
 }
 
 /** Distance in px from (x, y) to the element (nearest pin-chain segment;

@@ -191,6 +191,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "damage"
+version = "0.1.0"
+dependencies = [
+ "libm",
+ "serde",
+ "sim-core",
+]
+
+[[package]]
 name = "data-encoding"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1220,6 +1229,7 @@ name = "server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "damage",
  "machine",
  "serde",
  "serde_json",
