@@ -120,9 +120,9 @@ const PART_HOTKEYS: Record<string, string> = {
   l: 'Inductor',
   g: 'Ground',
   v: 'Battery',
+  V: 'V Rail',
   f: 'AC Source',
   i: 'Current Source',
-  y: 'V Rail',
   d: 'Diode',
   z: 'Zener',
   e: 'LED',
@@ -2761,7 +2761,7 @@ function frame(now: number) {
       ? `  ${speakerIds.length} speaker${speakerIds.length === 1 ? '' : 's'} silent offline (no substep sampler in the local sim)`
       : '';
   const hints = hintsOpen
-    ? `\nparts: R C L W G V Y D N P M A U 5 S B T Z E F I · drag part = move · drag the hoist cabinet = move the machine · dbl-click = edit values · right-click = menu` +
+    ? `\nparts: R C L W G V D N P M A U 5 S B T Z E F I · ⇧V rail · drag part = move · drag the hoist cabinet = move the machine · dbl-click = edit values · right-click = menu` +
       `\ndrag pin = wire · drag empty = select · Q rotate · ⌘Z undo · ⌘C/⌘V copy/paste · 1/2 probe · 3 listen · 0 ref · O scope · \` dock · J panel · K repair · X delete` +
       `\nH home district · shift+H fit everything · wheel = zoom (0.4–200 px/unit) · pan: middle / ctrl+drag / space+drag · ? hides this`
     : `\n? controls`;

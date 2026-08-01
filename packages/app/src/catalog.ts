@@ -82,7 +82,7 @@ export const CATALOG: PartDef[] = [
     name: 'V Rail',
     keys: 'rail vcc vdd supply single pin',
     cat: 'Sources',
-    key: 'Y',
+    key: '⇧V',
     make: () => ({ t: 'Rail', dc: 5, amp: 0, hz: 0, phase: 0 }),
   },
   {
