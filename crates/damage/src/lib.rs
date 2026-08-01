@@ -143,6 +143,7 @@ pub const REPORT_AT: f64 = 0.05;
 // |                     |         |                |       | deliver, not what they burn
 // | VoltageSource       | current | 10 A           | 5 s   | bench supply / battery pack:
 // | CurrentSource       | current | 10 A           | 5 s   | generous, so the LOAD dies first
+// | Rail                | current | 10 A           | 5 s   | same class as VoltageSource
 // | Wire, Ground        | —       | —              | —     | not breakable in this pass
 //
 // The metric column also picks the heat law (see `heat`): power-rated parts
@@ -185,7 +186,9 @@ pub fn rating(kind: &ElementKind) -> Option<Rating> {
         // GND pins are modelled, so the frame's power really is the chip's.
         K::OpAmp { .. } | K::Ota => return None,
         K::Timer555 => Rating::new(Power, 0.6, 3.0),
-        K::VoltageSource { .. } | K::CurrentSource { .. } => Rating::new(Current, 10.0, 5.0),
+        K::VoltageSource { .. } | K::CurrentSource { .. } | K::Rail { .. } => {
+            Rating::new(Current, 10.0, 5.0)
+        }
     })
 }
 
@@ -203,6 +206,7 @@ pub fn kind_name(kind: &ElementKind) -> &'static str {
         K::Inductor { .. } => "Inductor",
         K::VoltageSource { .. } => "Source",
         K::CurrentSource { .. } => "Current source",
+        K::Rail { .. } => "Rail",
         K::Switch { .. } => "Switch",
         K::Button { .. } => "Button",
         K::Diode => "Diode",

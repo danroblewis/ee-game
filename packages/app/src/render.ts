@@ -359,6 +359,30 @@ export function drawElement(d: DrawCtx, e: ElementSpec) {
       ctx.stroke();
       break;
     }
+    case 'Rail': {
+      // Ground's mirror image: a stem UP from the pin to a small ring — the
+      // implicit return path is the ground symbol it points away from. DC
+      // shows a '+' in the ring; AC shows a tilde.
+      const r = s * 0.2;
+      const cy = A[1] - s * 0.45;
+      ctx.strokeStyle = voltageColor(v(0));
+      ctx.beginPath();
+      ctx.moveTo(A[0], A[1]);
+      ctx.lineTo(A[0], cy + r);
+      ctx.stroke();
+      ctx.strokeStyle = '#c9c9d4';
+      ctx.beginPath();
+      ctx.arc(A[0], cy, r, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.fillStyle = '#c9c9d4';
+      ctx.font = `${Math.round(s * 0.32)}px ui-monospace`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(e.kind.amp === 0 ? '+' : '∿', A[0], cy + 0.5);
+      ctx.textAlign = 'start';
+      ctx.textBaseline = 'alphabetic';
+      break;
+    }
     case 'Resistor': {
       const e1 = add(mid, u, -s * 0.45);
       const e2 = add(mid, u, s * 0.45);

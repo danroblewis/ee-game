@@ -327,7 +327,7 @@ impl Engine {
                 | ElementKind::Speaker { ohms } => *ohms = value.max(1e-6),
                 ElementKind::Capacitor { farads } => *farads = value.max(1e-15),
                 ElementKind::Inductor { henries } => *henries = value.max(1e-12),
-                ElementKind::VoltageSource { dc, .. } => *dc = value,
+                ElementKind::VoltageSource { dc, .. } | ElementKind::Rail { dc, .. } => *dc = value,
                 ElementKind::CurrentSource { amps } => *amps = value,
                 ElementKind::Potentiometer { wiper, .. } => *wiper = value.clamp(0.01, 0.99),
                 _ => return,
@@ -709,6 +709,22 @@ impl Engine {
                                 self.a[(pin - 1) * n + bi] += sgn;
                             }
                         }
+                    }
+                    self.b[bi] = v;
+                }
+                ElementKind::Rail { dc, amp, hz, phase } => {
+                    // A voltage source whose far terminal IS ground: only the
+                    // one pin stamps, and node 0 has no row to receive the
+                    // return current (exactly like a grounded two-pin source).
+                    let v = if amp == 0.0 {
+                        dc
+                    } else {
+                        dc + amp * libm::sin(TWO_PI * hz * t_new + phase)
+                    };
+                    let bi = self.num_nodes + branch.ok_or(())?;
+                    if need_factor && node[0] > 0 {
+                        self.a[bi * n + (node[0] - 1)] += 1.0;
+                        self.a[(node[0] - 1) * n + bi] += 1.0;
                     }
                     self.b[bi] = v;
                 }
@@ -1166,6 +1182,12 @@ impl Engine {
                 }
                 ElementKind::CurrentSource { amps } => two(amps),
                 ElementKind::VoltageSource { .. } => two(bi_val.unwrap_or(0.0)),
+                ElementKind::Rail { .. } => {
+                    // One real pin: its current is the branch unknown; the
+                    // return leg lives in ground and has no pin to report.
+                    st.pin_i = [0.0; MAX_PINS];
+                    st.pin_i[0] = bi_val.unwrap_or(0.0);
+                }
                 ElementKind::Motor { .. } => {
                     // The armature current is the branch unknown; it is also
                     // the inductive history for the next step (same slot the

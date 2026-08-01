@@ -12,6 +12,7 @@ export type ElementKind =
   | { t: 'Inductor'; henries: number }
   | { t: 'VoltageSource'; dc: number; amp: number; hz: number; phase: number }
   | { t: 'CurrentSource'; amps: number }
+  | { t: 'Rail'; dc: number; amp: number; hz: number; phase: number }
   | { t: 'Switch'; closed: boolean }
   | { t: 'Button'; closed: boolean }
   | { t: 'Diode' }
@@ -61,6 +62,8 @@ export function pinLabels(kind: ElementKind): string[] {
       return ['A', 'W', 'B'];
     case 'Ground':
       return ['⏚'];
+    case 'Rail':
+      return ['+'];
     default:
       return ['a', 'b'];
   }

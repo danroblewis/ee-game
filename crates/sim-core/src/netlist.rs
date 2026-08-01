@@ -52,6 +52,16 @@ pub enum ElementKind {
     CurrentSource {
         amps: f64,
     },
+    /// Single-pin voltage rail: v(pin0) = dc + amp * sin(2*pi*hz*t + phase),
+    /// referenced to ground. The return path is implicit — the branch current
+    /// flows through node 0 — so a rail powers anything that has its own
+    /// ground reference, without a wire back to a battery.
+    Rail {
+        dc: f64,
+        amp: f64,
+        hz: f64,
+        phase: f64,
+    },
     /// Closed switch stamps as a 0 V source (its branch current is an MNA
     /// unknown); open switch stamps nothing.
     Switch {
@@ -139,7 +149,7 @@ impl ElementKind {
     pub fn pin_count(&self) -> usize {
         use ElementKind::*;
         match self {
-            Ground => 1,
+            Ground | Rail { .. } => 1,
             Timer555 => 6,
             Ota => 4,
             Npn { .. }
@@ -157,6 +167,7 @@ impl ElementKind {
         matches!(
             self,
             ElementKind::VoltageSource { .. }
+                | ElementKind::Rail { .. }
                 | ElementKind::Switch { closed: true }
                 | ElementKind::Button { closed: true }
                 | ElementKind::OpAmp { .. }

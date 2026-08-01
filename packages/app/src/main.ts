@@ -122,6 +122,7 @@ const PART_HOTKEYS: Record<string, string> = {
   v: 'Battery',
   f: 'AC Source',
   i: 'Current Source',
+  y: 'V Rail',
   d: 'Diode',
   z: 'Zener',
   e: 'LED',
@@ -236,7 +237,7 @@ function applyOp(e: ElementSpec, op: InteractOp) {
     if (e.kind.t === 'Resistor' || e.kind.t === 'Lamp' || e.kind.t === 'Speaker') e.kind.ohms = op.value;
     else if (e.kind.t === 'Capacitor') e.kind.farads = op.value;
     else if (e.kind.t === 'Inductor') e.kind.henries = op.value;
-    else if (e.kind.t === 'VoltageSource') e.kind.dc = op.value;
+    else if (e.kind.t === 'VoltageSource' || e.kind.t === 'Rail') e.kind.dc = op.value;
     else if (e.kind.t === 'CurrentSource') e.kind.amps = op.value;
     else if (e.kind.t === 'Potentiometer') e.kind.wiper = Math.min(0.99, Math.max(0.01, op.value));
   }
@@ -2760,7 +2761,7 @@ function frame(now: number) {
       ? `  ${speakerIds.length} speaker${speakerIds.length === 1 ? '' : 's'} silent offline (no substep sampler in the local sim)`
       : '';
   const hints = hintsOpen
-    ? `\nparts: R C L W G V D N P M A U 5 S B T Z E F I · drag part = move · drag the hoist cabinet = move the machine · dbl-click = edit values · right-click = menu` +
+    ? `\nparts: R C L W G V Y D N P M A U 5 S B T Z E F I · drag part = move · drag the hoist cabinet = move the machine · dbl-click = edit values · right-click = menu` +
       `\ndrag pin = wire · drag empty = select · Q rotate · ⌘Z undo · ⌘C/⌘V copy/paste · 1/2 probe · 3 listen · 0 ref · O scope · \` dock · J panel · K repair · X delete` +
       `\nH home district · shift+H fit everything · wheel = zoom (0.4–200 px/unit) · pan: middle / ctrl+drag / space+drag · ? hides this`
     : `\n? controls`;

@@ -342,6 +342,41 @@ mod tests {
         );
     }
 
+    /// A single-pin rail must behave exactly like a grounded battery: same
+    /// node voltage, same loop current, and the branch current reported on
+    /// its one pin.
+    #[test]
+    fn rail_is_a_grounded_battery() {
+        let rail = ElementKind::Rail {
+            dc: 5.0,
+            amp: 0.0,
+            hz: 0.0,
+            phase: 0.0,
+        };
+        let elems = vec![
+            ElementSpec {
+                id: 1,
+                kind: rail,
+                pins: vec![(0, 0)],
+            },
+            ElementSpec::two(2, ElementKind::Resistor { ohms: 1000.0 }, (0, 0), (8, 0)),
+            ElementSpec::ground(3, (8, 0)),
+        ];
+        let mut eng = Engine::new(10e-6);
+        eng.set_elements(&elems);
+        eng.advance(10);
+        let v = eng.voltage_at((0, 0)).unwrap();
+        assert!((v - 5.0).abs() < 1e-9, "rail node must sit at 5 V, got {v}");
+        // The rail sources the loop current through its single pin.
+        let i = eng.pin_current(1, 0).unwrap();
+        assert!((i + 5.0 / 1000.0).abs() < 1e-9, "rail branch current {i}");
+        // Configurable: SetValue retargets the DC level like a battery's.
+        eng.interact(1, InteractOp::SetValue { value: 3.3 });
+        eng.advance(10);
+        let v = eng.voltage_at((0, 0)).unwrap();
+        assert!((v - 3.3).abs() < 1e-9, "rail must follow SetValue, got {v}");
+    }
+
     #[test]
     fn state_hash_is_reproducible() {
         let run = || {

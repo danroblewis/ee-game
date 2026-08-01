@@ -555,7 +555,9 @@ fn source_ids(elems: &[ElementSpec]) -> Vec<u32> {
         .filter(|e| {
             matches!(
                 e.kind,
-                ElementKind::VoltageSource { .. } | ElementKind::CurrentSource { .. }
+                ElementKind::VoltageSource { .. }
+                    | ElementKind::CurrentSource { .. }
+                    | ElementKind::Rail { .. }
             )
         })
         .map(|e| e.id)
@@ -1468,7 +1470,8 @@ fn apply_to_specs(room: &Room, id: u32, op: InteractOp) {
         | (InteractOp::SetValue { value }, K::Speaker { ohms }) => *ohms = value.max(1e-6),
         (InteractOp::SetValue { value }, K::Capacitor { farads }) => *farads = value.max(1e-15),
         (InteractOp::SetValue { value }, K::Inductor { henries }) => *henries = value.max(1e-12),
-        (InteractOp::SetValue { value }, K::VoltageSource { dc, .. }) => *dc = value,
+        (InteractOp::SetValue { value }, K::VoltageSource { dc, .. })
+        | (InteractOp::SetValue { value }, K::Rail { dc, .. }) => *dc = value,
         (InteractOp::SetValue { value }, K::CurrentSource { amps }) => *amps = value,
         (InteractOp::SetValue { value }, K::Potentiometer { wiper, .. }) => {
             *wiper = value.clamp(0.01, 0.99)

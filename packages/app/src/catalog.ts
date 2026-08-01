@@ -79,6 +79,13 @@ export const CATALOG: PartDef[] = [
     make: () => ({ t: 'CurrentSource', amps: 0.01 }),
   },
   {
+    name: 'V Rail',
+    keys: 'rail vcc vdd supply single pin',
+    cat: 'Sources',
+    key: 'Y',
+    make: () => ({ t: 'Rail', dc: 5, amp: 0, hz: 0, phase: 0 }),
+  },
+  {
     name: 'Switch',
     keys: 'sw toggle',
     cat: 'Switches',
@@ -177,6 +184,7 @@ export function searchParts(q: string): PartDef[] {
 function pinCount(kind: ElementKind): number {
   switch (kind.t) {
     case 'Ground':
+    case 'Rail':
       return 1;
     case 'Timer555':
       return 6;
