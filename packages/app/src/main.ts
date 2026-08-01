@@ -56,7 +56,6 @@ import init, { Sim } from './wasm/sim_wasm';
 import {
   demoCircuit,
   MAX_PINS,
-  pinLabels,
   unpackFrame,
   type DocOp,
   type ElementKind,
@@ -657,7 +656,6 @@ function nearestPin(e: ElementSpec, x: number, y: number): number {
 // ---------------------------------------------------------------- canvas
 const canvas = document.getElementById('canvas') as HTMLCanvasElement;
 const hud = document.getElementById('hud') as HTMLDivElement;
-const tip = document.getElementById('tip') as HTMLDivElement;
 const ctx = canvas.getContext('2d')!;
 
 const cam: Camera = { scale: 48, ox: 60, oy: 60 };
@@ -2225,39 +2223,6 @@ const fmt = (v: number, unit: string) => {
   return `0 ${unit}`;
 };
 
-function describeValue(e: ElementSpec): string {
-  switch (e.kind.t) {
-    case 'Resistor':
-    case 'Lamp':
-      return `R ${fmt(e.kind.ohms, 'Ω')}`;
-    case 'Speaker':
-      return `${fmt(e.kind.ohms, 'Ω')} coil  (3 listens)`;
-    case 'Capacitor':
-      return `C ${fmt(e.kind.farads, 'F')}`;
-    case 'Inductor':
-      return `L ${fmt(e.kind.henries, 'H')}`;
-    case 'VoltageSource':
-      return e.kind.amp === 0
-        ? `${fmt(e.kind.dc, 'V')} DC`
-        : `${fmt(e.kind.dc, 'V')} ± ${fmt(e.kind.amp, 'V')} @ ${e.kind.hz} Hz`;
-    case 'Potentiometer':
-      return `${fmt(e.kind.ohms, 'Ω')} @ ${(e.kind.wiper * 100).toFixed(0)}%`;
-    case 'Npn':
-    case 'Pnp':
-      return `β ${e.kind.beta}`;
-    case 'Nmos':
-    case 'Pmos':
-      return `Vt ${fmt(e.kind.vt, 'V')}`;
-    case 'Zener':
-      return `Vz ${fmt(e.kind.vz, 'V')}`;
-    case 'OpAmp':
-      return `rail ±${fmt(e.kind.rail, 'V')}`;
-    case 'Ota':
-      return 'Iout = Iabc·tanh(vd/2Vt)';
-    default:
-      return '';
-  }
-}
 
 const scopeDiv = document.getElementById('scope') as HTMLDivElement;
 const scopeCv = document.getElementById('scopecv') as HTMLCanvasElement;
@@ -2749,31 +2714,10 @@ function frame(now: number) {
 
   dock.update(now, probes, traces, dockScope);
 
-  if (hover && mouse && !placing && !pasting && !wireDrag && !moveDrag) {
-    const l = live.get(hover.id);
-    tip.style.display = 'block';
-    tip.style.left = `${mouse.x + 14}px`;
-    tip.style.top = `${mouse.y + 14}px`;
-    const val = describeValue(hover);
-    const labels = pinLabels(hover.kind);
-    // The heat line is the teaching line: it says how close this part is to
-    // its own limit, and it is the server's number, not a guess.
-    const d = damage.get(hover.id);
-    const heat = d?.broken
-      ? '\nBROKEN — released its magic smoke (K = repair)'
-      : d && d.stress > 0.05
-        ? `\nheat ${(d.stress * 100).toFixed(0)}% of its limit${d.stress > 0.7 ? ' — SMOKING' : ''}`
-        : '';
-    tip.textContent =
-      `${hover.kind.t}${val ? '  ' + val : ''}\n` +
-      (l
-        ? labels.map((lb, p) => `${lb}: ${fmt(l.v[p] ?? 0, 'V')} ${fmt(l.i[p] ?? 0, 'A')}`).join('\n') +
-          `\nP ${fmt(l.power, 'W')}`
-        : '') +
-      heat;
-  } else {
-    tip.style.display = 'none';
-  }
+  // Deliberately NO hover readout: voltages, currents and power are only
+  // visible through probes, scopes and panel meters — placing an instrument
+  // IS the game. (Heat and breakage already show on the part itself: glow,
+  // smoke, scorch.)
 
   const mode = repairing
     ? 'repair tool: click a charred part to put it back into service (Esc exits)'
