@@ -1826,20 +1826,30 @@ async fn main() {
     tokio::spawn(sim_task(room.clone(), cmd_rx, hoist, hoist_rect, damage));
 
     let dist = std::env::var("EE_DIST").unwrap_or_else(|_| "packages/app/dist".into());
-    let static_files =
-        ServeDir::new(&dist).not_found_service(ServeFile::new(format!("{dist}/index.html")));
-
+    // Two cache policies, split by path. Vite content-hashes everything under
+    // /assets, so those are IMMUTABLE: a returning browser must not even
+    // revalidate them (the old headerless setup left caching to browser
+    // heuristics, which is exactly "sometimes instant, sometimes re-downloads
+    // the world"). The 17 KB shell is the opposite: always revalidate, so a
+    // rebuilt bundle never leaves a stale page pointing at dead hashes.
+    // NOTE: .layer() only wraps routes registered BEFORE it — the old code
+    // layered before fallback_service and the header never applied at all.
+    let immutable = tower_http::set_header::SetResponseHeaderLayer::overriding(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    let revalidate = tower_http::set_header::SetResponseHeaderLayer::overriding(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-cache"),
+    );
+    let shell = ServeDir::new(&dist).not_found_service(ServeFile::new(format!("{dist}/index.html")));
     let app = Router::new()
         .route("/ws", get(ws_handler))
-        // Dev-friendly caching: the app shell must always revalidate so a
-        // rebuilt bundle never leaves a stale page pointing at dead hashes.
-        .layer(
-            tower_http::set_header::SetResponseHeaderLayer::if_not_present(
-                axum::http::header::CACHE_CONTROL,
-                axum::http::HeaderValue::from_static("no-cache"),
-            ),
+        .nest_service(
+            "/assets",
+            axum::routing::get_service(ServeDir::new(format!("{dist}/assets"))).layer(immutable),
         )
-        .fallback_service(static_files)
+        .fallback_service(axum::routing::get_service(shell).layer(revalidate))
         .with_state(room);
 
     let addr = std::env::var("EE_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
