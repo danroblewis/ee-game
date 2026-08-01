@@ -2311,25 +2311,28 @@ const dock = createDock(scopeDiv, scopeCv, audio);
 /** Blue highlight over an element: its pin-chain plus dots on every pin
  * (pins must overlap exactly to connect — make them visible). */
 function drawHighlight(e: ElementSpec, strong: boolean) {
-  ctx.strokeStyle = strong ? '#5a8cff' : '#4a7de0';
-  ctx.fillStyle = '#7db1ff';
-  ctx.lineWidth = Math.max(4, cam.scale * 0.16);
-  ctx.globalAlpha = strong ? 0.5 : 0.35;
+  // One soft rounded box over the WHOLE part — no pin-to-pin "skeleton"
+  // lines: the symbol already draws its own geometry, so the highlight only
+  // has to say "this one", not re-trace it.
   const P = e.pins.map(toPx);
-  ctx.beginPath();
-  for (let k = 0; k + 1 < P.length; k++) {
-    ctx.moveTo(...P[k]!);
-    ctx.lineTo(...P[k + 1]!);
-  }
-  if (P.length === 3) {
-    ctx.moveTo(...P[0]!);
-    ctx.lineTo(...P[2]!);
-  }
-  if (P.length === 1) {
-    ctx.moveTo(P[0]![0] - cam.scale * 0.3, P[0]![1]);
-    ctx.lineTo(P[0]![0] + cam.scale * 0.3, P[0]![1]);
-  }
+  const pad = Math.max(6, cam.scale * 0.5);
+  let x0 = Math.min(...P.map((p) => p[0])) - pad;
+  let y0 = Math.min(...P.map((p) => p[1])) - pad;
+  let x1 = Math.max(...P.map((p) => p[0])) + pad;
+  let y1 = Math.max(...P.map((p) => p[1])) + pad;
+  // One-pin parts draw their body away from the pin: stretch to cover it.
+  if (e.kind.t === 'Rail') y0 -= cam.scale * 0.85;
+  if (e.kind.t === 'Ground') y1 += cam.scale * 0.72;
+  ctx.fillStyle = strong ? '#5a8cff' : '#4a7de0';
+  ctx.globalAlpha = strong ? 0.22 : 0.14;
+  roundRectPath(ctx, x0, y0, x1 - x0, y1 - y0, Math.min(8, pad * 0.6));
+  ctx.fill();
+  ctx.globalAlpha = strong ? 0.55 : 0.35;
+  ctx.strokeStyle = strong ? '#5a8cff' : '#4a7de0';
+  ctx.lineWidth = 1.5;
   ctx.stroke();
+  // Pin dots stay: they are the wire targets, not skeleton.
+  ctx.fillStyle = '#7db1ff';
   ctx.globalAlpha = 0.9;
   for (const [x, y] of P) {
     ctx.beginPath();
