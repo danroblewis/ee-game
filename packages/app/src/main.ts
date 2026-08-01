@@ -1511,6 +1511,34 @@ let hintsOpen = (() => {
   }
 })();
 
+/** True while an arrow-key nudge gesture is open: every repeat while the key
+ * is held joins ONE undo entry (history coalesces the Moves per id), and the
+ * arrow keyup closes it. */
+let nudging = false;
+
+/** Move the whole selection by one grid step (arrow keys). Locked fixture
+ * children stay put, exactly as in a drag. */
+function nudgeSelection(dx: number, dy: number) {
+  const ids = [...selectedIds].filter((id) => !isFixtureId(id));
+  if (ids.length === 0) return;
+  if (!nudging) {
+    history.begin(undefined, ids.length > 1 ? `move ${ids.length} parts` : 'move part');
+    nudging = true;
+  }
+  for (const id of ids) {
+    const e = elemById(id);
+    if (!e) continue;
+    editDoc({ t: 'Move', id, pins: e.pins.map(([px, py]) => [px + dx, py + dy] as Point) });
+  }
+}
+
+function endNudge() {
+  if (nudging) {
+    nudging = false;
+    history.end();
+  }
+}
+
 /** Grab the machine: select it and snapshot what has to travel together. */
 function startMachineDrag(x: number, y: number) {
   const r = hoist.rect();
@@ -2084,6 +2112,19 @@ window.addEventListener('keydown', (ev) => {
     ev.preventDefault();
     return;
   }
+  if (ev.key.startsWith('Arrow') && selectedIds.size > 0 && !isTypingTarget(ev)) {
+    const [dx, dy] =
+      ev.key === 'ArrowLeft'
+        ? [-1, 0]
+        : ev.key === 'ArrowRight'
+          ? [1, 0]
+          : ev.key === 'ArrowUp'
+            ? [0, -1]
+            : [0, 1];
+    nudgeSelection(dx, dy);
+    ev.preventDefault();
+    return;
+  }
   if (ev.key === '?' || ev.key === '/') {
     // '/' used to open the parts cascade; the right-click menu is the one
     // route to it now, and both keys toggle the help instead.
@@ -2213,7 +2254,14 @@ window.addEventListener('keydown', (ev) => {
 });
 window.addEventListener('keyup', (ev) => {
   if (ev.key === ' ') spaceHeld = false;
+  // The nudge gesture ends when the arrow lifts: held-key repeats coalesce
+  // into one undo entry, separate presses become separate entries.
+  if (ev.key.startsWith('Arrow')) endNudge();
 });
+// A pointer gesture or a lost window closes any open nudge group — its keyup
+// may never arrive, and a stale group would swallow unrelated edits.
+window.addEventListener('pointerdown', endNudge, true);
+window.addEventListener('blur', endNudge);
 
 // ---------------------------------------------------------------- render
 const fmt = (v: number, unit: string) => {

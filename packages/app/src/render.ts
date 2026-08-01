@@ -360,11 +360,13 @@ export function drawElement(d: DrawCtx, e: ElementSpec) {
       break;
     }
     case 'Rail': {
-      // Ground's mirror image: a stem UP from the pin to a small ring — the
+      // Ground's mirror image: a stem UP from the pin to a ring — the
       // implicit return path is the ground symbol it points away from. DC
-      // shows a '+' in the ring; AC shows a tilde.
-      const r = s * 0.2;
-      const cy = A[1] - s * 0.45;
+      // shows a '+' in the ring; AC shows a tilde. The ring is deliberately
+      // big: it is the part's whole body, so it has to be an easy grab
+      // (hitTest treats the stem+ring as the clickable body).
+      const r = s * 0.28;
+      const cy = A[1] - s * 0.55;
       ctx.strokeStyle = voltageColor(v(0));
       ctx.beginPath();
       ctx.moveTo(A[0], A[1]);
@@ -375,7 +377,7 @@ export function drawElement(d: DrawCtx, e: ElementSpec) {
       ctx.arc(A[0], cy, r, 0, Math.PI * 2);
       ctx.stroke();
       ctx.fillStyle = '#c9c9d4';
-      ctx.font = `${Math.round(s * 0.32)}px ui-monospace`;
+      ctx.font = `${Math.round(s * 0.4)}px ui-monospace`;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       ctx.fillText(e.kind.amp === 0 ? '+' : '∿', A[0], cy + 0.5);
@@ -1172,7 +1174,16 @@ export function drawElementsLod(
  * whole pin bounding box). */
 export function hitTest(cam: Camera, e: ElementSpec, x: number, y: number): number {
   const P = e.pins.map((p) => px(cam, p));
-  if (P.length === 1) return Math.hypot(x - P[0]![0], y - P[0]![1]);
+  if (P.length === 1) {
+    const [ax, ay] = P[0]!;
+    // One-pin parts draw a body away from the pin (Rail up, Ground down):
+    // the whole stem-to-symbol span is the clickable body, or the part
+    // could only ever be grabbed by its connection point.
+    const ext = e.kind.t === 'Rail' ? -0.85 : e.kind.t === 'Ground' ? 0.72 : 0;
+    const ey = ay + cam.scale * ext;
+    const t = ext === 0 ? 0 : Math.max(0, Math.min(1, (y - ay) / (ey - ay)));
+    return Math.hypot(x - ax, y - (ay + t * (ey - ay)));
+  }
   let best = Infinity;
   const segs: [Px, Px][] = [];
   for (let k = 0; k + 1 < P.length; k++) segs.push([P[k]!, P[k + 1]!]);
