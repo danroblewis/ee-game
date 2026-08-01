@@ -22,8 +22,8 @@
 //   right-click           cascading context menu — on a part:
 //                         edit/rotate/delete/probe/listen/copy; on empty
 //                         canvas: Add part ▸ category ▸ part, paste, scope,
-//                         panel, select all.  '/' opens the parts cascade
-//                         at the cursor.  There is no side palette.
+//                         panel, select all.  There is no side palette.
+//   ? or /                toggle the help block in the HUD
 //   drag from a pin       draw wire (pins must overlap to connect)
 //   ⌘/Ctrl+C, ⌘/Ctrl+V    copy selection / paste bound to cursor
 //   ⌘/Ctrl+Z, +Shift, ^Y  undo / redo — this player's own edits only
@@ -1261,6 +1261,10 @@ function openCtxPanel(depth: number, items: MenuItem[], ax: number, ay: number, 
       row.className = 'mi sub';
       row.textContent = it.label;
       const openChild = () => {
+        // A sibling (leaf or sub) may still carry the sticky highlight from
+        // its own submenu: this row owns the cascade now, so clear them all
+        // first or both rows stay lit.
+        for (const el of panel.querySelectorAll('.open')) el.classList.remove('open');
         const r = row.getBoundingClientRect();
         openCtxPanel(depth + 1, it.sub(), r.right - 3, r.top - 4, r.left);
         row.classList.add('open');
@@ -1492,14 +1496,14 @@ let panelResize: {
 } | null = null;
 let spaceHeld = false;
 let lastCursorSent = 0;
-/** The control-hint block. Collapsed by default after the first session: it is
- * wide enough to sit in front of world objects (the hoist, panels, cards), and
- * a returning player does not need the wall of text. '?' toggles it. */
+/** The control-hint block. Collapsed by default: it is wide enough to sit in
+ * front of world objects (the hoist, panels, cards). '?' or '/' toggles it,
+ * and the choice is remembered. */
 let hintsOpen = (() => {
   try {
-    return localStorage.getItem('ee.hints') !== '0';
+    return localStorage.getItem('ee.hints') === '1';
   } catch {
-    return true;
+    return false;
   }
 })();
 
@@ -2076,20 +2080,15 @@ window.addEventListener('keydown', (ev) => {
     ev.preventDefault();
     return;
   }
-  if (ev.key === '?') {
+  if (ev.key === '?' || ev.key === '/') {
+    // '/' used to open the parts cascade; the right-click menu is the one
+    // route to it now, and both keys toggle the help instead.
     hintsOpen = !hintsOpen;
     try {
       localStorage.setItem('ee.hints', hintsOpen ? '1' : '0');
     } catch {
       /* private mode: the toggle still works for this session */
     }
-    ev.preventDefault();
-    return;
-  }
-  if (ev.key === '/') {
-    // Keyboard route to the same cascade: parts menu at the cursor.
-    const at = mouse ?? { x: window.innerWidth / 2, y: window.innerHeight / 2 };
-    openCtxMenu(at.x, at.y, partsMenu());
     ev.preventDefault();
     return;
   }
@@ -2759,8 +2758,8 @@ function frame(now: number) {
       : '';
   const hints = hintsOpen
     ? `\nparts: R C L W G V D N P M A U 5 S B T Z E F I · drag part = move · drag the hoist cabinet = move the machine · dbl-click = edit values · right-click = menu` +
-      `\ndrag pin = wire · drag empty = select · Q rotate · ⌘Z undo · ⌘C/⌘V copy/paste · 1/2 probe · 3 listen · 0 ref · O scope · \` dock · J panel · K repair · X delete · / parts menu` +
-      `\nH home district · shift+H fit everything · wheel = zoom (0.4–200 px/unit) · pan: middle / ctrl+drag / space+drag`
+      `\ndrag pin = wire · drag empty = select · Q rotate · ⌘Z undo · ⌘C/⌘V copy/paste · 1/2 probe · 3 listen · 0 ref · O scope · \` dock · J panel · K repair · X delete` +
+      `\nH home district · shift+H fit everything · wheel = zoom (0.4–200 px/unit) · pan: middle / ctrl+drag / space+drag · ? hides this`
     : `\n? controls`;
   hud.textContent =
     `EE Game   sim t = ${simTime.toFixed(2)} s   ` +
