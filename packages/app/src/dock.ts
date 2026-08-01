@@ -65,9 +65,12 @@ export interface Dock {
   isOpen(): boolean;
   setOpen(v: boolean): void;
   toggle(): void;
-  /** Per-frame: hides the dock when there is nothing to show (no probes and
-   * no audio), draws waveforms only if open. */
+  /** Per-frame: the strip is ALWAYS visible (it carries room telemetry, not
+   * just waveforms); draws waveforms only if open and something is probed. */
   update(now: number, probes: Probe[], traces: TraceStore, set: ScopeSettings): void;
+  /** The server's sim-vs-wall dilation ratio from the frame stream, so the
+   * "sim 0.5x" warning does not need a speaker in the room to exist. */
+  onRt(ratio: number | null): void;
 }
 
 export function createDock(root: HTMLElement, cv: HTMLCanvasElement, audio: AudioControls): Dock {
@@ -174,23 +177,31 @@ export function createDock(root: HTMLElement, cv: HTMLCanvasElement, audio: Audi
     return { text: parts.join(' · '), cls, title };
   }
 
+  /** Latest dilation ratio from the frame stream (null before the first
+   * frame / offline). The audio path's own ratio wins when audio is live —
+   * it is measured against the samples actually being played. */
+  let frameRt: number | null = null;
+
   let audioKey = '';
   /** Mirror the player's state into the bar. `force` skips the change check
    * (used right after a click, whose effect is instant). */
   function syncAudio(force = false) {
     const st = audio.status();
     const live = st.speakers > 0 || st.listening;
-    const bufv = bufferText(st.buf, st.ratio, simIsSlow(st.ratio, performance.now()));
+    const ratio = st.ratio ?? frameRt;
+    const bufv = bufferText(st.buf, ratio, simIsSlow(ratio, performance.now()));
     const key =
       `${live}|${st.speakers}|${st.listening}|${audio.muted}|${st.sounding}|` +
       `${st.needsGesture}|${bufv.text}|${bufv.cls}`;
     if (!force && key === audioKey) return live;
     audioKey = key;
     audioEl.style.display = live ? 'flex' : 'none';
-    if (!live) return live;
+    // The buffer/dilation chip lives OUTSIDE the audio strip: "sim 0.5x" is
+    // room telemetry and must not need a speaker in the room to show up.
     bufEl.textContent = bufv.text;
     bufEl.className = bufv.cls;
     bufEl.title = bufv.title;
+    if (!live) return live;
     muteBtn.textContent = audio.muted ? 'sound off' : st.sounding ? 'sound ◂))' : 'sound ◂';
     muteBtn.title = audio.muted ? 'unmute (all sound is off)' : 'mute all sound';
     muteBtn.classList.toggle('off', audio.muted);
@@ -255,9 +266,10 @@ export function createDock(root: HTMLElement, cv: HTMLCanvasElement, audio: Audi
   /** Probe count plus each channel's latest value in its probe colour. */
   function updateSummary(probes: Probe[], traces: TraceStore) {
     if (probes.length === 0) {
-      if (sumKey !== '') {
-        sumKey = '';
-        sumEl.textContent = '';
+      // Not blank: say how to get a trace, or the empty strip reads as junk.
+      if (sumKey !== 'noprobes') {
+        sumKey = 'noprobes';
+        sumEl.textContent = 'no probes — press 1 (V) or 2 (I) on a part';
       }
       return;
     }
@@ -284,15 +296,13 @@ export function createDock(root: HTMLElement, cv: HTMLCanvasElement, audio: Audi
   function update(now: number, probes: Probe[], traces: TraceStore, set: ScopeSettings) {
     // Audio state is cheap to read but not free to reflect into the DOM, so
     // it rides the same ~10 Hz budget as the channel summary.
-    const audioLive = now - lastSumT >= SUMMARY_MS ? syncAudio() : audioEl.style.display !== 'none';
+    if (now - lastSumT >= SUMMARY_MS) syncAudio();
     if (hasProbes !== probes.length > 0) {
       hasProbes = probes.length > 0;
       apply();
     }
-    if (probes.length === 0 && !audioLive) {
-      root.style.display = 'none';
-      return;
-    }
+    // The strip never hides: it is the room's status line (sim speed, audio
+    // buffer, probe readouts) and the way the scope dock stays discoverable.
     root.style.display = 'block';
     if (open && hasProbes) renderScope(cv, traces, probes, set.timebase, set);
     if (now - lastSumT >= SUMMARY_MS) {
@@ -303,5 +313,13 @@ export function createDock(root: HTMLElement, cv: HTMLCanvasElement, audio: Audi
 
   apply();
   syncAudio(true);
-  return { isOpen: () => open, setOpen, toggle: () => setOpen(!open), update };
+  return {
+    isOpen: () => open,
+    setOpen,
+    toggle: () => setOpen(!open),
+    update,
+    onRt: (ratio) => {
+      frameRt = ratio;
+    },
+  };
 }

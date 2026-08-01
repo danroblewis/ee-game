@@ -376,6 +376,7 @@ const net = connect({
   },
   onFrame(f) {
     simTime = f.time;
+    dock.onRt(typeof f.rt === 'number' ? f.rt : null);
     const m = new Map<number, ElemLive>();
     for (const r of f.e) {
       const v: number[] = [];
@@ -464,6 +465,8 @@ const net = connect({
     if (online) {
       online = false;
       localSim.setElements(elements);
+      // Offline: no server, no dilation to report — drop the stale ratio.
+      dock.onRt(null);
       // The local sim has no damage model, so keeping the last snapshot
       // would leave parts drawn as broken that are now conducting.
       damage = new Map();

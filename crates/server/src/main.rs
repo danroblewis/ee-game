@@ -1353,7 +1353,14 @@ async fn sim_task(
                 .collect();
             let _ = room
                 .events
-                .send(json!({"t": "frame", "time": eng.time(), "e": e}).to_string());
+                .send(
+                    // `rt` rides every frame so the client's status strip can
+                    // report dilation without a speaker in the room (the
+                    // audio stream carries its own copy for rate matching).
+                    json!({"t": "frame", "time": eng.time(), "e": e,
+                           "rt": (rt * 1000.0).round() / 1000.0})
+                    .to_string(),
+                );
 
             // The hoist, once per tick alongside the frame.
             let _ = room

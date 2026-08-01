@@ -10,6 +10,9 @@ export interface ServerFrame {
   time: number;
   /** [id, npins, v0..v5, i0..i5, power] per element. */
   e: number[][];
+  /** Sim seconds per wall second, smoothed server-side (absent on servers
+   * from before it rode the frame). */
+  rt?: number;
 }
 
 export interface NetHandlers {
