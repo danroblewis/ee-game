@@ -24,7 +24,9 @@
 //                         canvas: Add part ▸ category ▸ part, paste, scope,
 //                         panel, select all.  There is no side palette.
 //   ? or /                toggle the help block in the HUD
-//   drag from a pin       draw wire (pins must overlap to connect)
+//   drag from a pin       reshape that part: stretch/shrink/reorient it by
+//                         carrying the pin (wires come from W + drag; pins
+//                         must overlap to connect)
 //   ⌘/Ctrl+C, ⌘/Ctrl+V    copy selection / paste bound to cursor
 //   ⌘/Ctrl+Z, +Shift, ^Y  undo / redo — this player's own edits only
 //   Q                     rotate placement ghost, paste ghost, or selection
@@ -1110,6 +1112,29 @@ function elementAt(x: number, y: number): ElementSpec | undefined {
 }
 
 /** Grid point of the nearest element pin, if the cursor is on one. */
+/** The element that OWNS the pin under the cursor (and which pin), for
+ * reshape-dragging. At a junction several parts share the point: a selected
+ * part wins, so the pin you see highlighted is the pin you grab. Fixture
+ * children are bolted down and never reshape. */
+function pinOwnerAt(x: number, y: number): { e: ElementSpec; k: number } | null {
+  const r = Math.min(HIT_PX, cam.scale * 0.4);
+  let best: { e: ElementSpec; k: number } | null = null;
+  let bestScore = r;
+  for (const e of nearCursor(x, y, r, 0)) {
+    if (isFixtureId(e.id)) continue;
+    for (let k = 0; k < e.pins.length; k++) {
+      const [px, py] = toPx(e.pins[k]!);
+      const d = Math.hypot(px - x, py - y);
+      const score = selectedIds.has(e.id) ? d - HIT_PX : d; // selected wins ties
+      if (d < r && score < bestScore) {
+        bestScore = score;
+        best = { e, k };
+      }
+    }
+  }
+  return best;
+}
+
 function pinAt(x: number, y: number): Point | null {
   const r = Math.min(HIT_PX, cam.scale * 0.4);
   let best: Point | null = null;
@@ -1445,7 +1470,8 @@ function canvasMenu(x: number, y: number): MenuItem[] {
 
 // ------------------------------------------------------------------ drags
 let panDrag: { x: number; y: number; ox: number; oy: number } | null = null;
-let wireDrag: { a: Point; b: Point } | null = null;
+/** Dragging one pin of one part: `k` is the pin index being carried. */
+let pinDrag: { id: number; k: number; moved: boolean; lastSent: number } | null = null;
 let placeDrag: { a: Point; b: Point } | null = null;
 let marquee: { x0: number; y0: number; x1: number; y1: number; add: boolean } | null = null;
 let moveDrag: {
@@ -1740,18 +1766,24 @@ canvas.addEventListener('pointerdown', (ev) => {
     selectedMachine = false;
     return;
   }
-  // Pins take priority: dragging from any terminal draws a wire.
+  // Pins take priority: dragging a terminal reshapes ITS part — stretch,
+  // shrink, reorient. Wires are placed with W (or the right-click menu),
+  // never by pin-dragging.
   if (!ev.shiftKey) {
-    const pin = pinAt(ev.clientX, ev.clientY);
-    if (pin) {
-      wireDrag = { a: pin, b: pin };
+    const own = pinOwnerAt(ev.clientX, ev.clientY);
+    if (own) {
+      history.begin([own.e], 'reshape part'); // pins mutate in place mid-drag
+      pinDrag = { id: own.e.id, k: own.k, moved: false, lastSent: 0 };
+      selectedIds = new Set([own.e.id]);
+      selectedProbe = null;
+      selectedMachine = false;
       return;
     }
   }
   const e = elementAt(ev.clientX, ev.clientY);
   // The machine assembly comes LAST, after pins and after parts: a pointer on
-  // a fixture terminal still starts a wire, and a pointer on a child part
-  // still selects and drags that part. Only the cabinet's own chrome — the
+  // a fixture terminal or child part still selects that part (fixture pins
+  // are bolted down, so they never reshape-drag). Only the cabinet's own chrome — the
   // grab bar, the frame, empty faceplate away from the children — picks up the
   // whole machine. Shift+drag stays a marquee, so a selection can still be
   // swept across the cabinet.
@@ -1881,8 +1913,26 @@ canvas.addEventListener('pointermove', (ev) => {
     placeDrag.b = snap(ev.clientX, ev.clientY);
     return;
   }
-  if (wireDrag) {
-    wireDrag.b = snap(ev.clientX, ev.clientY);
+  if (pinDrag) {
+    const here = snap(ev.clientX, ev.clientY);
+    const e = elemById(pinDrag.id);
+    if (e) {
+      const cur = e.pins[pinDrag.k]!;
+      const collides = e.pins.some(
+        (p, i) => i !== pinDrag!.k && p[0] === here[0] && p[1] === here[1],
+      );
+      // A part must not collapse onto itself: two of its own terminals on
+      // one grid point would merge its nodes.
+      if (!collides && (cur[0] !== here[0] || cur[1] !== here[1])) {
+        e.pins[pinDrag.k] = here;
+        space.update(e);
+        pinDrag.moved = true;
+      }
+      if (pinDrag.moved && online && now - pinDrag.lastSent > 60) {
+        pinDrag.lastSent = now;
+        net.sendEdit({ t: 'Move', id: e.id, pins: e.pins });
+      }
+    }
     return;
   }
   if (machineDrag) {
@@ -1959,7 +2009,7 @@ canvas.addEventListener('pointermove', (ev) => {
               ? 'pointer'
               : 'move'
           : onPin
-            ? 'crosshair' // drag from a terminal draws a wire
+            ? 'move' // drag from a terminal carries that pin (reshape)
             : over?.kind.t === 'Switch' || over?.kind.t === 'Button'
               ? 'pointer'
               : over
@@ -2042,11 +2092,13 @@ canvas.addEventListener('pointerup', (ev) => {
     placeDrag = null;
     return; // tool stays armed (Falstad-style); Esc exits
   }
-  if (wireDrag) {
-    if (wireDrag.a[0] !== wireDrag.b[0] || wireDrag.a[1] !== wireDrag.b[1]) {
-      editDoc({ t: 'Add', spec: { id: newId(), kind: { t: 'Wire' }, pins: [wireDrag.a, wireDrag.b] } });
-    }
-    wireDrag = null;
+  if (pinDrag) {
+    const e = elemById(pinDrag.id);
+    // The final pin position rides one Move; the drag's throttled sends were
+    // best-effort previews. No motion = the click just selected the part.
+    if (pinDrag.moved && e) editDoc({ t: 'Move', id: e.id, pins: e.pins });
+    history.end(); // one undo entry per reshape gesture
+    pinDrag = null;
     return;
   }
   if (moveDrag) {
@@ -2078,6 +2130,13 @@ canvas.addEventListener('pointercancel', () => {
   // A lost pointer must not leave the machine half-moved and un-undoable:
   // commit where it actually got to, as one entry.
   endMachineDrag();
+  // Same rule for a half-carried pin: commit where it landed, one entry.
+  if (pinDrag) {
+    const e = elemById(pinDrag.id);
+    if (pinDrag.moved && e) editDoc({ t: 'Move', id: e.id, pins: e.pins });
+    history.end();
+    pinDrag = null;
+  }
 });
 
 window.addEventListener('keydown', (ev) => {
@@ -2707,9 +2766,6 @@ function frame(now: number) {
 
   // Ghost previews for in-progress edits.
   ctx.globalAlpha = 0.45;
-  if (wireDrag) {
-    drawElement({ ctx, cam, dots, dtSec: 0 }, { id: 0, kind: { t: 'Wire' }, pins: [wireDrag.a, wireDrag.b] });
-  }
   if (placeDrag && placing) {
     const kind = placing.make();
     const clicked = placeDrag.b[0] === placeDrag.a[0] && placeDrag.b[1] === placeDrag.a[1];
@@ -2731,16 +2787,21 @@ function frame(now: number) {
   }
   ctx.globalAlpha = 1;
 
-  // Wire-endpoint connect indicator: green when the endpoint lands on an
-  // existing pin (overlapping pins = connected), gray otherwise.
-  if (wireDrag) {
-    const [bx, by] = toPx(wireDrag.b);
-    const connects = pinExistsAt(wireDrag.b);
-    ctx.strokeStyle = connects ? '#4bff6a' : '#8a8a98';
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.arc(bx, by, Math.max(5, cam.scale * 0.18), 0, Math.PI * 2);
-    ctx.stroke();
+  // Pin connect indicator on a reshape drag: green when the carried pin
+  // lands on another part's pin (overlapping pins = connected), gray when
+  // it floats free.
+  if (pinDrag && pinDrag.moved) {
+    const e = elemById(pinDrag.id);
+    const p = e?.pins[pinDrag.k];
+    if (p) {
+      const [bx, by] = toPx(p);
+      const connects = pinExistsAt(p, pinDrag.id);
+      ctx.strokeStyle = connects ? '#4bff6a' : '#8a8a98';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(bx, by, Math.max(5, cam.scale * 0.18), 0, Math.PI * 2);
+      ctx.stroke();
+    }
   }
 
   if (marquee) {
@@ -2813,7 +2874,7 @@ function frame(now: number) {
       : '';
   const hints = hintsOpen
     ? `\nparts: R C L W G V D N P M A U 5 S B T Z E F I · ⇧V rail · drag part = move · drag the hoist cabinet = move the machine · dbl-click = edit values · right-click = menu` +
-      `\ndrag pin = wire · drag empty = select · Q rotate · ⌘Z undo · ⌘C/⌘V copy/paste · 1/2 probe · 3 listen · 0 ref · O scope · \` dock · J panel · K repair · X delete` +
+      `\ndrag pin = reshape part · W then drag = wire · drag empty = select · Q rotate · ⌘Z undo · ⌘C/⌘V copy/paste · 1/2 probe · 3 listen · 0 ref · O scope · \` dock · J panel · K repair · X delete` +
       `\nH home district · shift+H fit everything · wheel = zoom (0.4–200 px/unit) · pan: middle / ctrl+drag / space+drag · ? hides this`
     : `\n? controls`;
   hud.textContent =
