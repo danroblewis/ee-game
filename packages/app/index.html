@@ -162,9 +162,10 @@
       .rail-grip { position: absolute; top: 24px; bottom: 0; width: 6px; cursor: ew-resize; }
       #rail-left .rail-grip { right: -3px; }
       #rail-right .rail-grip { left: -3px; }
-      /* Armed = a window is in the air and this side would take it. */
-      .rail.armed { border-color: #4ad4ff; box-shadow: inset 0 0 0 1px #4ad4ff33; }
-      .rail.armed .rail-bar { color: #8ee7ff; }
+      /* Armed = a window is in the air and this side would take it. Flash =
+         it just landed in this (shut) rail — same look, opposite tense. */
+      .rail.armed, .rail.flash { border-color: #4ad4ff; box-shadow: inset 0 0 0 1px #4ad4ff33; }
+      .rail.armed .rail-bar, .rail.flash .rail-bar { color: #8ee7ff; }
       .rail-caretline {
         flex: none; height: 2px; background: #8ee7ff; border-radius: 1px;
         margin: 3px 1px; box-shadow: 0 0 6px #8ee7ff99; display: none;
