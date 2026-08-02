@@ -191,6 +191,149 @@ fn opamp_comparator_rails() {
     );
 }
 
+/// The honest output stage, in the three places it has to be honest.
+///
+/// A real op-amp's output folds back to `isc` and stays there — it is
+/// short-circuit PROOF, not short-circuit fragile — so the failure a player
+/// meets is "it stops delivering", not "it exploded". These are the closed
+/// forms for that, and the reason an op-amp cannot drive a motor.
+#[test]
+fn opamp_output_current_folds_back_at_isc() {
+    use sim_core::{ElementKind as K, DEFAULT_OPAMP_ISC as ISC};
+
+    // Comparator railed high into a load, swept from light to dead short.
+    // pins: [in+, in-, out]; in+ at +1 V, in- grounded, so it wants +rail.
+    let build = |ohms: f64| {
+        vec![
+            spec3(
+                1,
+                K::OpAmp {
+                    rail: 5.0,
+                    isc: ISC,
+                },
+                (0, 0),
+                (0, 4),
+                (8, 2),
+            ),
+            spec(2, dc(1.0), (0, 0), (0, 8)),
+            spec(3, K::Wire, (0, 4), (0, 8)),
+            gnd(4, (0, 8)),
+            spec(5, r(ohms), (8, 2), (8, 8)),
+            gnd(6, (8, 8)),
+        ]
+    };
+    // 1 kΩ wants 5 mA: comfortably inside the limit, so the output sits on
+    // the rail exactly as it always did. (This is also why not one golden
+    // hash moved when the limit was added.)
+    let eng = settled(build(1000.0));
+    let vout = eng.voltage_at((8, 2)).unwrap();
+    assert!((vout - 5.0).abs() < 1e-6, "light load must still rail: {vout}");
+    assert!((eng.pin_current(1, 2).unwrap() + 0.005).abs() < 1e-6);
+
+    // 100 Ω would want 50 mA. It gets 25, and the output SAGS to 2.5 V —
+    // the truthful answer, and one the player can see on a probe.
+    let eng = settled(build(100.0));
+    let vout = eng.voltage_at((8, 2)).unwrap();
+    let iout = -eng.pin_current(1, 2).unwrap();
+    assert!((iout - ISC).abs() < 1e-9, "must fold back to isc: {iout} A");
+    assert!((vout - ISC * 100.0).abs() < 1e-4, "output sags to {vout} V");
+
+    // A dead short: still 25 mA, forever. 0.125 W in a 0.35 W package.
+    let eng = settled(build(1e-3));
+    let iout = -eng.pin_current(1, 2).unwrap();
+    assert!((iout - ISC).abs() < 1e-9, "shorted output: {iout} A");
+    let p = eng
+        .frame()
+        .into_iter()
+        .find(|f| f.id == 1)
+        .unwrap()
+        .power;
+    assert!(
+        (p - ISC * 5.0).abs() < 1e-4,
+        "a shorted op-amp burns i·rail in its output stage, not zero: {p} W"
+    );
+
+    // Negative feedback is limited too, and it is limited SYMMETRICALLY: a
+    // follower asked to sink 50 mA folds back at -25 mA.
+    let sink = vec![
+        spec3(
+            1,
+            K::OpAmp {
+                rail: 5.0,
+                isc: ISC,
+            },
+            (0, 0),
+            (0, 4),
+            (8, 2),
+        ),
+        spec(2, dc(-1.0), (0, 0), (0, 8)),
+        spec(3, K::Wire, (0, 4), (0, 8)),
+        gnd(4, (0, 8)),
+        spec(5, r(100.0), (8, 2), (8, 8)),
+        gnd(6, (8, 8)),
+    ];
+    let eng = settled(sink);
+    let iout = -eng.pin_current(1, 2).unwrap();
+    assert!((iout + ISC).abs() < 1e-9, "sinking limit: {iout} A");
+}
+
+/// A power MOSFET switching an inductive load with no freewheel path used
+/// to have NO solution at all: the winding's stored current had nowhere to
+/// go at turn-off, NR diverged, and the whole room quarantined with nothing
+/// on screen to explain it. Every real power MOSFET is avalanche-rated, and
+/// modelling that is what turns the freeze into a lesson.
+#[test]
+fn a_mosfet_avalanches_instead_of_stranding_an_inductor() {
+    use sim_core::ElementKind as K;
+    // 12 V -> 10 mH -> drain; gate driven from a switch, source grounded.
+    let build = |gate_on: bool| {
+        vec![
+            spec(1, dc(12.0), (0, 0), (0, 12)),
+            spec(2, K::Inductor { henries: 10e-3 }, (0, 0), (6, 0)),
+            spec3(3, K::Nmos { vt: 2.0, k: 5.0 }, (6, 6), (6, 0), (6, 10)),
+            spec(4, K::Wire, (6, 10), (0, 12)),
+            gnd(5, (0, 12)),
+            spec(6, dc(if gate_on { 10.0 } else { 0.0 }), (6, 6), (0, 12)),
+        ]
+    };
+    let mut eng = Engine::new(1e-6);
+    eng.set_elements(&build(true));
+    eng.advance(20_000); // 20 ms: the choke charges up
+    let i_on = eng.pin_current(2, 0).unwrap();
+    assert!(i_on > 0.5, "the inductor must have real current in it: {i_on} A");
+
+    // Now open the gate. Without the clamp this is where the solver died.
+    eng.set_elements(&build(false));
+    let report = eng.advance(2000);
+    assert!(!eng.is_quarantined(), "turn-off must stay solvable");
+    assert_eq!(report.steps, 2000);
+    // The FET holds the drain at its avalanche voltage while the winding
+    // dumps into it — tens of volts and amps, i.e. hundreds of watts, which
+    // is exactly the bill the player is meant to see.
+    let frames = eng.frame();
+    let fet = frames.iter().find(|f| f.id == 3).unwrap();
+    let vds = fet.v[1] - fet.v[2];
+    assert!(
+        (55.0..75.0).contains(&vds),
+        "the drain should sit at the avalanche knee, not run away: {vds} V"
+    );
+    assert!(
+        fet.power > 20.0,
+        "and it should be dissipating the winding's energy: {} W",
+        fet.power
+    );
+    // Left alone it decays: the energy is finite, so the clamp releases.
+    eng.advance(200_000);
+    assert!(!eng.is_quarantined());
+    let after = eng.frame();
+    let fet = after.iter().find(|f| f.id == 3).unwrap();
+    assert!(
+        fet.power.abs() < 1e-3,
+        "avalanche must end when the current does: {} W",
+        fet.power
+    );
+}
+
 #[test]
 fn opamp_relaxation_oscillates() {
     // Self-starts via the op-amp input offset (τ = RC = 1 ms to walk out
@@ -282,6 +425,8 @@ fn ota_output_current_saturates_at_iabc() {
             id: 1,
             kind: sim_core::ElementKind::Ota,
             pins: vec![(0, 0), (0, 2), (4, 1), (2, 4)],
+            tier: 0,
+            rot: 0,
         },
         spec(2, dc(3.0), (0, 0), (0, 6)), // in+ at +3 V (way past 2Vt)
         gnd(3, (0, 6)),
@@ -367,6 +512,8 @@ fn unpowered_timer555_is_harmless() {
         id: 1,
         kind: sim_core::ElementKind::Timer555,
         pins: vec![(0, 0), (0, 4), (0, 1), (0, 3), (4, 3), (4, 1)],
+        tier: 0,
+        rot: 0,
     }];
     let mut eng = engine_with(elems);
     eng.advance(500);
@@ -389,6 +536,8 @@ fn timer555_button_holds_output_high() {
         id: 20,
         kind: sim_core::ElementKind::Button { closed: false },
         pins: vec![(2, 4), (2, 8)],
+        tier: 0,
+        rot: 0,
     });
     elems.push(gnd(21, (2, 8)));
     let mut eng = engine_with(elems);

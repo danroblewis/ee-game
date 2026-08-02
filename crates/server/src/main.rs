@@ -164,7 +164,14 @@ fn demo_room_circuit() -> Vec<ElementSpec> {
         spec(14, r(1000.0), (28, 5), (31, 5)),
         // pins: [base, collector, emitter]
         spec3(15, K::Npn { beta: 100.0 }, (31, 5), (33, 2), (33, 6)),
-        spec(16, lamp(60.0, 1.2), (33, 6), (33, 8)),
+        // 220 Ω, not 60: an EMITTER FOLLOWER burns (Vcc - Ve)·Ie in the
+        // transistor, so the load current is the transistor's dissipation
+        // budget. A 60 Ω lamp put 0.26 W through a TO-92 with the knob at
+        // half — genuinely hot, correctly reported as smoking, and a poor
+        // thing for a demo room to be doing to itself on the first frame.
+        // At 220 Ω the worst case (knob centred) is 0.09 W and the lamp
+        // still reaches 78 % of its nameplate wide open.
+        spec(16, lamp(220.0, 0.4), (33, 6), (33, 8)),
         spec(17, K::Wire, (33, 8), (26, 8)),
         spec(18, K::Wire, (26, 8), (24, 8)),
         gnd(19, (24, 8)),
@@ -207,7 +214,7 @@ fn demo_room_circuit() -> Vec<ElementSpec> {
         spec(50, sine(2.0, 0.4), (22, 13), (22, 18)),
         spec(51, K::Wire, (22, 13), (26, 13)),
         // pins: [in+, in-, out]
-        spec3(52, K::OpAmp { rail: 5.0 }, (26, 13), (26, 15), (30, 14)),
+        spec3(52, K::OpAmp { rail: 5.0, isc: sim_core::DEFAULT_OPAMP_ISC }, (26, 13), (26, 15), (30, 14)),
         spec(53, K::Wire, (26, 15), (24, 15)),
         spec(54, K::Wire, (24, 15), (24, 18)),
         spec(55, r(220.0), (30, 14), (33, 14)),
@@ -222,7 +229,7 @@ fn demo_room_circuit() -> Vec<ElementSpec> {
         // Schmitt hysteresis from R1/R2 positive feedback (thresholds
         // ±rail/2), RC integrator on in-. f ≈ 1/(2·RC·ln3) ≈ 1 Hz; the
         // op-amp input offset self-starts it. LED blinks each + half.
-        spec3(70, K::OpAmp { rail: 5.0 }, (6, 26), (6, 24), (10, 25)),
+        spec3(70, K::OpAmp { rail: 5.0, isc: sim_core::DEFAULT_OPAMP_ISC }, (6, 26), (6, 24), (10, 25)),
         spec(71, K::Wire, (10, 25), (12, 25)),
         spec(72, r(100_000.0), (12, 25), (12, 21)), // Rf: out -> in-
         spec(73, K::Wire, (12, 21), (4, 21)),
@@ -279,6 +286,8 @@ fn demo_room_circuit() -> Vec<ElementSpec> {
             id: 120,
             kind: K::Ota,
             pins: vec![(4, 36), (4, 38), (8, 37), (6, 40)],
+            tier: 0,
+            rot: 0,
         },
         spec(121, K::Wire, (4, 36), (2, 36)),
         gnd(122, (2, 36)),
@@ -286,7 +295,7 @@ fn demo_room_circuit() -> Vec<ElementSpec> {
         gnd(124, (8, 41)),
         spec(125, r(1_000_000.0), (8, 37), (13, 37)), // triangle -> Schmitt in+
         // Schmitt trigger pins: [in+, in-, out]
-        spec3(130, K::OpAmp { rail: 5.0 }, (13, 37), (13, 39), (17, 38)),
+        spec3(130, K::OpAmp { rail: 5.0, isc: sim_core::DEFAULT_OPAMP_ISC }, (13, 37), (13, 39), (17, 38)),
         spec(131, r(2_000_000.0), (19, 34), (19, 38)), // feedback
         spec(132, K::Wire, (17, 38), (19, 38)),
         spec(133, K::Wire, (19, 34), (13, 34)),
@@ -336,6 +345,8 @@ fn demo_room_circuit() -> Vec<ElementSpec> {
             id: 165,
             kind: K::Timer555,
             pins: vec![(40, 36), (40, 44), (40, 38), (40, 42), (46, 42), (46, 38)],
+            tier: 0,
+            rot: 0,
         },
         spec(166, r(100_000.0), (52, 34), (52, 38)), // RA: rail -> DIS
         spec(167, K::Wire, (52, 38), (46, 38)),
@@ -362,7 +373,13 @@ fn demo_room_circuit() -> Vec<ElementSpec> {
         // 8 Ω speaker: close the switch and you HEAR it, because the server
         // streams the coil's own terminal voltage at 12.5 kHz. The switch
         // starts open so joining a room is quiet.
-        spec(200, sine(5.0, 440.0), (2, 52), (2, 60)),
+        //
+        // 2.5 V peak, not 5: the starting kit's series resistor is a ¼ W
+        // film part and its speaker is a ¼ W cone, so 5 V into 16 Ω would
+        // be 0.39 W mean in each of them — a demo room that cooks itself.
+        // Amplitude here is loudness and nothing else; the vignette is just
+        // as audible one notch down, and the parts run at 39 % of rated.
+        spec(200, sine(2.5, 440.0), (2, 52), (2, 60)),
         spec(201, K::Wire, (2, 52), (5, 52)),
         spec(202, K::Switch { closed: false }, (5, 52), (8, 52)),
         spec(203, r(8.0), (8, 52), (11, 52)),
@@ -613,7 +630,9 @@ fn motor_i_max() -> f64 {
         henries: machine::L_ARM,
         bemf: 0.0,
     };
-    damage::rating(&motor).map(|r| r.limit).unwrap_or(0.0)
+    // The fixture is placed at tier 0 (`hoist_fixture_at`), so the
+    // nameplate the player is shown is the rating the sweep enforces.
+    damage::rating(&motor, 0).map(|r| r.limit).unwrap_or(0.0)
 }
 
 /// Stand the fixture up inside `rect`: inject anything missing — a checkpoint
@@ -1678,7 +1697,11 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
                     // message — so a client that never sent the op is consistent
                     // within one tick.
                     for (id, pins) in children {
-                        let op = DocOp::Move { id, pins };
+                        let op = DocOp::Move {
+                            id,
+                            pins,
+                            rot: None,
+                        };
                         let _ = room.events.send(json!({"t": "doc", "op": op}).to_string());
                     }
                 }
@@ -2074,12 +2097,22 @@ fn apply_doc_op_to(elems: &mut Vec<ElementSpec>, op: &DocOp) -> bool {
             elems.retain(|e| e.id != *id);
             elems.len() != before
         }
-        DocOp::Move { id, pins } => {
+        DocOp::Move { id, pins, rot } => {
             let Some(e) = elems.iter_mut().find(|e| e.id == *id) else {
                 return false;
             };
             if pins.len() != e.kind.pin_count() {
                 return false;
+            }
+            // A rotation out of 0..3 is a client bug, and a Move is the one
+            // op that carries geometry for parts a player is dragging: drop
+            // the whole op rather than half-applying it, exactly as a wrong
+            // pin count does.
+            if let Some(r) = rot {
+                if *r > 3 {
+                    return false;
+                }
+                e.rot = *r;
             }
             e.pins = pins.clone();
             true
@@ -2621,6 +2654,21 @@ mod tests {
             i
         }
 
+        /// Like `step`, but samples one element's drain-source voltage on
+        /// EVERY solver substep. The machine tick is 640 us and an
+        /// inductive turn-off spike is tens of microseconds long, so a
+        /// once-per-tick sample aliases it away completely — which is a
+        /// trap for any test that tries to measure switching transients.
+        fn step_watching(&mut self, id: u32, peak: &mut f64) {
+            for _ in 0..MACHINE_SUBSTEPS {
+                self.eng.advance(1);
+                let a = self.eng.pin_voltage(id, 1).unwrap_or(0.0);
+                let b = self.eng.pin_voltage(id, 2).unwrap_or(0.0);
+                *peak = peak.max(a - b);
+            }
+            machine_step(&mut self.eng, &mut self.hoist, &self.sources);
+        }
+
         fn motor_broken(&self) -> bool {
             self.dmg.is_broken(MOTOR_ID)
         }
@@ -2785,8 +2833,17 @@ mod tests {
             (sa.0 - 9, sa.1 + 2),
             (sa.0 - 5, sa.1 + 5),
         );
+        // Power stage, to the right of the terminal column.
+        let d_low = (mm.0 + 4, mm.1); // motor low side = diode anode
+        let d_high = (mp.0 + 4, mp.1); // motor high side = diode cathode
+        let gate = (mm.0 + 4, mm.1 + 2);
+        let drain = (mm.0 + 8, mm.1);
+        let source = (mm.0 + 8, mm.1 + 4);
+        let sgnd = (mm.0 + 8, mm.1 + 8);
+        let (bat_p, bat_n) = ((mp.0 + 8, mp.1), (mp.0 + 8, mp.1 - 4));
+        let corner = (out.0, gate.1);
         vec![
-            // Sensor excitation: 4 V across SENSE-A .. SENSE-B.
+            // ---- brain: sensor excitation, 4 V across SENSE-A .. SENSE-B.
             spec(1, dc(4.0), sup_p, sup_n),
             gnd(2, sup_n),
             spec(3, K::Wire, sup_p, sa),
@@ -2795,12 +2852,35 @@ mod tests {
             spec(5, dc(3.2), ref_p, ref_n),
             gnd(6, ref_n),
             spec(7, K::Wire, ref_p, in_p),
-            // Comparator: in+ = setpoint, in- = wiper, out -> M+.
-            spec3(8, K::OpAmp { rail: 5.0 }, in_p, in_m, out),
+            // Comparator: in+ = setpoint, in- = wiper. Its output goes to a
+            // GATE, not to the motor: 25 mA cannot lift a crate, and the
+            // gate of a MOSFET draws exactly none.
+            spec3(
+                8,
+                K::OpAmp {
+                    rail: 5.0,
+                    isc: sim_core::DEFAULT_OPAMP_ISC,
+                },
+                in_p,
+                in_m,
+                out,
+            ),
             spec(9, K::Wire, in_m, sw),
-            spec(10, K::Wire, out, mp),
-            spec(11, K::Wire, mm, (mm.0 - 5, mm.1)),
-            gnd(12, (mm.0 - 5, mm.1)),
+            spec(10, K::Wire, out, corner),
+            spec(11, K::Wire, corner, gate),
+            // ---- muscle: 12 V through the motor, low-side switched by a
+            // power NMOS (tier 1: TO-220 on a small heatsink), with a
+            // freewheel diode across the winding.
+            spec(12, dc(6.0), bat_p, bat_n),
+            gnd(13, bat_n),
+            spec(14, K::Wire, bat_p, mp),
+            spec(15, K::Wire, mp, d_high),
+            spec(16, K::Diode, d_low, d_high),
+            spec(17, K::Wire, mm, d_low),
+            spec(18, K::Wire, d_low, drain),
+            spec3(19, K::Nmos { vt: 2.0, k: 5.0 }, gate, drain, source).at_tier(1),
+            spec(20, K::Wire, source, sgnd),
+            gnd(21, sgnd),
         ]
     }
 
@@ -2910,8 +2990,7 @@ mod tests {
             DocOp::Remove { id: MOTOR_ID },
             DocOp::Move {
                 id: MOTOR_ID,
-                pins: vec![(0, 0), (0, 4)],
-            },
+                pins: vec![(0, 0), (0, 4)], rot: None },
             DocOp::SetKind {
                 id: SENSOR_ID,
                 kind: K::Potentiometer {
@@ -3227,7 +3306,7 @@ mod tests {
                 .clone();
             let shifted: Vec<sim_core::Point> = pins.iter().map(|(x, y)| (x + 1, *y)).collect();
             assert!(
-                !apply_doc_op(&room, &DocOp::Move { id, pins: shifted }),
+                !apply_doc_op(&room, &DocOp::Move { id, pins: shifted, rot: None }),
                 "a direct Move on {id} must be refused"
             );
         }
@@ -3338,6 +3417,119 @@ mod tests {
         }
     }
 
+    /// Rotation and tier ride the ordinary op pipeline, and the pipeline is
+    /// the only place they can be set — so the authority is the authority
+    /// for these too, and a stale or hostile client cannot smuggle a
+    /// nonsense value into a shared room.
+    #[test]
+    fn rotation_and_tier_flow_through_the_op_pipeline() {
+        use sim_core::ElementKind as K;
+        let room = test_room(vec![
+            gnd(1, (0, 0)),
+            spec(2, r(1000.0), (0, 0), (4, 0)),
+            spec(3, dc(9.0), (4, 0), (0, 0)),
+        ]);
+        let rot_of = |id: u32| {
+            room.elements
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|e| e.id == id)
+                .unwrap()
+                .rot
+        };
+
+        // A one-pin part rotates without its pin moving: that is the whole
+        // reason the field exists.
+        assert_eq!(rot_of(1), 0);
+        assert!(apply_doc_op(
+            &room,
+            &DocOp::Move {
+                id: 1,
+                pins: vec![(0, 0)],
+                rot: Some(3),
+            }
+        ));
+        assert_eq!(rot_of(1), 3);
+        assert_eq!(
+            room.elements.lock().unwrap()[0].pins,
+            vec![(0, 0)],
+            "a rotation must not move the connection point"
+        );
+
+        // A Move with no `rot` (every drag, and every op an older client
+        // sends) leaves the symbol exactly as it was.
+        assert!(apply_doc_op(
+            &room,
+            &DocOp::Move {
+                id: 1,
+                pins: vec![(2, 2)],
+                rot: None,
+            }
+        ));
+        assert_eq!(rot_of(1), 3, "a plain move must not reset the orientation");
+
+        // Out of range: the whole op is dropped, like a wrong pin count.
+        assert!(!apply_doc_op(
+            &room,
+            &DocOp::Move {
+                id: 1,
+                pins: vec![(2, 2)],
+                rot: Some(9),
+            }
+        ));
+        assert_eq!(rot_of(1), 3);
+
+        // A tier arrives with the part, and a tier nobody has heard of is
+        // refused by the shared validator rather than clamped somewhere.
+        let power = |tier: u8| DocOp::Add {
+            spec: ElementSpec::three(10, K::Nmos { vt: 2.0, k: 5.0 }, (8, 0), (12, 0), (12, 4))
+                .at_tier(tier),
+        };
+        let mut next = room.elements.lock().unwrap().clone();
+        assert!(apply_doc_op_to(&mut next, &power(1)));
+        assert_eq!(check_room_doc(&next), Ok(()));
+        assert_eq!(next.last().unwrap().tier, 1);
+        assert_eq!(
+            damage::rating(&K::Nmos { vt: 2.0, k: 5.0 }, 1).unwrap().limit,
+            20.0,
+            "and it is judged as the power part it says it is"
+        );
+        let mut next = room.elements.lock().unwrap().clone();
+        assert!(apply_doc_op_to(&mut next, &power(sim_core::MAX_TIER + 1)));
+        assert!(matches!(
+            check_room_doc(&next),
+            Err(sim_core::Reject::BadValue { id: 10, .. })
+        ));
+    }
+
+    /// Rooms written before any of this existed have to load, and load as
+    /// the parts they were: starting-kit tier, unrotated, and — for the
+    /// op-amp — the 25 mA jellybean they were implicitly promising to be.
+    #[test]
+    fn documents_written_before_tiers_still_load() {
+        let old = r#"[
+            {"id":1,"kind":{"t":"Ground"},"pins":[[0,0]]},
+            {"id":2,"kind":{"t":"Resistor","ohms":1000.0},"pins":[[0,0],[4,0]]},
+            {"id":3,"kind":{"t":"OpAmp","rail":9.0},"pins":[[8,0],[8,2],[12,1]]}
+        ]"#;
+        let elems: Vec<ElementSpec> = serde_json::from_str(old).expect("old rooms must load");
+        assert!(elems.iter().all(|e| e.tier == 0 && e.rot == 0));
+        assert_eq!(
+            elems[2].kind,
+            sim_core::ElementKind::OpAmp {
+                rail: 9.0,
+                isc: sim_core::DEFAULT_OPAMP_ISC
+            }
+        );
+        assert_eq!(check_room_doc(&elems), Ok(()));
+        // And an old Move op — no `rot` field at all — still applies.
+        let op: DocOp = serde_json::from_str(r#"{"t":"Move","id":2,"pins":[[0,0],[6,0]]}"#)
+            .expect("old ops must parse");
+        let mut next = elems.clone();
+        assert!(apply_doc_op_to(&mut next, &op));
+    }
+
     /// The world is big now (50k parts), but the budget is still a hard wall
     /// and malformed specs are still refused.
     #[test]
@@ -3348,6 +3540,8 @@ mod tests {
                 id: k + 1,
                 kind: K::Wire,
                 pins: vec![(0, 0), (1, 0)],
+                tier: 0,
+                rot: 0,
             })
             .collect();
         let room = test_room(full);
@@ -3356,6 +3550,8 @@ mod tests {
                 id,
                 kind: K::Wire,
                 pins: vec![(2, 2), (3, 2)],
+                tier: 0,
+                rot: 0,
             },
         };
         // At the cap the op is dropped, not applied.
@@ -3373,6 +3569,8 @@ mod tests {
                     id: 900_002,
                     kind: K::Wire,
                     pins: vec![(0, 0)],
+                    tier: 0,
+                    rot: 0,
                 },
             }
         ));
@@ -3380,15 +3578,13 @@ mod tests {
             &room,
             &DocOp::Move {
                 id: 900_001,
-                pins: vec![(0, 0)],
-            }
+                pins: vec![(0, 0)], rot: None }
         ));
         assert!(apply_doc_op(
             &room,
             &DocOp::Move {
                 id: 900_001,
-                pins: vec![(4, 4), (5, 4)],
-            }
+                pins: vec![(4, 4), (5, 4)], rot: None }
         ));
         assert!(!apply_doc_op(&room, &DocOp::Remove { id: 12_345_678 }));
     }
@@ -3771,7 +3967,7 @@ mod tests {
         run.eng.advance(200);
         assert!(!run.eng.is_quarantined(), "the solver must survive it");
         let i = run.current(2);
-        let limit = damage::rating(&K::Led { color: 0 }).unwrap().limit;
+        let limit = damage::rating(&K::Led { color: 0 }, 0).unwrap().limit;
         assert!(
             i.abs() > 10.0 * limit,
             "a bare LED must be wildly over its {limit} A rating, got {i} A"
@@ -3816,7 +4012,7 @@ mod tests {
         );
         assert!(run.broke.is_empty(), "a properly driven LED must survive");
         assert!(!run.dmg.is_broken(3));
-        let rating = damage::rating(&K::Led { color: 0 }).unwrap();
+        let rating = damage::rating(&K::Led { color: 0 }, 0).unwrap();
         let load = i.abs() / rating.limit;
         assert_eq!(
             damage::time_to_break(damage::heat(rating.metric, load), rating.tau),
@@ -3857,10 +4053,10 @@ mod tests {
     /// in seconds, 80 % of rated runs it hot forever.
     #[test]
     fn a_resistor_cooks_at_twice_its_rating_and_lives_at_eighty_percent() {
-        let rating = damage::rating(&K::Resistor { ohms: 100.0 }).unwrap();
-        // 10 V across 100 Ω = 1.0 W into a half-watt part.
+        let rating = damage::rating(&K::Resistor { ohms: 100.0 }, 0).unwrap();
+        // 7.07 V across 100 Ω = 0.5 W into a quarter-watt part.
         let hot = vec![
-            spec(1, dc(10.0), (0, 0), (0, 8)),
+            spec(1, dc(50.0f64.sqrt()), (0, 0), (0, 8)),
             spec(2, r(100.0), (0, 0), (4, 0)),
             spec(3, K::Wire, (4, 0), (0, 8)),
             gnd(4, (0, 8)),
@@ -3868,7 +4064,7 @@ mod tests {
         let mut run = DamageRun::new(&hot);
         run.tick();
         let p = run.eng.frame().iter().find(|f| f.id == 2).unwrap().power;
-        assert!((p - 1.0).abs() < 1e-6, "solver says {p} W");
+        assert!((p - 0.5).abs() < 1e-6, "solver says {p} W");
         assert!((p / rating.limit - 2.0).abs() < 1e-6, "that is 2x rated");
         let t = run
             .run_until_break(2, 10.0)
@@ -3883,10 +4079,10 @@ mod tests {
         assert!((1.0..8.0).contains(&t), "'in seconds' means {t}");
         assert_eq!(run.current(2), 0.0, "and it is open afterwards");
 
-        // 10 V across 250 Ω = 0.4 W = 80 % of the same rating.
+        // 10 V across 500 Ω = 0.2 W = 80 % of the same rating.
         let warm = vec![
             spec(1, dc(10.0), (0, 0), (0, 8)),
-            spec(2, r(250.0), (0, 0), (4, 0)),
+            spec(2, r(500.0), (0, 0), (4, 0)),
             spec(3, K::Wire, (4, 0), (0, 8)),
             gnd(4, (0, 8)),
         ];
@@ -3909,7 +4105,7 @@ mod tests {
             (0.75..0.81).contains(&s),
             "it should read plainly hot and stay there: {s}"
         );
-        assert!((run.current(2) - 0.04).abs() < 1e-9, "still conducting");
+        assert!((run.current(2) - 0.02).abs() < 1e-9, "still conducting");
     }
 
     /// A broken part is a gap in the circuit, not a hole in the netlist: its
@@ -4030,7 +4226,7 @@ mod tests {
             ohms: machine::R_ARM,
             henries: machine::L_ARM,
             bemf: 0.0,
-        })
+        }, 0)
         .unwrap();
         let want = damage::time_to_break(
             damage::heat(rating.metric, i_stall / rating.limit),
@@ -4067,33 +4263,10 @@ mod tests {
     /// exactly the lesson (control the current, do not just apply volts).
     #[test]
     fn a_controlled_drive_holds_the_band_without_cooking_the_motor() {
-        let (mp, mm) = motor_pins();
-        let sensor = hoist_fixture()
-            .into_iter()
-            .find(|e| e.id == SENSOR_ID)
-            .unwrap();
-        let (sa, sw, sb) = (sensor.pins[0], sensor.pins[1], sensor.pins[2]);
-        let (sup_p, sup_n) = ((sa.0 - 17, sa.1), (sb.0 - 17, sb.1));
-        let (ref_p, ref_n) = ((sa.0 - 17, sa.1 + 8), (sa.0 - 17, sa.1 + 12));
-        let (in_p, in_m, out) = (
-            (sa.0 - 9, sa.1 + 8),
-            (sa.0 - 9, sa.1 + 2),
-            (sa.0 - 5, sa.1 + 5),
-        );
-        let mut run = HoistRun::new(vec![
-            spec(1, dc(4.0), sup_p, sup_n),
-            gnd(2, sup_n),
-            spec(3, K::Wire, sup_p, sa),
-            spec(4, K::Wire, sup_n, sb),
-            spec(5, dc(3.2), ref_p, ref_n),
-            gnd(6, ref_n),
-            spec(7, K::Wire, ref_p, in_p),
-            spec3(8, K::OpAmp { rail: 5.0 }, in_p, in_m, out),
-            spec(9, K::Wire, in_m, sw),
-            spec(10, K::Wire, out, mp),
-            spec(11, K::Wire, mm, (mm.0 - 5, mm.1)),
-            gnd(12, (mm.0 - 5, mm.1)),
-        ]);
+        // The SAME circuit `comparator_feedback_holds_the_crate_in_the_band`
+        // wins with — one builder, so the two halves of the claim ("it wins"
+        // and "it survives") can never drift apart.
+        let mut run = HoistRun::new(comparator_feedback_circuit());
 
         // 20 s: ~1.3 s to climb in, 5 s to win, and then 14 s more of holding
         // — over two motor thermal time constants (tau = 6 s), so the stress
@@ -4130,10 +4303,167 @@ mod tests {
             peak_stress < 0.75,
             "motor stress peaked at {peak_stress:.3} (peak current {peak_i:.2} A)"
         );
+        // Every part in the bill of materials, not just the motor — this is
+        // the whole point of the recalibration pass. Ids are the ones
+        // `comparator_feedback_circuit` builds.
+        let bom = [
+            (8, "op-amp"),
+            (12, "6 V supply"),
+            (14, "supply wire"),
+            (16, "freewheel diode"),
+            (18, "drain wire"),
+            (19, "power NMOS"),
+            (20, "source wire"),
+        ];
+        for (id, what) in bom {
+            let s = run.dmg.stress(id);
+            assert!(
+                s < 0.75,
+                "{what} (#{id}) settled at {s:.3} of failure — the intended \
+                 solution has to have margin everywhere, not just at the motor"
+            );
+            eprintln!("  {what:<16} #{id:<3} stress {s:.3}");
+        }
         eprintln!(
             "controlled drive: won at {won_at:.2} s, peak {peak_i:.2} A, \
              peak motor stress {peak_stress:.3} (rating {} A)",
             motor_i_max()
+        );
+    }
+
+    /// What happens when the freewheel diode is left out — and what must
+    /// NOT happen.
+    ///
+    /// Switch an inductive load off and its stored current has to go
+    /// somewhere. With no diode the only path left is the FET itself, in
+    /// avalanche. Before the MOSFET model had a breakdown clamp there was
+    /// no path at all: NR diverged on the first turn-off and the whole room
+    /// froze with nothing on screen to explain it — the worst possible
+    /// answer, because a frozen room teaches nothing and cannot be
+    /// debugged. Now the drain simply pins at the breakdown knee and the
+    /// winding dumps into the part, which is what really happens.
+    ///
+    /// The measured verdict for THIS machine is honest and slightly
+    /// anticlimactic, and the test says so rather than pretending
+    /// otherwise: the hoist armature is 1.5 mH, so each turn-off is about
+    /// 7 mJ — nothing to a TO-220, which is avalanche-rated for hundreds of
+    /// millijoules. The diode is good practice and it keeps the switching
+    /// node inside the supply rail; it is not what saves the part here. A
+    /// bigger winding would be a different story, and the model would say
+    /// so on its own.
+    #[test]
+    fn switching_a_motor_without_a_freewheel_diode_avalanches_the_fet() {
+        let mut circuit = comparator_feedback_circuit();
+        circuit.retain(|e| e.id != 16); // the freewheel diode
+        let mut run = HoistRun::new(circuit);
+        for _ in 0..(3.0 / MACHINE_H) as u32 {
+            run.step(); // climb into the band, where the bang-bang lives
+        }
+        let mut peak_vds = 0.0f64;
+        for _ in 0..(0.5 / MACHINE_H) as u32 {
+            run.step_watching(19, &mut peak_vds);
+        }
+        assert!(
+            !run.eng.is_quarantined(),
+            "an unclamped turn-off must never freeze the room"
+        );
+        assert!(
+            peak_vds > 50.0,
+            "the drain must ring up to the avalanche knee: peaked at {peak_vds:.1} V \
+             on a 6 V supply"
+        );
+
+        // With the diode fitted, the same drive never leaves the supply
+        // rail: the winding freewheels through the diode instead of through
+        // the transistor. That difference is the whole reason the part is
+        // in the circuit, and it is measurable.
+        let mut run = HoistRun::new(comparator_feedback_circuit());
+        for _ in 0..(3.0 / MACHINE_H) as u32 {
+            run.step();
+        }
+        let mut peak_clamped = 0.0f64;
+        for _ in 0..(0.5 / MACHINE_H) as u32 {
+            run.step_watching(19, &mut peak_clamped);
+        }
+        assert!(
+            peak_clamped < 8.0,
+            "with a freewheel diode the drain stays near the rail: {peak_clamped:.1} V"
+        );
+        eprintln!(
+            "freewheel diode: drain peaks {peak_vds:.1} V without it, \
+             {peak_clamped:.1} V with it"
+        );
+    }
+
+    /// The other half of the honest op-amp: the OLD winning solution — an
+    /// op-amp output wired straight to M+ — must now be unable to move the
+    /// crate at all. Not "it breaks": it physically cannot deliver the
+    /// current, which is the truthful failure and the one that teaches
+    /// something. `machine::HOLD_CURRENT` is 0.94 A; a 741-class output
+    /// stage folds back at 25 mA, i.e. 2.7 % of the torque gravity asks for.
+    #[test]
+    fn an_op_amp_cannot_drive_a_motor() {
+        let (mp, mm) = motor_pins();
+        let sensor = hoist_fixture()
+            .into_iter()
+            .find(|e| e.id == SENSOR_ID)
+            .unwrap();
+        let (sa, sw, sb) = (sensor.pins[0], sensor.pins[1], sensor.pins[2]);
+        let (sup_p, sup_n) = ((sa.0 - 17, sa.1), (sb.0 - 17, sb.1));
+        let (ref_p, ref_n) = ((sa.0 - 17, sa.1 + 8), (sa.0 - 17, sa.1 + 12));
+        let (in_p, in_m, out) = (
+            (sa.0 - 9, sa.1 + 8),
+            (sa.0 - 9, sa.1 + 2),
+            (sa.0 - 5, sa.1 + 5),
+        );
+        let mut run = HoistRun::new(vec![
+            spec(1, dc(4.0), sup_p, sup_n),
+            gnd(2, sup_n),
+            spec(3, K::Wire, sup_p, sa),
+            spec(4, K::Wire, sup_n, sb),
+            spec(5, dc(3.2), ref_p, ref_n),
+            gnd(6, ref_n),
+            spec(7, K::Wire, ref_p, in_p),
+            spec3(
+                8,
+                K::OpAmp {
+                    rail: 5.0,
+                    isc: sim_core::DEFAULT_OPAMP_ISC,
+                },
+                in_p,
+                in_m,
+                out,
+            ),
+            spec(9, K::Wire, in_m, sw),
+            spec(10, K::Wire, out, mp), // straight into the motor
+            spec(11, K::Wire, mm, (mm.0 - 5, mm.1)),
+            gnd(12, (mm.0 - 5, mm.1)),
+        ]);
+
+        let mut peak_i = 0.0f64;
+        for _ in 0..(6.0 / MACHINE_H) as u32 {
+            peak_i = peak_i.max(run.step().abs());
+        }
+        assert!(
+            peak_i <= sim_core::DEFAULT_OPAMP_ISC * 1.001,
+            "an op-amp may never source more than its isc: {peak_i:.4} A"
+        );
+        assert_eq!(run.hoist.y, 0.0, "and the crate never leaves the floor");
+        assert!(!run.hoist.win);
+        // It does not explode either: a real op-amp is short-circuit proof,
+        // so it sits there refusing to deliver, indefinitely.
+        assert!(!run.dmg.is_broken(8), "an op-amp survives its own limit");
+        // It DOES run warm: 25 mA held against a 5 V rail is 0.124 W of a
+        // 0.35 W part, so the faceplate reads about a third of the way to
+        // failure and stays there. Hot, honest, and immortal.
+        let s = run.dmg.stress(8);
+        assert!(
+            (0.25..0.45).contains(&s),
+            "a shorted op-amp should read plainly warm and survive: {s:.3}"
+        );
+        eprintln!(
+            "op-amp direct drive: {peak_i:.4} A peak vs {:.4} A needed to hold",
+            machine::HOLD_CURRENT
         );
     }
 
@@ -4213,7 +4543,7 @@ mod tests {
         let elems = vec![
             spec(7, r(100.0), (0, 0), (4, 0)),
             spec(9, K::Led { color: 0 }, (4, 0), (8, 0)),
-            spec(11, K::Wire, (8, 0), (12, 0)),
+            gnd(11, (8, 0)),
         ];
         let mut dmg = DamageModel::new();
         dmg.set_document(&elems);
@@ -4231,7 +4561,7 @@ mod tests {
         assert_eq!(row[0], 9.0);
         assert_eq!(row[1], 1.0);
         assert_eq!(row[2], 1.0);
-        // Wires and grounds never appear: they do not break in this pass.
+        // A ground symbol never appears: it is a reference, not a part.
         assert!(dmg.rating_of(11).is_none());
 
         // What every client in the room actually receives, tick by tick: a
@@ -4336,7 +4666,7 @@ mod tests {
             .map(|(id, s, n)| (*id, s / *n as f64))
             .fold((0u32, 0.0f64), |m, e| if e.1 > m.1 { e } else { m });
         assert!(
-            worst.1 < 0.9,
+            worst.1 < 0.7,
             "part #{} settles at {:.2} of its failure temperature — too close \
              to the edge for a demo room",
             worst.0,
@@ -4870,8 +5200,7 @@ mod tests {
                 "pin-drag collapsing the battery onto one point",
                 DocOp::Move {
                     id: 1,
-                    pins: vec![(2, 2), (2, 2)],
-                },
+                    pins: vec![(2, 2), (2, 2)], rot: None },
                 |r| *r == Reject::CollapsedPins { id: 1 },
             ),
         ];
@@ -4888,6 +5217,8 @@ mod tests {
                         phase: 0.0,
                     },
                     pins: vec![(70, 70)],
+                    tier: 0,
+                    rot: 0,
                 });
                 assert_eq!(check_room_doc(&with_rail), Ok(()), "lone rail is legal");
                 assert_eq!(
@@ -4930,7 +5261,11 @@ mod tests {
                         hz: 0.0,
                         phase: 0.0,
                     },
+                    // Derived from the fixture, not hardcoded: the chip's
+                    // terminals move with its package.
                     pins: vec![fixture_pin(MOTOR_ID, 0)],
+                    tier: 0,
+                    rot: 0,
                 },
             },
             DocOp::Add {
@@ -4943,8 +5278,7 @@ mod tests {
             },
             DocOp::Move {
                 id: 55,
-                pins: vec![(30, 14), (33, 14)],
-            },
+                pins: vec![(30, 14), (33, 14)], rot: None },
         ];
         let mut doc = room;
         for op in legal {

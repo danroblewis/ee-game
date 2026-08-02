@@ -295,7 +295,7 @@ impl Builder {
         self.r(sup, (cx + 8, 60), 10_000.0);
         self.r((cx + 8, 60), gnd, 10_000.0);
         self.three(
-            ElementKind::OpAmp { rail: 12.0 },
+            ElementKind::OpAmp { rail: 12.0, isc: sim_core::DEFAULT_OPAMP_ISC },
             (cx + 8, 60),
             (cx + 4, 120),
             (cx + 2, 60),
@@ -311,7 +311,7 @@ impl Builder {
     fn relax_osc(&mut self, cx: i32) {
         let (sup, gnd) = ((cx, RAIL_Y), (cx, GND_Y));
         let (hp, hn, o) = ((cx + 10, 100), (cx + 4, 100), (cx + 7, 60));
-        self.three(ElementKind::OpAmp { rail: 5.0 }, hp, hn, o);
+        self.three(ElementKind::OpAmp { rail: 5.0, isc: sim_core::DEFAULT_OPAMP_ISC }, hp, hn, o);
         self.r(o, hn, 10_000.0);
         self.c(hn, gnd, 100e-9);
         self.r(o, hp, 10_000.0);

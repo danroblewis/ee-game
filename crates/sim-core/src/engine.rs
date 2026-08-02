@@ -34,6 +34,27 @@ const BJT_BETA_R: f64 = 1.0;
 /// MOSFET off-state drain-source leak, and per-iteration voltage damping.
 const MOS_LEAK: f64 = 1e-8;
 const MOS_DAMP: f64 = 0.5;
+/// Drain-source avalanche breakdown: every real power MOSFET is
+/// avalanche-rated (2N7000 and IRLZ44N are both 55-60 V), and the clamp is
+/// not decoration — it is what stops an inductive turn-off from having no
+/// solution at all. Switch a motor off with an off-state FET presenting
+/// `MOS_LEAK` and the winding's stored current has nowhere to go: NR
+/// diverges and the whole room quarantines with no diagnosis. With the
+/// clamp the energy goes where it goes in the world — into the FET, which
+/// gets hot and eventually lets go, and the fix a player discovers is the
+/// real fix (fit a freewheel diode).
+///
+/// Structurally this is the `Zener` branch applied across drain-source, and
+/// it is gated to be EXACTLY zero more than 40·nVt below breakdown, so no
+/// circuit that never approaches 60 V changes by one bit.
+const MOS_BV: f64 = 55.0;
+const MOS_BV_IS: f64 = 1e-3;
+const MOS_BV_NVT: f64 = 0.15;
+/// Voltage below breakdown at which the avalanche term is forced to exactly
+/// zero. 40 e-foldings down is 4e-18 of the knee current — arithmetically
+/// nothing, and making it structurally nothing is what guarantees that no
+/// circuit which stays clear of `MOS_BV` changes by a single bit.
+const MOS_BV_MARGIN: f64 = 40.0 * MOS_BV_NVT;
 /// Op-amp open-loop gain and input offset voltage. The offset is a real
 /// device property, and it matters here: an ideal offset-free op-amp in a
 /// positive-feedback loop has an exact metastable solution that a
@@ -999,14 +1020,19 @@ impl Engine {
                     }
                     self.b[bi] = drop;
                 }
-                ElementKind::OpAmp { rail } => {
+                ElementKind::OpAmp { rail, isc } => {
                     let bi = self.num_nodes + branch.ok_or(())?;
                     let (p, m, out) = (node[0], node[1], node[2]);
-                    // Output branch current column.
+                    // Output branch current column. The branch unknown is
+                    // the current INTO the out pin, so an op-amp SOURCING
+                    // current carries a negative branch value.
                     if out > 0 {
                         self.a[(out - 1) * n + bi] += 1.0;
                     }
-                    // Constraint row depends on rail region.
+                    // Constraint row depends on the output-stage region:
+                    //   0   linear     vout = A·(vp - vm + Voff)
+                    //  ±1   railed     vout = ±rail
+                    //  ±2   limited    i_out = ±isc, vout free
                     match state.region {
                         0 => {
                             if p > 0 {
@@ -1021,11 +1047,20 @@ impl Engine {
                             // vout = A(vp - vm + Voff)
                             self.b[bi] = -OPAMP_GAIN * OPAMP_VOFF;
                         }
-                        r => {
+                        r if r.abs() == 1 => {
                             if out > 0 {
                                 self.a[bi * n + (out - 1)] += 1.0;
                             }
                             self.b[bi] = r as f64 * rail;
+                        }
+                        r => {
+                            // Folded back: the output stage is a current
+                            // source of ±isc and the node voltage is
+                            // whatever the load makes it. r = +2 means the
+                            // amp is driving high, i.e. SOURCING isc, i.e. a
+                            // branch (into-pin) current of -isc.
+                            self.a[bi * n + bi] += 1.0;
+                            self.b[bi] = -(r.signum() as f64) * isc;
                         }
                     }
                 }
@@ -1111,14 +1146,54 @@ impl Engine {
                     st.vg2 = nbc;
                 }
                 ElementKind::Nmos { .. } | ElementKind::Pmos { .. } => {
-                    let vs: Vec<f64> = (0..3).map(|p| self.xv(node[p])).collect();
+                    let mut vs = [self.xv(node[0]), self.xv(node[1]), self.xv(node[2])];
+                    // Breakdown limiting — the MOSFET's version of what
+                    // `pnjlim` does for a diode junction.
+                    //
+                    // A solved drain voltage past the avalanche knee is an
+                    // extrapolation off a nearly vertical curve, so the
+                    // honest next guess is the knee itself. And because
+                    // that is a BOUND rather than an extrapolation it can
+                    // be taken in one step, instead of crawling there half
+                    // a volt an iteration: an inductive turn-off has to
+                    // move the drain fifty-odd volts inside one timestep,
+                    // which at `MOS_DAMP` costs more NR passes than there
+                    // are — that is precisely why an unclamped turn-off
+                    // used to diverge and freeze the whole room.
+                    //
+                    // Everything below `MOS_BV` is untouched, damping and
+                    // all, so no sub-breakdown circuit moves by one bit.
                     let st = &mut self.elems[ei].state;
-                    for (last, v) in st.lastv.iter_mut().zip(vs.iter()) {
+                    let vds = vs[1] - vs[2];
+                    let sgn = if vds >= 0.0 { 1.0 } else { -1.0 };
+                    let now = sgn * vds;
+                    let was = sgn * (st.lastv[1] - st.lastv[2]);
+                    let breaking = now > MOS_BV - MOS_BV_MARGIN || was > MOS_BV - MOS_BV_MARGIN;
+                    if breaking {
+                        // The exponential is limited the way every other
+                        // junction in this engine is limited, so it steps
+                        // ONTO the curve from below in one pass and falls
+                        // off it freely in one pass — instead of crawling
+                        // at MOS_DAMP in both directions.
+                        let vcrit =
+                            MOS_BV_NVT * libm::log(MOS_BV_NVT / (core::f64::consts::SQRT_2 * MOS_BV_IS));
+                        let lim = MOS_BV + pnjlim(now - MOS_BV, was - MOS_BV, MOS_BV_NVT, vcrit);
+                        if (lim - now).abs() > 0.01 {
+                            converged = false;
+                        }
+                        vs[1] = vs[2] + sgn * lim;
+                    }
+                    for (p, v) in vs.iter().enumerate() {
+                        let last = &mut st.lastv[p];
                         let delta = v - *last;
                         if delta.abs() > 0.01 {
                             converged = false;
                         }
-                        *last += delta.clamp(-MOS_DAMP, MOS_DAMP);
+                        *last += if breaking && p == 1 {
+                            delta
+                        } else {
+                            delta.clamp(-MOS_DAMP, MOS_DAMP)
+                        };
                     }
                 }
                 ElementKind::Ota => {
@@ -1162,21 +1237,62 @@ impl Engine {
                         st.region = latch;
                     }
                 }
-                ElementKind::OpAmp { rail } => {
+                ElementKind::OpAmp { rail, isc } => {
                     let target = OPAMP_GAIN * (self.xv(node[0]) - self.xv(node[1]) + OPAMP_VOFF);
+                    let vout = self.xv(node[2]);
+                    // Current OUT of the output pin: the branch unknown is
+                    // the current in.
+                    let i_out = -self.elems[ei]
+                        .branch
+                        .map(|b| self.x[self.num_nodes + b])
+                        .unwrap_or(0.0);
+                    let over = isc * 1.000001;
                     let st = &mut self.elems[ei].state;
                     let new_region = match st.region {
                         0 => {
-                            let vout = self.x[if node[2] > 0 { node[2] - 1 } else { 0 }];
                             if node[2] > 0 && vout.abs() > rail * 1.000001 {
                                 if vout > 0.0 {
                                     1
                                 } else {
                                     -1
                                 }
+                            } else if i_out > over {
+                                // The load wants more than the output stage
+                                // can give even without saturating: fold
+                                // back. This is what makes a follower into
+                                // 10 Ω sag instead of delivering an amp.
+                                2
+                            } else if i_out < -over {
+                                -2
                             } else {
                                 0
                             }
+                        }
+                        r if r.abs() == 2 => {
+                            let s = r.signum();
+                            if (s as f64) * target < 0.0 {
+                                // The amplifier now wants the other way.
+                                // Relax to linear and let the next pass pick
+                                // the region the load actually implies —
+                                // jumping straight to the opposite limit
+                                // would chatter forever in a follower whose
+                                // load is only marginally too heavy.
+                                0
+                            } else if (s as f64) * vout > rail * 1.000001 {
+                                // Pushing isc took the output past its own
+                                // rail: the load is lighter than the limit
+                                // after all, so it is the RAIL that binds.
+                                s
+                            } else {
+                                r
+                            }
+                        }
+                        r if (r as f64) * i_out > over => {
+                            // Railed, and the load is dragging more than the
+                            // output stage can supply. A real op-amp does not
+                            // die here, it stops delivering: the output sags
+                            // off the rail at constant current.
+                            2 * r
                         }
                         r => {
                             // Any opposing drive flips DIRECTLY to the
@@ -1472,7 +1588,7 @@ impl Engine {
                     *val = self.xv(e.node[i]);
                 }
                 let i = e.state.pin_i;
-                let power = (0..npins).map(|p| v[p] * i[p]).sum();
+                let power = elem_power(&e.spec.kind, npins, &v, &i);
                 ElemFrame {
                     id: e.spec.id,
                     npins,
@@ -1586,6 +1702,41 @@ impl Engine {
     }
 }
 
+/// What a part DISSIPATES this instant, in watts.
+///
+/// For every part whose terminals are all modelled this is just `Σ v·i` over
+/// the pins — conservation does the rest, and a part that is delivering
+/// power reads negative.
+///
+/// The op-amp is the one exception, and it is an exception about honesty
+/// rather than convenience. Its model has no supply terminals: the return
+/// current for whatever the output drives vanishes into node 0, so `Σ v·i`
+/// is the power it DELIVERS to the load, not the power it burns. Worse, the
+/// number is not even recoverable from the sum — a railed output sits at
+/// exactly ±rail, so the output transistor's own drop is identically zero
+/// there. What a real output stage burns is the difference between the
+/// supply it works against and the pin it lands on, times the current it
+/// passes, and that IS computable from solved quantities:
+///
+/// ```text
+///   P = |i_out| · (rail - sign(i_out)·vout)
+/// ```
+///
+/// sourcing 25 mA into a dead short on a ±5 V part = 0.125 W (hot, and
+/// survivable forever, which is why shorting an op-amp output does not
+/// destroy it); the same short on a ±100 V part is 2.5 W and kills it.
+/// Quiescent supply current is deliberately NOT added: the model does not
+/// draw it from any node, so charging the player for it would be inventing
+/// a number no solver produced.
+fn elem_power(kind: &ElementKind, npins: usize, v: &[f64; MAX_PINS], i: &[f64; MAX_PINS]) -> f64 {
+    if let ElementKind::OpAmp { rail, .. } = kind {
+        let i_out = -i[2];
+        let drop = rail - if i_out >= 0.0 { v[2] } else { -v[2] };
+        return i_out.abs() * drop.max(0.0);
+    }
+    (0..npins).map(|p| v[p] * i[p]).sum()
+}
+
 /// (saturation current, n·Vt, reverse-breakdown offset).
 fn diode_params(kind: &ElementKind) -> (f64, f64, Option<f64>) {
     match kind {
@@ -1643,10 +1794,21 @@ fn mos_eval(pol: f64, vt: f64, k: f64, v: &[f64]) -> MosOp {
     } else {
         (0.5 * k * vgst * vgst, k * vgst, MOS_LEAK)
     };
+    // Drain-source avalanche. `vds` is normalized non-negative (the higher
+    // terminal is always the effective drain), so this is a one-sided
+    // exponential. Below the guard the term underflows to nothing anyway;
+    // making it structurally zero is what keeps every sub-60 V circuit
+    // bit-identical to before the clamp existed.
+    let (i_av, g_av) = if vds > MOS_BV - MOS_BV_MARGIN {
+        let i = MOS_BV_IS * libm::exp((vds - MOS_BV) / MOS_BV_NVT);
+        (i, i / MOS_BV_NVT)
+    } else {
+        (0.0, 0.0)
+    };
     MosOp {
-        id: id + MOS_LEAK * vds,
+        id: id + MOS_LEAK * vds + i_av,
         gm,
-        gds,
+        gds: gds + g_av,
         vgs,
         vds,
         d_index,

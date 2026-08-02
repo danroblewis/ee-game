@@ -60,7 +60,11 @@ export function invertOp(op: DocOp, before: ElementSpec | null | undefined): Doc
     case 'Remove':
       return before ? { t: 'Add', spec: clone(before) } : null;
     case 'Move':
-      return before ? { t: 'Move', id: op.id, pins: clone(before.pins) } : null;
+      // Undoing a move restores the ORIENTATION too, or rotating a ground
+      // symbol would be the one gesture undo could not take back.
+      return before
+        ? { t: 'Move', id: op.id, pins: clone(before.pins), rot: before.rot ?? 0 }
+        : null;
     case 'SetKind':
       return before ? { t: 'SetKind', id: op.id, kind: clone(before.kind) } : null;
   }

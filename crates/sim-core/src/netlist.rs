@@ -10,10 +10,20 @@ pub type Point = (i32, i32);
 /// Largest pin count of any element (the 555 timer is 6-pin).
 pub const MAX_PINS: usize = 6;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// Short-circuit output current a legacy (field-less) `OpAmp` deserialises
+/// to: a 741/LM358-class jellybean. See `ElementKind::OpAmp`.
+pub const DEFAULT_OPAMP_ISC: f64 = 0.025;
+
+#[cfg(feature = "serde")]
+fn default_opamp_isc() -> f64 {
+    DEFAULT_OPAMP_ISC
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(tag = "t"))]
 pub enum ElementKind {
+    #[default]
     Wire,
     /// Pins its single endpoint to node 0.
     Ground,
@@ -102,10 +112,23 @@ pub enum ElementKind {
         vt: f64,
         k: f64,
     },
-    /// Ideal-ish op-amp: open-loop gain 1e5, output clamped to ±rail.
-    /// Pins: [in+, in-, out]. Inputs draw no current.
+    /// Op-amp: open-loop gain 1e5, output clamped to ±`rail`, output
+    /// current clamped to ±`isc`. Pins: [in+, in-, out]. Inputs draw no
+    /// current.
+    ///
+    /// `isc` is the short-circuit output current, and it is the honest half
+    /// of the model: a real op-amp's output stage folds back to `I_sc` and
+    /// sits there indefinitely (741 ≈ 25 mA, TL07x/LM358 ≈ 40 mA), which is
+    /// why shorting an op-amp's output does not destroy it. Without it the
+    /// part is an unlimited current source and "op-amp straight into a
+    /// motor" works, which it does not in the world.
+    ///
+    /// Old documents have no `isc` field; serde defaults them to the 741's
+    /// 25 mA, which is what they were implicitly promising to be.
     OpAmp {
         rail: f64,
+        #[cfg_attr(feature = "serde", serde(default = "default_opamp_isc"))]
+        isc: f64,
     },
     /// Operational transconductance amplifier (LM13700-style).
     /// Pins: [in+, in-, out, bias]. The bias pin is a diode junction to
@@ -215,12 +238,47 @@ impl ElementKind {
     }
 }
 
-#[derive(Clone, Debug)]
+/// Highest tier index a document may carry. sim-core owns only the
+/// SYNTACTIC bound (so a hostile or stale client cannot smuggle a `tier:
+/// 200` past `check_document`); what a tier MEANS is the `damage` crate's
+/// table, which clamps anything it has no row for down to its top row.
+/// Raise this when the tech tree needs more headroom than four rungs.
+pub const MAX_TIER: u8 = 3;
+
+/// One placed part.
+///
+/// `kind` is the ELECTRICAL model — everything the matrix sees. `tier` and
+/// `rot` are deliberately outside it: neither may ever reach a stamp, so
+/// neither can change a state hash, a node count or a matrix entry.
+#[derive(Clone, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ElementSpec {
     pub id: u32,
     pub kind: ElementKind,
     pub pins: Vec<Point>,
+    /// Which RATING this instance carries: 0 is the starting kit, higher
+    /// tiers are the same device in a bigger package (a 5 W wirewound
+    /// resistor is `Resistor` at tier 1). The tech tree gates which tiers a
+    /// player may place; the damage crate owns what each tier can take. The
+    /// solver ignores this field completely — a 5 W and a 0.25 W resistor of
+    /// the same ohms are the same circuit, which is exactly why headroom can
+    /// be progression instead of a rewrite.
+    ///
+    /// Absent in old saves and old client ops: serde defaults it to 0, so
+    /// every part in an existing room is a starting-kit part.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub tier: u8,
+    /// Quarter-turn symbol rotation, 0..3 clockwise. RENDER ONLY, and it
+    /// exists for the parts whose pins cannot express an orientation:
+    /// `Ground` and `Rail` have a single pin, so rotating their pins is a
+    /// no-op and the symbol would always point the same way. Multi-pin parts
+    /// take their orientation from their pin geometry and ignore this.
+    ///
+    /// It is in the shared document (not client-local) because two players
+    /// looking at one room must see one schematic. It is not in
+    /// `ElementKind` because it must cost the netlist nothing.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub rot: u8,
 }
 
 impl ElementSpec {
@@ -230,6 +288,8 @@ impl ElementSpec {
             id,
             kind,
             pins: vec![a, b],
+            tier: 0,
+            rot: 0,
         }
     }
 
@@ -239,6 +299,8 @@ impl ElementSpec {
             id,
             kind,
             pins: vec![a, b, c],
+            tier: 0,
+            rot: 0,
         }
     }
 
@@ -247,7 +309,21 @@ impl ElementSpec {
             id,
             kind: ElementKind::Ground,
             pins: vec![at],
+            tier: 0,
+            rot: 0,
         }
+    }
+
+    /// Same part, one tier up the tech tree.
+    pub fn at_tier(mut self, tier: u8) -> Self {
+        self.tier = tier;
+        self
+    }
+
+    /// Same part, symbol turned `rot` quarter-turns clockwise.
+    pub fn rotated(mut self, rot: u8) -> Self {
+        self.rot = rot & 3;
+        self
     }
 }
 
@@ -263,9 +339,19 @@ pub enum DocOp {
     Remove {
         id: u32,
     },
+    /// Reposition a part's pins, and (optionally) turn its symbol.
+    ///
+    /// Rotation rides the Move because rotation IS a geometric transform:
+    /// for a two-pin part the client rotates the pins and `rot` stays None,
+    /// for a one-pin part the pins are unchanged and `rot` carries the whole
+    /// of the turn. One op, one undo entry, either way. `None` means "leave
+    /// the symbol as it is", which is also what an old client's Move
+    /// deserialises to.
     Move {
         id: u32,
         pins: Vec<Point>,
+        #[cfg_attr(feature = "serde", serde(default))]
+        rot: Option<u8>,
     },
     /// Reconfigure a part's parameters (the properties-panel path). The
     /// new kind must keep the same pin count.

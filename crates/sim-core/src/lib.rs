@@ -7,7 +7,10 @@ mod netlist;
 pub mod validate;
 
 pub use engine::{AdvanceReport, ElemFrame, ElemTap, Engine, GMIN};
-pub use netlist::{DocOp, ElementKind, ElementSpec, InteractOp, ParamWrite, Point, MAX_PINS};
+pub use netlist::{
+    DocOp, ElementKind, ElementSpec, InteractOp, ParamWrite, Point, DEFAULT_OPAMP_ISC, MAX_PINS,
+    MAX_TIER,
+};
 pub use validate::{check_document, Reject};
 
 #[cfg(test)]
@@ -360,6 +363,8 @@ mod tests {
                 id: 1,
                 kind: rail,
                 pins: vec![(0, 0)],
+                tier: 0,
+                rot: 0,
             },
             ElementSpec::two(2, ElementKind::Resistor { ohms: 1000.0 }, (0, 0), (8, 0)),
             ElementSpec::ground(3, (8, 0)),

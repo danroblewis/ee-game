@@ -158,7 +158,7 @@ pub fn opamp_follower() -> Vec<ElementSpec> {
     vec![
         spec(1, dc(2.0), (0, 0), (0, 8)),
         // pins: [in+, in-, out]; out wired back to in-.
-        spec3(2, ElementKind::OpAmp { rail: 13.5 }, (0, 0), (6, 4), (8, 0)),
+        spec3(2, ElementKind::OpAmp { rail: 13.5, isc: sim_core::DEFAULT_OPAMP_ISC }, (0, 0), (6, 4), (8, 0)),
         spec(3, ElementKind::Wire, (8, 0), (6, 4)),
         spec(4, r(1000.0), (8, 0), (0, 8)),
         gnd(5, (0, 8)),
@@ -169,7 +169,7 @@ pub fn opamp_follower() -> Vec<ElementSpec> {
 pub fn opamp_comparator() -> Vec<ElementSpec> {
     vec![
         spec(1, dc(1.0), (0, 0), (0, 8)),
-        spec3(2, ElementKind::OpAmp { rail: 5.0 }, (0, 0), (4, 6), (8, 0)),
+        spec3(2, ElementKind::OpAmp { rail: 5.0, isc: sim_core::DEFAULT_OPAMP_ISC }, (0, 0), (4, 6), (8, 0)),
         spec(3, ElementKind::Wire, (4, 6), (0, 8)), // in- to ground
         spec(4, r(1000.0), (8, 0), (0, 8)),
         gnd(5, (0, 8)),
@@ -214,7 +214,7 @@ pub fn pot_divider() -> Vec<ElementSpec> {
 pub fn opamp_relaxation() -> Vec<ElementSpec> {
     vec![
         // pins: [in+, in-, out]
-        spec3(1, ElementKind::OpAmp { rail: 5.0 }, (0, 6), (0, 2), (4, 4)),
+        spec3(1, ElementKind::OpAmp { rail: 5.0, isc: sim_core::DEFAULT_OPAMP_ISC }, (0, 6), (0, 2), (4, 4)),
         // integrator: Rf out -> in-, C in- -> ground
         spec(2, r(10_000.0), (4, 4), (8, 4)),
         spec(3, ElementKind::Wire, (8, 4), (8, 0)),
@@ -248,13 +248,15 @@ pub fn ota_vco(vctrl: f64) -> Vec<ElementSpec> {
             id: 1,
             kind: ElementKind::Ota,
             pins: vec![(0, 0), (0, 2), (4, 1), (2, 4)],
+            tier: 0,
+            rot: 0,
         },
         gnd(2, (0, 0)), // in+ grounded: OTA inverts the square wave
         spec(3, ElementKind::Capacitor { farads: 10e-9 }, (4, 1), (4, 5)),
         gnd(4, (4, 5)),
         // Schmitt trigger: non-inverting comparator with hysteresis.
         spec(5, r(1_000_000.0), (4, 1), (8, 1)), // triangle -> in+ (light load!)
-        spec3(6, ElementKind::OpAmp { rail: 5.0 }, (8, 1), (8, 3), (12, 2)),
+        spec3(6, ElementKind::OpAmp { rail: 5.0, isc: sim_core::DEFAULT_OPAMP_ISC }, (8, 1), (8, 3), (12, 2)),
         gnd(7, (8, 3)),
         spec(8, r(2_000_000.0), (12, 2), (12, -2)), // feedback: out -> in+
         spec(9, ElementKind::Wire, (12, -2), (8, -2)),
@@ -288,6 +290,8 @@ pub fn timer555_astable() -> Vec<ElementSpec> {
             id: 5,
             kind: ElementKind::Timer555,
             pins: vec![(6, 0), (6, 10), (4, 6), (4, 4), (10, 4), (2, 2)],
+            tier: 0,
+            rot: 0,
         },
         spec(6, r(10_000.0), (2, 0), (2, 2)), // RA: rail -> DIS
         spec(7, r(10_000.0), (2, 2), (2, 4)), // RB: DIS -> THR/TRIG

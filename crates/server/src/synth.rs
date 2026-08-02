@@ -195,6 +195,7 @@ fn ota(id: u32, inp: Point, inm: Point, out: Point, bias: Point) -> ElementSpec 
         id,
         kind: K::Ota,
         pins: vec![inp, inm, out, bias],
+        ..Default::default()
     }
 }
 
@@ -222,8 +223,9 @@ pub fn synth_room_circuit() -> Vec<ElementSpec> {
     // player drops next to it.
     e.push(ElementSpec {
         id: 10,
-        kind: K::OpAmp { rail: SUPPLY_V },
+        kind: K::OpAmp { rail: SUPPLY_V, isc: sim_core::DEFAULT_OPAMP_ISC },
         pins: vec![G2, SUM, OUT],
+        ..Default::default()
     });
     e.push(spec(11, r(6.8e6), OUT, SUM)); // Rf: transimpedance
     e.push(spec(ID_SPEAKER, K::Speaker { ohms: 8.0 }, OUT, G2));
@@ -241,7 +243,7 @@ pub fn synth_room_circuit() -> Vec<ElementSpec> {
     // also the richer sound.
     e.push(ota(20, SQ, G2, TRI, VBIAS));
     e.push(spec(21, cap(C_VCO), TRI, G2));
-    e.push(spec3(22, K::OpAmp { rail: 5.0 }, HYS, TRI, SQ));
+    e.push(spec3(22, K::OpAmp { rail: 5.0, isc: sim_core::DEFAULT_OPAMP_ISC }, HYS, TRI, SQ));
     e.push(spec(23, r(R_HYST_TOP), SQ, HYS));
     e.push(spec(24, r(R_HYST_BOT), HYS, G2));
     // The exponential converter's Thevenin resistance at the bias pin is
@@ -324,6 +326,7 @@ pub fn synth_room_circuit() -> Vec<ElementSpec> {
         id: 76,
         kind: K::Nmos { vt: 1.0, k: NMOS_K },
         pins: vec![SENV, SIN, SUM],
+        ..Default::default()
     });
     e.push(spec(77, K::Diode, STRIG, SENV));
     e.push(spec(78, cap(15e-9), SENV, G3));

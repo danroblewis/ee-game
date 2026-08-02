@@ -2,6 +2,7 @@
 // its placement geometry. Cost gates quantity/ratings later — never access
 // (design pillar): the full palette is available from minute one.
 
+import { DEFAULT_OPAMP_ISC } from './circuit';
 import type { ElementKind, Point } from './circuit';
 
 /** Menu categories, in the order the right-click submenu lists them. */
@@ -23,6 +24,15 @@ export interface PartDef {
   cat: Category;
   /** Single-key shortcut shown in the menu (see PART_HOTKEYS in main.ts). */
   key?: string;
+  /** Rating tier this entry places at. 0 (the starting kit) when omitted.
+   *
+   *  This is where the tech tree will attach: a higher tier is the SAME
+   *  `ElementKind` — same solver, same matrix, same numbers — with a bigger
+   *  package behind it, so "unlock the 5 W resistor" is one more row in this
+   *  list and one more row in `crates/damage`'s ladder, and nothing else in
+   *  the game has to move. Everything here is placeable today; gating comes
+   *  with the tree itself. */
+  tier?: number;
   make(): ElementKind;
 }
 
@@ -31,12 +41,30 @@ const nextSeed = () => Math.floor(Math.random() * 0x1_0000_0000) >>> 0;
 
 export const CATALOG: PartDef[] = [
   { name: 'Wire', keys: 'w line', cat: 'Passive', key: 'W', make: () => ({ t: 'Wire' }) },
+  {
+    // 14 AWG: 15 A instead of 3, for runs that carry real load current.
+    name: 'Heavy Wire',
+    keys: 'w line thick gauge awg power',
+    cat: 'Passive',
+    tier: 1,
+    make: () => ({ t: 'Wire' }),
+  },
   { name: 'Ground', keys: 'gnd earth', cat: 'Passive', key: 'G', make: () => ({ t: 'Ground' }) },
   {
     name: 'Resistor',
     keys: 'r ohm',
     cat: 'Passive',
     key: 'R',
+    make: () => ({ t: 'Resistor', ohms: 1000 }),
+  },
+  {
+    // The worked example of a tier: electrically identical to the ¼ W part
+    // above (same kind, same ohms), thermally a different animal — 5 W and a
+    // 25 s body instead of 0.25 W and 6 s.
+    name: 'Resistor 5 W',
+    keys: 'r ohm power wirewound high',
+    cat: 'Passive',
+    tier: 1,
     make: () => ({ t: 'Resistor', ohms: 1000 }),
   },
   {
@@ -126,7 +154,14 @@ export const CATALOG: PartDef[] = [
     cat: 'Outputs',
     make: () => ({ t: 'Speaker', ohms: 8 }),
   },
-  { name: 'Diode', keys: 'd rectifier', cat: 'Diodes', key: 'D', make: () => ({ t: 'Diode' }) },
+  { name: 'Diode', keys: 'd rectifier flyback freewheel', cat: 'Diodes', key: 'D', make: () => ({ t: 'Diode' }) },
+  {
+    name: 'Schottky 3 A',
+    keys: 'd rectifier power schottky fast',
+    cat: 'Diodes',
+    tier: 1,
+    make: () => ({ t: 'Diode' }),
+  },
   {
     name: 'Zener',
     keys: 'z regulator breakdown',
@@ -163,11 +198,35 @@ export const CATALOG: PartDef[] = [
     make: () => ({ t: 'Pmos', vt: 1.5, k: 0.05 }),
   },
   {
+    // The part that can actually switch a motor. A logic-level TO-220:
+    // k = 5 A/V² at a 2 V threshold is 67 mΩ from a 5 V gate (20 mΩ from
+    // 12 V), so an amp through it burns 67 mW instead of the 1.9 W the
+    // small-signal part above would. Tier 1: 20 W on a small heatsink.
+    // Its gate draws no current at all, which is why a 25 mA op-amp can
+    // drive it.
+    name: 'Power NMOS',
+    keys: 'fet mosfet power motor switch driver irlz44 to220',
+    cat: 'Transistors',
+    tier: 1,
+    make: () => ({ t: 'Nmos', vt: 2, k: 5 }),
+  },
+  {
+    name: 'Power PMOS',
+    keys: 'fet mosfet power high side switch to220',
+    cat: 'Transistors',
+    tier: 1,
+    make: () => ({ t: 'Pmos', vt: 2, k: 5 }),
+  },
+  {
     name: 'Op-Amp',
     keys: 'amplifier comparator',
     cat: 'Chips',
     key: 'A',
-    make: () => ({ t: 'OpAmp', rail: 12 }),
+    // 25 mA of output current, like every jellybean op-amp ever made. It is
+    // a BRAIN, not a muscle: past this the output folds back and the voltage
+    // sags, so an op-amp cannot drive a motor, a relay coil or a filament —
+    // it drives the gate of something that can.
+    make: () => ({ t: 'OpAmp', rail: 12, isc: DEFAULT_OPAMP_ISC }),
   },
   {
     name: 'OTA',

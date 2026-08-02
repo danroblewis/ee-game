@@ -180,12 +180,13 @@ pub fn vco(pl: &Place, pitch_wiper: f64, dither_v: f64) -> Vec<ElementSpec> {
             id: i,
             kind: K::Ota,
             pins: vec![pl.square(), g, pl.triangle(), pl.bias()],
+            ..Default::default()
         },
         spec(i + 1, K::Capacitor { farads: C_VCO }, pl.triangle(), g),
         // Schmitt comparator [in+, in-, out]: hysteresis node, triangle, square.
         spec3(
             i + 2,
-            K::OpAmp { rail: 5.0 },
+            K::OpAmp { rail: 5.0, isc: sim_core::DEFAULT_OPAMP_ISC },
             pl.hys(),
             pl.triangle(),
             pl.square(),
@@ -217,7 +218,7 @@ pub fn vco(pl: &Place, pitch_wiper: f64, dither_v: f64) -> Vec<ElementSpec> {
         // nothing, so this is ONE element and it is what makes the 1 V/oct
         // law hold: driving R_SCALE straight from a 10 k pot wiper costs
         // 844 cents at CV = 3.6 V (measured), and 1.3 cents with the buffer.
-        spec3(i + 10, K::OpAmp { rail: 9.0 }, pl.wiper(), pl.cv(), pl.cv()),
+        spec3(i + 10, K::OpAmp { rail: 9.0, isc: sim_core::DEFAULT_OPAMP_ISC }, pl.wiper(), pl.cv(), pl.cv()),
     ];
     if dither_v > 0.0 {
         v.push(spec(
@@ -275,6 +276,7 @@ pub fn lfo_555(
             id: i,
             kind: K::Timer555,
             pins: vec![pl.rail, g, ctl, ctl, out, dis],
+            ..Default::default()
         },
         spec(i + 1, r(100_000.0), pl.rail, dis), // R_A
         // R_B as a rheostat: end b sits on the wiper so only the a..wiper
@@ -336,9 +338,10 @@ pub fn lfo_triangle(
             id: i,
             kind: K::Ota,
             pins: vec![sq, g, tri, bias],
+            ..Default::default()
         },
         spec(i + 1, K::Capacitor { farads: C_LFO }, tri, g),
-        spec3(i + 2, K::OpAmp { rail: 5.0 }, hys, tri, sq),
+        spec3(i + 2, K::OpAmp { rail: 5.0, isc: sim_core::DEFAULT_OPAMP_ISC }, hys, tri, sq),
         spec(i + 3, r(1_000_000.0), sq, hys),
         spec(i + 4, r(1_000_000.0), hys, g),
         spec(i + 5, r(R_SCALE), cv_source, bias),
@@ -346,7 +349,7 @@ pub fn lfo_triangle(
         spec(i + 7, r(R_GND), bias, g),
     ];
     if let Some((target, r_inj)) = buffer_to {
-        v.push(spec3(i + 8, K::OpAmp { rail: 9.0 }, tri, buf, buf));
+        v.push(spec3(i + 8, K::OpAmp { rail: 9.0, isc: sim_core::DEFAULT_OPAMP_ISC }, tri, buf, buf));
         v.push(spec(i + 9, r(r_inj), buf, target));
     }
     v

@@ -227,6 +227,8 @@ function hintText(m: MachineMsg | null): string {
     'that voltage by hand and you are the feedback; close the loop off SNS W\n' +
     'and the crate finds the height instead. Keep M+ inside the nameplate:\n' +
     'parked against a stop, a bare supply burns the motor out.\n' +
+    'An op-amp is a brain, not a muscle — 25 mA is all it can source, so it\n' +
+    'has to command something that can carry the drum current.\n' +
     'drag the chip to move the whole machine · ⌘Z undoes it · ⓘ for the pinout.'
   );
 }

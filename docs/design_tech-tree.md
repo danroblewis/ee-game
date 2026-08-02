@@ -1,8 +1,9 @@
 # Tech tree: parts as progression
 
 *Status: recorded idea, not scheduled. Captured 2026-08-02 from the owner.
-Nothing here is built. The one thing being built now is the SEAM it needs —
-see "What this requires of the damage model" below.*
+The tree itself is NOT built. **The seam it needs is** — see "What this
+requires of the damage model", which is now a description of shipped code
+rather than a requirement.*
 
 ## The idea
 
@@ -35,26 +36,48 @@ makes the unlock legible.
 
 Natural tiers, all of which are the same *kind* at a different rating:
 
-| kind | starting tier | later tier |
-|---|---|---|
-| Resistor | 0.5 W film | high-power wirewound |
-| Capacitor | 25 V electrolytic | supercapacitor, high-voltage film |
-| Nmos / Pmos | 1 W small-signal | power MOSFET on a heatsink |
-| Npn / Pnp | 0.625 W TO-92 | power BJT |
-| Motor, Speaker, Inductor | small | rated for real load |
+| kind | starting tier | later tier | state |
+|---|---|---|---|
+| Resistor | ¼ W film | 5 W wirewound | **shipped** |
+| Wire | 22 AWG, 3 A | 14 AWG, 15 A | **shipped** |
+| Nmos / Pmos | 0.35 W TO-92 | 20 W TO-220 on a heatsink | **shipped** |
+| Capacitor | 16 V electrolytic | 100 V film | **shipped** |
+| Diode | 1N4001, 1 A | 3 A Schottky | **shipped** |
+| Npn / Pnp | 0.35 W TO-92 | 15 W TO-220 | **shipped** |
+| Motor, Speaker, Inductor | small | rated for real load | one rung so far |
 
-## What this requires of the damage model
+## What this requires of the damage model — BUILT
 
-Today a rating is hardcoded **per kind** (one match arm per `ElementKind`).
-That shape cannot express "a 0.5 W resistor and a 5 W resistor are the same
-kind at different tiers", so a tech tree would mean rewriting the damage
-crate later.
+A rating used to be hardcoded **per kind** (one match arm per
+`ElementKind`), a shape that cannot express "a 0.25 W resistor and a 5 W
+resistor are the same kind at different tiers". That is fixed, and the fix
+is the only part of this document that exists in code:
 
-The requirement, which is being built now as part of the device work: a
-rating must become a property of the **part instance** — a tier or variant
-carried in the document and validated like any other parameter — defaulting
-to the low tier so existing saved rooms still load. Then shipping a new tier
-is content, not surgery.
+- **`ElementSpec::tier: u8`** (`crates/sim-core/src/netlist.rs`) — a
+  per-instance document property, `#[serde(default)]` so every part in every
+  existing saved room is tier 0, the starting kit. It rides `Add` through
+  the ordinary op pipeline and is range-checked against
+  `netlist::MAX_TIER` by `check_document`, so client and server can never
+  disagree about what is placeable.
+- **It never reaches the solver.** `tier` is not in `ElementKind`, so it
+  cannot be stamped, cannot change a node count and cannot move a state
+  hash. Two resistors at different tiers are the same circuit — which is
+  exactly what makes headroom a *reward* rather than a rebalance.
+- **`damage::tiers(kind) -> &[Tier]`** is the ladder: one row per rung,
+  lowest first, each with a name a player sees. `damage::rating(kind, tier)`
+  picks the instance's rung and clamps a tier from a newer build down to the
+  best rung this one knows, so a room from the future still loads and still
+  cooks its parts.
+- **`PartDef::tier`** in `packages/app/src/catalog.ts` is where a rung
+  becomes a placeable part.
+
+**Shipping a new tier is therefore: one row in `tiers()`, one entry in the
+catalogue.** No solver change, no wire-format change, no migration. Three
+worked examples ship already — the 5 W wirewound resistor, the 14 AWG heavy
+wire and (the one the Freight Hoist needs) the TO-220 power MOSFET.
+
+What is deliberately NOT built: any gating. Every tier is placeable today.
+The tree decides *who may place what*, and that is the tree's job.
 
 ## Open questions
 

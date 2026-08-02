@@ -295,6 +295,7 @@ pub fn sequencer(sq: &Seq) -> Vec<ElementSpec> {
         id: next(),
         kind: K::Timer555,
         pins: vec![vcc, g555, trg, ramp, out5, dis],
+        ..Default::default()
     });
     v.push(gnd(next(), g555));
     // TRIG tied to THR: one wire down the left of the chip. (This used to be
@@ -347,11 +348,13 @@ pub fn sequencer(sq: &Seq) -> Vec<ElementSpec> {
             id: next(),
             kind: K::Ota,
             pins: vec![ramp, edge(k), gt[k], cbias],
+            ..Default::default()
         });
         v.push(ElementSpec {
             id: next(),
             kind: K::Ota,
             pins: vec![hi, ramp, gt[k], cbias],
+            ..Default::default()
         });
     }
 
@@ -382,7 +385,7 @@ pub fn sequencer(sq: &Seq) -> Vec<ElementSpec> {
     v.push(spec(next(), r(R_CV), cvb, gout));
     v.push(gnd(next(), gout));
     // unity-gain buffer. pins [in+, in-, out]
-    v.push(spec3(next(), K::OpAmp { rail: SUPPLY_V }, cvb, cv, cv));
+    v.push(spec3(next(), K::OpAmp { rail: SUPPLY_V, isc: sim_core::DEFAULT_OPAMP_ISC }, cvb, cv, cv));
 
     // ---- beat row: a latching toggle and a steering diode per step.
     // Diodes, not resistors: they keep the bus amplitude independent of how
@@ -470,9 +473,10 @@ pub fn probe_vco(sq: &Seq, id0: u32, r_v: f64, c_v: f64, rail: f64) -> Vec<Eleme
             id: next(),
             kind: K::Ota,
             pins: vec![sqr, g, tri, vb],
+            ..Default::default()
         },
         spec(next(), K::Capacitor { farads: c_v }, tri, g),
-        spec3(next(), K::OpAmp { rail }, fb, tri, sqr),
+        spec3(next(), K::OpAmp { rail, isc: sim_core::DEFAULT_OPAMP_ISC }, fb, tri, sqr),
         spec(next(), r(100e3), sqr, fb),
         spec(next(), r(100e3), fb, g),
     ]

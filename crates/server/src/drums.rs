@@ -78,6 +78,7 @@ fn pot(id: u32, ohms: f64, wiper: f64, a: Point, w: Point, b: Point) -> ElementS
         id,
         kind: K::Potentiometer { ohms, wiper },
         pins: vec![a, w, b],
+        ..Default::default()
     }
 }
 fn ota(id: u32, ip: Point, im: Point, out: Point, bias: Point) -> ElementSpec {
@@ -85,6 +86,7 @@ fn ota(id: u32, ip: Point, im: Point, out: Point, bias: Point) -> ElementSpec {
         id,
         kind: K::Ota,
         pins: vec![ip, im, out, bias],
+        ..Default::default()
     }
 }
 
@@ -141,12 +143,14 @@ pub fn drum_kit(o: Point, id0: u32, seed: u32) -> Drums {
             phase: 0.0,
         },
         pins: vec![v9],
+        ..Default::default()
     });
     e.push(ElementSpec {
         id: id(1),
         kind: K::Timer555,
         // [vcc, gnd, trig, thr, out, dis]
         pins: vec![v9, g, tcap, tcap, t555o, tdis],
+        ..Default::default()
     });
     e.push(spec(id(2), r(10_000.0), v9, tdis)); // RA
     e.push(spec(id(3), r(330_000.0), tdis, tcap)); // RB
@@ -167,8 +171,9 @@ pub fn drum_kit(o: Point, id0: u32, seed: u32) -> Drums {
     // 6.8 MΩ for every OTA voice on the summing bus.
     e.push(ElementSpec {
         id: id(10),
-        kind: K::OpAmp { rail: 9.0 },
+        kind: K::OpAmp { rail: 9.0, isc: sim_core::DEFAULT_OPAMP_ISC },
         pins: vec![ka, sum, out], // [in+, in-, out]
+        ..Default::default()
     });
     e.push(spec(id(11), r(6.8e6), out, sum));
     e.push(spec(id(12), r(100_000.0), sum, g));

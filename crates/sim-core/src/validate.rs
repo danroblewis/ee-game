@@ -73,6 +73,8 @@ pub const MAX_HZ: f64 = 1e9;
 pub const MIN_BETA: f64 = 1e-3;
 pub const MAX_BETA: f64 = 1e9;
 pub const MAX_MOS_K: f64 = 1e9;
+/// Smallest op-amp output-current limit a document may carry.
+pub const MIN_OPAMP_ISC: f64 = 1e-6;
 
 /// Why a document was refused. `code()` is the machine-readable reason for
 /// the wire protocol; `hint()` is a human sentence the client can surface
@@ -225,9 +227,17 @@ fn check_kind(kind: &ElementKind) -> Result<(), &'static str> {
             }
             Ok(())
         }
-        K::OpAmp { rail } => {
+        K::OpAmp { rail, isc } => {
             if !in_range(rail, 0.0, MAX_SOURCE_VOLTS) {
                 return Err("op-amp rail must be a finite value between 0 and 1 MV");
+            }
+            // A zero-isc op-amp would stamp a 0 A current source in the
+            // limited region — legal, but it would be a part that cannot do
+            // anything, and the branch row would be indistinguishable from a
+            // typo. The floor is 1 uA (below any real part) and the ceiling
+            // is the same 1 MA every other source gets.
+            if !in_range(isc, MIN_OPAMP_ISC, MAX_SOURCE_AMPS) {
+                return Err("op-amp output current limit must be between 1 uA and 1 MA");
             }
             Ok(())
         }
@@ -289,6 +299,24 @@ pub fn check_document(specs: &[ElementSpec], dt: f64) -> Result<(), Reject> {
         }
         if let Err(hint) = check_kind(&s.kind) {
             return Err(Reject::BadValue { id: s.id, hint });
+        }
+        // Tier and rotation never reach a stamp, so neither can make a
+        // document unsolvable — but both are indices into small tables
+        // (the damage crate's rating rows, the renderer's four quarter
+        // turns) and an out-of-range one is a stale or hostile client, not
+        // a placement. Refusing here means neither table ever needs a
+        // defensive clamp for a value that should not exist.
+        if s.tier > crate::netlist::MAX_TIER {
+            return Err(Reject::BadValue {
+                id: s.id,
+                hint: "that part tier does not exist yet",
+            });
+        }
+        if s.rot > 3 {
+            return Err(Reject::BadValue {
+                id: s.id,
+                hint: "rotation must be 0, 1, 2 or 3 quarter turns",
+            });
         }
         if collapses_when_coincident(&s.kind) && s.pins[0] == s.pins[1] {
             return Err(Reject::CollapsedPins { id: s.id });
@@ -434,6 +462,8 @@ mod tests {
                 id: 1,
                 kind: rail(12.0),
                 pins: vec![(0, 0)],
+                tier: 0,
+                rot: 0,
             },
             ElementSpec::ground(2, (0, 0)),
         ];
@@ -444,11 +474,15 @@ mod tests {
                 id: 1,
                 kind: rail(12.0),
                 pins: vec![(0, 0)],
+                tier: 0,
+                rot: 0,
             },
             ElementSpec {
                 id: 2,
                 kind: rail(5.0),
                 pins: vec![(0, 0)],
+                tier: 0,
+                rot: 0,
             },
         ];
         rejected(&d, Reject::Unsolvable);
@@ -459,6 +493,8 @@ mod tests {
                 id: 1,
                 kind: rail(12.0),
                 pins: vec![(0, 0)],
+                tier: 0,
+                rot: 0,
             },
             ElementSpec::two(2, dc(5.0), (0, 0), (0, 6)),
             ElementSpec::ground(3, (0, 6)),
@@ -470,6 +506,8 @@ mod tests {
                 id: 1,
                 kind: rail(5.0),
                 pins: vec![(0, 0)],
+                tier: 0,
+                rot: 0,
             },
             ElementSpec::two(2, r(1000.0), (0, 0), (8, 0)),
             ElementSpec::ground(3, (8, 0)),
@@ -627,6 +665,8 @@ mod tests {
                 id: 1,
                 kind: rail(5.0),
                 pins: vec![(57, 5)],
+                tier: 0,
+                rot: 0,
             },
             ElementSpec::ground(2, (57, 9)),
         ];
@@ -639,6 +679,54 @@ mod tests {
         let mut with_top = d.clone();
         with_top.push(ElementSpec::two(10, dc(9.0), (57, 19), (61, 19)));
         rejected(&with_top, Reject::UnsolvableWhenSwitched);
+    }
+
+    /// Tier and rotation are document properties that must never touch the
+    /// matrix, so validation of them is purely a range check — and the
+    /// circuit they ride on must solve identically either way.
+    #[test]
+    fn tier_and_rotation_are_range_checked_and_electrically_inert() {
+        use crate::netlist::MAX_TIER;
+        // In range: accepted, on any part.
+        for tier in 0..=MAX_TIER {
+            let mut d = base();
+            d[1] = d[1].clone().at_tier(tier);
+            ok(&d);
+        }
+        for rot in 0..4u8 {
+            let mut d = base();
+            d[2] = d[2].clone().rotated(rot); // the ground symbol
+            ok(&d);
+        }
+        // Out of range: refused, and pinned to the offending element.
+        let mut d = base();
+        d[1].tier = MAX_TIER + 1;
+        match check_document(&d, DT) {
+            Err(Reject::BadValue { id: 2, .. }) => {}
+            other => panic!("tier {} must be refused, got {other:?}", MAX_TIER + 1),
+        }
+        let mut d = base();
+        d[2].rot = 4;
+        match check_document(&d, DT) {
+            Err(Reject::BadValue { id: 3, .. }) => {}
+            other => panic!("rot 4 must be refused, got {other:?}"),
+        }
+
+        // The point of the whole design: turning a symbol or upgrading a
+        // part's package cannot change one number in the circuit. Same
+        // document, four rotations and four tiers, identical state digest.
+        let mut want = None;
+        for (tier, rot) in (0..=MAX_TIER).zip(0..4u8) {
+            let d: Vec<ElementSpec> = base()
+                .into_iter()
+                .map(|s| s.at_tier(tier).rotated(rot))
+                .collect();
+            let mut eng = Engine::new(DT);
+            eng.set_elements(&d);
+            eng.advance(500);
+            let h = eng.state_hash();
+            assert_eq!(*want.get_or_insert(h), h, "tier/rot must not reach the solver");
+        }
     }
 
     #[test]

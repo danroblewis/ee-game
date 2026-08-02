@@ -486,6 +486,31 @@ function zigzag(ctx: CanvasRenderingContext2D, a: Px, b: Px, va: number, vb: num
   ctx.stroke();
 }
 
+/** Screen-space unit vector a ONE-PIN part's body points along.
+ *
+ *  Two-, three- and six-pin parts get their orientation for free: their pins
+ *  are somewhere, and the symbol is drawn between them. A `Ground` or `Rail`
+ *  has exactly one pin, which a rotation maps onto itself, so there is
+ *  nowhere in the geometry to put a direction — it lives in `ElementSpec.rot`
+ *  instead, a quarter-turn count that rides the shared document and never
+ *  reaches the netlist.
+ *
+ *  `base` is the untouched (rot = 0) direction in canvas units: +1 for
+ *  Ground, whose stem has always hung DOWN from the pin, and -1 for Rail,
+ *  which has always pointed UP. Turning is clockwise on screen, matching
+ *  `rotateElements`. */
+export function oneAxis(e: ElementSpec, base: number): [number, number] {
+  const q = ((e.rot ?? 0) % 4 + 4) % 4;
+  const dirs: [number, number][] = [
+    [0, 1],
+    [-1, 0],
+    [0, -1],
+    [1, 0],
+  ];
+  const [dx, dy] = dirs[q]!;
+  return [dx * base, dy * base];
+}
+
 export function drawElement(d: DrawCtx, e: ElementSpec) {
   const { ctx, cam } = d;
   const s = cam.scale;
@@ -519,39 +544,51 @@ export function drawElement(d: DrawCtx, e: ElementSpec) {
       break;
     }
     case 'Ground': {
+      // The body hangs off the single pin along `oneAxis`, which is where
+      // the part's `rot` finally lands: a one-pin symbol has no pin geometry
+      // to orient it, so the document carries the quarter-turn instead.
+      const [ux, uy] = oneAxis(e, 1);
+      const at = (along: number, across: number): Px => [
+        A[0] + s * (ux * along - uy * across),
+        A[1] + s * (uy * along + ux * across),
+      ];
       ctx.strokeStyle = voltageColor(v(0));
       ctx.beginPath();
       ctx.moveTo(A[0], A[1]);
-      ctx.lineTo(A[0], A[1] + s * 0.25);
-      for (const [w, dy] of [[0.5, 0.25], [0.33, 0.47], [0.16, 0.69]] as const) {
-        ctx.moveTo(A[0] - s * w * 0.5, A[1] + s * dy);
-        ctx.lineTo(A[0] + s * w * 0.5, A[1] + s * dy);
+      ctx.lineTo(...at(0.25, 0));
+      for (const [w, d] of [[0.5, 0.25], [0.33, 0.47], [0.16, 0.69]] as const) {
+        ctx.moveTo(...at(d, -w * 0.5));
+        ctx.lineTo(...at(d, w * 0.5));
       }
       ctx.stroke();
       break;
     }
     case 'Rail': {
-      // Ground's mirror image: a stem UP from the pin to a ring — the
+      // Ground's mirror image: a stem AWAY from the pin to a ring — the
       // implicit return path is the ground symbol it points away from. DC
       // shows a '+' in the ring; AC shows a tilde. The ring is deliberately
       // big: it is the part's whole body, so it has to be an easy grab
       // (hitTest treats the stem+ring as the clickable body).
+      const [ux, uy] = oneAxis(e, -1);
       const r = s * 0.28;
-      const cy = A[1] - s * 0.55;
+      const cx = A[0] + ux * s * 0.55;
+      const cy = A[1] + uy * s * 0.55;
       ctx.strokeStyle = voltageColor(v(0));
       ctx.beginPath();
       ctx.moveTo(A[0], A[1]);
-      ctx.lineTo(A[0], cy + r);
+      ctx.lineTo(cx - ux * r, cy - uy * r);
       ctx.stroke();
       ctx.strokeStyle = '#c9c9d4';
       ctx.beginPath();
-      ctx.arc(A[0], cy, r, 0, Math.PI * 2);
+      ctx.arc(cx, cy, r, 0, Math.PI * 2);
       ctx.stroke();
       ctx.fillStyle = '#c9c9d4';
       ctx.font = `${Math.round(s * 0.4)}px ui-monospace`;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
-      ctx.fillText(e.kind.amp === 0 ? '+' : '∿', A[0], cy + 0.5);
+      // The glyph never turns: a rotated '+' is a '+', and a rotated tilde
+      // is unreadable. Only the body's DIRECTION is what the rotation means.
+      ctx.fillText(e.kind.amp === 0 ? '+' : '∿', cx, cy + 0.5);
       ctx.textAlign = 'start';
       ctx.textBaseline = 'alphabetic';
       break;
@@ -1051,6 +1088,27 @@ export function drawElement(d: DrawCtx, e: ElementSpec) {
         asize,
         voltageColor(v(2)),
       );
+      // A power part wears its heatsink. Tier 1+ MOSFETs are the same
+      // device model with a TO-220 tab behind them, and since the tab is the
+      // entire difference between "this can switch an amp" and "this dies in
+      // a second", it has to be visible on the canvas — a player must be
+      // able to tell the two apart without opening the properties panel.
+      if ((e.tier ?? 0) > 0) {
+        const tabC = add(chC, ug, s * 0.34);
+        ctx.strokeStyle = '#8a8a96';
+        ctx.beginPath();
+        for (let f = -1; f <= 1; f++) {
+          const root = add(tabC, bn, f * halfCh * 0.62);
+          const tip = add(root, ug, s * 0.3);
+          ctx.moveTo(root[0], root[1]);
+          ctx.lineTo(tip[0], tip[1]);
+        }
+        const bar0 = add(tabC, bn, -halfCh * 0.75);
+        const bar1 = add(tabC, bn, halfCh * 0.75);
+        ctx.moveTo(bar0[0], bar0[1]);
+        ctx.lineTo(bar1[0], bar1[1]);
+        ctx.stroke();
+      }
       // The gate draws no current, so only the conducting legs get dots.
       const idd = iPin(1);
       drawDotsPath(ctx, cam, [...dl.pts].reverse(), d.dots.advance(e.id, idd, d.dtSec), idd);
@@ -1510,13 +1568,17 @@ export function hitTest(cam: Camera, e: ElementSpec, x: number, y: number): numb
   const P = e.pins.map((p) => px(cam, p));
   if (P.length === 1) {
     const [ax, ay] = P[0]!;
-    // One-pin parts draw a body away from the pin (Rail up, Ground down):
-    // the whole stem-to-symbol span is the clickable body, or the part
-    // could only ever be grabbed by its connection point.
-    const ext = e.kind.t === 'Rail' ? -0.85 : e.kind.t === 'Ground' ? 0.72 : 0;
-    const ey = ay + cam.scale * ext;
-    const t = ext === 0 ? 0 : Math.max(0, Math.min(1, (y - ay) / (ey - ay)));
-    return Math.hypot(x - ax, y - (ay + t * (ey - ay)));
+    // One-pin parts draw a body away from the pin, in whichever direction
+    // their rotation points: the whole stem-to-symbol span is the clickable
+    // body, or the part could only ever be grabbed by its connection point.
+    const len = e.kind.t === 'Rail' ? 0.85 : e.kind.t === 'Ground' ? 0.72 : 0;
+    if (len === 0) return Math.hypot(x - ax, y - ay);
+    const [ux, uy] = oneAxis(e, e.kind.t === 'Rail' ? -1 : 1);
+    const dx = ux * cam.scale * len;
+    const dy = uy * cam.scale * len;
+    const l2 = dx * dx + dy * dy;
+    const t = Math.max(0, Math.min(1, ((x - ax) * dx + (y - ay) * dy) / l2));
+    return Math.hypot(x - (ax + t * dx), y - (ay + t * dy));
   }
   let best = Infinity;
   const segs: [Px, Px][] = [];

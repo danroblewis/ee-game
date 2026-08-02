@@ -241,8 +241,10 @@ let selectedProbe: number | null = null;
  * walks `selectedIds`. */
 let selectedMachine = false;
 
-/** Copy/paste: kinds + pins relative to the selection centroid. */
-type ClipItem = { kind: ElementKind; pins: Point[] };
+/** Copy/paste: kinds + pins relative to the selection centroid, plus the
+ * two per-instance document properties (rating tier, symbol rotation) —
+ * copying a 5 W resistor has to give you a 5 W resistor. */
+type ClipItem = { kind: ElementKind; pins: Point[]; tier?: number; rot?: number };
 let clipboard: ClipItem[] = [];
 let pasting: ClipItem[] | null = null;
 
@@ -285,6 +287,7 @@ function applyDoc(op: DocOp) {
     const e = elemById(op.id);
     if (e) {
       e.pins = op.pins;
+      if (op.rot !== undefined) e.rot = op.rot & 3;
       space.update(e);
     }
   } else if (op.t === 'SetKind') {
@@ -1095,6 +1098,7 @@ const FIELD_LABELS: Record<string, string> = {
   vt: 'threshold V',
   k: 'k A/V²',
   rail: 'rail ±V',
+  isc: 'out limit A',
   wiper: 'wiper 0-1',
   volts: 'amplitude ±V',
   seed: 'seed (whole number)',
@@ -1110,7 +1114,14 @@ function buildProps(host: HTMLElement, target: ElementSpec, onClose?: () => void
   mark(target.kind);
   host.innerHTML = '';
   const h = document.createElement('h3');
-  h.textContent = `${target.kind.t}  #${target.id}`;
+  // The tier is the part's RATING, not its behaviour: two resistors at
+  // different tiers solve identically and only differ in what they can take,
+  // so it belongs in the header next to the id rather than in the field list
+  // with the electrical parameters. The authority on what a tier can take is
+  // `crates/damage`; the client deliberately does not keep a second copy of
+  // that table to disagree with.
+  const tier = target.tier ?? 0;
+  h.textContent = `${target.kind.t}  #${target.id}${tier > 0 ? `  ·  tier ${tier}` : ''}`;
   host.appendChild(h);
   if (onClose) {
     const x = document.createElement('button');
@@ -1273,14 +1284,26 @@ function centroidOf(sel: ElementSpec[]): Point {
   return [Math.round(sx / n), Math.round(sy / n)];
 }
 
-/** Rotate parts 90° clockwise about their shared centroid. */
+/** Rotate parts 90° clockwise about their shared centroid.
+ *
+ *  Two things turn, and a part usually only has one of them. PINS carry the
+ *  orientation of every multi-pin part: rotate them and the symbol follows,
+ *  because the renderer derives the body from the pin geometry. A ONE-PIN
+ *  part (Ground, Rail) has nothing to rotate — its single pin maps to itself
+ *  about its own centre — so its orientation is a separate quarter-turn
+ *  count carried in the shared document, and this is where it advances.
+ *
+ *  Both ride the same `Move`, so a rotation is one op, one undo entry and
+ *  one broadcast whichever kind of part it lands on. And because `rot` never
+ *  reaches the netlist, turning a ground symbol cannot change one number in
+ *  the circuit — which is the whole point: it is a drawing decision. */
 function rotateElements(sel: ElementSpec[]) {
   if (sel.length === 0) return;
   const [cx, cy] = centroidOf(sel);
   history.begin(sel, sel.length > 1 ? `rotate ${sel.length} parts` : 'rotate part');
   for (const e of sel) {
     const pins = e.pins.map(([x, y]) => [cx - (y - cy), cy + (x - cx)] as Point);
-    editDoc({ t: 'Move', id: e.id, pins });
+    editDoc({ t: 'Move', id: e.id, pins, rot: ((e.rot ?? 0) + 1) & 3 });
   }
   history.end();
 }
@@ -1372,6 +1395,8 @@ function copyElements(sel: ElementSpec[]) {
   clipboard = sel.map((e) => ({
     kind: JSON.parse(JSON.stringify(e.kind)) as ElementKind,
     pins: e.pins.map(([x, y]) => [x - cx, y - cy] as Point),
+    tier: e.tier ?? 0,
+    rot: e.rot ?? 0,
   }));
 }
 
@@ -1396,6 +1421,8 @@ function commitPaste(at: Point) {
         id,
         kind: JSON.parse(JSON.stringify(item.kind)) as ElementKind,
         pins: item.pins.map(([x, y]) => [x + at[0], y + at[1]] as Point),
+        tier: item.tier ?? 0,
+        rot: item.rot ?? 0,
       },
     });
   }
@@ -1409,7 +1436,7 @@ function commitPaste(at: Point) {
 /** Paste the clipboard straight down at `at` (context-menu Paste). */
 function pasteAt(at: Point) {
   if (clipboard.length === 0) return;
-  pasting = clipboard.map((c) => ({ kind: c.kind, pins: c.pins }));
+  pasting = clipboard.map((c) => ({ ...c }));
   placing = null;
   commitPaste(at);
 }
@@ -1417,7 +1444,7 @@ function pasteAt(at: Point) {
 /** Arm the cursor-bound paste ghost (⌘/Ctrl+V). */
 function armPaste() {
   if (clipboard.length === 0) return;
-  pasting = clipboard.map((c) => ({ kind: c.kind, pins: c.pins }));
+  pasting = clipboard.map((c) => ({ ...c }));
   placing = null;
   canvas.style.cursor = 'crosshair';
 }
@@ -2467,7 +2494,19 @@ canvas.addEventListener('pointerup', (ev) => {
     const clicked = placeDrag.b[0] === a[0] && placeDrag.b[1] === a[1];
     const b = clicked ? placeEnd(a) : placeDrag.b;
     const id = newId();
-    editDoc({ t: 'Add', spec: { id, kind, pins: placePins(kind, a, b) } });
+    // `placeRot` is the armed quarter-turn. For a two- or three-pin part it
+    // has already done its work through `placeEnd`, which points the drag;
+    // for a one-pin part there is no drag to point, so it rides the spec.
+    editDoc({
+      t: 'Add',
+      spec: {
+        id,
+        kind,
+        pins: placePins(kind, a, b),
+        tier: placing.tier ?? 0,
+        rot: placeRot,
+      },
+    });
     selectedIds = new Set([id]);
     selectedProbe = null;
     selectedMachine = false;
@@ -2657,8 +2696,9 @@ window.addEventListener('keydown', (ev) => {
     } else if (pasting) {
       // Rotate the paste ghost 90° clockwise about its centroid (origin).
       pasting = pasting.map((c) => ({
-        kind: c.kind,
+        ...c,
         pins: c.pins.map(([x, y]) => [-y, x] as Point),
+        rot: ((c.rot ?? 0) + 1) & 3,
       }));
     } else {
       rotateSelection();
@@ -2670,7 +2710,7 @@ window.addEventListener('keydown', (ev) => {
     if (pasting) {
       // Ghost pins are relative to the cursor, so the centroid is the origin.
       pasting = pasting.map((c) => ({
-        kind: c.kind,
+        ...c,
         pins: c.pins.map(([x, y]) => (axis === 'x' ? [-x, y] : [x, -y]) as Point),
       }));
     } else if (placing) {

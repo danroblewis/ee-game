@@ -22,7 +22,7 @@ export type ElementKind =
   | { t: 'Pnp'; beta: number }
   | { t: 'Nmos'; vt: number; k: number }
   | { t: 'Pmos'; vt: number; k: number }
-  | { t: 'OpAmp'; rail: number }
+  | { t: 'OpAmp'; rail: number; isc: number }
   | { t: 'Ota' }
   | { t: 'Timer555' }
   | { t: 'Potentiometer'; ohms: number; wiper: number }
@@ -34,10 +34,23 @@ export type ElementKind =
   // the document has to know them or their pins are untyped and unnamed.
   | { t: 'Motor'; ohms: number; henries: number; bemf: number };
 
+/** A jellybean op-amp's short-circuit output current (741/LM358 class).
+ *  Mirrors `sim_core::DEFAULT_OPAMP_ISC`; an op-amp cannot source more than
+ *  this, which is why it cannot drive a motor. */
+export const DEFAULT_OPAMP_ISC = 0.025;
+
 export interface ElementSpec {
   id: number;
   kind: ElementKind;
   pins: Point[];
+  /** Rating tier: 0 is the starting kit, higher rungs are the same device
+   *  in a bigger package. Damage-only — the solver ignores it entirely.
+   *  Absent on parts placed by older clients; treat as 0. */
+  tier?: number;
+  /** Quarter-turn symbol rotation, 0..3 clockwise. Only the one-pin parts
+   *  (Ground, Rail) use it: everything else takes its orientation from its
+   *  pin geometry. Absent on older parts; treat as 0. */
+  rot?: number;
 }
 
 export type InteractOp =
@@ -47,7 +60,11 @@ export type InteractOp =
 export type DocOp =
   | { t: 'Add'; spec: ElementSpec }
   | { t: 'Remove'; id: number }
-  | { t: 'Move'; id: number; pins: Point[] }
+  /** Reposition, and optionally turn the symbol. `rot` is omitted for the
+   *  ordinary drag/reshape case ("leave the symbol alone") and carries the
+   *  whole of the turn for one-pin parts, whose pins a rotation cannot
+   *  move. */
+  | { t: 'Move'; id: number; pins: Point[]; rot?: number }
   | { t: 'SetKind'; id: number; kind: ElementKind };
 
 /** Pin labels for tooltips, by kind. */
