@@ -13,7 +13,7 @@ pub use netlist::{
     DocOp, ElementKind, ElementSpec, InteractOp, ParamWrite, Point, DEFAULT_OPAMP_ISC, MAX_PINS,
     MAX_TIER,
 };
-pub use validate::{check_document, Reject};
+pub use validate::{check_document, Reject, SmallIds};
 
 #[cfg(test)]
 mod tests {

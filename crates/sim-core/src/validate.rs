@@ -159,7 +159,10 @@ impl SmallIds {
         self.len == 0
     }
 
-    fn of(all: &[u32]) -> Self {
+    /// Public so `Reject::SourceLoop` is constructible outside this module —
+    /// every other variant's fields are plain, and one that could only be
+    /// built here would make the enum awkward to match against in tests.
+    pub fn of(all: &[u32]) -> Self {
         let mut s = SmallIds {
             len: all.len().min(u8::MAX as usize) as u8,
             ..Default::default()
