@@ -63,6 +63,7 @@ import { ratedA } from './machines/hoist';
 import type { MachineFrame, MachineMsg } from './machines/seam';
 import type { ElemLive, ElementSpec } from './circuit';
 import type { Camera, DamageState, DotFlow } from './render';
+import { fmtEng } from './units';
 
 export type { MachineMsg } from './machines/seam';
 
@@ -179,16 +180,6 @@ const writeLS = (k: string, v: string) => {
     /* ignore */
   }
 };
-
-/** SI formatting, same shape as the HUD's `fmt` in main.ts. */
-function fmtSI(v: number, unit: string): string {
-  const a = Math.abs(v);
-  if (a >= 1000) return `${(v / 1000).toFixed(2)} k${unit}`;
-  if (a >= 1) return `${v.toFixed(2)} ${unit}`;
-  if (a >= 1e-3) return `${(v * 1e3).toFixed(2)} m${unit}`;
-  if (a >= 1e-6) return `${(v * 1e6).toFixed(2)} µ${unit}`;
-  return `0 ${unit}`;
-}
 
 /** The instruction on the goal card.
  *
@@ -405,9 +396,13 @@ function buildCard(root: HTMLElement, reset: () => void): Card {
       badge.textContent = at.stale ? 'NO LINK' : m.win ? 'HELD' : inBand ? 'IN BAND' : 'OUT';
       badge.className = `goal-badge${at.stale ? '' : m.win ? ' win' : inBand ? ' in' : ''}`;
 
-      vHeight.textContent = `${(m.y * 1000).toFixed(1)} mm`;
-      vVel.textContent = `${(m.vel * 1000).toFixed(0)} mm/s`;
-      vCur.textContent = fmtSI(m.i, 'A');
+      // Height and speed go through the same formatter as everything else,
+      // because the hand-rolled `* 1000 .toFixed(0)` printed `0 mm/s` for a
+      // crate creeping at 400 um/s — the same false zero the electrical
+      // readouts had, in a different unit.
+      vHeight.textContent = fmtEng(m.y, 'm');
+      vVel.textContent = fmtEng(m.vel, 'm/s');
+      vCur.textContent = fmtEng(m.i, 'A');
       // Over the nameplate current is exactly the moment worth flagging:
       // both numbers come from the message, and the comparison is the whole
       // lesson (the motor is now cooking).
@@ -419,7 +414,7 @@ function buildCard(root: HTMLElement, reset: () => void): Card {
         hintFor = m.imax;
         hint.textContent = hintText(m);
       }
-      vJoule.textContent = `${m.joules.toFixed(1)} J`;
+      vJoule.textContent = fmtEng(m.joules, 'J');
       vLand.textContent = String(m.landings);
       vBand.textContent = `${(m.band[0] * 1000).toFixed(0)}–${(m.band[1] * 1000).toFixed(0)} mm`;
 

@@ -46,6 +46,7 @@ import {
   type ScopeControlId,
   type TraceStore,
 } from './scope';
+import { fmtEng, fmtEntry, parseField, quantityOf } from './units';
 
 // ------------------------------------------------------------ shared state
 
@@ -766,16 +767,6 @@ function dockSideOf(plid: number): RailSide | null {
 
 // ---------------------------------------------------------------- widgets
 
-const fmtSI = (v: number, unit: string) => {
-  const a = Math.abs(v);
-  if (!Number.isFinite(v)) return `— ${unit}`;
-  if (a >= 1000) return `${(v / 1000).toFixed(2)} k${unit}`;
-  if (a >= 1) return `${v.toFixed(2)} ${unit}`;
-  if (a >= 1e-3) return `${(v * 1e3).toFixed(1)} m${unit}`;
-  if (a >= 1e-6) return `${(v * 1e6).toFixed(1)} µ${unit}`;
-  return `0.00 ${unit}`;
-};
-
 export interface PanelHostDeps {
   /** The document (server truth when online). */
   elements(): ElementSpec[];
@@ -960,14 +951,14 @@ function potWidget(plid: number, id: number, deps: PanelHostDeps): Widget {
       spec = ctx.byId.get(id);
       const k = spec?.kind;
       if (k?.t !== 'Potentiometer') return;
-      lab.textContent = `POT #${id} ${fmtSI(k.ohms, 'Ω')}`;
+      lab.textContent = `POT #${id} ${fmtEntry(k.ohms, quantityOf('Potentiometer', 'ohms'))}`;
       if (!dragging) {
         slider.value = String(k.wiper);
         needle.style.transform = `rotate(${-135 + k.wiper * 270}deg)`;
       }
       const l = ctx.live.get(id);
       // The wiper pin voltage is solver output, not a UI guess.
-      val.textContent = `${(k.wiper * 100).toFixed(0)}% ${l ? fmtSI(l.v[1] ?? 0, 'V') : ''}`;
+      val.textContent = `${(k.wiper * 100).toFixed(0)}% ${l ? fmtEng(l.v[1] ?? 0, 'V') : ''}`;
     },
   };
 }
@@ -995,7 +986,7 @@ function switchWidget(id: number, deps: PanelHostDeps): Widget {
       btn.textContent = k.closed ? 'ON' : 'OFF';
       btn.classList.toggle('on', k.closed);
       const l = ctx.live.get(id);
-      val.textContent = l ? fmtSI(l.i[0] ?? 0, 'A') : '—';
+      val.textContent = l ? fmtEng(l.i[0] ?? 0, 'A') : '—';
     },
   };
 }
@@ -1018,12 +1009,12 @@ function indicatorWidget(id: number): Widget {
         // Same normalization the schematic symbol uses: P / rated W.
         bright = clamp(Math.abs(l?.power ?? 0) / Math.max(1e-9, k.rated_watts), 0, 1);
         lab.textContent = `LAMP #${id}`;
-        val.textContent = l ? fmtSI(l.power, 'W') : '—';
+        val.textContent = l ? fmtEng(l.power, 'W') : '—';
       } else if (k?.t === 'Led') {
         bright = clamp(Math.abs(l?.i[0] ?? 0) / 0.02, 0, 1);
         color = LED_COLORS[k.color] ?? LED_COLORS[0]!;
         lab.textContent = `LED #${id}`;
-        val.textContent = l ? fmtSI(l.i[0] ?? 0, 'A') : '—';
+        val.textContent = l ? fmtEng(l.i[0] ?? 0, 'A') : '—';
       }
       dot.style.background = color;
       dot.style.opacity = String(0.16 + 0.84 * bright);
@@ -1039,10 +1030,18 @@ function sourceWidget(id: number, dc0: number, deps: PanelHostDeps): Widget {
   const push = sender(deps, () => spec);
   let span = Math.max(12, Math.ceil(Math.abs(dc0) * 2));
 
+  // Text, not number: the panel's source box takes the same engineering
+  // notation as every other entry field, so "-4.5", "250m" and "1k2" all
+  // mean what they say. A `type=number` input would have discarded the last
+  // two before any of our code ran.
+  const Q = quantityOf('VoltageSource', 'dc');
   const num = document.createElement('input');
   num.className = 'pnum';
-  num.type = 'number';
-  num.step = 'any';
+  num.type = 'text';
+  num.inputMode = 'decimal';
+  num.autocomplete = 'off';
+  num.spellcheck = false;
+  num.title = 'volts — try 5, -4.5, 250m';
   const slider = document.createElement('input');
   slider.className = 'pslider';
   slider.type = 'range';
@@ -1057,7 +1056,8 @@ function sourceWidget(id: number, dc0: number, deps: PanelHostDeps): Widget {
   const set = (v: number, force: boolean) => {
     if (!Number.isFinite(v)) return;
     slider.value = String(v);
-    num.value = String(Number(v.toFixed(3)));
+    num.value = fmtEntry(v, Q);
+    num.classList.remove('bad');
     push({ t: 'SetValue', value: v }, force);
   };
   slider.addEventListener('pointerdown', () => (dragging = true));
@@ -1067,11 +1067,18 @@ function sourceWidget(id: number, dc0: number, deps: PanelHostDeps): Widget {
     set(Number(slider.value), true);
   });
   num.addEventListener('change', () => {
-    const v = Number(num.value);
-    if (!Number.isFinite(v)) return;
-    span = Math.max(span, Math.ceil(Math.abs(v) * 1.2));
+    const r = parseField(num.value, Q);
+    if (!r.ok) {
+      // The box says so rather than reverting silently: a value that vanishes
+      // when you press enter teaches nothing about why it was refused.
+      num.classList.add('bad');
+      num.title = r.err;
+      return;
+    }
+    num.title = 'volts — try 5, -4.5, 250m';
+    span = Math.max(span, Math.ceil(Math.abs(r.value) * 1.2));
     applySpan();
-    set(v, true);
+    set(r.value, true);
   });
   ctl.append(num, slider);
 
@@ -1089,10 +1096,11 @@ function sourceWidget(id: number, dc0: number, deps: PanelHostDeps): Widget {
       }
       if (!dragging && document.activeElement !== num) {
         slider.value = String(k.dc);
-        num.value = String(Number(k.dc.toFixed(3)));
+        num.value = fmtEntry(k.dc, Q);
+        num.classList.remove('bad');
       }
       const l = ctx.live.get(id);
-      val.textContent = l ? fmtSI(l.i[0] ?? 0, 'A') : '—';
+      val.textContent = l ? fmtEng(l.i[0] ?? 0, 'A') : '—';
     },
   };
 }
@@ -1126,7 +1134,7 @@ function probeWidget(pid: number): Widget {
       }
       let v = p.kind === 'v' ? (l.v[p.pin] ?? 0) : (l.i[p.pin] ?? 0);
       if (p.kind === 'v' && p.r) v -= ctx.live.get(p.r[0])?.v[p.r[1]] ?? 0;
-      seg.textContent = fmtSI(v, unit);
+      seg.textContent = fmtEng(v, unit);
       val.textContent = `#${p.elem}.${p.pin}${p.r ? ' Δ' : ''}`;
     },
   };
@@ -1236,7 +1244,7 @@ function scopeWidget(sid: number, deps: PanelHostDeps): Widget {
       if (!scope) return;
       lab.textContent = `SCOPE ${sid}`;
       syncChans();
-      val.textContent = `${fmtSI(scope.set.timebase / 10, 's')}/div`;
+      val.textContent = `${fmtEng(scope.set.timebase / 10, 's', { trim: true })}/div`;
       renderScope(cv, ctx.traces, active(), scope.set.timebase, scope.set);
     },
   };

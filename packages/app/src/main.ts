@@ -130,6 +130,23 @@ import {
   type ScopeControlId,
 } from './scope';
 import { createDock } from './dock';
+import {
+  fmtEntry,
+  parseEng,
+  parseField,
+  quantityOf,
+  rangeText,
+  seriesLadder,
+  stepLadder,
+  type Quantity,
+} from './units';
+import {
+  isPreferred,
+  nearestPreferred,
+  preferredNeighbours,
+  seriesExplainer,
+  stdValuesMode,
+} from './eseries';
 
 const DT = 10e-6;
 const MAX_STEPS_PER_FRAME = 4000; // local-mode wall budget
@@ -1218,28 +1235,172 @@ const propsDlg = document.getElementById('propsdlg') as HTMLDivElement;
 /** Element the floating editor is open for (double-click / context menu). */
 let dlgFor: number | null = null;
 
+// The unit is no longer part of the label: it is part of the VALUE now, and
+// the field carries it (`4.7 kΩ`, not `4700` under a heading that says Ω).
+// Repeating it in the label just made the two disagree whenever the value
+// needed a prefix.
 const FIELD_LABELS: Record<string, string> = {
-  ohms: 'resistance Ω',
-  rated_watts: 'rated W',
-  farads: 'capacitance F',
-  henries: 'inductance H',
-  dc: 'DC volts',
-  amp: 'AC amplitude V',
-  hz: 'frequency Hz',
-  phase: 'phase rad',
-  amps: 'current A',
+  ohms: 'resistance',
+  rated_watts: 'rated power',
+  farads: 'capacitance',
+  henries: 'inductance',
+  dc: 'DC',
+  amp: 'AC amplitude',
+  hz: 'frequency',
+  phase: 'phase',
+  amps: 'current',
   closed: 'closed',
-  vz: 'zener V',
+  vz: 'zener',
   color: 'color 0-4',
   beta: 'beta',
-  vt: 'threshold V',
-  k: 'k A/V²',
-  rail: 'rail ±V',
-  isc: 'out limit A',
+  vt: 'threshold',
+  k: 'k',
+  rail: 'rail ±',
+  isc: 'out limit',
   wiper: 'wiper 0-1',
-  volts: 'amplitude ±V',
-  seed: 'seed (whole number)',
+  volts: 'amplitude ±',
+  // A motor's back-EMF constant had NO entry here, so it rendered with its
+  // raw serde field name.
+  bemf: 'back-EMF K',
+  seed: 'seed (whole)',
 };
+
+/** A property field that carries a physical quantity.
+ *
+ *  This replaces `<input type="number">`, which could not be kept: a number
+ *  input rejects "4k7" at the DOM level and hands JavaScript back an empty
+ *  string, so no amount of parsing downstream would ever see what the player
+ *  typed. Going to `type="text"` costs the native spinner and the numeric
+ *  keypad, so both are put back by hand — the arrows here are BETTER than the
+ *  ones they replace, because stepping a 100 nF capacitor by 1 (which is what
+ *  `step=any` did) is useless and stepping it along a 1-2-5 ladder is not.
+ *
+ *  The document is edited only when the text actually changed. That is the
+ *  second half of the round-trip guarantee: `fmtEntry` makes the string
+ *  faithful, and this makes an untouched field a no-op even for the values no
+ *  short string can reproduce. */
+function valueField(
+  q: Quantity,
+  initial: number,
+  onCommit: (v: number) => void,
+): { input: HTMLInputElement; note: HTMLDivElement } {
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.inputMode = 'decimal';
+  input.autocomplete = 'off';
+  input.spellcheck = false;
+  const note = document.createElement('div');
+  note.className = 'pnote';
+
+  let value = initial;
+  let shown = fmtEntry(initial, q);
+  input.value = shown;
+  // The legal range IS the field's own constraint, so the player meets it
+  // here rather than as a server rejection bouncing back a round trip later.
+  const range = rangeText(q);
+  input.title = range ? `range ${range}${q.prefixed ? '  ·  prefixes: p n µ m k M G' : ''}` : '';
+
+  const hint = () => {
+    input.classList.remove('bad');
+    note.className = 'pnote';
+    note.textContent = '';
+    // ---- PART 2 PROTOTYPE. Off unless the player opted in; see eseries.ts.
+    if (stdValuesMode() !== 'hint' || !q.series || !Number.isFinite(value) || value <= 0) return;
+    const series = q.series;
+    if (isPreferred(value, series)) {
+      note.textContent = `✓ ${series} standard value`;
+      note.classList.add('good');
+      return;
+    }
+    // Both neighbours, nearest first — the point is that a stock value is a
+    // CHOICE between two rungs, not a correction to one.
+    const [lo, hi] = preferredNeighbours(value, series);
+    const near = nearestPreferred(value, series);
+    const cands = lo === hi ? [near] : near === hi ? [hi, lo] : [lo, hi];
+    note.append(`not stocked · nearest ${series}: `);
+    cands.forEach((cand, i) => {
+      if (i) note.append(' · ');
+      const a = document.createElement('span');
+      a.className = 'snap';
+      a.textContent = fmtEntry(cand, q);
+      a.title = 'use this value';
+      // Snapping is an explicit click. Nothing here ever changes a value on
+      // its own — that is the difference between a prototype and a decision.
+      a.onclick = () => {
+        input.value = fmtEntry(cand, q);
+        commit();
+      };
+      note.append(a);
+    });
+    const why = document.createElement('span');
+    why.className = 'why';
+    why.textContent = ' ⓘ';
+    why.title = 'why do parts come in fixed values?';
+    why.onclick = () => {
+      const open = note.querySelector('.explain');
+      if (open) {
+        open.remove();
+        return;
+      }
+      const box = document.createElement('div');
+      box.className = 'explain';
+      for (const para of seriesExplainer(series)) {
+        const p = document.createElement('p');
+        p.textContent = para;
+        box.appendChild(p);
+      }
+      note.appendChild(box);
+    };
+    note.append(why);
+  };
+
+  const commit = () => {
+    const text = input.value;
+    // Unchanged text is never an edit. This is what makes "open the dialog
+    // and press enter" provably a no-op on every value in every saved room.
+    if (text === shown) {
+      hint();
+      return;
+    }
+    const r = parseField(text, q);
+    if (!r.ok) {
+      input.classList.add('bad');
+      note.className = 'pnote err';
+      note.textContent = r.err;
+      return;
+    }
+    value = r.value;
+    shown = fmtEntry(r.value, q);
+    input.value = shown;
+    hint();
+    onCommit(r.value);
+  };
+
+  input.addEventListener('change', commit);
+  input.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') {
+      ev.preventDefault();
+      commit();
+    } else if (ev.key === 'Escape') {
+      input.value = shown;
+      hint();
+      input.blur();
+    } else if (ev.key === 'ArrowUp' || ev.key === 'ArrowDown') {
+      ev.preventDefault();
+      const cur = parseEng(input.value, q);
+      const base = cur.ok ? cur.value : value;
+      // With the Part 2 opt-in on, the arrows walk the stock ladder instead
+      // of 1-2-5 — the detents ARE the lesson, felt in the fingers.
+      const mants =
+        stdValuesMode() === 'hint' && q.series ? seriesLadder(q.series) : undefined;
+      input.value = fmtEntry(stepLadder(base, ev.key === 'ArrowUp' ? 1 : -1, q, mants), q);
+      commit();
+    }
+  });
+
+  hint();
+  return { input, note };
+}
 
 /** The property editor, rendered into any host box. Used twice: docked
  *  (single-click selection) and floating next to the part (double-click).
@@ -1275,8 +1436,8 @@ function buildProps(host: HTMLElement, target: ElementSpec, onClose?: () => void
     const span = document.createElement('span');
     span.textContent = FIELD_LABELS[field] ?? field;
     label.appendChild(span);
-    const input = document.createElement('input');
     if (typeof value === 'boolean') {
+      const input = document.createElement('input');
       input.type = 'checkbox';
       input.checked = value;
       input.onchange = () => {
@@ -1284,20 +1445,19 @@ function buildProps(host: HTMLElement, target: ElementSpec, onClose?: () => void
         editDoc({ t: 'SetKind', id: target.id, kind });
         mark(kind);
       };
+      label.appendChild(input);
+      host.appendChild(label);
     } else {
-      input.type = 'number';
-      input.step = 'any';
-      input.value = String(value);
-      input.onchange = () => {
-        const num = Number(input.value);
-        if (!Number.isFinite(num)) return;
-        const kind = { ...target.kind, [field]: num } as ElementSpec['kind'];
+      const q = quantityOf(target.kind.t, field);
+      const f = valueField(q, value as number, (v) => {
+        const kind = { ...target.kind, [field]: v } as ElementSpec['kind'];
         editDoc({ t: 'SetKind', id: target.id, kind });
         mark(kind);
-      };
+      });
+      label.appendChild(f.input);
+      host.appendChild(label);
+      host.appendChild(f.note);
     }
-    label.appendChild(input);
-    host.appendChild(label);
   }
 
   const row = document.createElement('div');
@@ -2913,16 +3073,9 @@ window.addEventListener('pointerdown', endNudge, true);
 window.addEventListener('blur', endNudge);
 
 // ---------------------------------------------------------------- render
-const fmt = (v: number, unit: string) => {
-  const a = Math.abs(v);
-  if (a >= 1000) return `${(v / 1000).toFixed(2)} k${unit}`;
-  if (a >= 1) return `${v.toFixed(2)} ${unit}`;
-  if (a >= 1e-3) return `${(v * 1e3).toFixed(2)} m${unit}`;
-  if (a >= 1e-6) return `${(v * 1e6).toFixed(2)} µ${unit}`;
-  if (a >= 1e-9) return `${(v * 1e9).toFixed(2)} n${unit}`;
-  return `0 ${unit}`;
-};
-
+// (A fifth copy of the SI formatter lived here, with no call sites at all —
+// deleted rather than ported. hoist.ts's copy even carried a doc comment
+// pointing at it as the canonical one.)
 
 const scopeDiv = document.getElementById('scope') as HTMLDivElement;
 const scopeCv = document.getElementById('scopecv') as HTMLCanvasElement;
