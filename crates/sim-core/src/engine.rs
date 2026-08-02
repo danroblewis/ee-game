@@ -220,6 +220,33 @@ pub struct ElemFrame {
     pub power: f64,
 }
 
+/// Numbers per element in the flat wire layout: `[id, npins, v0..vN, i0..iN,
+/// power]`. Lives HERE, next to `MAX_PINS`, because it is a function of it —
+/// it used to be a `const` in `sim-wasm` with a compile-time assert, a
+/// spelled-out `[f64; 15]` in the server and a `15` in TypeScript, and the
+/// server's copy was the dangerous one: an array literal with `f.v[0]…f.v[5]`
+/// written out compiles at ANY ceiling and simply stops sending the pins past
+/// six. Every renderer would draw the extra legs dead and nothing anywhere
+/// would go red.
+pub const FRAME_STRIDE: usize = 3 + 2 * MAX_PINS;
+
+impl ElemFrame {
+    /// Push this frame's `FRAME_STRIDE` numbers in wire order. The one
+    /// implementation both transports use, so the browser build and the
+    /// server build cannot disagree about the layout.
+    pub fn pack(&self, mut push: impl FnMut(f64)) {
+        push(f64::from(self.id));
+        push(self.npins as f64);
+        for v in self.v {
+            push(v);
+        }
+        for i in self.i {
+            push(i);
+        }
+        push(self.power);
+    }
+}
+
 pub struct Engine {
     elems: Vec<CompiledElem>,
     /// Junction (geometric point) -> electrical node.

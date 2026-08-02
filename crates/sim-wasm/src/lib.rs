@@ -12,11 +12,14 @@ pub struct Sim {
     frame_buf: Vec<f32>,
 }
 
-/// Flat frame layout per element: [id, npins, v0..v5, i0..i5, power].
-pub const FRAME_STRIDE: usize = 15;
-/// Keep the stride honest when MAX_PINS moves (the TS mirror in
-/// `circuit.ts` and the server's frame array must be bumped with it).
-const _: () = assert!(FRAME_STRIDE == 3 + 2 * sim_core::MAX_PINS);
+/// Flat frame layout per element: `[id, npins, v0..vN, i0..iN, power]`.
+///
+/// Re-exported from `sim-core` rather than restated: it is derived from
+/// `MAX_PINS`, and the whole point of moving it there is that the browser
+/// transport, the server's WebSocket frame and the TypeScript mirror in
+/// `circuit.ts` all read one definition instead of three that must be
+/// remembered together.
+pub use sim_core::FRAME_STRIDE;
 
 #[wasm_bindgen]
 impl Sim {
@@ -49,20 +52,12 @@ impl Sim {
         Ok(())
     }
 
-    /// Flat frame: [id, npins, v0..v5, i0..i5, power] * n, in document
-    /// order.
+    /// Flat frame: `[id, npins, v0..vN, i0..iN, power] * n`, in document
+    /// order. `FRAME_STRIDE` numbers per element.
     pub fn frame(&mut self) -> Vec<f32> {
         self.frame_buf.clear();
         for f in self.engine.frame() {
-            self.frame_buf.push(f.id as f32);
-            self.frame_buf.push(f.npins as f32);
-            for v in f.v {
-                self.frame_buf.push(v as f32);
-            }
-            for i in f.i {
-                self.frame_buf.push(i as f32);
-            }
-            self.frame_buf.push(f.power as f32);
+            f.pack(|x| self.frame_buf.push(x as f32));
         }
         self.frame_buf.clone()
     }

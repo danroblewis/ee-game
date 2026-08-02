@@ -81,7 +81,7 @@ use machine::Hoist;
 use registry::{Life, Parked, Registry, RoomHandle};
 use serde::Deserialize;
 use serde_json::json;
-use sim_core::{DocOp, ElementKind, ElementSpec, Engine, InteractOp, ParamWrite};
+use sim_core::{DocOp, ElementKind, ElementSpec, Engine, InteractOp, ParamWrite, FRAME_STRIDE};
 use std::sync::{
     atomic::{AtomicU32, Ordering},
     Arc,
@@ -1976,28 +1976,19 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
             if let Some(msg) = damage_msg(&damage, &mut damage_shown) {
                 let _ = room.events.send(msg);
             }
-            // Same flat layout as the WASM facade:
-            // [id, npins, v0..v5, i0..i5, power].
-            let e: Vec<[f64; 15]> = fr
+            // Same flat layout as the WASM facade, and now literally the
+            // same code: `ElemFrame::pack` is the one definition of the wire
+            // order. This used to be a `[f64; 15]` with `f.v[0]…f.v[5]`
+            // spelled out, which compiles unchanged at any `MAX_PINS` and
+            // would have silently stopped sending the pins past six the
+            // moment the ceiling moved — every leg of an 8-pin chip drawn
+            // dead, with nothing to notice it.
+            let e: Vec<Vec<f64>> = fr
                 .iter()
                 .map(|f| {
-                    [
-                        f.id as f64,
-                        f.npins as f64,
-                        f.v[0],
-                        f.v[1],
-                        f.v[2],
-                        f.v[3],
-                        f.v[4],
-                        f.v[5],
-                        f.i[0],
-                        f.i[1],
-                        f.i[2],
-                        f.i[3],
-                        f.i[4],
-                        f.i[5],
-                        f.power,
-                    ]
+                    let mut row = Vec::with_capacity(FRAME_STRIDE);
+                    f.pack(|x| row.push(x));
+                    row
                 })
                 .collect();
             let _ = room.events.send(
@@ -2624,6 +2615,52 @@ mod tests {
     /// Substeps in one room tick, exactly as `sim_task` budgets them.
     fn steps_per_tick() -> u32 {
         (((1.0 / TICK_HZ) / DT).round() as u32).min(MAX_STEPS_PER_TICK)
+    }
+
+    /// Every pin a part HAS must reach the client, at every pin ceiling.
+    ///
+    /// The frame row was an array literal with `f.v[0]…f.v[5]` written out.
+    /// That compiles unchanged at any `MAX_PINS` and silently drops the
+    /// pins past six: a 9-pin shift register would broadcast with five of
+    /// its legs reading a flat 0 V and no current, which renders as a part
+    /// that is wired but dead. Nothing in the type system can catch it, so
+    /// it gets a test — the stride, and a pin that only exists above the
+    /// old ceiling actually carrying its solved voltage.
+    #[test]
+    fn frame_rows_carry_every_pin() {
+        assert_eq!(FRAME_STRIDE, 3 + 2 * sim_core::MAX_PINS);
+
+        // The widest part in the room, with its highest-numbered pin
+        // actually conducting: a 555 whose DIS pin (5) sinks a resistor.
+        let mut eng = Engine::new(DT);
+        eng.set_elements(&sim_golden::timer555_astable());
+        // Run to a point in the astable cycle where the discharge pin is
+        // actually conducting, so the assertion below is not vacuous.
+        let mut fr = eng.frame();
+        for _ in 0..200 {
+            eng.advance(20);
+            fr = eng.frame();
+            if fr.iter().any(|f| f.npins == 6 && f.i[5].abs() > 1e-6) {
+                break;
+            }
+        }
+        let t = fr
+            .iter()
+            .find(|f| f.npins == 6)
+            .expect("the 555 is in the frame");
+        let mut row = Vec::new();
+        t.pack(|x| row.push(x));
+        assert_eq!(row.len(), FRAME_STRIDE);
+        assert_eq!(row[1], 6.0, "npins");
+
+        // Every pin the part has must survive the trip, value for value.
+        for p in 0..t.npins {
+            assert_eq!(row[2 + p], t.v[p], "pin {p} voltage");
+            assert_eq!(row[2 + sim_core::MAX_PINS + p], t.i[p], "pin {p} current");
+        }
+        assert_eq!(row[FRAME_STRIDE - 1], t.power);
+        // Not vacuous: the top pin is carrying something.
+        assert!(t.i[5].abs() > 1e-6, "DIS should be sinking current");
     }
 
     /// The damage half of the room loop: sweep the frame ONCE, integrate
