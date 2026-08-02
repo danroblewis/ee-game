@@ -12,3 +12,6 @@ sim-math = { path = "../sim-math" }
 
 [dev-dependencies]
 libm.workspace = true
+# Adversarial verification asserts against the REAL damage ladder rather
+# than a copy of its numbers.
+damage = { path = "../damage" }
