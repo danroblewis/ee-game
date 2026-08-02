@@ -79,7 +79,7 @@ import { CATALOG, CATEGORIES, makePins, partsInCategory, type PartDef } from './
 import { History, isTypingTarget } from './history';
 import { createHoist, type MachineRect } from './hoist';
 import { connect, type RoomHello } from './net';
-import { claimSeed, createRooms } from './rooms';
+import { createRooms, loadBench, saveBench } from './rooms';
 import {
   applyPanelOp,
   drawPanelGhost,
@@ -433,21 +433,64 @@ function resetForRoom(room: RoomHello | null) {
   setPanelRoom(room?.id ?? null);
 
   const home = room?.view?.home;
-  if (home && home.length === 4) {
-    homeRect = { x0: home[0]!, y0: home[1]!, x1: home[2]!, y1: home[3]! };
-  } else {
-    homeRect = { ...DEFAULT_HOME };
-  }
+  homeAuthored = !!home && home.length === 4;
+  homeRect = homeAuthored
+    ? { x0: home![0]!, y0: home![1]!, x1: home![2]!, y1: home![3]! }
+    : { ...DEFAULT_HOME };
+
+  // The bench. In-place scopes exist only in this browser (see `loadBench`),
+  // so there are two questions and they are not the same one:
+  //
+  //   have I been in this room before?  -> restore what I left here
+  //   never been?                       -> materialize the template's seeds
+  //
+  // `loadBench` answers the first with null-vs-array, so a player who closed
+  // every scope keeps an empty bench instead of being handed the template's
+  // again, and a player who reloads gets their own instruments back where
+  // THEY put them rather than where the template first put them.
+  const seeds = room?.view?.scopes ?? [];
+  // The camera frames the seeds wherever the bench came from: they are where
+  // the author aimed it, and they do not move when the player moves a scope.
+  homeSeeds = seeds.map((s) => {
+    const r = seedToScope(s, 0);
+    return [r.x, r.y, r.x + r.w, r.y + r.h] as [number, number, number, number];
+  });
   fitHome();
 
-  // Seed the room's in-place scopes ONCE per room per browser: after that
-  // they are the player's instruments, and re-joining must not re-litter the
-  // bench with copies of them.
-  const seeds = room?.view?.scopes ?? [];
-  if (room && seeds.length > 0 && claimSeed(room.id)) {
-    for (const s of seeds) floatScopes.push(seedToScope(s, sidCounter++));
+  if (room) {
+    const kept = loadBench(room.id);
+    for (const s of kept ?? seeds) floatScopes.push(seedToScope(s, sidCounter++));
+    // Write straight back — including the empty list, and including a room
+    // whose template ships nothing. The stored list IS the "I have been here"
+    // record, so it has to exist from the first join, not from the first time
+    // the player happens to touch a scope.
+    benchSaved = '';
+    persistBench();
   }
 }
+
+// The bench is saved by watching it rather than by hooking each of the dozen
+// places that can change one (drag, resize, retune, channel toggle, close,
+// the panel host's own remove). A serialize-and-compare a second is cheap
+// next to a frame, and unlike a hook it cannot be forgotten by the next
+// person who adds a way to move a scope.
+let benchSaved = '';
+let benchCheckedAt = 0;
+
+/** Persist this room's in-place scopes, if they changed. No-op offline and
+ * against a pre-rooms server: with no room code there is nothing to key. */
+function persistBench() {
+  if (!roomKey) return;
+  const list = floatScopes.map(scopeToSeed);
+  const json = JSON.stringify(list);
+  if (json === benchSaved) return;
+  benchSaved = json;
+  saveBench(roomKey, list);
+}
+
+// A reload is the case that lost the bench in the first place, and it can
+// land between two ticks of the watcher.
+window.addEventListener('pagehide', () => persistBench());
 
 /** `?room=CODE` in the address bar is an invite link: it is where a shared
  * URL lands, and it is what a reload comes back to. No code = the server's
@@ -477,6 +520,9 @@ const net = connect({
     // the camera back to the district the player deliberately left.
     const key = room?.id ?? '';
     if (key !== roomKey) {
+      // Bank the bench we are about to drop, under the code it belongs to,
+      // before `roomKey` names somewhere else.
+      persistBench();
       roomKey = key;
       resetForRoom(room);
     }
@@ -583,6 +629,7 @@ const net = connect({
     // district every 2.5 s while they are panning around the local sim. If
     // `roomKey` is already null there is nothing left to drop.
     if (roomKey !== null) {
+      persistBench();
       roomKey = null;
       resetForRoom(null);
       hoist.clear(); // whatever machine that room had, it is not ours any more
@@ -833,6 +880,19 @@ const MAX_SCALE = 200;
 const DEFAULT_HOME = { x0: -10, y0: -10, x1: 60, y1: 60 };
 let homeRect = { ...DEFAULT_HOME };
 
+/** True when `homeRect` came from a room's `view.home` — i.e. somebody chose
+ * it — rather than from the fallback literal above. It is the difference
+ * between a rect that is AUTHORED and one that is merely a default, and
+ * `fitHome` treats the two completely differently. See there. */
+let homeAuthored = false;
+
+/** The rects, in grid units, of the instruments the room's template ships.
+ * Part of the landing view: an author who puts a scope under the bench meant
+ * the player to see the scope. Taken from the template's seeds, NOT from the
+ * live bench, so 'H' stays idempotent and dragging a scope to the next county
+ * never redefines home. */
+let homeSeeds: [number, number, number, number][] = [];
+
 /** The rect the camera is looking at right now, in grid units. This is the
  * `view.home` a template gets when the player saves this room as one. */
 const camRect = (): [number, number, number, number] => {
@@ -865,9 +925,42 @@ function pinBounds(list: ElementSpec[]): [number, number, number, number] | null
   return isFinite(x0) ? [x0, y0, x1, y1] : null;
 }
 
-/** 'H' / join / reset: frame what is in the home district (or the district
- * itself when it is still empty). */
+/**
+ * 'H' / join / reset: go home.
+ *
+ * There are two kinds of home and they deserve opposite treatment.
+ *
+ * An AUTHORED home is a rect somebody chose — `view.home` from a room's
+ * template — and it is honoured as written. Framing the parts inside it
+ * instead would silently overrule the author: a district whose parts sit in
+ * one corner would land the player on that corner, and the empty bench the
+ * author left room for (to build on, to drop instruments on, to walk into)
+ * would be off-screen. That is not a hypothetical either — it is what the
+ * hoist room did: it framed the four fixture parts and left the scope the
+ * template ships almost entirely outside the camera. Deliberate empty space
+ * is CONTENT in a level, so the rect is the floor: the camera shows all of
+ * it, plus the instruments the template ships, and never less.
+ *
+ * The DEFAULT home is not a choice, it is a fallback — offline, or against a
+ * server from before rooms existed. Nobody framed it, so there is nothing to
+ * honour, and the old behaviour is the right one: frame whatever is actually
+ * standing in the starter district and only fall back to the bare rect when
+ * it is empty.
+ */
 function fitHome() {
+  if (homeAuthored) {
+    let [x0, y0, x1, y1] = [homeRect.x0, homeRect.y0, homeRect.x1, homeRect.y1];
+    for (const [sx0, sy0, sx1, sy1] of homeSeeds) {
+      x0 = Math.min(x0, sx0);
+      y0 = Math.min(y0, sy0);
+      x1 = Math.max(x1, sx1);
+      y1 = Math.max(y1, sy1);
+    }
+    // MIN_SCALE, not 8: a lower clamp on zoom is a licence to cut the rect in
+    // half, which is the one thing this branch exists to prevent.
+    fitRect(x0, y0, x1, y1, MIN_SCALE, 60);
+    return;
+  }
   const inHome = space
     .query(homeRect.x0, homeRect.y0, homeRect.x1, homeRect.y1)
     .filter((e) =>
@@ -2847,6 +2940,11 @@ let lastT = performance.now();
 function frame(now: number) {
   const wallDt = Math.min(0.1, (now - lastT) / 1000);
   lastT = now;
+
+  if (now - benchCheckedAt > 1000) {
+    benchCheckedAt = now;
+    persistBench();
+  }
 
   // Speakers are sources of sound the moment they exist in the document.
   // No-op unless the document actually changed since the last frame.

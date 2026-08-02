@@ -27,7 +27,8 @@
 // shows both, because only one of them is the thing you paste to a friend.
 
 import type { GoneReason, RoomHello, RoomView } from './net';
-import { lsFlag, lsSet } from './store';
+import type { SeedScope } from './scope';
+import { lsFlag, lsGet, lsSet } from './store';
 
 /** One row of GET /api/rooms. */
 export interface RoomListing {
@@ -826,18 +827,67 @@ export function createRooms(deps: RoomsDeps): RoomsUI {
   };
 }
 
-// -------------------------------------------------------- once-per-room UI
+// ------------------------------------------------- the bench, per room code
 //
-// In-place scopes are client-local, so a template SEEDS them: the first time
-// this browser joins a given room it materializes the room's scopes, and from
-// then on they are the player's own instruments to move, retune or delete.
-// The flag is per room code, so re-joining never re-litters the bench.
+// In-place scopes are client-local: main.ts owns the array, the server has
+// never seen a sid, and nothing about them is replicated. So a template SEEDS
+// them — the room hands over a rect, a channel list and a timebase, and from
+// then on they are that player's own instruments to move, retune or delete.
+//
+// Which makes them the only piece of a room that exists NOWHERE if this
+// browser does not keep it. A flag saying "already seeded" is durable; the
+// instruments it gated were not, so the first reload after a join left the
+// bench permanently empty — seeded once, then gone forever, with the flag
+// still set so they could never come back.
+//
+// The fix is to persist the thing itself rather than a proxy for it. The
+// stored LIST is now the record: its presence means "this browser has been in
+// this room" (so a template never re-litters the bench), and its contents are
+// the bench itself (so a reload puts the instruments back exactly where the
+// player left them, not where the template first put them). One record, so
+// the two can never disagree — which the flag-plus-memory pair did, silently,
+// the moment the page reloaded.
 
 const seedKey = (code: string) => `ee.room.${code}.seeded`;
+const benchKey = (code: string) => `ee.room.${code}.scopes`;
 
-/** True exactly once per room per browser. */
-export function claimSeed(code: string): boolean {
-  if (lsFlag(seedKey(code))) return false;
+/**
+ * The in-place scopes this browser has in room `code`, or null when it has
+ * never been there — the caller's cue to materialize the template's seeds.
+ *
+ * An empty array is NOT null: "I have been here and I have no scopes" is a
+ * player who closed them, and re-seeding that bench would be the litter this
+ * whole mechanism exists to prevent.
+ *
+ * Every element is untrusted (localStorage is user-editable and survives
+ * across versions); `seedToScope` clamps each one, so all this owes the
+ * caller is "an array of objects, or null".
+ */
+export function loadBench(code: string): SeedScope[] | null {
+  const isSeed = (s: unknown): s is SeedScope =>
+    !!s && typeof s === 'object' && !Array.isArray(s);
+  const raw = lsGet(benchKey(code));
+  if (raw === null) {
+    // Migration: profiles that joined under the flag-only build. The flag is
+    // the only surviving evidence that they were here, and honouring it keeps
+    // the promise it was written for — no re-litter — at the cost of the
+    // scopes that build had already lost for them.
+    return lsFlag(seedKey(code)) ? [] : null;
+  }
+  try {
+    const v: unknown = JSON.parse(raw);
+    // The same deal net.ts makes with `view.scopes`: keep the objects, drop
+    // everything else, and let `seedToScope` clamp what is inside them.
+    return Array.isArray(v) ? v.filter(isSeed) : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Record this browser's bench for room `code`. Called with an empty list
+ * too: that is what "been here, closed them all" looks like. */
+export function saveBench(code: string, scopes: unknown[]): void {
+  lsSet(benchKey(code), JSON.stringify(scopes));
+  // Keep the legacy flag in step so a downgrade does not re-seed the bench.
   lsSet(seedKey(code), '1');
-  return true;
 }

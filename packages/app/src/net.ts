@@ -349,6 +349,13 @@ export function connect(h: NetHandlers, room: string | null = null): Net {
         // rooms sends no `room` key: null, not a fabricated one, because "I
         // don't know which room" is honest and the chip says so rather than
         // showing a made-up code.
+        //
+        // THIS IS THE LINE THE BUG WAS ON. `parseHello` being correct never
+        // saved anybody: the shipped defect was handing `m.room` to onHello
+        // instead of `p.room`, and a guard aimed at the parser cannot see the
+        // difference. So wirecheck drives this switch over a stub socket and
+        // asserts on what onHello RECEIVES — put `m.room` back and it goes
+        // red on the exact three fields the players lost.
         const p = parseHello(m);
         if (p.drift.length > 0) {
           console.error(`hello: wire drift — ${describeDrift(p.drift)}`);

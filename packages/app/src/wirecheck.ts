@@ -18,11 +18,37 @@
 // hello_msg (crates/server/src/lifecycle_tests.rs). Move a field on either
 // side and one of them fails, naming the path.
 //
-// What it CANNOT prove: that the camera lands somewhere a player wants to be,
-// or that the seeded scope is pointing at an interesting node. That needs a
-// browser and a human.
+// TEST AT THE LAYER THE DEFECT CAN OCCUR, NOT ONE BELOW IT. The first version
+// of this file only exercised `parseHello` — and `parseHello` was never where
+// the bug was. The bug was one layer UP, in connect()'s `case 'hello'`, which
+// decided what to hand `onHello`; the whole defect was that it handed over
+// `m.room` instead of the parsed object. Proof that the distinction is not
+// academic: putting that exact line back — `h.onHello(m.you, ..., m.room)` —
+// left `tsc --noEmit` clean, `wirecheck` green and all 48 server tests
+// passing. Three guards, none of them touching the line the bug was on.
+//
+// Hence the last section below, which drives the real `connect()` over a stub
+// socket and asserts on the object `onHello` ACTUALLY RECEIVES. The acceptance
+// test for any guard here is "would this have caught the original bug?" — and
+// that section does, by construction, because it is looking at the value the
+// original bug got wrong rather than at a function it called on the way.
+//
+// What it still CANNOT prove: that the camera lands somewhere a player wants
+// to be, or that the seeded scope is pointing at an interesting node. That
+// needs a browser and a human.
 
-import { describeDrift, parseHello, type ParsedHello } from './net';
+import {
+  connect,
+  describeDrift,
+  parseHello,
+  type NetHandlers,
+  type ParsedHello,
+  type RoomHello,
+  type WireDrift,
+} from './net';
+import type { ElementSpec } from './circuit';
+import type { Panel } from './panel';
+import type { Probe } from './scope';
 
 // This file runs under node (see package.json), never in the browser, and the
 // repo carries no @types/node — one honest declaration beats a dependency.
@@ -219,6 +245,183 @@ console.log('parseHello — garbage in, no throw');
 for (const bad of [null, 42, 'hello', [], undefined]) {
   const q = parseHello(bad);
   check(`${JSON.stringify(bad) ?? 'undefined'} yields an empty hello with drift`, q.drift.length > 0 && q.room === null);
+}
+
+// ============================================================ THE JOIN ITSELF
+//
+// Everything above tests a pure function. The bug was not in a pure function.
+//
+// `connect()` owns the socket, the message switch and the handler call, and
+// the shipped defect lived in exactly one line of it: `case 'hello'` forwarded
+// the raw `m.room` — {id, name, template, players} and nothing else — as the
+// client's `RoomHello`, while `machine` and `view` sat untouched beside it.
+// `parseHello` can be perfect and that line can still throw its result away.
+//
+// So: run the real `connect()` against a stub WebSocket, feed it a real
+// `hello` frame, and assert on the object that came out the other end.
+
+class StubSocket {
+  static OPEN = 1;
+  readyState = StubSocket.OPEN;
+  onopen: (() => void) | null = null;
+  onclose: (() => void) | null = null;
+  onerror: (() => void) | null = null;
+  onmessage: ((ev: { data: string }) => void) | null = null;
+  sent: string[] = [];
+  closed = false;
+  constructor(public url: string) {
+    sockets.push(this);
+  }
+  send(s: string) {
+    this.sent.push(s);
+  }
+  close() {
+    this.closed = true;
+    this.readyState = 3;
+  }
+}
+let sockets: StubSocket[] = [];
+
+// The browser globals `connect()` reads. Defined, not assigned: node ships its
+// own `WebSocket` these days and a plain assignment would be at its mercy.
+const def = (name: string, value: unknown) =>
+  Object.defineProperty(globalThis, name, { value, writable: true, configurable: true });
+def('WebSocket', StubSocket);
+def('location', { protocol: 'https:', host: 'game.example' });
+def('window', { setTimeout: () => 0, clearTimeout: () => {} });
+
+/** Exactly the five arguments `onHello` is handed — the client's whole idea of
+ * the room it just joined. */
+interface HelloCall {
+  you: number;
+  elements: ElementSpec[];
+  probes: Probe[];
+  panels: Panel[];
+  room: RoomHello | null;
+}
+
+/** A `connect()` wired to recording handlers, plus its stub socket. */
+function dial(code: string | null = null) {
+  sockets = [];
+  const hellos: HelloCall[] = [];
+  const drifts: WireDrift[][] = [];
+  const nop = () => {};
+  const handlers: NetHandlers = {
+    onHello: (you, elements, probes, panels, room) =>
+      hellos.push({ you, elements, probes, panels, room }),
+    onRoomMeta: nop,
+    onRoomGone: nop,
+    onFrame: nop,
+    onOp: nop,
+    onDoc: nop,
+    onProbes: nop,
+    onPanels: nop,
+    onMachine: nop,
+    onDamage: nop,
+    onSamples: nop,
+    onAudio: nop,
+    onPresence: nop,
+    onCursor: nop,
+    onClose: nop,
+    onWireDrift: (d) => drifts.push(d),
+  };
+  const net = connect(handlers, code);
+  const deliver = (msg: unknown) => {
+    const s = sockets[sockets.length - 1];
+    if (!s || !s.onmessage) throw new Error('connect() opened no socket');
+    s.onmessage({ data: JSON.stringify(msg) });
+  };
+  return { net, hellos, drifts, deliver, socket: () => sockets[sockets.length - 1] };
+}
+
+console.log('connect — the room object onHello RECEIVES is the parsed one');
+{
+  const d = dial();
+  d.deliver(sample);
+  check('onHello fired exactly once', d.hellos.length === 1);
+  const got = d.hellos[0];
+  const room = got?.room ?? null;
+  check('you', got?.you === 1);
+  check('elements', got?.elements.length === 4);
+  check('probes', got?.probes.length === 2);
+  check('panels', got?.panels.length === 1);
+  check('room.id', room?.id === '7AWF4N');
+  check('room.name', room?.name === 'Hoist practice');
+  check('room.template', room?.template === 'hoist');
+  check('room.players', room?.players === 1);
+  // The three fields the shipped bug dropped. Each of these is a line that
+  // goes red the moment `case 'hello'` forwards the wire's `room` again.
+  check('room.machine — the goal card arrives', room?.machine === true);
+  check(
+    'room.view.home — the camera arrives',
+    eq(room?.view?.home, [22, -2, 68, 28]),
+    JSON.stringify(room?.view?.home),
+  );
+  check(
+    'room.view.scopes — the instrument arrives',
+    room?.view?.scopes?.length === 1 && room.view.scopes[0]?.timebase === 0.5,
+    JSON.stringify(room?.view?.scopes),
+  );
+  // And nothing MORE than RoomHello: the raw `m.room` is a different object
+  // with a different set of keys, and so is the whole message. Naming the
+  // exact key set is what makes "it happens to have an id" not enough.
+  check(
+    'room is a RoomHello, key for key',
+    eq(Object.keys(room ?? {}).sort(), [
+      'id',
+      'machine',
+      'name',
+      'players',
+      'template',
+      'view',
+    ]),
+    Object.keys(room ?? {}).sort().join(','),
+  );
+  check('a clean payload is not drift', d.drifts.length === 0);
+  // The reconnect loop must come back to the room we landed in, not to the
+  // null we dialled — an invite link is followed once.
+  check('the socket now wants this room', d.net.code() === '7AWF4N', String(d.net.code()));
+}
+
+console.log('connect — a payload the client cannot read is reported to the app');
+{
+  const d = dial();
+  const stripped = JSON.parse(JSON.stringify(sample)) as Record<string, unknown>;
+  delete stripped.view;
+  delete stripped.machine;
+  d.deliver(stripped);
+  const room = d.hellos[0]?.room ?? null;
+  check('the room still lands', room?.id === '7AWF4N');
+  check('no goal card is latched', room?.machine === false);
+  check('no camera is invented', room?.view === null);
+  check('onWireDrift fired', d.drifts.length === 1);
+  check(
+    'and it named both fields',
+    eq((d.drifts[0] ?? []).map((x) => x.field).sort(), ['hello.machine', 'hello.view']),
+    JSON.stringify(d.drifts[0]),
+  );
+}
+
+console.log('connect — a pre-rooms server still joins');
+{
+  const d = dial();
+  d.deliver({ t: 'hello', you: 3, elements: [], probes: [], panels: [] });
+  check('room is null, not fabricated', d.hellos[0]?.room === null);
+  check('no drift', d.drifts.length === 0);
+  check('and the retry loop keeps aiming at the default room', d.net.code() === null);
+}
+
+console.log('connect — the code in the URL is the room you get');
+{
+  const d = dial('AB12CD');
+  check(
+    'the socket asks for it',
+    d.socket()?.url === 'wss://game.example/ws?room=AB12CD',
+    String(d.socket()?.url),
+  );
+  d.net.join(null);
+  check('and join(null) drops it', d.socket()?.url === 'wss://game.example/ws', String(d.socket()?.url));
+  check('the old socket was closed', sockets[0]?.closed === true);
 }
 
 console.log(failures === 0 ? '\nwirecheck: all ok' : `\nwirecheck: ${failures} FAILED`);
