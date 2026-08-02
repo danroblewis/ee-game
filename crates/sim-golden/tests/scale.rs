@@ -20,37 +20,50 @@ fn lu_ops_matches_dense_lu() {
             let mut eng = Engine::new(20e-6);
             eng.set_elements(&w.flat());
             eng.advance(20);
-            let n = eng.unknowns();
-            let a = eng.matrix().to_vec();
+            // One matrix per island since partitioning landed: check the
+            // mirror against the real kernel on every one of them.
+            let mut biggest = 0usize;
+            let mut fill_seen = false;
+            for island in eng.islands() {
+                let n = island.unknowns();
+                if n == 0 {
+                    continue;
+                }
+                biggest = biggest.max(n);
+                let a = island.matrix().to_vec();
 
-            let mut lu = DenseLu::new(n);
-            assert!(lu.factor(&a), "reference factor went singular");
-            let (ops, mirror) = scale::lu_ops(&a, n);
+                let mut lu = DenseLu::new(n);
+                assert!(lu.factor(&a), "reference factor went singular");
+                let (ops, mirror) = scale::lu_ops(&a, n);
 
-            assert!(!ops.singular);
-            assert_eq!(ops.n, n);
-            assert_eq!(
-                mirror,
-                lu.factor_slice(),
-                "mirror LU differs from sim-math (bit level)"
-            );
-            assert_eq!(ops.factor_nnz, lu.factor_nnz());
-            // Every subdiagonal entry gets exactly one division, and every
-            // one either updates its row or is counted as skipped.
-            let sub = (n * (n - 1) / 2) as u64;
-            assert_eq!(ops.divisions, sub);
-            assert_eq!(ops.pivot_cmps, sub);
-            // Some row updates are always skipped (MNA matrices are sparse),
-            // so dense-LU cost is structure dependent rather than a clean
-            // n^3/3 -- but fill-in eats most of the saving, which is exactly
-            // what the baseline needs to report.
-            assert!(ops.skipped_rows > 0, "{ops:?}");
-            assert!(ops.updates < ops.dense_updates(), "{ops:?}");
-            assert!(ops.structure_saving() > 0.0 && ops.structure_saving() < 1.0);
-            assert!(
-                ops.factor_nnz > eng.matrix_nnz(),
-                "no fill-in at all? {ops:?}"
-            );
+                assert!(!ops.singular);
+                assert_eq!(ops.n, n);
+                assert_eq!(
+                    mirror,
+                    lu.factor_slice(),
+                    "mirror LU differs from sim-math (bit level)"
+                );
+                assert_eq!(ops.factor_nnz, lu.factor_nnz());
+                // Every subdiagonal entry gets exactly one division, and every
+                // one either updates its row or is counted as skipped.
+                let sub = (n * (n - 1) / 2) as u64;
+                assert_eq!(ops.divisions, sub);
+                assert_eq!(ops.pivot_cmps, sub);
+                // Some row updates are always skipped (MNA matrices are
+                // sparse), so dense-LU cost is structure dependent rather
+                // than a clean n^3/3.
+                assert!(ops.skipped_rows > 0, "{ops:?}");
+                assert!(ops.updates < ops.dense_updates(), "{ops:?}");
+                assert!(ops.structure_saving() > 0.0 && ops.structure_saving() < 1.0);
+                fill_seen |= ops.factor_nnz > island.matrix_nnz();
+            }
+            // Fill-in is a topology property: a single connected world fills
+            // heavily, a world of small builds barely at all — which is the
+            // whole reason partitioning is worth so much.
+            assert!(biggest > 0);
+            if matches!(structure, Structure::One) {
+                assert!(fill_seen, "a connected world must fill in");
+            }
         }
     }
 }
@@ -154,9 +167,11 @@ fn worlds_simulate_without_quarantine() {
         let r = eng.advance(200);
         assert_eq!(r.steps, 200, "steps short: {r:?}");
         assert!(!eng.is_quarantined(), "quarantined: {r:?}");
-        // Sanity: the supply rail is powered and the solve is finite.
-        assert!(eng.solution().iter().all(|v| v.is_finite()));
-        assert!(eng.solution().iter().any(|v| *v > 1.0));
+        // Sanity: the supply rail is powered and every island's solve is
+        // finite.
+        let x = || eng.islands().iter().flat_map(|i| i.solution().iter());
+        assert!(x().all(|v| v.is_finite()));
+        assert!(x().any(|v| *v > 1.0));
     }
 }
 
@@ -182,4 +197,118 @@ fn nonlinear_worlds_refactor_every_iteration_linear_ones_do_not() {
         f_lin < 10,
         "linear world refactored {f_lin} times in 100 substeps"
     );
+}
+
+/// The property the quiescence lever is sold on, asserted rather than
+/// eyeballed in a report: a world of DC-only builds really does go
+/// completely still, the engine really does stop visiting it, and the
+/// numbers it keeps reporting are the ones the solver last produced —
+/// identical, to the volt, to a world simulated with no skipping at all.
+#[test]
+fn an_idle_world_goes_static_and_still_reads_the_same_as_a_fully_solved_one() {
+    let specs = scale::generate(
+        GenParams::new(1_000, Structure::Districts { size: 100 })
+            .nonlinear(30)
+            .active(0),
+    )
+    .flat();
+
+    let mut skipping = Engine::new(20e-6);
+    skipping.set_elements(&specs);
+    let mut plain = Engine::new(20e-6);
+    plain.set_tuning(sim_core::Tuning::off());
+    plain.set_elements(&specs);
+    // 300 ms of sim time: past the ~250 ms a DC district needs to settle.
+    for _ in 0..15 {
+        skipping.advance(1_000);
+        plain.advance(1_000);
+    }
+    assert_eq!(
+        skipping.time(),
+        plain.time(),
+        "the world clock is untouched"
+    );
+
+    let solving = skipping
+        .islands()
+        .iter()
+        .filter(|i| i.unknowns() > 0)
+        .count();
+    assert!(
+        skipping.static_islands() * 4 >= solving * 3,
+        "only {}/{solving} idle islands went static",
+        skipping.static_islands()
+    );
+
+    // A skipped island must not invent anything: every pin agrees with the
+    // engine that solved every substep.
+    let plain_frame = plain.frame();
+    for f in skipping.frame() {
+        let p = plain_frame.iter().find(|p| p.id == f.id).unwrap();
+        for k in 0..f.npins {
+            assert!(
+                (f.v[k] - p.v[k]).abs() < 1e-3,
+                "elem {} pin {k}: skipped {} vs solved {}",
+                f.id,
+                f.v[k],
+                p.v[k]
+            );
+        }
+    }
+
+    // Nothing further is spent on the islands that have gone static. Per
+    // island, deliberately: at 300 ms a couple of districts are still
+    // finishing a long tail, and they SHOULD still be solving — sleeping is
+    // now gated on a demonstrated decay, not merely on having gone quiet
+    // (see `Tuning::quiescence_decay`). What must hold is that a sleeping
+    // island costs nothing at all, and that it stays asleep.
+    let before: Vec<(bool, u64)> = skipping
+        .islands()
+        .iter()
+        .map(|i| (i.is_static(), i.factorizations()))
+        .collect();
+    let asleep = before.iter().filter(|(s, _)| *s).count();
+    let r = skipping.advance(1_000);
+    assert_eq!(r.steps, 1_000, "the clock keeps its promises");
+    assert_eq!(
+        r.static_islands as usize, asleep,
+        "an island that was asleep did work anyway"
+    );
+    for (island, (was_static, facs)) in skipping.islands().iter().zip(before) {
+        if was_static {
+            assert!(island.is_static(), "a sleeping island woke on its own");
+            assert_eq!(
+                island.factorizations(),
+                facs,
+                "a sleeping island factored"
+            );
+        }
+    }
+}
+
+/// ...and the other side of it: a world where every district contains
+/// something that switches must not be skipped at all. A lever that is
+/// wrong here is a lever that lies about the game.
+#[test]
+fn a_fully_active_world_is_never_declared_static() {
+    let specs = scale::generate(
+        GenParams::new(1_000, Structure::Districts { size: 100 })
+            .nonlinear(30)
+            .active(100),
+    )
+    .flat();
+    let mut eng = Engine::new(20e-6);
+    eng.set_elements(&specs);
+    let solving = eng.islands().iter().filter(|i| i.unknowns() > 0).count();
+    for _ in 0..15 {
+        eng.advance(1_000);
+        // A district built around an oscillator or an AC source is never
+        // still. Allow a couple of stragglers only for districts whose
+        // switching block happens to sit latched.
+        assert!(
+            eng.static_islands() * 10 <= solving,
+            "{}/{solving} active islands were declared static",
+            eng.static_islands()
+        );
+    }
 }

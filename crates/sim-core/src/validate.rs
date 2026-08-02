@@ -121,8 +121,21 @@
 //! engine can solve.
 
 use crate::constraint::ConstraintKey;
-use crate::engine::Engine;
+use crate::engine::{Engine, Tuning};
 use crate::netlist::{ElementKind, ElementSpec, Point};
+
+/// The tuning every engine this module builds runs with: both work-skipping
+/// levers off.
+///
+/// The gate is an observational experiment. Quiescence freezes an island
+/// that has stopped moving and local dt integrates a slow one at `k·dt`;
+/// both are correct for a live room and both are wrong here, because the
+/// question the gate asks is "does this document's solver survive the next
+/// few hundred substeps", and an island that skips them has not answered it.
+#[inline]
+fn sim_tuning_off() -> Tuning {
+    Tuning::off()
+}
 
 // ---- value ranges. Lower bounds match the `InteractOp::SetValue` clamps in
 // `Engine::interact`; upper bounds keep every derived quantity (1/ohms, C/h,
@@ -896,7 +909,7 @@ fn blame_for_divergence(eng: &Engine, specs: &[ElementSpec]) -> Option<u32> {
         }
         // A malformed element is dropped by `set_elements`, so it may not be
         // in the compiled list at all: skip it, do not abandon the search.
-        let Some((_, n)) = nodes.iter().find(|(id, _)| *id == s.id) else {
+        let Some((_, _, n)) = nodes.iter().find(|(id, _, _)| *id == s.id) else {
             continue;
         };
         if n[0] != n[1] && find(&mut parent, n[0]) == find(&mut parent, n[1]) {
@@ -915,6 +928,9 @@ fn blame_for_divergence(eng: &Engine, specs: &[ElementSpec]) -> Option<u32> {
 /// depth is paid by documents that are FINE, never by the ones being caught.
 fn trial(specs: &[ElementSpec], dt: f64, steps: u32) -> Option<Reject> {
     let mut eng = Engine::new(dt);
+    // Levers off: see `check_document`. A trial that skips the island it is
+    // trialling proves nothing about it.
+    eng.set_tuning(sim_tuning_off());
     eng.set_elements(specs);
     if eng.is_linear() {
         return None;
@@ -999,7 +1015,7 @@ fn split_blocks(eng: &Engine, specs: &[ElementSpec]) -> Option<Blocks> {
     // First element seen at each node; usize::MAX = none yet.
     let mut first: Vec<usize> = vec![usize::MAX; eng.node_count() + 1];
     for (i, s) in specs.iter().enumerate() {
-        for &nd in &nodes[i].1[..s.pins.len()] {
+        for &nd in &nodes[i].2[..s.pins.len()] {
             if nd == 0 {
                 continue; // ground couples nothing: it has no row
             }
@@ -1024,7 +1040,7 @@ fn split_blocks(eng: &Engine, specs: &[ElementSpec]) -> Option<Blocks> {
     // Distinct non-ground nodes per block, counted as they are first seen.
     let mut node_seen: Vec<usize> = vec![usize::MAX; eng.node_count() + 1];
     for (i, s) in specs.iter().enumerate() {
-        let ns = &nodes[i].1[..s.pins.len()];
+        let ns = &nodes[i].2[..s.pins.len()];
         if ns.iter().all(|n| *n == 0) {
             // Every pin on ground: no row, no column, nothing to solve. These
             // are the `Ground` parts and the wires along a ground rail — the
@@ -1202,7 +1218,14 @@ pub fn check_document(specs: &[ElementSpec], dt: f64) -> Result<(), Reject> {
 
     // As placed: name the degeneracy first, then let the LU catch whatever
     // the structural pass does not model.
+    //
+    // The gate is an OBSERVATIONAL experiment, so it runs with the
+    // work-skipping levers off (`Tuning::off`). A trial that lets an island
+    // sleep, or integrates it at `k·dt`, is measuring its own skipping
+    // instead of the world — and the divergence this gate exists to catch is
+    // exactly the kind of event a sleeping island would never reach.
     let mut eng = Engine::new(dt);
+    eng.set_tuning(sim_tuning_off());
     eng.set_elements(specs);
     diagnose(&eng)?;
     if !eng.probe_solvable() {

@@ -595,14 +595,25 @@ impl DamageModel {
     /// tick's frame, and return the parts that just broke.
     ///
     /// `h` must be the simulated time the tick actually advanced (a
-    /// quarantined or budget-limited tick advances less, and must therefore
-    /// cook less). Callers pass 0 for a tick that produced no new numbers.
+    /// budget-limited tick advances less, and must therefore cook less).
+    /// Callers pass 0 for a tick that produced no new numbers.
+    ///
+    /// Quarantine is handled here rather than by the caller, and per part:
+    /// a part whose island stopped solving carries no new numbers, so there
+    /// is nothing to integrate for it — while every part on every OTHER
+    /// island is still dissipating real power and must still cook. Skipping
+    /// the whole sweep because something, somewhere, diverged is an exploit:
+    /// it lets a player make an overloaded part immortal by quarantining an
+    /// unrelated board.
     pub fn tick(&mut self, frames: &[ElemFrame], h: f64) -> Vec<Broke> {
         let mut broke = Vec::new();
         if !(h.is_finite() && h > 0.0) || self.rated.is_empty() {
             return broke;
         }
         for f in frames {
+            if f.quarantined {
+                continue; // no new numbers: a frozen circuit cooks nothing
+            }
             let Ok(k) = self.rated.binary_search_by_key(&f.id, |r| r.id) else {
                 continue; // wire, ground, or a part the document dropped
             };
@@ -774,6 +785,7 @@ mod tests {
             v: [0.0; MAX_PINS],
             i: [0.0; MAX_PINS],
             power,
+            quarantined: false,
         };
         f.i[0] = i0;
         f.i[1] = -i0;

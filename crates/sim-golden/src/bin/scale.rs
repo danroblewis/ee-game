@@ -33,7 +33,9 @@
 //!   --min-steps 5             substeps to time even if that blows the budget
 //!   --step-cap 40             hard wall-second cap on one config's substeps
 //!   --frame-max 8000          elements above which frame() is skipped
-//!   --skip islands|quiescence|sizes|crossover|kernel
+//!   --settle-ms 0            sim ms to run before the stopwatch starts
+//!   --tuning default|off      quiescence + local dt on, or the islands-only yardstick
+//!   --skip islands|quiescence|levers|sizes|crossover|kernel
 //!
 //! Everything printed is measured on the machine that ran it; the harness
 //! prints the machine, profile and every input so a number can never be
@@ -43,6 +45,68 @@ use sim_core::Engine;
 use sim_golden::scale::{self, GenParams, LuOps, Structure, World};
 use sim_math::DenseLu;
 use std::time::Instant;
+
+/// Solver cost of one world, measured island by island and summed.
+///
+/// Since per-island partitioning landed there is no world matrix to time:
+/// `Engine` holds one small dense system per electrically independent build.
+/// Summing the islands is the honest comparison against the single-matrix
+/// numbers in `docs/scale-baseline.md` — same elements, same total unknowns,
+/// the work just stopped being one `n x n` problem.
+struct Kernel {
+    factor_ms: f64,
+    solve_us: f64,
+    lu_nnz: usize,
+    ops: LuOps,
+    dense_updates: u64,
+    islands: usize,
+    max_n: usize,
+}
+
+fn kernel_cost(eng: &Engine) -> Kernel {
+    let live: Vec<usize> = (0..eng.island_count())
+        .filter(|i| eng.islands()[*i].unknowns() > 0)
+        .collect();
+    // One shared budget spread over the islands: 50 islands x 0.5 s would
+    // make the harness itself the slowest thing in the repo.
+    let each = (0.5 / live.len().max(1) as f64).clamp(0.004, 0.5);
+    let mut k = Kernel {
+        factor_ms: 0.0,
+        solve_us: 0.0,
+        lu_nnz: 0,
+        ops: LuOps::default(),
+        dense_updates: 0,
+        islands: live.len(),
+        max_n: 0,
+    };
+    for i in live {
+        let island = &eng.islands()[i];
+        let n = island.unknowns();
+        let a = island.matrix().to_vec();
+        let mut lu = DenseLu::new(n);
+        k.factor_ms += time_median(each, 200, || {
+            lu.factor(&a);
+        }) * 1e3;
+        k.lu_nnz += lu.factor_nnz();
+        let mut rhs = vec![1.0f64; n];
+        k.solve_us += time_median(each * 0.4, 2000, || {
+            rhs.iter_mut().for_each(|v| *v = 1.0);
+            lu.solve(&mut rhs);
+        }) * 1e6;
+        let (ops, _) = scale::lu_ops(&a, n);
+        k.dense_updates += ops.dense_updates();
+        k.ops.updates += ops.updates;
+        k.ops.divisions += ops.divisions;
+        k.ops.skipped_rows += ops.skipped_rows;
+        k.ops.pivot_cmps += ops.pivot_cmps;
+        k.ops.swap_moves += ops.swap_moves;
+        k.ops.factor_nnz += ops.factor_nnz;
+        k.ops.singular |= ops.singular;
+        k.ops.n += n;
+        k.max_n = k.max_n.max(n);
+    }
+    k
+}
 
 /// Matches the server (`crates/server/src/main.rs`): dt = 20 us, 30 Hz tick.
 const DT: f64 = 20e-6;
@@ -81,6 +145,11 @@ struct Row {
     label: String,
     elements: usize,
     islands: usize,
+    /// Islands the engine actually solves (the partition it built itself).
+    engine_islands: usize,
+    /// Unknowns in the largest island: what really sets the substep cost.
+    max_n: usize,
+    dense_updates: u64,
     n: usize,
     nnz: usize,
     nnz_per_row: f64,
@@ -93,8 +162,12 @@ struct Row {
     factor_ms: f64,
     solve_us: f64,
     step_us: f64,
+    /// NR iterations per substep PER ISLAND: convergence is per island now,
+    /// so this is the number that is comparable across world sizes.
     nr_mean: f64,
     nr_max: u32,
+    /// Refactorizations per substep per island, and per simulated second
+    /// summed over the whole world.
     refac_per_substep: f64,
     refac_per_simsec: f64,
     ratio: f64,
@@ -131,6 +204,30 @@ struct Cfg {
     step_cap_s: f64,
     /// Element count above which `frame()` is skipped instead of measured.
     frame_max: usize,
+    /// Milliseconds of SIM time to run before the stopwatch starts. The
+    /// default 0 keeps the historical behaviour (4 substeps, i.e. a world
+    /// that was just placed). `docs/scale-baseline.md` measured that a
+    /// DC-only district needs ~250 ms to reach its static state, so any
+    /// measurement of a *settled room* must say so and pay for it.
+    settle_ms: f64,
+    /// Quiescence / local dt thresholds the sweep runs with. `Tuning::off()`
+    /// reproduces the islands-only yardstick.
+    tuning: sim_core::Tuning,
+}
+
+/// Settle an engine for `cfg.settle_ms` of sim time, in chunks so a slow
+/// world does not hand `advance` an enormous budget in one call.
+fn settle(eng: &mut Engine, cfg: &Cfg) {
+    if cfg.settle_ms <= 0.0 {
+        eng.advance(4);
+        return;
+    }
+    let mut left = (cfg.settle_ms * 1e-3 / DT) as u32;
+    while left > 0 {
+        let chunk = left.min(2_000);
+        eng.advance(chunk);
+        left -= chunk;
+    }
 }
 
 /// Advance one substep at a time, collecting per-step NR and factorization
@@ -143,6 +240,30 @@ struct StepStats {
     factorizations: u64,
     rescues: u32,
     quarantined: bool,
+    /// Island-level integration steps: with local dt one of these covers `k`
+    /// world substeps, so this is the divisor that turns `nr_total` into
+    /// iterations per solve.
+    island_steps: u64,
+    /// Islands asleep, and islands that ran the solver, summed over the
+    /// measured substeps — divide by `steps` for the mean.
+    static_sum: u64,
+    live_sum: u64,
+    /// Sum of every awake island's `k`, summed over the measured substeps.
+    k_sum: u64,
+}
+
+impl StepStats {
+    /// Mean islands asleep per substep.
+    fn mean_static(&self) -> f64 {
+        self.static_sum as f64 / self.steps as f64
+    }
+    /// Mean local dt multiple over the awake islands.
+    fn mean_k(&self) -> f64 {
+        if self.live_sum == 0 {
+            return 1.0;
+        }
+        self.k_sum as f64 / self.live_sum as f64
+    }
 }
 
 fn measure_steps(eng: &mut Engine, cfg: &Cfg) -> StepStats {
@@ -151,6 +272,7 @@ fn measure_steps(eng: &mut Engine, cfg: &Cfg) -> StepStats {
     let t = Instant::now();
     let r0 = eng.advance(1);
     let first = t.elapsed().as_secs_f64();
+    let (k0, live0) = eng.local_dt_spread();
     let mut st = StepStats {
         steps: 1,
         wall: first,
@@ -159,6 +281,10 @@ fn measure_steps(eng: &mut Engine, cfg: &Cfg) -> StepStats {
         factorizations: eng.factorizations() - f0,
         rescues: r0.rescues,
         quarantined: r0.quarantined,
+        island_steps: r0.island_steps as u64,
+        static_sum: r0.static_islands as u64,
+        live_sum: live0 as u64,
+        k_sum: k0,
     };
     // Always time `min_steps` substeps (a 2-sample mean of a 1 s substep is
     // not a measurement), but never run past the hard cap.
@@ -179,6 +305,11 @@ fn measure_steps(eng: &mut Engine, cfg: &Cfg) -> StepStats {
         st.factorizations += eng.factorizations() - f;
         st.rescues += r.rescues;
         st.quarantined = r.quarantined;
+        st.island_steps += r.island_steps as u64;
+        st.static_sum += r.static_islands as u64;
+        let (ks, live) = eng.local_dt_spread();
+        st.k_sum += ks;
+        st.live_sum += live as u64;
     }
     st
 }
@@ -192,8 +323,10 @@ fn measure(params: GenParams, cfg: &Cfg) -> Option<Row> {
         let bytes = (topo.unknowns * topo.unknowns * 8) as f64;
         println!(
             "SKIPPED  {label}\n         junctions={} nodes={} branches={} islands={} \
-             n={} unknowns; today's ONE dense matrix needs {:.2} GB for A plus the \
-             same again for its LU copy, over the --max-n {} cap. Not measured.",
+             n={} unknowns; ONE dense matrix over all of it would need {:.2} GB for A \
+             plus the same again for its LU copy, over the --max-n {} cap. Not measured. \
+             (The engine no longer builds that matrix — the cap is kept so the \
+             one-circuit worst case stays comparable with the baseline.)",
             topo.junctions,
             topo.nodes,
             topo.branches,
@@ -206,6 +339,7 @@ fn measure(params: GenParams, cfg: &Cfg) -> Option<Row> {
     }
 
     let mut eng = Engine::new(DT);
+    eng.set_tuning(cfg.tuning);
     let t = Instant::now();
     eng.set_elements(&specs);
     let compile_ms = t.elapsed().as_secs_f64() * 1e3;
@@ -215,28 +349,18 @@ fn measure(params: GenParams, cfg: &Cfg) -> Option<Row> {
         "generator topology disagrees with compile()"
     );
 
-    // Settle a few steps so the matrix is stamped and the linear path has
-    // taken its one-off factorization out of the per-step measurement.
-    eng.advance(4);
+    // Settle so the matrices are stamped and the linear path has taken its
+    // one-off factorization out of the per-step measurement (and, when
+    // --settle-ms says so, so the room has reached the state a room is
+    // actually in most of the time).
+    settle(&mut eng, cfg);
     let n = eng.unknowns();
     let nnz = eng.matrix_nnz();
 
-    // Dense LU factor and solve, timed separately on the live matrix.
-    let a = eng.matrix().to_vec();
-    let mut lu = DenseLu::new(n);
-    let factor_ms = time_median(0.5, 25, || {
-        lu.factor(&a);
-    }) * 1e3;
-    let lu_nnz = lu.factor_nnz();
-    let mut rhs = vec![1.0f64; n];
-    let solve_us = time_median(0.2, 500, || {
-        rhs.iter_mut().for_each(|v| *v = 1.0);
-        lu.solve(&mut rhs);
-    }) * 1e6;
-    drop(lu);
-    // What that factor call actually executed, counted (see `scale::lu_ops`).
-    let (ops, _) = scale::lu_ops(&a, n);
-    drop(a);
+    // Dense LU factor and solve, timed separately on the live matrices —
+    // one per island, summed.
+    let k = kernel_cost(&eng);
+    let (factor_ms, solve_us, lu_nnz, ops) = (k.factor_ms, k.solve_us, k.lu_nnz, k.ops);
 
     let st = measure_steps(&mut eng, cfg);
     let step_us = st.wall / st.steps as f64 * 1e6;
@@ -256,10 +380,14 @@ fn measure(params: GenParams, cfg: &Cfg) -> Option<Row> {
         0.0
     };
 
+    let islands = k.islands.max(1) as f64;
     Some(Row {
         label,
         elements: specs.len(),
         islands: topo.islands,
+        engine_islands: k.islands,
+        max_n: k.max_n,
+        dense_updates: k.dense_updates,
         n,
         nnz,
         nnz_per_row: nnz as f64 / n as f64,
@@ -272,9 +400,9 @@ fn measure(params: GenParams, cfg: &Cfg) -> Option<Row> {
         factor_ms,
         solve_us,
         step_us,
-        nr_mean: st.nr_total as f64 / st.steps as f64,
+        nr_mean: st.nr_total as f64 / (st.island_steps.max(1)) as f64,
         nr_max: st.nr_max,
-        refac_per_substep: st.factorizations as f64 / st.steps as f64,
+        refac_per_substep: st.factorizations as f64 / st.steps as f64 / islands,
         refac_per_simsec: st.factorizations as f64 / sim_s,
         ratio,
         tick_pct: step_us * steps_per_tick() / (1e6 / TICK_HZ) * 100.0,
@@ -288,34 +416,37 @@ fn measure(params: GenParams, cfg: &Cfg) -> Option<Row> {
 fn print_row(r: &Row) {
     println!("--- {}", r.label);
     println!(
-        "    elements={} islands={} n={} (nodes+branches) nnz={} \
-         nnz/row={:.2} density={:.4}% linear={}",
+        "    elements={} islands={} (engine solves {}) sum n={} (nodes+branches), \
+         largest island n={}   nnz={} nnz/row={:.2} density={:.4}% linear={}",
         r.elements,
         r.islands,
+        r.engine_islands,
         r.n,
+        r.max_n,
         r.nnz,
         r.nnz_per_row,
         r.density * 100.0,
         r.linear
     );
     println!(
-        "    LU factor nnz={} = {:.1}x fill over the matrix, {:.1}% of the n^2 \
-         dense footprint",
+        "    LU factor nnz={} = {:.1}x fill over the matrices, {:.1}% of one \
+         (sum n)^2 dense footprint",
         r.lu_nnz,
         r.fill,
         100.0 * r.lu_nnz as f64 / (r.n * r.n) as f64
     );
     println!(
-        "    LU work counted: {:.3} M row-updates per factor = {:.1}% of a \
-         structure-blind n^3/3 ({:.3} M); zero-multiplier row skips {}",
+        "    LU work counted: {:.3} M row-updates to factor EVERY island once = \
+         {:.1}% of a structure-blind sum of n_i^3/3 ({:.3} M); zero-multiplier \
+         row skips {}",
         r.ops.updates as f64 / 1e6,
-        100.0 * (1.0 - r.ops.structure_saving()),
-        r.ops.dense_updates() as f64 / 1e6,
+        100.0 * r.ops.updates as f64 / r.dense_updates.max(1) as f64,
+        r.dense_updates as f64 / 1e6,
         r.ops.skipped_rows
     );
     println!(
-        "    compile(set_elements)={:.2} ms   dense factor={:.3} ms   \
-         solve={:.1} us   frame()={}",
+        "    compile(set_elements)={:.2} ms   dense factor (all islands)={:.3} ms   \
+         solve (all islands)={:.1} us   frame()={}",
         r.compile_ms,
         r.factor_ms,
         r.solve_us,
@@ -326,8 +457,9 @@ fn print_row(r: &Row) {
         }
     );
     println!(
-        "    per substep={:.1} us   NR iters/substep mean={:.2} max={}   \
-         refactors/substep={:.2}   refactors/sim-second={:.0}   rescues={}{}",
+        "    per substep (whole world)={:.1} us   NR iters/substep/island mean={:.2} \
+         max(world sum)={}   refactors/substep/island={:.2}   \
+         refactors/sim-second (all islands)={:.0}   rescues={}{}",
         r.step_us,
         r.nr_mean,
         r.nr_max,
@@ -358,11 +490,12 @@ fn print_row(r: &Row) {
 
 fn md_row(r: &Row) -> String {
     format!(
-        "| {} | {} | {} | {} | {} | {:.2} | {:.1}x | {:.2} | {:.3} | {:.1} | {:.1} | {:.2} | {} | {:.0} | {:.0}% | {:.0}% | **{:.4}x** | {:.0}% |",
+        "| {} | {} | {} | {} | {} | {} | {:.2} | {:.1}x | {:.2} | {:.3} | {:.1} | {:.1} | {:.2} | {} | {:.0} | {:.0}% | {:.0}% | **{:.4}x** | {:.0}% |",
         r.elements,
         r.label.split(", ").nth(1).unwrap_or("?"),
         r.islands,
         r.n,
+        r.max_n,
         r.nnz,
         r.nnz_per_row,
         r.fill,
@@ -380,7 +513,7 @@ fn md_row(r: &Row) -> String {
     )
 }
 
-const MD_HEAD: &str = "| elements | structure | islands | n | nnz | nnz/row | LU fill | compile ms | factor ms | solve us | us/substep | NR mean | NR max | refactor/sim-s | refactor share | solve share | real-time | tick budget |\n|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|";
+const MD_HEAD: &str = "| elements | structure | islands | sum n | max n | nnz | nnz/row | LU fill | compile ms | factor ms | solve us | us/substep | NR mean/island | NR max | refactor/sim-s | refactor share | solve share | real-time | tick budget |\n|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|";
 
 // ------------------------------------------------------------------ kernel
 
@@ -393,8 +526,12 @@ const MD_HEAD: &str = "| elements | structure | islands | n | nnz | nnz/row | LU
 /// the same `n` says which of the two is actually paying for the factor — and
 /// therefore whether a sparse solver would win by avoiding flops or by
 /// avoiding memory traffic.
-fn kernel_experiment(dsize: usize, nonlinear: u32) {
+fn kernel_experiment(_dsize: usize, nonlinear: u32) {
     println!("\n=== LU KERNEL: dense matrix vs stamped MNA matrix at the same n ===");
+    println!(
+        "  (the MNA side is a ONE-CIRCUIT world: since per-island partitioning \
+         landed, a districts world has no matrix bigger than one build)"
+    );
     println!(
         "  | n | dense factor ms | dense row-updates | ns/update | MNA factor ms | \
          MNA row-updates | MNA ns/'update' | dense/MNA time |"
@@ -422,14 +559,13 @@ fn kernel_experiment(dsize: usize, nonlinear: u32) {
         }) * 1e3;
         let (d_ops, _) = scale::lu_ops(&a, n);
 
-        // The closest stamped MNA matrix: grow a districts world until its
-        // unknown count reaches n.
+        // The closest stamped MNA matrix: grow a one-circuit world until its
+        // unknown count reaches n. It is one island, so the engine really does
+        // build this matrix.
         let mut target = n * 4;
         let (mut m_n, mut specs) = (0usize, Vec::new());
         while m_n < n && target < n * 40 {
-            let w = scale::generate(
-                GenParams::new(target, Structure::Districts { size: dsize }).nonlinear(nonlinear),
-            );
+            let w = scale::generate(GenParams::new(target, Structure::One).nonlinear(nonlinear));
             specs = w.flat();
             m_n = scale::topology(&specs).unknowns;
             target += n / 2;
@@ -437,8 +573,13 @@ fn kernel_experiment(dsize: usize, nonlinear: u32) {
         let mut eng = Engine::new(DT);
         eng.set_elements(&specs);
         eng.advance(4);
-        let m_n = eng.unknowns();
-        let ma = eng.matrix().to_vec();
+        let big = eng
+            .islands()
+            .iter()
+            .max_by_key(|i| i.unknowns())
+            .expect("a world with unknowns");
+        let m_n = big.unknowns();
+        let ma = big.matrix().to_vec();
         let mut mlu = DenseLu::new(m_n);
         let m_ms = time_median(0.4, 20, || {
             mlu.factor(&ma);
@@ -477,8 +618,9 @@ fn crossover(structure: Structure, nonlinear: u32, active: u32, cfg: &Cfg) {
         let world = scale::generate(p);
         let specs = world.flat();
         let mut eng = Engine::new(DT);
+        eng.set_tuning(cfg.tuning);
         eng.set_elements(&specs);
-        eng.advance(4);
+        settle(&mut eng, cfg);
         let st = measure_steps(&mut eng, cfg);
         if st.quarantined {
             return None;
@@ -532,46 +674,173 @@ fn crossover(structure: Structure, nonlinear: u32, active: u32, cfg: &Cfg) {
     );
 }
 
+// ---------------------------------------------------------------- levers
+
+/// What each work-skipping lever is actually worth, on top of islands.
+///
+/// Four configurations of the SAME world, settled the same way and measured
+/// the same way: islands only (the yardstick), + quiescence, + local dt,
+/// and both. `active_percent` is swept because the quiescence win is worth
+/// exactly `1/(1 - idle fraction)` and that fraction is a property of the
+/// room, not of the engine.
+///
+/// Settling matters and is stated: `docs/scale-baseline.md` measured that a
+/// DC-only district needs ~250 ms of sim time to reach its static state, so
+/// every configuration is given the same settle before the stopwatch
+/// starts. Measuring from t=0 would report the transient, not the room.
+///
+/// 250 ms is when a district stops MOVING VISIBLY. It is not when the
+/// engine can certify that the travel it has left is under a microvolt,
+/// which is what sleeping now requires and which a tail of tau = 0.5 s
+/// cannot demonstrate for several seconds. So this sweep is worth running
+/// at more than one settle — `--settle-ms` overrides — and the difference
+/// between them is the honest shape of the quiescence lever: it pays when
+/// the room really has stopped, not when it merely looks stopped.
+const SETTLE_MS: f64 = 300.0;
+
+fn levers_experiment(total: usize, dsize: usize, nonlinear: u32, actives: &[u32], cfg: &Cfg) {
+    let settle_ms = if cfg.settle_ms > 0.0 {
+        cfg.settle_ms
+    } else {
+        SETTLE_MS
+    };
+    println!("\n=== LEVERS: what quiescence and local dt are worth on top of islands ===");
+    println!(
+        "  {} elements in ~{}-element districts, {}% nonlinear blocks, settled {settle_ms} ms \
+         of sim time before timing (a DC district needs ~250 ms to go still)",
+        total, dsize, nonlinear
+    );
+    println!(
+        "  tuning: slew<={:.3} V/s and drift<={:.0e} V held for {:.0} ms => static; \
+         local dt doubles after {} steps under {:.0e} V of estimated step error, \
+         capped at k={} / {:.0} us",
+        sim_core::Tuning::default().quiescence_slew,
+        sim_core::Tuning::default().quiescence_drift,
+        sim_core::Tuning::default().quiescence_hold * 1e3,
+        sim_core::Tuning::default().local_dt_hold,
+        sim_core::Tuning::default().local_dt_err,
+        sim_core::Tuning::default().local_dt_max_k,
+        sim_core::Tuning::default().local_dt_max * 1e6,
+    );
+    println!(
+        "\n  | active% | config | us/substep | real-time | vs islands-only | static islands | mean k | NR/solve | refactor/sim-s |"
+    );
+    println!("  |---:|---|---:|---:|---:|---:|---:|---:|---:|");
+    for &active in actives {
+        let params = GenParams::new(total, Structure::Districts { size: dsize })
+            .nonlinear(nonlinear)
+            .active(active);
+        let specs = scale::generate(params).flat();
+        let mut base = 0.0f64;
+        for (name, tuning) in lever_configs() {
+            let mut eng = Engine::new(DT);
+            eng.set_tuning(tuning);
+            eng.set_elements(&specs);
+            // Same settle for every configuration, in SIM time, so the
+            // comparison is between rooms in the same state.
+            let settle = (settle_ms * 1e-3 / DT) as u32;
+            let mut left = settle;
+            while left > 0 {
+                let chunk = left.min(2_000);
+                eng.advance(chunk);
+                left -= chunk;
+            }
+            let st = measure_steps(&mut eng, cfg);
+            let step_us = st.wall / st.steps as f64 * 1e6;
+            let ratio = st.steps as f64 * DT / st.wall;
+            if base == 0.0 {
+                base = step_us;
+            }
+            println!(
+                "  | {active} | {name} | {:.1} | {:.4}x | {:.2}x | {:.1}/{} | {:.2} | {:.2} | {:.0} |",
+                step_us,
+                ratio,
+                base / step_us,
+                st.mean_static(),
+                eng.island_count(),
+                st.mean_k(),
+                st.nr_total as f64 / st.island_steps.max(1) as f64,
+                st.factorizations as f64 / (st.steps as f64 * DT),
+            );
+        }
+    }
+    println!(
+        "\n  Read the `vs islands-only` column as the lever's multiplier on the \n  \
+         partitioned engine. The two levers overlap by construction — an island \n  \
+         that has gone completely still is also an island whose curvature is zero \n  \
+         — so the `both` row is NOT the product of the two middle rows, and \n  \
+         quoting it as one would be a lie."
+    );
+}
+
+fn lever_configs() -> Vec<(&'static str, sim_core::Tuning)> {
+    let d = sim_core::Tuning::default();
+    vec![
+        ("islands only", sim_core::Tuning::off()),
+        (
+            "+ quiescence",
+            sim_core::Tuning {
+                local_dt: false,
+                ..d
+            },
+        ),
+        (
+            "+ local dt",
+            sim_core::Tuning {
+                quiescence: false,
+                ..d
+            },
+        ),
+        ("+ both (shipping)", d),
+    ]
+}
+
 // --------------------------------------------------------------- islands
 
-/// One global matrix (today) vs one matrix per district (the unbuilt win).
+/// The engine's own partition vs one hand-built `Engine` per district.
+///
+/// Before per-island partitioning this experiment compared the shipping
+/// engine (ONE dense matrix over the whole world) against a manual
+/// per-district split, and measured the win the split was worth:
+/// **58.6x on the factor, 68.4x on the whole substep** at 5,122 elements
+/// (`docs/scale-baseline.md`, "Structural win 1"). The engine now does the
+/// split itself, so the monolithic side no longer exists to be measured —
+/// what this checks instead is that the built-in partition captures the
+/// whole win, i.e. that it costs the same as splitting by hand.
 fn islands_experiment(total: usize, dsize: usize, nonlinear: u32, cfg: &Cfg) {
-    println!("\n=== ISLANDS: one world matrix vs one matrix per district ===");
+    println!("\n=== ISLANDS: the engine's own partition vs one Engine per district ===");
     let params = GenParams::new(total, Structure::Districts { size: dsize }).nonlinear(nonlinear);
     let world = scale::generate(params);
     let specs = world.flat();
     let topo = scale::topology(&specs);
+
+    let mut whole = Engine::new(DT);
+    let t = Instant::now();
+    whole.set_elements(&specs);
+    let g_compile = t.elapsed().as_secs_f64() * 1e3;
+    whole.advance(4);
     println!(
-        "world: {} elements in {} districts -> compile() builds ONE {}x{} matrix \
-         ({} islands are all in it)",
+        "world: {} elements in {} districts -> compile() builds {} islands, \
+         sum n={} (largest {}); one matrix over all of it would be {}x{}",
         specs.len(),
         world.districts.len(),
+        whole.island_count(),
+        whole.unknowns(),
+        whole.max_island_unknowns(),
         topo.unknowns,
-        topo.unknowns,
-        topo.islands
+        topo.unknowns
     );
-    if topo.unknowns > cfg.max_n {
-        println!("  global side skipped: n over --max-n");
-        return;
-    }
-
-    let mut global = Engine::new(DT);
-    let t = Instant::now();
-    global.set_elements(&specs);
-    let g_compile = t.elapsed().as_secs_f64() * 1e3;
-    global.advance(4);
-    let a = global.matrix().to_vec();
-    let mut lu = DenseLu::new(global.unknowns());
-    let g_factor = time_median(0.5, 25, || {
-        lu.factor(&a);
-    }) * 1e3;
-    let (g_ops, _) = scale::lu_ops(&a, global.unknowns());
-    drop((lu, a));
-    let gs = measure_steps(&mut global, cfg);
+    assert_eq!(
+        whole.unknowns(),
+        topo.unknowns,
+        "partitioning must not change the total unknown count"
+    );
+    let g = kernel_cost(&whole);
+    let gs = measure_steps(&mut whole, cfg);
     let g_step_us = gs.wall / gs.steps as f64 * 1e6;
-    let g_nr = gs.nr_total as f64 / gs.steps as f64;
+    let g_nr = gs.nr_total as f64 / gs.steps as f64 / g.islands as f64;
 
-    // Per-district engines: exactly the same elements, partitioned.
+    // Per-district engines: exactly the same elements, split by hand.
     let mut engines: Vec<Engine> = Vec::with_capacity(world.districts.len());
     let t = Instant::now();
     for d in &world.districts {
@@ -588,16 +857,13 @@ fn islands_experiment(total: usize, dsize: usize, nonlinear: u32, cfg: &Cfg) {
     let mut n_sum = 0usize;
     let mut n_max = 0usize;
     for e in engines.iter() {
-        let a = e.matrix().to_vec();
-        let mut lu = DenseLu::new(e.unknowns());
-        i_factor += time_median(0.02, 200, || {
-            lu.factor(&a);
-        }) * 1e3;
-        i_updates += scale::lu_ops(&a, e.unknowns()).0.updates;
+        let k = kernel_cost(e);
+        i_factor += k.factor_ms;
+        i_updates += k.ops.updates;
         n_sum += e.unknowns();
-        n_max = n_max.max(e.unknowns());
+        n_max = n_max.max(k.max_n);
     }
-    // Per-substep cost of the partitioned world = every island stepped once.
+    // Per-substep cost of the hand-split world = every engine stepped once.
     let t = Instant::now();
     let mut sweeps = 0u32;
     let mut nr_max = 0u32;
@@ -614,21 +880,23 @@ fn islands_experiment(total: usize, dsize: usize, nonlinear: u32, cfg: &Cfg) {
     let i_nr = nr_total as f64 / (sweeps as f64 * engines.len() as f64);
 
     println!(
-        "  GLOBAL   n={} compile={:.2} ms  one factor={:.3} ms ({:.2} M row-updates)  \
-         NR iters/substep mean={:.2} max={}  per substep={:.1} us  real-time={:.4}x",
-        global.unknowns(),
+        "  ENGINE   {} islands, sum n={} (max {})  compile={:.2} ms  \
+         sum of all factors={:.3} ms ({:.2} M row-updates)  NR iters/substep/island \
+         mean={:.2}  per substep (whole world)={:.1} us  real-time={:.4}x",
+        g.islands,
+        whole.unknowns(),
+        g.max_n,
         g_compile,
-        g_factor,
-        g_ops.updates as f64 / 1e6,
+        g.factor_ms,
+        g.ops.updates as f64 / 1e6,
         g_nr,
-        gs.nr_max,
         g_step_us,
         DT / (g_step_us / 1e6)
     );
     println!(
-        "  ISLANDS  {} engines, sum n={} (max {})  compile={:.2} ms  \
+        "  MANUAL   {} engines, sum n={} (max {})  compile={:.2} ms  \
          sum of all factors={:.3} ms ({:.2} M row-updates)  NR iters/substep/island \
-         mean={:.2} max={}  per substep (all islands)={:.1} us  real-time={:.4}x",
+         mean={:.2} max={}  per substep (all engines)={:.1} us  real-time={:.4}x",
         engines.len(),
         n_sum,
         n_max,
@@ -641,20 +909,20 @@ fn islands_experiment(total: usize, dsize: usize, nonlinear: u32, cfg: &Cfg) {
         DT / (i_step_us / 1e6)
     );
     println!(
-        "  => factor {:.1}x cheaper, {:.1}x fewer row-updates, compile {:.1}x cheaper, \
-         whole substep {:.1}x cheaper for electrically identical worlds \
-         ({} global substeps, {} island sweeps timed)",
-        g_factor / i_factor,
-        g_ops.updates as f64 / i_updates.max(1) as f64,
+        "  => built-in partition vs hand-split: factor {:.2}x, row-updates {:.2}x, \
+         compile {:.2}x, whole substep {:.2}x (1.00x = the engine gives away nothing; \
+         {} engine substeps, {} hand-split sweeps timed)",
+        g.factor_ms / i_factor,
+        g.ops.updates as f64 / i_updates.max(1) as f64,
         g_compile / i_compile,
         g_step_us / i_step_us,
         gs.steps,
         sweeps
     );
     println!(
-        "  note: NR convergence is global too — one unconverged device makes the whole \
-         world iterate again ({:.2} vs {:.2} iterations per substep above).",
-        g_nr, i_nr
+        "  baseline for the same world, ONE matrix (docs/scale-baseline.md, measured \
+         before this change): n=1348, one factor 7.813 ms, 3.48 M row-updates, \
+         2.09 NR iters/substep, 20,536 us/substep, 0.0010x real time."
     );
 }
 
@@ -693,16 +961,29 @@ fn quiescence_experiment(total: usize, dsize: usize, nonlinear: u32, active: u32
         .nonlinear(nonlinear)
         .active(active);
     let world: World = scale::generate(params);
-    let mut engines: Vec<Engine> = world
-        .districts
-        .iter()
-        .map(|d| {
-            let mut e = Engine::new(DT);
-            e.set_elements(d);
-            e
-        })
+    // One engine for the whole world: the islands ARE the districts now, so
+    // the experiment reads the shipping partition instead of hand-building
+    // one engine per district.
+    let mut eng = Engine::new(DT);
+    // OBSERVATIONAL: the levers are switched off here on purpose. This
+    // experiment asks "does the world go still?", and an engine that skips
+    // still islands would answer its own question — a slept island's
+    // `solution()` cannot move, so every reading would be static by
+    // construction. The lever WIN is measured in `levers_experiment`.
+    eng.set_tuning(sim_core::Tuning::off());
+    eng.set_elements(&world.flat());
+    let live: Vec<usize> = (0..eng.island_count())
+        .filter(|i| eng.islands()[*i].unknowns() > 0)
         .collect();
-    let ns: Vec<usize> = engines.iter().map(|e| e.unknowns()).collect();
+    let mut district_of: Vec<Option<usize>> = vec![None; eng.island_count()];
+    for (id, isl, _) in eng.element_nodes() {
+        district_of[isl].get_or_insert(World::district_of(id));
+    }
+    // Which observation slot each district's island landed in.
+    let slot_of_district: Vec<Option<usize>> = (0..world.districts.len())
+        .map(|d| live.iter().position(|i| district_of[*i] == Some(d)))
+        .collect();
+    let ns: Vec<usize> = live.iter().map(|i| eng.islands()[*i].unknowns()).collect();
     let total_n: usize = ns.iter().sum();
     let cube: f64 = ns.iter().map(|n| (*n as f64).powi(3)).sum();
     // A district counts as static in a substep if no unknown moved by more
@@ -711,10 +992,11 @@ fn quiescence_experiment(total: usize, dsize: usize, nonlinear: u32, active: u32
     const STATIC_V: f64 = 1e-6;
     const WINDOW: u32 = 500; // 10 ms observation window
     println!(
-        "\n  --- active_percent={active} (ASSUMPTION): {} districts, {} built with a \
-         switching block (relaxation oscillator or 1 kHz AC source), {} unknowns total, \
-         {nonlinear}% nonlinear blocks",
-        engines.len(),
+        "\n  --- active_percent={active} (ASSUMPTION): {} districts -> {} solving \
+         islands, {} built with a switching block (relaxation oscillator or 1 kHz AC \
+         source), {} unknowns total, {nonlinear}% nonlinear blocks",
+        world.districts.len(),
+        live.len(),
         world.active.len(),
         total_n,
     );
@@ -727,26 +1009,27 @@ fn quiescence_experiment(total: usize, dsize: usize, nonlinear: u32, active: u32
     );
     println!("  | settled sim time | static districts | static unknowns | static share of sum(n_i^3) | mean per-substep static |");
     println!("  |---|---|---|---|---|");
-    let mut last_moved = vec![true; engines.len()];
+    let mut last_moved = vec![true; live.len()];
     let mut settled_ms = 0.0f64;
     for target_ms in [10.0f64, 50.0, 250.0, 1000.0] {
         let extra = ((target_ms - settled_ms) * 1e-3 / DT) as u32;
-        for e in engines.iter_mut() {
-            e.advance(extra);
-        }
+        eng.advance(extra);
         settled_ms = target_ms;
-        let mut moved = vec![false; engines.len()];
+        let mut moved = vec![false; live.len()];
         let mut static_steps = 0u64;
         for _ in 0..WINDOW {
-            for (i, e) in engines.iter_mut().enumerate() {
-                let before = e.solution().to_vec();
-                e.advance(1);
-                let m = before
+            let before: Vec<Vec<f64>> = live
+                .iter()
+                .map(|i| eng.islands()[*i].solution().to_vec())
+                .collect();
+            eng.advance(1);
+            for (k, i) in live.iter().enumerate() {
+                let m = before[k]
                     .iter()
-                    .zip(e.solution().iter())
+                    .zip(eng.islands()[*i].solution().iter())
                     .any(|(a, b)| (a - b).abs() > STATIC_V);
                 if m {
-                    moved[i] = true;
+                    moved[k] = true;
                 } else {
                     static_steps += 1;
                 }
@@ -770,24 +1053,34 @@ fn quiescence_experiment(total: usize, dsize: usize, nonlinear: u32, active: u32
             "  | {:.0} ms | {}/{} = {:.0}% | {:.0}% | {:.0}% | {:.0}% |",
             target_ms,
             s_count as usize,
-            engines.len(),
-            pct(s_count, engines.len() as f64),
+            live.len(),
+            pct(s_count, live.len() as f64),
             pct(s_n, total_n as f64),
             pct(s_cube, cube),
-            pct(static_steps as f64, WINDOW as f64 * engines.len() as f64)
+            pct(static_steps as f64, WINDOW as f64 * live.len() as f64)
         );
         last_moved = moved;
     }
     // Instrument self-check: every district built with a switching block must
     // read as moving, or the measurement is not measuring what it claims.
-    let active_moving = world.active.iter().filter(|i| last_moved[**i]).count();
+    let active_moving = world
+        .active
+        .iter()
+        .filter(|d| slot_of_district[**d].is_some_and(|k| last_moved[k]))
+        .count();
     println!(
         "  self-check: {}/{} districts built with a switching block read as moving",
         active_moving,
         world.active.len()
     );
-    let quiet_but_not_built_quiet = (0..engines.len())
-        .filter(|i| last_moved[*i] && !world.active.contains(i))
+    let quiet_but_not_built_quiet = (0..live.len())
+        .filter(|k| {
+            last_moved[*k]
+                && !world
+                    .active
+                    .iter()
+                    .any(|d| slot_of_district[*d] == Some(*k))
+        })
         .count();
     println!(
         "  {} DC-only districts still moving after 1 s of sim time \
@@ -850,6 +1143,13 @@ fn main() {
         frame_max: arg_val(&args, "--frame-max")
             .and_then(|s| s.parse().ok())
             .unwrap_or(8_000),
+        settle_ms: arg_val(&args, "--settle-ms")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0),
+        tuning: match arg_val(&args, "--tuning").as_deref() {
+            Some("off") => sim_core::Tuning::off(),
+            _ => sim_core::Tuning::default(),
+        },
     };
 
     println!("# sim-core scale baseline");
@@ -869,7 +1169,11 @@ fn main() {
         TICK_HZ,
         steps_per_tick()
     );
-    println!("dense-matrix cap: n <= {max_n}\n");
+    println!("dense-matrix cap: n <= {max_n}");
+    println!(
+        "levers: quiescence={} local dt={} ; settle before timing = {} ms of sim time\n",
+        cfg.tuning.quiescence, cfg.tuning.local_dt, cfg.settle_ms
+    );
 
     // Device mix of a representative world, so the shape is on the record.
     let sample = scale::generate(
@@ -946,6 +1250,14 @@ fn main() {
     }
     if !skip.iter().any(|s| s == "quiescence") {
         quiescence_sweep(2_000, dsize, nonlinear, active);
+    }
+    if !skip.iter().any(|s| s == "levers") {
+        let mut actives = vec![0u32, 20, 50, 100];
+        if !actives.contains(&active) {
+            actives.push(active);
+            actives.sort_unstable();
+        }
+        levers_experiment(5_000, dsize, nonlinear, &actives, &cfg);
     }
 
     println!("\n=== markdown table (docs/scale-baseline.md) ===");

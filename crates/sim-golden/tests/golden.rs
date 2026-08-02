@@ -727,3 +727,199 @@ fn all_golden_circuits_pass_placement_validation() {
     // Both switch states of the demo lamp.
     assert_eq!(sim_core::check_document(&demo_lamp(false), DT), Ok(()));
 }
+
+/// Asking for a finer simulation must never make the answer worse. `dt` is
+/// the accuracy the room asked for; an engine in which halving it degrades
+/// the result has inverted the meaning of its own parameter.
+///
+/// Measured before the fix, worst error against the closed form over the
+/// first 10 ms of `rc_step`:
+///
+/// | dt     | levers off | levers on |
+/// |--------|------------|-----------|
+/// | 20 µs  | 3.79e-3    | 3.79e-3   |
+/// | 5 µs   | 2.47e-4    | 3.63e-3   |
+/// | 1 µs   | 9.89e-6    | 1.09e-2   |  <- 1,100x worse than levers off,
+///                                        and worse than 20x the step size
+///
+/// The mechanism was read-out staleness, not truncation: an absolute
+/// per-step error budget let `k` rise in exact proportion as `dt` fell, so
+/// the island kept ending its step up to `(k-1)·dt` of world time early and
+/// the first-order lag `slew × lag` never shrank. `Tuning::local_dt_slew`
+/// governs that lag directly, which is what puts the room dt back in charge.
+#[test]
+fn refining_the_room_dt_never_makes_the_answer_worse() {
+    // Worst |v_cap - closed form| over the first 10 ms, sampled every 40 µs
+    // — a whole number of substeps at every dt in the sweep, so all six
+    // runs are compared on exactly the same instants.
+    let worst = |dt: f64, tuning: sim_core::Tuning| {
+        let mut eng = Engine::new(dt);
+        eng.set_tuning(tuning);
+        eng.set_elements(&rc_step());
+        let per = (40e-6 / dt).round() as u32;
+        let mut worst = 0.0f64;
+        for _ in 0..250 {
+            eng.advance(per);
+            let t = eng.time();
+            let v = eng.voltage_at((8, 0)).unwrap();
+            worst = worst.max((v - 10.0 * (1.0 - libm::exp(-t / 1e-3))).abs());
+        }
+        worst
+    };
+
+    let mut prev: Option<(f64, f64)> = None;
+    for dt in [40e-6, 20e-6, 10e-6, 5e-6, 2e-6, 1e-6] {
+        let on = worst(dt, sim_core::Tuning::default());
+        let off = worst(dt, sim_core::Tuning::off());
+        // The levers may cost at most the staleness ceiling they are
+        // allowed to spend — and on this circuit they cost nothing at all,
+        // because a cap moving at kilovolts per second is never dilated.
+        let ceiling = sim_core::Tuning::default().local_dt_slew * dt;
+        assert!(
+            on <= off + ceiling,
+            "dt={dt:.0e}: levers cost {:.3e}, ceiling {ceiling:.3e}",
+            on - off
+        );
+        if let Some((pdt, pworst)) = prev {
+            assert!(
+                on <= pworst,
+                "refining dt from {pdt:.0e} to {dt:.0e} made the answer \
+                 WORSE: {pworst:.4e} -> {on:.4e}"
+            );
+        }
+        prev = Some((dt, on));
+    }
+    // ...and it really is converging, not just failing to get worse.
+    assert!(prev.unwrap().1 < 1e-5, "dt refinement bought nothing");
+
+    // The reproduction, kept: take the staleness governor away (which is
+    // exactly the controller that shipped) and the inversion comes back —
+    // the finest dt in the sweep lands worse than the coarsest but one.
+    let ungoverned = sim_core::Tuning {
+        local_dt_slew: f64::INFINITY,
+        local_dt_slew_i: f64::INFINITY,
+        ..sim_core::Tuning::default()
+    };
+    let (coarse, fine) = (worst(20e-6, ungoverned), worst(1e-6, ungoverned));
+    assert!(
+        fine > coarse,
+        "the pre-fix controller no longer inverts ({fine:.3e} at 1 us vs \
+         {coarse:.3e} at 20 us), so this test proves nothing"
+    );
+}
+
+/// `Tuning::off()` is the yardstick every measurement of the levers is taken
+/// against, so it has to be the SAME ENGINE that existed before islands and
+/// the levers landed — not "close enough", the same bits.
+///
+/// These digests were produced by the unpartitioned engine at commit
+/// 0475bbf, the merge base this work landed on. Every one of them survived
+/// three separate things unchanged: per-island partitioning (the node
+/// numbering a one-island document gets is exactly the numbering it had),
+/// per-island ideal-constraint merging, and per-island piecewise-linear
+/// factorization reuse. If a lever, or the partition, ever leaks a decision
+/// into the path taken with the levers off, this test says so, and every
+/// performance number in `docs/scale-baseline.md` stops meaning anything
+/// until it passes again.
+///
+/// Bit-identity is also why `state_hash` still reproduces: it walks the
+/// islands' solution vectors in island order and the elements in DOCUMENT
+/// order, and for a single-island circuit both are what they always were.
+///
+/// KNOW WHAT THIS DOES NOT COVER. `every_golden_circuit_is_a_single_island`
+/// is a guard, but it is also this test's ceiling: passing here says nothing
+/// about a world that actually partitions. Measured separately on generated
+/// multi-island rooms, levers off: linear ones stay bit-identical, but ones
+/// containing a smooth nonlinearity land within 1.75e-8 V (57x inside
+/// `NR_ABSTOL`) with an identical discrete trajectory — because `main` ran
+/// ONE global Newton loop, where a still-moving diode dragged its converged
+/// neighbours through extra iterations, and each island now converges alone.
+/// Do not "fix" that by re-coupling the loops. See the exactness-scope table
+/// in `docs/scale-baseline.md` before quoting "bit for bit" anywhere.
+#[test]
+fn with_both_levers_off_the_engine_is_the_pre_lever_engine_bit_for_bit() {
+    let want: &[(&str, u64)] = &[
+        ("demo_lamp", 0x8ea6635af49d7cac),
+        ("rc_step", 0x81501c4d4de6f40d),
+        ("rl_step", 0x3e87234f3f92f577),
+        ("rlc_ring", 0x73c8d122d5f0385d),
+        ("half_wave_rectifier", 0x80a7cfb690de1c7f),
+        ("npn_switch", 0x854cefa9a46cb938),
+        ("emitter_follower", 0x89aeff94fab2f084),
+        ("nmos_switch", 0x4514efde3a618625),
+        ("opamp_follower", 0x41e2e1d8df28af5c),
+        ("opamp_comparator", 0x539b9cdfa8b92244),
+        ("zener_regulator", 0xa3126d892895678f),
+        ("opamp_relaxation", 0x61d0292acee94cc4),
+        ("ota_vco", 0x6e972258d2b8fa35),
+        ("timer555_astable", 0x3a6caa090f0e09ae),
+        ("pot_divider", 0x690dcc11c656ea76),
+        ("led_loop", 0x20adc6d1dbcb0cfe),
+        ("motor_step", 0xef8d8ee93986bba0),
+        ("noise_rc", 0xde7b8af17db3ee3e),
+    ];
+    // The determinism harness's own protocol: 1 us, 10k steps, every golden
+    // circuit, in order.
+    let mut seen = 0usize;
+    for (name, elems) in all_golden() {
+        let mut eng = Engine::new(1e-6);
+        eng.set_tuning(sim_core::Tuning::off());
+        eng.set_elements(&elems);
+        let report = eng.advance(10_000);
+        assert_eq!(report.steps, 10_000, "{name}");
+        let (_, hash) = want
+            .iter()
+            .find(|(n, _)| *n == name)
+            .unwrap_or_else(|| panic!("no pre-lever digest recorded for {name}"));
+        assert_eq!(
+            eng.state_hash(),
+            *hash,
+            "{name}: levers off no longer reproduces the pre-lever engine"
+        );
+        seen += 1;
+    }
+    assert_eq!(seen, want.len(), "a golden circuit went missing");
+}
+
+/// ...and the same circuits, run with factorization reuse switched off as
+/// well, must land on the SAME digests. The three mechanisms this work
+/// touches — the island partition, the constraint merging inside it, and the
+/// piecewise-linear reuse on top of it — are each individually exact, and
+/// this is the statement that they are jointly exact too.
+#[test]
+fn levers_off_and_reuse_off_is_the_same_engine_again() {
+    for (name, elems) in all_golden() {
+        let mut a = Engine::new(1e-6);
+        a.set_tuning(sim_core::Tuning::off());
+        a.set_elements(&elems);
+        let mut b = Engine::new(1e-6);
+        b.set_tuning(sim_core::Tuning::off());
+        b.set_elements(&elems);
+        b.set_reuse_pwl(false);
+        a.advance(10_000);
+        b.advance(10_000);
+        assert_eq!(a.state_hash(), b.state_hash(), "{name}");
+    }
+}
+
+/// Every golden circuit is ONE island, which is what makes the digest test
+/// above a statement about partitioning rather than about luck: with one
+/// island the island-local node numbering IS the global numbering, so the
+/// unknown vector the digest walks is laid out exactly as it was.
+///
+/// If a golden is ever added that genuinely splits, this fails rather than
+/// letting the digest test quietly start comparing a permuted vector.
+#[test]
+fn every_golden_circuit_is_a_single_island() {
+    for (name, elems) in all_golden() {
+        let mut eng = Engine::new(DT);
+        eng.set_elements(&elems);
+        let solving = eng.islands().iter().filter(|i| i.unknowns() > 0).count();
+        assert_eq!(solving, 1, "{name} is not one island");
+        assert_eq!(
+            eng.islands()[0].unknowns(),
+            eng.unknowns(),
+            "{name}: the one island must hold every unknown"
+        );
+    }
+}
