@@ -247,6 +247,20 @@ export class History {
     return now() - this.msgAt < NOTE_MS ? this.msg : '';
   }
 
+  /**
+   * Forget everything. Called when the client changes ROOM: the stacks hold
+   * element ids and captured specs from the old document, and replaying one
+   * of those into a different room would either be rejected (best case) or
+   * quietly re-add a part from somebody else's world (worst case). There is
+   * no "undo my last room" — the entries are not portable, so they go.
+   */
+  clear(): void {
+    this.undoStack = [];
+    this.redoStack = [];
+    this.group = null;
+    this.msgAt = -Infinity;
+  }
+
   private commit(g: Group): void {
     const undo: DocOp[] = [];
     for (const op of g.ops) {

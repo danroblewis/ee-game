@@ -151,6 +151,55 @@ export function defaultScopeSettings(timebase = 5): ScopeSettings {
   };
 }
 
+// ------------------------------------------------------------ seed scopes
+//
+// A room template ships the instruments it wants on screen. In-place scopes
+// are CLIENT-LOCAL state (main.ts owns the array; the server never sees a
+// sid), so a template cannot replicate them — it seeds them: the room hands
+// over a rect, a channel list and a timebase once, and from then on the
+// scopes are that player's own. That is why the wire form below is a flat
+// record and not a `FloatScope`: no sid, no live Maps, nothing per-session.
+
+/** The wire form of an in-place oscilloscope carried by a room's `view`. */
+export interface SeedScope {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  /** Probe ids to show, or null/absent for "every probe". */
+  pids?: number[] | null;
+  timebase?: number;
+}
+
+const clampNum = (v: unknown, lo: number, hi: number, dflt: number): number =>
+  typeof v === 'number' && Number.isFinite(v) ? Math.max(lo, Math.min(hi, v)) : dflt;
+
+/** A seed → a real instrument. A template file is hand-editable, so treat
+ * every field as untrusted: clamp the geometry and build a FRESH settings
+ * object (ScopeSettings carries live Maps that must never be shared between
+ * two scopes). */
+export function seedToScope(seed: SeedScope, sid: number): FloatScope {
+  const set = defaultScopeSettings(clampNum(seed.timebase, 0.001, 60, 5));
+  const pids = Array.isArray(seed.pids)
+    ? seed.pids.filter((p): p is number => typeof p === 'number' && Number.isFinite(p))
+    : null;
+  return {
+    sid,
+    x: clampNum(seed.x, -1e6, 1e6, 0),
+    y: clampNum(seed.y, -1e6, 1e6, 0),
+    w: clampNum(seed.w, 2, 400, 12),
+    h: clampNum(seed.h, 2, 400, 6),
+    set,
+    pids,
+  };
+}
+
+/** The reverse, for "save this room as a template": the parts of an
+ * instrument worth handing to the next player, and only those. */
+export function scopeToSeed(s: FloatScope): SeedScope {
+  return { x: s.x, y: s.y, w: s.w, h: s.h, pids: s.pids, timebase: s.set.timebase };
+}
+
 /** Auto-scale state used when a caller renders without a settings object. */
 const legacyAuto = new Map<number, AutoState>();
 

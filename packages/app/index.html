@@ -414,6 +414,182 @@
       .goalcard.win .goal-hd { background: linear-gradient(#3d3418, #2a2513); }
       .goalcard.win .goal-title { color: #ffe6a1; }
       .goalcard.win .goal-fill { background: linear-gradient(#ffd76b, #c98f22); }
+
+      /* ---- rooms: which room am I in, and how do I get to another one
+         (rooms.ts owns the elements; this is only their look).
+
+         The chip wears the HUD's chrome — same plate, same border, same
+         mono face — because it IS status, just status you can click. It
+         lives in the top-right gutter #hud already reserves for itself
+         (max-width: 100vw - 320px), so the two never collide. */
+      #roomchip {
+        position: fixed; top: 8px; right: 12px; z-index: 26;
+        display: flex; align-items: center; gap: 7px; max-width: 300px;
+        color: #c9c9d4; font: 12px/1.5 ui-monospace, monospace;
+        background: #0d0d12d9; border: 1px solid #23232c; border-radius: 6px;
+        padding: 4px 9px; cursor: pointer;
+        user-select: none; -webkit-user-select: none;
+      }
+      #roomchip:hover { background: #17171f; border-color: #3a3a48; color: #fff; }
+      #roomchip:focus-visible { outline: none; border-color: #4ad4ff; }
+      #roomchip .rc-dot {
+        width: 7px; height: 7px; border-radius: 50%; flex: none;
+        background: #4bff6a; box-shadow: 0 0 6px #4bff6a99;
+      }
+      #roomchip.off .rc-dot { background: #6e6e7e; box-shadow: none; }
+      #roomchip .rc-name {
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
+      }
+      #roomchip .rc-code { color: #7a7a8a; letter-spacing: 0.1em; flex: none; }
+      #roomchip .rc-pop { color: #6e6e7e; flex: none; }
+
+      /* The browser. First thing in the app with a real backdrop: it is
+         modal on purpose — leaving a room is not an edit. */
+      #roomdlg {
+        position: fixed; inset: 0; z-index: 50; display: none;
+        align-items: center; justify-content: center;
+        background: #05050ac2;
+        font: 13px/1.6 ui-monospace, monospace; color: #c9c9d4;
+      }
+      #roomdlg.open { display: flex; }
+      .rdlg {
+        width: min(780px, 94vw); max-height: 86vh; display: flex; flex-direction: column;
+        background: #17171ef7; border: 1px solid #454558; border-radius: 8px;
+        box-shadow: 0 18px 60px #000c;
+      }
+      .rdlg-hd {
+        display: flex; align-items: center; gap: 10px;
+        padding: 9px 10px 8px 12px; border-bottom: 1px solid #2c2c38;
+      }
+      .rdlg-hd h3 {
+        margin: 0; font: 600 13px ui-monospace, monospace; color: #fff;
+        letter-spacing: 0.12em; flex: none;
+      }
+      .rtabs { display: flex; gap: 4px; }
+      .rtab {
+        background: #22222c; color: #9a9aa5; border: 1px solid #3a3a48;
+        border-radius: 4px; padding: 3px 9px; font: inherit; cursor: pointer;
+      }
+      .rtab:hover { background: #2e2e3c; color: #fff; }
+      .rtab:focus-visible { outline: none; border-color: #4ad4ff; }
+      .rtab.on { background: #14303a; color: #8ee7ff; border-color: #2f6a7f; }
+      .rdlg-x {
+        margin-left: auto; background: none; border: none; color: #8a8a98;
+        font: 16px/1 ui-monospace, monospace; padding: 0 3px; cursor: pointer;
+      }
+      .rdlg-x:hover { color: #fff; }
+      .rdlg-body { padding: 10px 12px; overflow: auto; flex: 1 1 auto; }
+      .rdlg-ft {
+        border-top: 1px solid #2c2c38; padding: 9px 12px;
+        display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+      }
+      .rmsg { color: #8a8a98; font-size: 11px; flex: 1 1 200px; min-height: 16px; }
+      .rmsg.bad { color: #ff8f8f; }
+      .rmsg.good { color: #7dffb0; }
+      .rlead { color: #9a9aa5; font-size: 11.5px; line-height: 1.5; margin-bottom: 9px; }
+      .rempty { color: #6e6e7e; padding: 18px 2px; text-align: center; }
+
+      /* One room per row: identity on the left (the whole strip joins), the
+         two destructive-ish verbs parked on the right. */
+      .rrow {
+        display: flex; align-items: center; gap: 6px; margin-bottom: 6px;
+        background: #12121a; border: 1px solid #2c2c38; border-radius: 6px;
+      }
+      .rrow.here { background: #12211c; border-color: #2f7f63; }
+      .rjoin {
+        flex: 1 1 auto; min-width: 0; text-align: left; background: none;
+        border: none; color: inherit; font: inherit; padding: 7px 9px;
+        cursor: pointer; border-radius: 6px 0 0 6px;
+      }
+      .rjoin:hover, .rjoin:focus-visible { background: #20202c; color: #fff; outline: none; }
+      .rjoin:disabled { cursor: default; }
+      .rjoin:disabled:hover { background: none; }
+      .rrow .rn { display: flex; align-items: center; gap: 8px; color: #e8e8ef; }
+      .rrow .rnm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .rrow .rmeta { color: #6e6e7e; font-size: 11px; }
+      .rhere, .rtag {
+        flex: none; font: 700 10px ui-monospace, monospace; letter-spacing: 0.1em;
+        border-radius: 3px; padding: 1px 5px;
+      }
+      .rhere { color: #7dffb0; background: #14463a; border: 1px solid #2f7f63; }
+      .rtag { color: #ffe6a1; background: #40320f; border: 1px solid #a9862f; }
+      .ract { display: flex; gap: 6px; align-items: center; padding-right: 8px; flex: none; }
+      .rwarn { color: #ffb3b3; font-size: 11px; }
+      .rbtn {
+        background: #22222c; color: #c9c9d4; border: 1px solid #3a3a48;
+        border-radius: 4px; padding: 3px 9px; font: inherit; cursor: pointer;
+      }
+      .rbtn:hover { background: #2e2e3c; color: #fff; }
+      .rbtn:focus-visible { outline: none; border-color: #4ad4ff; }
+      .rbtn:disabled { opacity: 0.45; cursor: default; }
+      .rbtn:disabled:hover { background: #22222c; color: #c9c9d4; }
+      .rbtn.go { background: #14303a; color: #8ee7ff; border-color: #2f6a7f; }
+      .rbtn.go:hover { background: #1b3f4c; color: #fff; }
+      .rbtn.danger { background: #2a1c1c; color: #ffb3b3; border-color: #6a3a3a; }
+      .rbtn.danger:hover { background: #3a2222; color: #fff; }
+      .rinput {
+        width: 150px; background: #0f0f14; color: #e8e8ef; border: 1px solid #3a3a48;
+        border-radius: 4px; padding: 3px 6px; font: inherit; outline: none;
+      }
+      .rinput.wide { width: 260px; max-width: 46vw; }
+      .rinput:focus { border-color: #4ad4ff; }
+      .rmake { display: flex; gap: 8px; align-items: center; flex: none; }
+
+      /* Template cards: the .pwin cyan ring marks the pick, so "selected"
+         means the same thing here as it does on an instrument. */
+      .tgrid {
+        display: grid; gap: 8px;
+        grid-template-columns: repeat(auto-fill, minmax(224px, 1fr));
+      }
+      .tcard {
+        position: relative; text-align: left; font: inherit; color: inherit;
+        background: #12121a; border: 1px solid #2c2c38; border-radius: 6px;
+        /* room at the bottom-right for the delete × on saved templates */
+        padding: 8px 9px 9px; cursor: pointer;
+      }
+      .tcard:hover { background: #181822; border-color: #3a3a48; }
+      .tcard.on, .tcard:focus-visible {
+        outline: none; border-color: #4ad4ff;
+        box-shadow: 0 0 0 1px #4ad4ff55, 0 0 16px #4ad4ff1f;
+      }
+      .tcard .tn {
+        display: flex; align-items: baseline; gap: 8px; color: #dff0f8; font-weight: 600;
+      }
+      .tcard .tsrc {
+        margin-left: auto; flex: none; color: #6e6e7e;
+        font: 10px ui-monospace, monospace; letter-spacing: 0.08em;
+      }
+      .tcard .tb { color: #9a9aa5; font-size: 11px; line-height: 1.45; margin: 4px 0 7px; }
+      .tcard .ts { color: #6e6e7e; font-size: 10.5px; padding-right: 16px; }
+      .tdel {
+        position: absolute; right: 4px; bottom: 3px; background: none; border: none;
+        color: #5a5a68; font: 14px/1 ui-monospace, monospace; padding: 0 3px; cursor: pointer;
+      }
+      .tdel:hover { color: #ff8f8f; }
+      .tconfirm {
+        display: flex; align-items: center; gap: 6px; margin-top: 6px;
+        color: #ffb3b3; font-size: 11px;
+      }
+      .rlabel {
+        color: #8a8a98; font-size: 11px; letter-spacing: 0.06em; margin: 8px 0 3px;
+      }
+      .rkeep, .rdrop { margin: 0 0 4px; padding-left: 18px; font-size: 11.5px; }
+      .rkeep li { color: #9ad6b6; }
+      .rdrop li { color: #c8a98a; }
+      .rform {
+        display: flex; flex-direction: column; gap: 7px;
+        margin-top: 12px; padding-top: 10px; border-top: 1px solid #2c2c38;
+      }
+      .rfield { display: flex; align-items: center; gap: 8px; }
+      .rfield > span { flex: 0 0 96px; color: #8a8a98; font-size: 11.5px; }
+      /* The text inputs own the rest of the row rather than sitting at a
+         fixed 150px with dead space beside them. */
+      .rfield .rinput { flex: 1 1 auto; width: auto; max-width: 420px; }
+      /* The checkbox row reads left-to-right: box, then its sentence — the
+         96px label column would otherwise wrap the sentence into a stripe. */
+      .rcheck { cursor: pointer; }
+      .rcheck > input { flex: none; accent-color: #4ad4ff; }
+      .rcheck > span { flex: 1 1 auto; color: #8a8a98; font-size: 11.5px; }
     </style>
   </head>
   <body>

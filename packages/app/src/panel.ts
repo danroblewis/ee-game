@@ -421,7 +421,18 @@ export function panelHotAt(cam: Camera, panels: Panel[], x: number, y: number): 
 
 // ------------------------------------------------------------- local prefs
 
-const LS = 'eepanel';
+/** Where a panel's window sits and whether it is collapsed is per PLAYER and
+ * per ROOM: plids are room-scoped ids, so two rooms both holding a `plid: 1`
+ * would otherwise share (and fight over) one stored position. The room code
+ * goes in the key; the bare prefix stays the pre-rooms key, so a single-room
+ * server and a player's existing layout are unchanged. */
+let LS = 'eepanel';
+
+/** Point the panel prefs at a room. Called from `resetForRoom`. */
+export function setPanelRoom(code: string | null) {
+  LS = code ? `eepanel:${code}` : 'eepanel';
+}
+
 const lsGet = (key: string): string | null => {
   try {
     return localStorage.getItem(`${LS}:${key}`);

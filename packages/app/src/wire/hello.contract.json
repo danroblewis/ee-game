@@ -1,0 +1,106 @@
+{
+  "$comment": [
+    "THE `hello` CONTRACT, asserted from both ends.",
+    "",
+    "`hello` is the only message that carries a whole room, and four of the",
+    "things a template promises ride on it: the parts, the panels, the camera",
+    "(view.home) and the instruments (view.scopes) — plus whether the room has",
+    "a goal at all (machine). Two of those once went missing for a release,",
+    "because the server wrote `view` and `machine` beside `room` while the",
+    "client forwarded `room` alone as its RoomHello. Both halves compiled. The",
+    "TypeScript interface declared the fields it never received.",
+    "",
+    "So the shape lives HERE, in one file neither half owns, and both assert",
+    "against it:",
+    "",
+    "  server  crates/server/src/lifecycle_tests.rs ::",
+    "          the_hello_a_room_sends_is_the_shape_the_client_parses",
+    "          — builds a real hoist room, calls hello_msg, and checks every",
+    "            path below against the message that goes out on the socket.",
+    "",
+    "  client  packages/app/src/wirecheck.ts (pnpm --filter @ee/app wirecheck)",
+    "          — runs `sample` through net.ts's parseHello, AND feeds it to a",
+    "            real connect() over a stub socket, checking the object that",
+    "            reaches onHello. The second half is the one that would have",
+    "            caught the original bug: the parser was never wrong, the",
+    "            line that chose what to pass on was.",
+    "",
+    "Move a field on either side and one of the two fails, naming the path.",
+    "",
+    "`types` are the paths a room-serving server must send, with their JSON",
+    "types (dots walk into objects). `sample` is a verbatim hello from a room",
+    "made from the built-in `hoist` template: the one that ships a camera, a",
+    "scope and a goal, so nothing in the contract is exercised by absence."
+  ],
+  "types": {
+    "t": "string",
+    "you": "number",
+    "elements": "array",
+    "probes": "array",
+    "panels": "array",
+    "room": "object",
+    "room.id": "string",
+    "room.name": "string",
+    "room.template": "string",
+    "room.players": "number",
+    "machine": "boolean",
+    "view": "object",
+    "view.home": "array",
+    "view.scopes": "array"
+  },
+  "sample": {
+    "t": "hello",
+    "you": 1,
+    "elements": [
+      {
+        "id": 900,
+        "kind": { "t": "Motor", "ohms": 2, "henries": 0.0015, "bemf": 0 },
+        "pins": [
+          [57, 5],
+          [57, 9]
+        ]
+      },
+      {
+        "id": 901,
+        "kind": { "t": "Potentiometer", "ohms": 10000, "wiper": 0.98 },
+        "pins": [
+          [57, 12],
+          [61, 14],
+          [57, 16]
+        ]
+      },
+      {
+        "id": 902,
+        "kind": { "t": "Switch", "closed": false },
+        "pins": [
+          [57, 19],
+          [61, 19]
+        ]
+      },
+      {
+        "id": 903,
+        "kind": { "t": "Switch", "closed": true },
+        "pins": [
+          [57, 22],
+          [61, 22]
+        ]
+      }
+    ],
+    "probes": [
+      { "pid": 1, "elem": 900, "pin": 0, "kind": "i", "r": null },
+      { "pid": 2, "elem": 901, "pin": 1, "kind": "v", "r": null }
+    ],
+    "panels": [{ "plid": 1, "name": "DRIVE", "x0": 26, "y0": 4, "x1": 44, "y1": 20 }],
+    "room": {
+      "id": "7AWF4N",
+      "name": "Hoist practice",
+      "template": "hoist",
+      "players": 1
+    },
+    "machine": true,
+    "view": {
+      "home": [22, -2, 68, 28],
+      "scopes": [{ "x": 26, "y": 22, "w": 18, "h": 9, "pids": [1, 2], "timebase": 0.5 }]
+    }
+  }
+}
