@@ -261,6 +261,22 @@ fn len_along(v: Point, d: Point) -> i32 {
 
 // ------------------------------------------------------------- the layout
 
+/// Place a part deliberately: family `shape`, anchor end at `t`, tip pointing
+/// along the unit axis `d`, axial length `l`, mirrored or not.
+///
+/// [`canonical_pins`] is the *gesture* — what a drag from A to B produces —
+/// and it can only ever build unmirrored parts, because a drag has no way to
+/// say which way round the symbol goes. This is the *other* constructor: the
+/// one a room generator wants, where the author knows exactly which way the
+/// op-amp's `+` should face. It reaches the same [`base`] table and the same
+/// [`D4`], so anything it builds passes [`is_rigid`] by construction — which
+/// is the point of it being here rather than a second layout table in the
+/// server. `shape_place_is_always_rigid` holds it to that over the whole
+/// product of families, directions, lengths and handednesses.
+pub fn place(shape: Shape, t: Point, d: Point, l: i32, mirrored: bool) -> Vec<Point> {
+    build(shape, t, d, l.max(MIN_LEN), mirrored)
+}
+
 /// Build the pins of a placement: family `shape`, base origin at `t`, tip
 /// direction `d` (a unit axis), axial length `l`, mirrored or not.
 fn build(shape: Shape, t: Point, d: Point, l: i32, mirrored: bool) -> Vec<Point> {
@@ -565,6 +581,34 @@ mod tests {
             Shape::Dip555 => ElementKind::Timer555,
             Shape::Single => ElementKind::Ground,
             Shape::Free => ElementKind::Wire,
+        }
+    }
+
+    /// [`place`] is the constructor a room generator builds a schematic with,
+    /// so anything it can produce must already satisfy the gate — otherwise a
+    /// shipped template would be a document the editor refuses to touch.
+    #[test]
+    fn shape_place_is_always_rigid() {
+        for shape in SHAPES {
+            let kind = kind_for(shape);
+            for d in [(1, 0), (0, 1), (-1, 0), (0, -1)] {
+                for mirrored in [false, true] {
+                    for l in [MIN_LEN, 1, 2, 3, 4, 5, 8, 13] {
+                        for t in [(0, 0), (7, -3), (-11, 40)] {
+                            let pins = place(shape, t, d, l, mirrored);
+                            assert_eq!(pins.len(), kind.pin_count());
+                            assert!(
+                                is_rigid(&kind, &pins),
+                                "{shape:?} placed at {t:?} along {d:?} len {l} \
+                                 mirrored={mirrored} is not in its own family: {pins:?}"
+                            );
+                            let got = decompose(shape, &pins).expect("decomposes");
+                            assert_eq!(got.axis(), d, "{shape:?} tip direction");
+                            assert_eq!(got.mirrored(), mirrored, "{shape:?} handedness");
+                        }
+                    }
+                }
+            }
         }
     }
 
