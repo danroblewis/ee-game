@@ -82,6 +82,38 @@ impl Sim {
     }
 }
 
+/// Placement-time validation — the SAME implementation the server enforces
+/// (`sim_core::check_document`), so the client can refuse an op before
+/// sending it (and paint the placement ghost red) without ever disagreeing
+/// with the authority. `specs` is the candidate document as a JSON array of
+/// ElementSpec; `dt` is the sim timestep.
+///
+/// Returns `null` when the document is placeable, else
+/// `{code, id, hint}` — `code` machine-readable ("bad_value",
+/// "collapsed_pins", "unsolvable", "unsolvable_switched"), `id` the
+/// offending element when it is one element's fault, `hint` a sentence for
+/// the DRC callout.
+#[wasm_bindgen(js_name = checkDocument)]
+pub fn check_document(specs: JsValue, dt: f64) -> Result<JsValue, JsValue> {
+    #[derive(serde::Serialize)]
+    struct RejectOut {
+        code: &'static str,
+        id: Option<u32>,
+        hint: &'static str,
+    }
+    let specs: Vec<ElementSpec> =
+        serde_wasm_bindgen::from_value(specs).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    match sim_core::check_document(&specs, dt) {
+        Ok(()) => Ok(JsValue::NULL),
+        Err(r) => serde_wasm_bindgen::to_value(&RejectOut {
+            code: r.code(),
+            id: r.id(),
+            hint: r.hint(),
+        })
+        .map_err(|e| JsValue::from_str(&e.to_string())),
+    }
+}
+
 /// S1 harness: identical output format to `sim-golden`'s native `hash` bin.
 #[cfg(feature = "golden")]
 #[wasm_bindgen(js_name = goldenHash)]

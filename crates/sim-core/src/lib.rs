@@ -4,9 +4,11 @@
 
 mod engine;
 mod netlist;
+pub mod validate;
 
 pub use engine::{AdvanceReport, ElemFrame, ElemTap, Engine, GMIN};
 pub use netlist::{DocOp, ElementKind, ElementSpec, InteractOp, ParamWrite, Point, MAX_PINS};
+pub use validate::{check_document, Reject};
 
 #[cfg(test)]
 mod tests {

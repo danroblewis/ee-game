@@ -761,10 +761,15 @@ enum PanelOp {
 
 enum Cmd {
     Interact {
+        /// Client id of the sender, for the `reject` broadcast: an op that
+        /// fails the placement gate must tell the client that (optimistically)
+        /// applied it, not just silently disagree with it.
+        who: u32,
         id: u32,
         op: InteractOp,
     },
     Edit {
+        who: u32,
         op: DocOp,
     },
     Probe {
@@ -785,11 +790,13 @@ enum Cmd {
     /// Drag the whole hoist assembly by an integer grid delta (the player has
     /// the cabinet in hand). Applied at a tick boundary like every other op.
     MachineMove {
+        who: u32,
         dx: i32,
         dy: i32,
     },
     /// Fix a part that released its magic smoke (the repair tool).
     Repair {
+        who: u32,
         id: u32,
     },
     Join,
@@ -987,6 +994,16 @@ async fn sim_task(
         for id in damage.broken_ids() {
             eng.set_broken(id, true);
         }
+        // A restored document predating the placement gate (or hand-edited
+        // on disk) can be unsolvable; it cannot be refused — it IS the room —
+        // so say why the room is about to freeze instead of freezing mutely.
+        if let Err(r) = check_room_doc(&elems) {
+            tracing::warn!(
+                "restored document fails placement validation ({}): \
+                 the room may quarantine until the offending part is removed",
+                r.code()
+            );
+        }
     }
     // Was the last damage snapshot non-empty? One empty snapshot is sent
     // after the room goes quiet, so clients clear their overlays; after that,
@@ -1032,17 +1049,37 @@ async fn sim_task(
         }
 
         // Assembly moves arriving this tick, summed and applied once below.
+        // `pending_mover` is the last client to touch the cabinet this tick —
+        // the one a refused move is reported to.
         let mut pending_move = (0i32, 0i32);
+        let mut pending_mover = 0u32;
         while let Ok(cmd) = cmds.try_recv() {
             match cmd {
-                Cmd::Interact { id, op } => {
+                Cmd::Interact { who, id, op } => {
                     // The hoist fixture is server-owned: no knob drags, no
                     // hand-flipping its limit switches.
                     if reserved_id(id) {
                         continue;
                     }
+                    // Same two-phase gate as a document edit: mirror the op
+                    // into a candidate copy and validate BEFORE the engine
+                    // sees it. This is what refuses a switch flip that would
+                    // short a source (possible on documents that predate the
+                    // placement gate) and a knob write carrying an
+                    // out-of-range value — `SetValue` on a source's dc had
+                    // no clamp at all.
+                    let candidate = {
+                        let elems = room.elements.lock().unwrap();
+                        let mut next = elems.clone();
+                        apply_interact_to(&mut next, id, op);
+                        next
+                    };
+                    if let Err(r) = check_room_doc(&candidate) {
+                        let _ = room.events.send(reject_msg(who, "interact", &r));
+                        continue;
+                    }
                     eng.interact(id, op);
-                    apply_to_specs(&room, id, op);
+                    *room.elements.lock().unwrap() = candidate;
                     let _ = room
                         .events
                         .send(json!({"t": "op", "id": id, "op": op}).to_string());
@@ -1051,7 +1088,7 @@ async fn sim_task(
                     hoist.reset();
                     room.dirty.store(true, Ordering::Relaxed);
                 }
-                Cmd::MachineMove { dx, dy } => {
+                Cmd::MachineMove { who, dx, dy } => {
                     // Coalesced, not applied here: a drag sends ~2 ops per
                     // tick and translation is additive, so summing them costs
                     // one netlist recompile per tick instead of one per op.
@@ -1059,19 +1096,53 @@ async fn sim_task(
                     // refused move rather than a panic.
                     pending_move.0 = pending_move.0.saturating_add(dx);
                     pending_move.1 = pending_move.1.saturating_add(dy);
+                    pending_mover = who;
                 }
-                Cmd::Repair { id } => {
+                Cmd::Repair { who, id } => {
                     // Deliberately NOT a document op: a repair is a world
                     // event, so it is allowed on the server-owned hoist
                     // fixture (ids 900-999) and it never enters anyone's undo
                     // history. The next tick's snapshot tells every client.
+                    //
+                    // Gated all the same: a repair re-stamps a branch, and on
+                    // a document that predates the placement gate (or was
+                    // hand-edited on disk) the all-healthy topology can be
+                    // singular — the gate vouches for exactly that document,
+                    // so refusing the repair keeps the room alive.
+                    if let Err(r) = {
+                        let elems = room.elements.lock().unwrap();
+                        check_room_doc(&elems)
+                    } {
+                        let _ = room.events.send(reject_msg(who, "repair", &r));
+                        continue;
+                    }
                     if apply_repair(&mut damage, &mut eng, id) {
                         room.dirty.store(true, Ordering::Relaxed);
                         tracing::info!("part #{id} repaired");
                     }
                 }
-                Cmd::Edit { op } => {
-                    if apply_doc_op(&room, &op) {
+                Cmd::Edit { who, op } => {
+                    // Two-phase commit: build the candidate document, run the
+                    // placement gate, and only then let the engine see it.
+                    // An unsolvable op is refused with a machine-readable
+                    // reason INSTEAD of quarantining the whole room — the
+                    // netlist itself is never corrupted.
+                    let candidate = {
+                        let elems = room.elements.lock().unwrap();
+                        let mut next = elems.clone();
+                        apply_doc_op_to(&mut next, &op).then_some(next)
+                    };
+                    // Syntactic failures (unknown/duplicate/reserved id) stay
+                    // silent drops, as before: they are client bugs or races,
+                    // not placements a player can act on.
+                    let Some(next) = candidate else { continue };
+                    if let Err(r) = check_room_doc(&next) {
+                        tracing::info!("edit refused ({}): {:?}", r.code(), op);
+                        let _ = room.events.send(reject_msg(who, "edit", &r));
+                        continue;
+                    }
+                    {
+                        *room.elements.lock().unwrap() = next;
                         room.dirty.store(true, Ordering::Relaxed);
                         let elems = room.elements.lock().unwrap().clone();
                         sources = source_ids(&elems);
@@ -1169,24 +1240,39 @@ async fn sim_task(
         // (height, velocity, hold timer, landing count) is deliberately
         // untouched — dragging the box is a move, not a reset.
         if pending_move != (0, 0) {
+            // Two-phase like every other mutation: land the fixture on a
+            // CANDIDATE copy and gate it. This path never goes through
+            // `apply_doc_op`, and a drag can park the closed LIM-BOT switch
+            // exactly on a player's source terminals — a move that would
+            // freeze the whole room is refused instead (the cabinet simply
+            // does not follow the pointer, and the dragger is told why).
             let moved = {
-                let mut elems = room.elements.lock().unwrap();
-                move_machine(&mut elems, &mut hoist_rect, pending_move.0, pending_move.1)
+                let elems = room.elements.lock().unwrap();
+                let mut next = elems.clone();
+                let mut next_rect = hoist_rect;
+                move_machine(&mut next, &mut next_rect, pending_move.0, pending_move.1)
+                    .map(|children| (next, next_rect, children))
             };
-            if let Some(children) = moved {
-                room.dirty.store(true, Ordering::Relaxed);
-                // The children's pins moved, so the netlist's geometry did:
-                // recompile (continuous state survives by id). `sources`
-                // cannot change — a move touches no element's kind.
-                let elems = room.elements.lock().unwrap().clone();
-                eng.set_elements(&elems);
-                // The children reach every client through the ordinary doc
-                // path, and the new footprint rides this tick's `machine`
-                // message — so a client that never sent the op is consistent
-                // within one tick.
-                for (id, pins) in children {
-                    let op = DocOp::Move { id, pins };
-                    let _ = room.events.send(json!({"t": "doc", "op": op}).to_string());
+            if let Some((next, next_rect, children)) = moved {
+                if let Err(r) = check_room_doc(&next) {
+                    let _ = room.events.send(reject_msg(pending_mover, "machinemove", &r));
+                } else {
+                    *room.elements.lock().unwrap() = next;
+                    hoist_rect = next_rect;
+                    room.dirty.store(true, Ordering::Relaxed);
+                    // The children's pins moved, so the netlist's geometry did:
+                    // recompile (continuous state survives by id). `sources`
+                    // cannot change — a move touches no element's kind.
+                    let elems = room.elements.lock().unwrap().clone();
+                    eng.set_elements(&elems);
+                    // The children reach every client through the ordinary doc
+                    // path, and the new footprint rides this tick's `machine`
+                    // message — so a client that never sent the op is consistent
+                    // within one tick.
+                    for (id, pins) in children {
+                        let op = DocOp::Move { id, pins };
+                        let _ = room.events.send(json!({"t": "doc", "op": op}).to_string());
+                    }
                 }
             }
         }
@@ -1280,9 +1366,18 @@ async fn sim_task(
             }
             // A separate message type so scope decimation and speaker audio
             // never have to agree on a cadence. Best-effort like `frame`: a
-            // lagged consumer skips chunks, which costs a few ms of silence
-            // and desyncs nothing (the client re-primes on the time gap).
-            if !taps.is_empty() {
+            // lagged consumer skips chunks, which costs a blip of silence
+            // and desyncs nothing (the client bridges small time gaps and
+            // re-primes on large ones).
+            //
+            // A QUARANTINED solver is a different matter: `advance` is a
+            // no-op with time frozen, so this tick's samples are the same
+            // stale value with the same t0 as last tick's, forever. Sending
+            // them made every chunk trip the client's discontinuity check
+            // and read as "audio never buffers" (permanent priming). Not
+            // sending is the honest signal — the stream STOPS, the client
+            // fades out and reports STALLED, and rt falls to 0 to say why.
+            if !taps.is_empty() && !eng.is_quarantined() {
                 let _ =
                     room.events
                         .send(audio_message(t0, DT * AUDIO_EVERY as f64, rt, &taps, abufs));
@@ -1454,11 +1549,35 @@ fn sample_probes(eng: &Engine, probes: &[Probe], bufs: &mut [Vec<f32>]) {
     }
 }
 
-/// Mirror an applied op into the stored specs so late joiners get current
-/// switch positions and values.
-fn apply_to_specs(room: &Room, id: u32, op: InteractOp) {
+/// The placement gate, shared by every path that mutates the netlist (doc
+/// edit, interact, repair, machine move): would sim-core accept `elems` as
+/// the room's document? One implementation, in sim-core, so the client can
+/// run the identical check through sim-wasm. A candidate that fails here is
+/// NEVER committed — the live matrix can no longer be corrupted by a
+/// placement, only refused.
+fn check_room_doc(elems: &[ElementSpec]) -> Result<(), sim_core::Reject> {
+    sim_core::check_document(elems, DT)
+}
+
+/// The broadcast telling client `who` why its op was refused, with a
+/// machine-readable `code` (+ offending element id when there is one) and a
+/// human `hint` for the DRC-style callout. Broadcast, not unicast: every
+/// client already ignores unknown message types, and the sender needs it to
+/// roll back its optimistic local apply.
+fn reject_msg(who: u32, ctx: &str, r: &sim_core::Reject) -> String {
+    json!({
+        "t": "reject", "who": who, "ctx": ctx,
+        "code": r.code(), "id": r.id(), "hint": r.hint(),
+    })
+    .to_string()
+}
+
+/// Mirror an interact op into a candidate copy of the specs (same clamps as
+/// `Engine::interact`), so the placement gate can judge the document the op
+/// would produce BEFORE the engine sees it — and so late joiners get
+/// current switch positions and values once it commits.
+fn apply_interact_to(elems: &mut [ElementSpec], id: u32, op: InteractOp) {
     use sim_core::ElementKind as K;
-    let mut elems = room.elements.lock().unwrap();
     let Some(e) = elems.iter_mut().find(|e| e.id == id) else {
         return;
     };
@@ -1480,10 +1599,20 @@ fn apply_to_specs(room: &Room, id: u32, op: InteractOp) {
     }
 }
 
-/// Validate and apply a document edit. Returns false to drop the op
-/// (malformed id, unknown id, or a server-owned fixture) — the full
-/// permission/rules pipeline is M4.
+/// Syntactically validate and apply a document edit. Returns false to drop
+/// the op (malformed id, unknown id, or a server-owned fixture). This is
+/// only the SYNTACTIC half: the electrical half is `check_room_doc`, run by
+/// the edit pipeline on the candidate document this produces, before it is
+/// committed.
+#[cfg(test)]
 fn apply_doc_op(room: &Room, op: &DocOp) -> bool {
+    let mut elems = room.elements.lock().unwrap();
+    apply_doc_op_to(&mut elems, op)
+}
+
+/// `apply_doc_op` against a plain vec, so the edit pipeline can build a
+/// CANDIDATE document (clone, apply, validate) without touching the room.
+fn apply_doc_op_to(elems: &mut Vec<ElementSpec>, op: &DocOp) -> bool {
     // Machine fixtures (ids 900-999) cannot be added, moved, reconfigured or
     // deleted by players. Wiring TO their terminals is untouched: that is an
     // op on the player's own wire.
@@ -1494,7 +1623,6 @@ fn apply_doc_op(room: &Room, op: &DocOp) -> bool {
     if reserved_id(target) {
         return false;
     }
-    let mut elems = room.elements.lock().unwrap();
     match op {
         DocOp::Add { spec } => {
             if spec.pins.len() != spec.kind.pin_count()
@@ -1711,10 +1839,10 @@ async fn client_session(mut socket: WebSocket, room: Arc<Room>) {
                 if let Message::Text(text) = msg {
                     match serde_json::from_str::<ClientMsg>(&text) {
                         Ok(ClientMsg::Interact { id, op }) => {
-                            let _ = room.cmds.send(Cmd::Interact { id, op });
+                            let _ = room.cmds.send(Cmd::Interact { who: me, id, op });
                         }
                         Ok(ClientMsg::Edit { op }) => {
-                            let _ = room.cmds.send(Cmd::Edit { op });
+                            let _ = room.cmds.send(Cmd::Edit { who: me, op });
                         }
                         Ok(ClientMsg::Probe { elem, pin, kind }) => {
                             let _ = room.cmds.send(Cmd::Probe { elem, pin, kind });
@@ -1729,10 +1857,10 @@ async fn client_session(mut socket: WebSocket, room: Arc<Room>) {
                             let _ = room.cmds.send(Cmd::MachineReset);
                         }
                         Ok(ClientMsg::MachineMove { dx, dy }) => {
-                            let _ = room.cmds.send(Cmd::MachineMove { dx, dy });
+                            let _ = room.cmds.send(Cmd::MachineMove { who: me, dx, dy });
                         }
                         Ok(ClientMsg::Repair { id }) => {
-                            let _ = room.cmds.send(Cmd::Repair { id });
+                            let _ = room.cmds.send(Cmd::Repair { who: me, id });
                         }
                         Ok(ClientMsg::Cursor { x, y }) => {
                             let _ = room.events.send(
@@ -3681,5 +3809,293 @@ mod tests {
         let mut panels = Vec::new();
         assert!(apply_panel_op(&mut panels, &AtomicU32::new(7), &op));
         assert_eq!(panels[0].plid, 7);
+    }
+
+    // ------------------------------------------------- the placement gate
+    //
+    // Each test below is one measured breaker repro replayed through the
+    // exact candidate pipeline the sim task runs: syntactic apply on a
+    // clone (`apply_doc_op_to`), then the electrical gate
+    // (`check_room_doc`) — refusal means the live netlist never sees it.
+
+    /// The full room a fresh server stands up (showcase + hoist fixture).
+    fn full_room() -> Vec<ElementSpec> {
+        let mut elems = demo_room_circuit();
+        elems.extend(hoist_fixture());
+        elems
+    }
+
+    /// Apply `op` to a candidate copy of `elems` and run the gate,
+    /// asserting the syntactic half accepted it (these repros are all
+    /// well-formed ops — that is the point).
+    fn gate(elems: &[ElementSpec], op: &DocOp) -> Result<(), sim_core::Reject> {
+        let mut next = elems.to_vec();
+        assert!(
+            apply_doc_op_to(&mut next, op),
+            "op must be syntactically fine: {op:?}"
+        );
+        check_room_doc(&next)
+    }
+
+    /// The room every player actually joins must pass the gate — including
+    /// the worst case with every switch and button closed — or nothing
+    /// could ever be placed again.
+    #[test]
+    fn the_shipped_room_passes_the_gate() {
+        assert_eq!(check_room_doc(&full_room()), Ok(()));
+    }
+
+    #[test]
+    fn gate_refuses_each_breaker_repro_class() {
+        use sim_core::Reject;
+        let room = full_room();
+        let add = |id: u32, kind: K, a: (i32, i32), b: (i32, i32)| DocOp::Add {
+            spec: spec(id, kind, a, b),
+        };
+        let cases: Vec<(&str, DocOp, fn(&Reject) -> bool)> = vec![
+            (
+                "wire shorting the vignette-A battery",
+                add(5001, K::Wire, (2, 2), (2, 8)),
+                |r| *r == Reject::Unsolvable,
+            ),
+            (
+                "second battery stacked on the first (agreeing)",
+                add(5002, dc(9.0), (2, 2), (2, 8)),
+                |r| *r == Reject::Unsolvable,
+            ),
+            (
+                "second battery stacked on the first (disagreeing)",
+                add(5003, dc(5.0), (2, 2), (2, 8)),
+                |r| *r == Reject::Unsolvable,
+            ),
+            (
+                "battery across the hoist's LIM-BOT pair (closed at rest)",
+                add(5004, dc(9.0), (57, 22), (61, 22)),
+                |r| *r == Reject::Unsolvable,
+            ),
+            (
+                "battery across LIM-TOP: fine until the MACHINE closes it",
+                add(5005, dc(9.0), (57, 19), (61, 19)),
+                |r| *r == Reject::UnsolvableWhenSwitched,
+            ),
+            (
+                "wire across LIM-TOP (the measured self-locking deadlock)",
+                add(5006, K::Wire, (57, 19), (61, 19)),
+                |r| *r == Reject::UnsolvableWhenSwitched,
+            ),
+            (
+                "open switch across the battery, closable by any player",
+                add(5007, K::Switch { closed: false }, (2, 2), (2, 8)),
+                |r| *r == Reject::UnsolvableWhenSwitched,
+            ),
+            (
+                "ground on the same point as a fresh rail",
+                DocOp::Add {
+                    spec: gnd(5008, (70, 70)),
+                },
+                |_| unreachable!("applied after the rail below"),
+            ),
+            (
+                "zero-ohm resistor typed into the properties panel",
+                DocOp::SetKind {
+                    id: 55,
+                    kind: r(0.0),
+                },
+                |r| matches!(r, Reject::BadValue { id: 55, .. }),
+            ),
+            (
+                "negative resistance typed into the properties panel",
+                DocOp::SetKind {
+                    id: 55,
+                    kind: r(-100.0),
+                },
+                |r| matches!(r, Reject::BadValue { id: 55, .. }),
+            ),
+            (
+                "zero-henry inductor (NaN broadcaster)",
+                DocOp::SetKind {
+                    id: 55,
+                    kind: K::Inductor { henries: 0.0 },
+                },
+                |r| matches!(r, Reject::BadValue { id: 55, .. }),
+            ),
+            (
+                "1e300 V source (energy-meter/save-file destroyer)",
+                DocOp::SetKind {
+                    id: 1,
+                    kind: dc(1e300),
+                },
+                |r| matches!(r, Reject::BadValue { id: 1, .. }),
+            ),
+            (
+                "1e150 A current source dropped in empty space",
+                add(5009, K::CurrentSource { amps: 1e150 }, (90, 90), (90, 96)),
+                |r| matches!(r, Reject::BadValue { id: 5009, .. }),
+            ),
+            (
+                "pin-drag collapsing the battery onto one point",
+                DocOp::Move {
+                    id: 1,
+                    pins: vec![(2, 2), (2, 2)],
+                },
+                |r| *r == Reject::CollapsedPins { id: 1 },
+            ),
+        ];
+        for (why, op, want) in cases {
+            if why.starts_with("ground on the same point") {
+                // Two-step repro: rail first (legal), then the ground.
+                let mut with_rail = room.clone();
+                with_rail.push(ElementSpec {
+                    id: 5100,
+                    kind: K::Rail {
+                        dc: 12.0,
+                        amp: 0.0,
+                        hz: 0.0,
+                        phase: 0.0,
+                    },
+                    pins: vec![(70, 70)],
+                });
+                assert_eq!(check_room_doc(&with_rail), Ok(()), "lone rail is legal");
+                assert_eq!(
+                    gate(&with_rail, &op),
+                    Err(sim_core::Reject::Unsolvable),
+                    "{why}"
+                );
+                continue;
+            }
+            let got = gate(&room, &op).expect_err(why);
+            assert!(want(&got), "{why}: wrong reject {got:?}");
+        }
+        // And the room itself is untouched by all that refusing.
+        assert_eq!(check_room_doc(&room), Ok(()));
+    }
+
+    /// The gate must NOT refuse ordinary building: every legal op class on
+    /// the live room, including wiring to the hoist terminals (the intended
+    /// use) and the mid-build states the breakers measured as solvable.
+    #[test]
+    fn gate_accepts_ordinary_building() {
+        let room = full_room();
+        let legal = vec![
+            // A floating battery in empty space: normal mid-build.
+            DocOp::Add {
+                spec: spec(6001, dc(5.0), (70, 70), (70, 76)),
+            },
+            // A dangling current source: normal mid-build (GMIN-solvable).
+            DocOp::Add {
+                spec: spec(6002, K::CurrentSource { amps: 1.0 }, (72, 70), (72, 76)),
+            },
+            // A rail straight onto the motor's M+ terminal, ground on M-:
+            // the canonical hoist drive.
+            DocOp::Add {
+                spec: ElementSpec {
+                    id: 6003,
+                    kind: K::Rail {
+                        dc: 5.0,
+                        amp: 0.0,
+                        hz: 0.0,
+                        phase: 0.0,
+                    },
+                    pins: vec![(57, 5)],
+                },
+            },
+            DocOp::Add {
+                spec: gnd(6004, (57, 9)),
+            },
+            // Ordinary properties edit and pin drag.
+            DocOp::SetKind {
+                id: 55,
+                kind: r(470.0),
+            },
+            DocOp::Move {
+                id: 55,
+                pins: vec![(30, 14), (33, 14)],
+            },
+        ];
+        let mut doc = room;
+        for op in legal {
+            let mut next = doc.clone();
+            assert!(apply_doc_op_to(&mut next, &op), "syntactic: {op:?}");
+            assert_eq!(check_room_doc(&next), Ok(()), "gate must accept {op:?}");
+            doc = next; // ops build on each other, like a real session
+        }
+    }
+
+    /// The machine-move path: dragging the cabinet so its closed LIM-BOT
+    /// switch lands exactly on a player's battery terminals must be refused
+    /// by the same gate (this path never passes through `apply_doc_op`).
+    #[test]
+    fn gate_refuses_machine_move_landing_on_a_source() {
+        let mut room = full_room();
+        // The measured repro: battery + load at (80,30)-(84,30), far from
+        // the hoist's default footprint.
+        room.push(spec(7001, dc(9.0), (80, 30), (84, 30)));
+        room.push(spec(7002, r(100.0), (80, 30), (84, 30)));
+        room.push(gnd(7003, (84, 30)));
+        assert_eq!(check_room_doc(&room), Ok(()));
+
+        // machinemove dx=23, dy=8 lands LIM-BOT (closed) on those pins.
+        let mut next = room.clone();
+        let mut rect = HOIST_RECT;
+        let moved = move_machine(&mut next, &mut rect, 23, 8);
+        assert!(moved.is_some(), "the move itself is well-formed");
+        assert_eq!(
+            check_room_doc(&next),
+            Err(sim_core::Reject::Unsolvable),
+            "landing a closed limit switch on a source must be refused"
+        );
+        // A harmless drag of the same distance elsewhere stays legal.
+        let mut next = room.clone();
+        let mut rect = HOIST_RECT;
+        assert!(move_machine(&mut next, &mut rect, -23, 8).is_some());
+        assert_eq!(check_room_doc(&next), Ok(()));
+    }
+
+    /// The interact path: a switch flip that would short a source (possible
+    /// on documents predating the gate) and an out-of-range knob write are
+    /// both caught on the candidate copy.
+    #[test]
+    fn gate_refuses_poison_interacts() {
+        // A pre-gate document: open switch straight across the battery.
+        let mut room = full_room();
+        room.push(spec(8001, K::Switch { closed: false }, (2, 2), (2, 8)));
+        // (The gate would have refused this Add; simulate a legacy doc.)
+        let mut closed = room.clone();
+        apply_interact_to(&mut closed, 8001, InteractOp::SetSwitch { closed: true });
+        assert_eq!(
+            check_room_doc(&closed),
+            Err(sim_core::Reject::Unsolvable),
+            "closing the shorting switch must be refused"
+        );
+
+        // Knob write pushing a source to an absurd value: SetValue on dc
+        // had no clamp at all before the gate.
+        let room = full_room();
+        let mut next = room.clone();
+        apply_interact_to(&mut next, 1, InteractOp::SetValue { value: 1e300 });
+        assert!(
+            matches!(
+                check_room_doc(&next),
+                Err(sim_core::Reject::BadValue { id: 1, .. })
+            ),
+            "1e300 V through the knob path must be refused"
+        );
+        // An ordinary knob write sails through.
+        let mut next = room.clone();
+        apply_interact_to(&mut next, 1, InteractOp::SetValue { value: 12.0 });
+        assert_eq!(check_room_doc(&next), Ok(()));
+    }
+
+    /// The reject broadcast is well-formed and machine-readable.
+    #[test]
+    fn reject_msg_is_machine_readable() {
+        let r = sim_core::Reject::UnsolvableWhenSwitched;
+        let v: serde_json::Value = serde_json::from_str(&reject_msg(3, "edit", &r)).unwrap();
+        assert_eq!(v["t"], "reject");
+        assert_eq!(v["who"], 3);
+        assert_eq!(v["ctx"], "edit");
+        assert_eq!(v["code"], "unsolvable_switched");
+        assert!(v["id"].is_null());
+        assert!(v["hint"].as_str().is_some_and(|h| !h.is_empty()));
     }
 }

@@ -558,3 +558,23 @@ fn all_golden_circuits_run_clean() {
         }
     }
 }
+
+/// Placement validation must never reject a valid circuit: every golden
+/// circuit — including their worst case with every switch closed — passes
+/// `check_document` at both the golden dt and the server's dt. This is the
+/// contract that lets the server refuse ops through the same function
+/// without ever refusing legitimate play.
+#[test]
+fn all_golden_circuits_pass_placement_validation() {
+    for (name, elems) in all_golden() {
+        for dt in [DT, 20e-6] {
+            assert_eq!(
+                sim_core::check_document(&elems, dt),
+                Ok(()),
+                "{name} must be placeable at dt={dt}"
+            );
+        }
+    }
+    // Both switch states of the demo lamp.
+    assert_eq!(sim_core::check_document(&demo_lamp(false), DT), Ok(()));
+}

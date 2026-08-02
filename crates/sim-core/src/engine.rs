@@ -490,6 +490,31 @@ impl Engine {
         self.be_steps = BE_STEPS_AFTER_EVENT;
     }
 
+    /// Stamp and LU-factor the system for the current document WITHOUT
+    /// advancing any state: true when the MNA matrix is nonsingular, i.e.
+    /// the next step could at least factor. This is the structural half of
+    /// placement validation (`crate::validate`) — a `false` here is exactly
+    /// the condition that would quarantine the engine one step later.
+    ///
+    /// Backward Euler on purpose: it is what the post-edit event steps run,
+    /// and structural singularity (dependent source rows, zero rows) is
+    /// independent of `h` and the integration mode anyway. Device state and
+    /// the solution vector are untouched; the trial factorization is
+    /// discarded so a subsequent step re-stamps from scratch.
+    pub fn probe_solvable(&mut self) -> bool {
+        if self.n == 0 {
+            return true; // an empty world is trivially solvable
+        }
+        // Clear BEFORE as well as after. `build()` skips stamping AND
+        // factoring when a retained factorization is still valid, so probing
+        // with one armed would answer `true` without testing anything — the
+        // probe must always do the work it claims to cost.
+        self.factor_valid = false;
+        let ok = self.build(self.time + self.dt, self.dt, true).is_ok();
+        self.factor_valid = false;
+        ok
+    }
+
     /// Advance up to `max_steps` fixed-dt substeps. The caller owns the
     /// wall-clock budget (Falstad's rule: heavy circuits slow sim time,
     /// never the UI).

@@ -201,8 +201,15 @@ impl Hoist {
     /// Accumulate the energy the player's sources delivered over `h`
     /// seconds. `watts` is Σ max(-power, 0) across sources, straight from
     /// the solver — sinking sources (a charging battery) do not refund.
+    ///
+    /// Finite-only, because this accumulator OUTLIVES the reading: a single
+    /// ±inf watt (a legacy save with an unbounded source, before placement
+    /// validation capped values) would stick `joules` at inf forever, which
+    /// serializes as JSON `null` in both the `machine` broadcast and the
+    /// room checkpoint — and a checkpoint with a `null` where a number
+    /// belongs silently discards the ENTIRE saved room on the next boot.
     pub fn accumulate_joules(&mut self, watts: f64, h: f64) {
-        if watts > 0.0 {
+        if watts.is_finite() && watts > 0.0 {
             self.joules += h * watts;
         }
     }
