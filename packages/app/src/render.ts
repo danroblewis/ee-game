@@ -131,15 +131,34 @@ export interface DamageState {
   poppedAt?: number;
 }
 
-/** Stress at which the heat tint becomes visible. */
-export const STRESS_WARM = 0.35;
+/** Stress at which the heat tint becomes visible. The wire carries everything
+ * from 0.05 up, so this is purely "how early should a player be warned"; a
+ * quarter of the way to failure is early enough to act and late enough that
+ * an idle district is not a field of halos. */
+export const STRESS_WARM = 0.25;
 /** Stress at which the part starts smoking — the last warning. */
-export const STRESS_SMOKE = 0.7;
+export const STRESS_SMOKE = 0.62;
 /** Magic-smoke burst duration, ms. */
-const POP_MS = 1600;
+const POP_MS = 2600;
+/** The white-hot instant, the shock ring, and the ember shower, ms. Three
+ * nested timescales so the blast has a shape instead of one long puff. */
+const FLASH_MS = 260;
+const SHOCK_MS = 620;
+const EMBER_MS = 1100;
 /** Scorch/char colour, and the "find me" colour when zoomed out. */
 const CHAR = '#1a1216';
 const BROKEN_MARK = '#ff6a3d';
+/** Burnt rim of the crater: dark enough to read as scorched, light enough to
+ * be a shape against the canvas. */
+const EMBER_RIM = '#7d3a20';
+const SMOKE_GREY = '#c9c9d4';
+const SMOKE_BLUE = '#78aaff';
+const TAU = Math.PI * 2;
+
+const clamp01 = (x: number) => (x < 0 ? 0 : x > 1 ? 1 : x);
+/** Crack directions across a dead part's crater. Hoisted so the render loop
+ * does not allocate a literal per broken part per frame. */
+const CRACK_DIRS = [-1, 0.35, 1];
 
 /** Cheap deterministic 0..1 from an integer — per-part smoke placement that
  * does not shimmer between frames. */
@@ -148,14 +167,81 @@ const hash01 = (n: number): number => {
   return x - Math.floor(x);
 };
 
-/** Heat colour for a stress level: amber at the first warning, deep red at
- * the edge of failure. */
-function heatColor(stress: number, alpha: number): string {
-  const t = Math.max(0, Math.min(1, (stress - STRESS_WARM) / (1 - STRESS_WARM)));
-  const r = 255;
-  const g = Math.round(190 - 130 * t);
-  const b = Math.round(90 - 80 * t);
-  return `rgba(${r},${g},${b},${alpha.toFixed(3)})`;
+// Heat colours, precomputed once per step of the ramp: amber at the first
+// warning, deep red at the edge of failure. Building these strings per part
+// per frame is exactly the allocation churn the render loop must not have,
+// so brightness is carried by `globalAlpha` instead of by the colour.
+const HEAT_STEPS = 24;
+const HOTTEST = HEAT_STEPS - 1;
+const heatSolid: string[] = [];
+const heatCore: string[] = [];
+const heatEdge: string[] = [];
+const heatGone: string[] = [];
+for (let i = 0; i < HEAT_STEPS; i++) {
+  const t = i / HOTTEST;
+  const g = Math.round(198 - 152 * t);
+  const b = Math.round(102 - 92 * t);
+  heatSolid.push(`rgb(255,${g},${b})`);
+  heatCore.push(`rgba(255,${g},${b},1)`);
+  heatEdge.push(`rgba(255,${g},${b},0.30)`);
+  heatGone.push(`rgba(255,${g},${b},0)`);
+}
+const heatIdx = (t: number) => Math.max(0, Math.min(HOTTEST, Math.round(t * HOTTEST)));
+
+// Radial-gradient cache. A gradient's coordinates are resolved in the user
+// space at PAINT time, so one built at the origin with a canonical radius can
+// be re-centred and resized with a transform. That turns "one gradient per
+// stressed part per frame" into a fixed set of ~50 objects built once.
+const GLOW_HEAT = 0;
+const GLOW_FLASH = 1;
+const GLOW_SOOT = 2;
+const UNIT_R = 64;
+const gradCache = new Map<number, CanvasGradient>();
+let gradOwner: CanvasRenderingContext2D | null = null;
+
+function glowGrad(ctx: CanvasRenderingContext2D, kind: number, idx: number): CanvasGradient {
+  if (gradOwner !== ctx) {
+    gradCache.clear();
+    gradOwner = ctx;
+  }
+  const key = kind * HEAT_STEPS + idx;
+  let g = gradCache.get(key);
+  if (g) return g;
+  g = ctx.createRadialGradient(0, 0, UNIT_R * 0.08, 0, 0, UNIT_R);
+  if (kind === GLOW_HEAT) {
+    // A steep shoulder: the halo says "this part", not "this neighbourhood",
+    // so twenty warm parts stay twenty warm parts.
+    g.addColorStop(0, heatCore[idx]!);
+    g.addColorStop(0.38, heatEdge[idx]!);
+    g.addColorStop(1, heatGone[idx]!);
+  } else if (kind === GLOW_FLASH) {
+    g.addColorStop(0, 'rgba(255,255,250,1)');
+    g.addColorStop(0.34, 'rgba(255,246,220,0.94)');
+    g.addColorStop(0.58, 'rgba(255,188,96,0.62)');
+    g.addColorStop(0.8, 'rgba(255,112,32,0.26)');
+    g.addColorStop(1, 'rgba(255,80,16,0)');
+  } else {
+    // Soot has to read on a near-black canvas, so the smudge is ASH: pale at
+    // the rim, going dark towards the crater the char body fills in.
+    g.addColorStop(0, 'rgba(96,80,74,0.16)');
+    g.addColorStop(0.45, 'rgba(78,64,60,0.30)');
+    g.addColorStop(0.78, 'rgba(52,42,40,0.20)');
+    g.addColorStop(1, 'rgba(40,32,30,0)');
+  }
+  gradCache.set(key, g);
+  return g;
+}
+
+/** Fill a cached glow of radius `r` at the current origin. */
+function glow(ctx: CanvasRenderingContext2D, kind: number, idx: number, r: number) {
+  const k = r / UNIT_R;
+  ctx.save();
+  ctx.scale(k, k);
+  ctx.fillStyle = glowGrad(ctx, kind, idx);
+  ctx.beginPath();
+  ctx.arc(0, 0, UNIT_R, 0, TAU);
+  ctx.fill();
+  ctx.restore();
 }
 
 /** Centre of a part's pin chain, in px. */
@@ -175,28 +261,50 @@ function drawStress(d: DrawCtx, e: ElementSpec, P: Px[], stress: number) {
   const { ctx, cam } = d;
   const s = cam.scale;
   const c = centerOf(P);
-  const t = (stress - STRESS_WARM) / (1 - STRESS_WARM);
-  const rad = s * (0.7 + 0.5 * t);
-  const g = ctx.createRadialGradient(c[0], c[1], s * 0.1, c[0], c[1], rad);
-  g.addColorStop(0, heatColor(stress, 0.15 + 0.5 * t));
-  g.addColorStop(1, heatColor(stress, 0));
-  ctx.fillStyle = g;
-  ctx.beginPath();
-  ctx.arc(c[0], c[1], rad, 0, Math.PI * 2);
-  ctx.fill();
+  const t = clamp01((stress - STRESS_WARM) / (1 - STRESS_WARM));
+  const idx = heatIdx(t);
+  // The throb IS the server's number: both its depth and its rate come from
+  // `stress`, so a part that cools stops moving and a healthy one never
+  // starts. Motion carries the level across a crowded district far better
+  // than more ink would, and it costs nothing to read at a glance.
+  const beat =
+    d.time === undefined ? 0 : Math.sin(d.time * (0.0035 + 0.016 * t) + hash01(e.id) * TAU);
+  const pulse = 1 + 0.09 * t * t * beat;
+
+  ctx.save();
+  ctx.translate(c[0], c[1]);
+  ctx.scale(pulse, pulse);
+  // Alpha climbs slowly (t^1.3) while radius climbs fast: a merely warm part
+  // stays a hint, a part at its limit is a bonfire, and neither is confusable
+  // with the other.
+  ctx.globalAlpha = Math.min(1, (0.13 + 0.62 * Math.pow(t, 1.3)) * (0.94 + 0.06 * beat));
+  glow(ctx, GLOW_HEAT, idx, s * (0.85 + 1.35 * t));
+  if (t > 0.4) {
+    // Incandescent core — the only additive ink in the heat system, and small
+    // enough that overlapping hot parts brighten each other's centres without
+    // washing the schematic out.
+    const k = (t - 0.4) / 0.6;
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = 0.3 * k;
+    glow(ctx, GLOW_HEAT, HOTTEST, s * (0.18 + 0.3 * k));
+    ctx.globalCompositeOperation = 'source-over';
+  }
+  ctx.restore();
 
   if (stress < STRESS_SMOKE || d.time === undefined) return;
-  // Thin wisps: three puffs on a staggered 1.8 s cycle, rising and fading.
-  const k = (stress - STRESS_SMOKE) / (1 - STRESS_SMOKE);
-  ctx.fillStyle = '#c9c9d4';
-  for (let n = 0; n < 3; n++) {
-    const phase = ((d.time / 1800 + hash01(e.id * 7 + n)) % 1 + 1) % 1;
-    const a = (1 - phase) * (0.12 + 0.3 * k);
+  // Smoke: the last warning, so it is a column and not a wisp. Puff count,
+  // size and opacity all ride the remaining margin to failure.
+  const k = clamp01((stress - STRESS_SMOKE) / (1 - STRESS_SMOKE));
+  const puffs = 3 + Math.round(4 * k);
+  ctx.fillStyle = SMOKE_GREY;
+  for (let n = 0; n < puffs; n++) {
+    const phase = (((d.time / 2600 + hash01(e.id * 7 + n)) % 1) + 1) % 1;
+    const a = (1 - phase) * (0.14 + 0.34 * k);
     if (a <= 0.01) continue;
-    const dx = (hash01(e.id * 13 + n) - 0.5) * s * 0.5 * phase;
+    const dx = (hash01(e.id * 13 + n) - 0.5) * s * 0.8 * phase;
     ctx.globalAlpha = a;
     ctx.beginPath();
-    ctx.arc(c[0] + dx, c[1] - s * (0.35 + 1.1 * phase), s * (0.08 + 0.16 * phase), 0, Math.PI * 2);
+    ctx.arc(c[0] + dx, c[1] - s * (0.45 + 1.9 * phase), s * (0.12 + 0.34 * phase), 0, TAU);
     ctx.fill();
   }
   ctx.globalAlpha = 1;
@@ -209,52 +317,115 @@ function drawBroken(d: DrawCtx, e: ElementSpec, P: Px[]) {
   const s = cam.scale;
   const c = centerOf(P);
 
-  // Scorch: a sooty smudge that survives on the schematic until repair.
-  const g = ctx.createRadialGradient(c[0], c[1], s * 0.05, c[0], c[1], s * 0.95);
-  g.addColorStop(0, 'rgba(20,14,16,0.85)');
-  g.addColorStop(0.65, 'rgba(30,20,22,0.55)');
-  g.addColorStop(1, 'rgba(30,20,22,0)');
-  ctx.fillStyle = g;
-  ctx.beginPath();
-  ctx.arc(c[0], c[1], s * 0.95, 0, Math.PI * 2);
-  ctx.fill();
+  // Scorch: an ash smudge that survives on the schematic until repair. Grey,
+  // not orange — a wall of dead parts must read as a burnt-out district and
+  // never compete for attention with the ones that are still merely hot.
+  ctx.save();
+  ctx.translate(c[0], c[1]);
+  glow(ctx, GLOW_SOOT, 0, s * 1.8);
+  ctx.restore();
 
-  // Charred, crumpled body: a dark blob with two cracks through it.
-  ctx.fillStyle = CHAR;
+  // Charred, burst body: a ragged crater rather than a neat disc, so a dead
+  // part is recognisable as wreckage at a glance and never as a symbol. Char
+  // on a near-black canvas is invisible on its own, so the crater is given a
+  // scorched rim — that outline, not the fill, is what carries the shape.
   ctx.beginPath();
-  ctx.arc(c[0], c[1], s * 0.3, 0, Math.PI * 2);
+  for (let n = 0; n <= 11; n++) {
+    const a = (n / 11) * TAU;
+    const rr = s * (0.36 + 0.26 * hash01(e.id * 41 + (n % 11)));
+    const x = c[0] + Math.cos(a) * rr;
+    const y = c[1] + Math.sin(a) * rr;
+    if (n === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.closePath();
+  ctx.fillStyle = CHAR;
   ctx.fill();
+  ctx.strokeStyle = EMBER_RIM;
+  ctx.lineWidth = Math.max(1.5, s * 0.055);
+  ctx.stroke();
+  // Cracks glowing through the char, thrown out past the crater rim.
   ctx.strokeStyle = BROKEN_MARK;
-  ctx.lineWidth = Math.max(1.5, s * 0.05);
-  for (const dir of [-1, 1]) {
+  ctx.lineWidth = Math.max(2, s * 0.075);
+  for (const dir of CRACK_DIRS) {
     ctx.beginPath();
-    ctx.moveTo(c[0] - s * 0.42 * dir, c[1] - s * 0.34);
-    ctx.lineTo(c[0] - s * 0.08 * dir, c[1] - s * 0.06);
-    ctx.lineTo(c[0] + s * 0.16 * dir, c[1] + s * 0.12);
-    ctx.lineTo(c[0] + s * 0.4 * dir, c[1] + s * 0.36);
+    ctx.moveTo(c[0] - s * 0.66 * dir, c[1] - s * 0.52);
+    ctx.lineTo(c[0] - s * 0.11 * dir, c[1] - s * 0.08);
+    ctx.lineTo(c[0] + s * 0.24 * dir, c[1] + s * 0.18);
+    ctx.lineTo(c[0] + s * 0.63 * dir, c[1] + s * 0.55);
     ctx.stroke();
   }
 
-  // The magic smoke, one shot, blue as tradition demands.
+  // The moment it let go. One shot per part, timed off the server-reported
+  // break this client actually witnessed — no `poppedAt`, no blast.
   if (d.time === undefined || d.dmg?.poppedAt === undefined) return;
-  const age = (d.time - d.dmg.poppedAt) / POP_MS;
-  if (age < 0 || age > 1) return;
-  for (let n = 0; n < 6; n++) {
-    const phase = Math.min(1, age * (1.1 + 0.5 * hash01(e.id * 31 + n)));
-    const a = (1 - phase) * 0.6;
+  const ms = d.time - d.dmg.poppedAt;
+  if (ms < 0 || ms > POP_MS) return;
+  const age = ms / POP_MS;
+
+  ctx.save();
+  ctx.translate(c[0], c[1]);
+
+  // 1. The white-hot instant: a fireball that opens to four grid units.
+  if (ms < FLASH_MS) {
+    const f = ms / FLASH_MS;
+    const fade = Math.pow(1 - f, 1.6);
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = fade;
+    glow(ctx, GLOW_FLASH, 0, s * (1.8 + 3.4 * Math.sqrt(f)));
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  // 2. Two shock rings, the second a beat behind the first, both easing out.
+  if (ms < SHOCK_MS) {
+    ctx.strokeStyle = heatSolid[HOTTEST]!;
+    for (let ring = 0; ring < 2; ring++) {
+      const u = (ms - ring * 90) / SHOCK_MS;
+      if (u <= 0 || u >= 1) continue;
+      const inv = 1 - u;
+      ctx.globalAlpha = inv * inv * (ring === 0 ? 0.9 : 0.5);
+      ctx.lineWidth = Math.max(1.5, s * (ring === 0 ? 0.2 : 0.11) * inv);
+      ctx.beginPath();
+      ctx.arc(0, 0, s * (0.3 + (ring === 0 ? 4.1 : 2.9) * (1 - inv * inv)), 0, TAU);
+      ctx.stroke();
+    }
+  }
+
+  // 3. Embers thrown clear, arcing down as they cool.
+  if (ms < EMBER_MS) {
+    const u = ms / EMBER_MS;
+    const u0 = Math.max(0, u - 0.1);
+    ctx.lineCap = 'round';
+    ctx.lineWidth = Math.max(1.2, s * 0.085 * (1 - u));
+    ctx.globalAlpha = (1 - u) * (1 - u) * 0.95;
+    for (let n = 0; n < 16; n++) {
+      const ang = hash01(e.id * 53 + n) * TAU;
+      const sp = 2.2 + 3.4 * hash01(e.id * 71 + n);
+      const ca = Math.cos(ang) * sp;
+      const sa = Math.sin(ang) * sp;
+      ctx.strokeStyle = heatSolid[heatIdx(0.3 + 0.7 * hash01(e.id * 97 + n))]!;
+      ctx.beginPath();
+      ctx.moveTo(ca * u0 * s, (sa * u0 + 3.2 * u0 * u0) * s);
+      ctx.lineTo(ca * u * s, (sa * u + 3.2 * u * u) * s);
+      ctx.stroke();
+    }
+  }
+
+  // 4. The magic smoke itself, blue as tradition demands — a dozen puffs
+  // climbing well clear of the part, so the failure is legible for seconds
+  // rather than for an instant.
+  ctx.fillStyle = SMOKE_BLUE;
+  for (let n = 0; n < 12; n++) {
+    const phase = Math.min(1, age * (1.35 + 0.75 * hash01(e.id * 31 + n)));
+    const a = (1 - phase) * 0.55;
     if (a <= 0.01) continue;
-    const dx = (hash01(e.id * 17 + n) - 0.5) * s * 1.1 * phase;
-    ctx.fillStyle = `rgba(120,170,255,${a.toFixed(3)})`;
+    const dx = (hash01(e.id * 17 + n) - 0.5) * s * 1.7 * phase;
+    ctx.globalAlpha = a;
     ctx.beginPath();
-    ctx.arc(
-      c[0] + dx,
-      c[1] - s * (0.2 + 1.7 * phase),
-      s * (0.12 + 0.42 * phase),
-      0,
-      Math.PI * 2,
-    );
+    ctx.arc(dx, -s * (0.25 + 2.6 * phase), s * (0.22 + 0.85 * phase), 0, TAU);
     ctx.fill();
   }
+  ctx.restore();
 }
 
 interface DrawCtx {
@@ -1066,6 +1237,9 @@ export function drawElementsLod(
   live: Map<number, ElemLive>,
   single: boolean,
   dmg?: Map<number, DamageState>,
+  /** `performance.now()`, so a break that happens while the camera is out at
+   * district scale still announces itself. Absent = no blast ping. */
+  time?: number,
 ) {
   const paths: (Path2D | undefined)[] = new Array<Path2D | undefined>(LOD_STEPS);
   const tick = Math.max(1, cam.scale * 0.3);
@@ -1151,11 +1325,44 @@ export function drawElementsLod(
     ctx.stroke(path);
   }
   ctx.lineCap = 'round';
+  if (dmg && dmg.size > 0) {
+    // Heat has to carry across the district too, or a player who zoomed out to
+    // find the fault loses the only clue to where it is. Screen-space sized
+    // and alpha-ramped exactly like the symbol-scale halo, so "hot" looks the
+    // same thing at every zoom — just smaller.
+    for (const e of elems) {
+      const st = dmg.get(e.id);
+      if (!st || st.broken || st.stress <= STRESS_WARM) continue;
+      const P = e.pins;
+      if (P.length === 0) continue;
+      let cx = 0;
+      let cy = 0;
+      for (const p of P) {
+        cx += p[0];
+        cy += p[1];
+      }
+      const t = clamp01((st.stress - STRESS_WARM) / (1 - STRESS_WARM));
+      const r = Math.max(2.5, Math.min(10, cam.scale * (0.6 + 1.1 * t)));
+      ctx.globalAlpha = 0.22 + 0.5 * t;
+      ctx.fillStyle = heatSolid[heatIdx(t)]!;
+      ctx.beginPath();
+      ctx.arc(
+        cam.ox + (cx / P.length) * cam.scale,
+        cam.oy + (cy / P.length) * cam.scale,
+        r,
+        0,
+        TAU,
+      );
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
   if (dead.length > 0) {
     // One path for all of them: a district full of dead parts costs one
     // stroke call, and each mark stays legible (screen-space size) however
     // far out the camera is.
-    const r = Math.max(3, Math.min(7, cam.scale * 0.9));
+    const r = Math.max(4, Math.min(9, cam.scale * 1.1));
     const marks = new Path2D();
     for (const [x, y] of dead) {
       marks.moveTo(x - r, y - r);
@@ -1164,8 +1371,46 @@ export function drawElementsLod(
       marks.lineTo(x - r, y + r);
     }
     ctx.strokeStyle = BROKEN_MARK;
-    ctx.lineWidth = 2;
+    ctx.lineWidth = 2.5;
     ctx.stroke(marks);
+  }
+
+  // The blast, district-scale: an expanding ping on parts this client watched
+  // let go. Same one-shot clock as the close-up blast, so it is the server's
+  // break being announced and not an animation that runs on its own.
+  if (dmg && time !== undefined) {
+    for (const e of elems) {
+      const st = dmg.get(e.id);
+      if (!st?.broken || st.poppedAt === undefined || e.pins.length === 0) continue;
+      const u = (time - st.poppedAt) / SHOCK_MS;
+      if (u < 0 || u > 1) continue;
+      let cx = 0;
+      let cy = 0;
+      for (const p of e.pins) {
+        cx += p[0];
+        cy += p[1];
+      }
+      const inv = 1 - u;
+      // Screen-space floor: out here the part is a couple of pixels wide, so a
+      // ring scaled to it would be invisible — the ping has to be big enough
+      // to catch the eye and small enough not to cover the district.
+      const rr = Math.max(34, cam.scale * 3.2) * (1 - inv * inv);
+      const px2 = cam.ox + (cx / e.pins.length) * cam.scale;
+      const py2 = cam.oy + (cy / e.pins.length) * cam.scale;
+      ctx.strokeStyle = heatSolid[HOTTEST]!;
+      ctx.globalAlpha = inv * inv;
+      ctx.lineWidth = Math.max(2, 5 * inv);
+      ctx.beginPath();
+      ctx.arc(px2, py2, rr, 0, TAU);
+      ctx.stroke();
+      // A hot spark where the part was, so the ring has something to point at.
+      ctx.globalAlpha = inv;
+      ctx.fillStyle = '#fff3d6';
+      ctx.beginPath();
+      ctx.arc(px2, py2, Math.max(2, 7 * inv), 0, TAU);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
   }
 }
 

@@ -2745,8 +2745,9 @@ function frame(now: number) {
     }
   } else {
     // Too small for symbols: conductors only, colored by the solver frame —
-    // plus a marker on every dead part, because finding them IS the repair.
-    drawElementsLod(ctx, cam, visible, live, cam.scale < LOD_CHAIN, damage);
+    // plus heat, a blast ping and a marker on every dead part, because
+    // finding them IS the repair.
+    drawElementsLod(ctx, cam, visible, live, cam.scale < LOD_CHAIN, damage, now);
   }
 
   // Hover highlight (blue element + pin dots), Falstad-style.
