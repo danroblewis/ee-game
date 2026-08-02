@@ -142,6 +142,8 @@ impl RoomHandle {
             next_pid: self.room.next_pid.load(Ordering::Relaxed),
             panels: self.room.panels.lock().unwrap().clone(),
             next_plid: self.room.next_plid.load(Ordering::Relaxed),
+            layers: self.room.layers.lock().unwrap().clone(),
+            next_lid: self.room.next_lid.load(Ordering::Relaxed),
             machine: *machine,
             view: self.view.lock().unwrap().clone(),
             damage: damage.clone(),
@@ -192,6 +194,8 @@ impl RoomHandle {
             next_pid: self.room.next_pid.load(Ordering::Relaxed),
             panels: self.room.panels.lock().unwrap().clone(),
             next_plid: self.room.next_plid.load(Ordering::Relaxed),
+            layers: self.room.layers.lock().unwrap().clone(),
+            next_lid: self.room.next_lid.load(Ordering::Relaxed),
             machine,
             view: view
                 .unwrap_or_else(|| self.view.lock().unwrap().clone())
@@ -594,6 +598,8 @@ pub fn build_handle(path: PathBuf, meta: RoomMeta, setup: RoomSetup) -> Arc<Room
         next_pid,
         panels,
         next_plid,
+        layers,
+        next_lid,
         machine,
         view,
         damage,
@@ -610,9 +616,13 @@ pub fn build_handle(path: PathBuf, meta: RoomMeta, setup: RoomSetup) -> Arc<Room
         elements: Mutex::new(elements),
         probes: Mutex::new(probes.iter().map(Probe::from_saved).collect()),
         panels: Mutex::new(panels),
+        layers: Mutex::new(layers),
+        // Never restored from anywhere: a fresh room has nobody looking.
+        claims: Mutex::new(Vec::new()),
         next_client: AtomicU32::new(1),
         next_pid: AtomicU32::new(next_pid.max(1)),
         next_plid: AtomicU32::new(next_plid.max(1)),
+        next_lid: AtomicU32::new(next_lid.max(1)),
         population: AtomicU32::new(0),
         dirty: AtomicBool::new(false),
     });

@@ -48,6 +48,7 @@ import {
 } from './net';
 import type { ElementSpec } from './circuit';
 import type { Panel } from './panel';
+import type { Layer } from './layer';
 import type { Probe } from './scope';
 
 // This file runs under node (see package.json), never in the browser, and the
@@ -305,6 +306,8 @@ function dial(code: string | null = null) {
   sockets = [];
   const hellos: HelloCall[] = [];
   const drifts: WireDrift[][] = [];
+  const layerCalls: { list: Layer[]; claims: [number, number][] }[] = [];
+  const sensorCalls: [number, number][][] = [];
   const nop = () => {};
   const handlers: NetHandlers = {
     onHello: (you, elements, probes, panels, room) =>
@@ -316,6 +319,8 @@ function dial(code: string | null = null) {
     onDoc: nop,
     onProbes: nop,
     onPanels: nop,
+    onLayers: (list, cl) => layerCalls.push({ list, claims: cl }),
+    onSensors: (list) => sensorCalls.push(list),
     onMachine: nop,
     onDamage: nop,
     onSamples: nop,
@@ -332,7 +337,15 @@ function dial(code: string | null = null) {
     if (!s || !s.onmessage) throw new Error('connect() opened no socket');
     s.onmessage({ data: JSON.stringify(msg) });
   };
-  return { net, hellos, drifts, deliver, socket: () => sockets[sockets.length - 1] };
+  return {
+    net,
+    hellos,
+    drifts,
+    layerCalls,
+    sensorCalls,
+    deliver,
+    socket: () => sockets[sockets.length - 1],
+  };
 }
 
 console.log('connect — the room object onHello RECEIVES is the parsed one');
@@ -460,6 +473,165 @@ console.log('connect — the SECOND room replaces the first');
     got?.id !== '7AWF4N' && got?.name !== 'Hoist practice',
     `${got?.id}/${got?.name}`,
   );
+}
+
+// ------------------------------------------------- external inputs (privacy)
+//
+// TEST AT THE LAYER THE DEFECT CAN OCCUR. The failure this whole feature has
+// to be incapable of is "a frame, a buffer or a device identity ends up on
+// the socket". A reviewer reading the code cannot prove that stays true after
+// the next edit; these two checks can.
+//
+// The first drives the REAL `connect()` with the real sender and asserts on
+// the bytes that reach the socket. The second is a static scan of the whole
+// client for the APIs that could turn media into something transmissible —
+// currently zero hits, and this pins it at zero.
+
+console.log('sensor — the only thing a camera puts on the wire is [[int,int]]');
+{
+  const d = dial();
+  d.deliver(sample);
+  const before = d.socket()?.sent.length ?? 0;
+  // Deliberately hostile input: fractional, out of range, negative, huge.
+  d.net.sendSensor([
+    [42, 20841.7],
+    [57, -5],
+    [58, 999999],
+  ]);
+  const sent = (d.socket()?.sent ?? []).slice(before);
+  check('exactly one message', sent.length === 1, String(sent.length));
+  const m = JSON.parse(sent[0] ?? '{}') as Record<string, unknown>;
+  check('t is "sensor"', m.t === 'sensor');
+  check('it has exactly two keys', Object.keys(m).sort().join(',') === 's,t', Object.keys(m).join(','));
+  const list = m.s as unknown[];
+  check('s is a list of pairs', Array.isArray(list) && list.length === 3);
+  let shapeOk = true;
+  let rangeOk = true;
+  for (const row of list) {
+    const pair = row as unknown[];
+    if (!Array.isArray(pair) || pair.length !== 2) shapeOk = false;
+    else {
+      for (const n of pair) {
+        if (typeof n !== 'number' || !Number.isInteger(n)) shapeOk = false;
+      }
+      const q = pair[1] as number;
+      if (q < 0 || q > 65535) rangeOk = false;
+    }
+  }
+  check('every entry is [int, int]', shapeOk, JSON.stringify(list));
+  check('every q is inside 0..65535', rangeOk, JSON.stringify(list));
+  check('fractions are rounded, not printed', eq(list[0], [42, 20842]), JSON.stringify(list[0]));
+  check('negatives clamp to dark', eq(list[1], [57, 0]), JSON.stringify(list[1]));
+  check('overflow clamps to full scale', eq(list[2], [58, 65535]), JSON.stringify(list[2]));
+  // The size of the promise, stated as a number: a frame is ~100 kB and this
+  // is not that. Twelve-ish bytes per moved sensor per tick.
+  check('the whole message is tiny', (sent[0] ?? '').length < 80, String((sent[0] ?? '').length));
+  // And an empty batch sends nothing at all — a camera pointed at a still
+  // wall is silent on the wire.
+  const quiet = d.socket()?.sent.length ?? 0;
+  d.net.sendSensor([]);
+  check('an empty batch is not a message', (d.socket()?.sent.length ?? 0) === quiet);
+}
+
+console.log('sensor — layers arrive through one handler, hello and broadcast alike');
+{
+  const d = dial();
+  const withLayers = JSON.parse(JSON.stringify(sample)) as Record<string, unknown>;
+  withLayers.layers = [{ lid: 1, x0: 0, y0: 0, x1: 20, y1: 15, name: 'CAMERA 1' }];
+  withLayers.claims = [[1, 7]];
+  d.deliver(withLayers);
+  check('hello delivered the layers', d.layerCalls[0]?.list.length === 1);
+  check('and who is driving them', eq(d.layerCalls[0]?.claims, [[1, 7]]));
+  // A hello with no layers is not an error: every save written before this
+  // feature existed has none.
+  const d2 = dial();
+  d2.deliver(sample);
+  check('an older room has no layers and no drift', d2.layerCalls[0]?.list.length === 0);
+  check('and it is still a clean payload', d2.drifts.length === 0);
+  // The live broadcast lands in the same place.
+  d2.deliver({ t: 'layers', list: [{ lid: 4, x0: 1, y0: 1, x1: 9, y1: 7, name: 'X' }], claims: [] });
+  check('the broadcast uses the same handler', d2.layerCalls.length === 2);
+  d2.deliver({ t: 'sensors', s: [[42, 32768]] });
+  check('a reading reaches onSensors', eq(d2.sensorCalls[0], [[42, 32768]]));
+}
+
+console.log('privacy — the client has no way to transmit media, and cannot grow one');
+{
+  // Media only becomes transmissible through a small, nameable set of APIs.
+  // None of them appear anywhere in this client, and this is the guard that
+  // notices the day one does.
+  const banned = [
+    'RTCPeerConnection',
+    'MediaRecorder',
+    'getDisplayMedia',
+    'toDataURL',
+    'toBlob',
+    'FileReader',
+  ];
+  const files = [
+    'main.ts', 'net.ts', 'sensor.ts', 'sensor-worker.ts', 'panel.ts', 'render.ts',
+    'audio.ts', 'audio-worklet.ts', 'scope.ts', 'rooms.ts', 'dock.ts', 'hoist.ts',
+    'chip.ts', 'catalog.ts', 'circuit.ts', 'history.ts', 'spatial.ts', 'sfx.ts',
+  ];
+  const fs = require('fs');
+  const hits: string[] = [];
+  let read = 0;
+  for (const f of files) {
+    let src = '';
+    for (const base of ['src/', 'packages/app/src/']) {
+      try {
+        src = fs.readFileSync(base + f, 'utf8');
+        break;
+      } catch {
+        /* try the next root */
+      }
+    }
+    if (!src) continue;
+    read++;
+    for (const b of banned) {
+      // Skip the comment lines that NAME the ban (this file's own prose, and
+      // sensor.ts's header): a mention is not a call site.
+      for (const line of src.split('\n')) {
+        const t = line.trim();
+        if (t.startsWith('//') || t.startsWith('*') || t.startsWith('/*')) continue;
+        if (line.includes(b)) hits.push(`${f}: ${t.slice(0, 60)}`);
+      }
+    }
+  }
+  check('every client source was scanned', read >= 15, `${read} files`);
+  check('no media-egress API anywhere in the client', hits.length === 0, hits.join(' | '));
+
+  // getUserMedia exists exactly once, in the sampler, and only inside the
+  // click that claims a layer — never at module scope.
+  let sensorSrc = '';
+  for (const base of ['src/', 'packages/app/src/']) {
+    try {
+      sensorSrc = fs.readFileSync(base + 'sensor.ts', 'utf8');
+      break;
+    } catch {
+      /* try the next root */
+    }
+  }
+  const calls = (sensorSrc.match(/getUserMedia\(/g) ?? []).length;
+  check('exactly one getUserMedia call site', calls === 1, String(calls));
+  check(
+    'and it is inside start(), not at module scope',
+    sensorSrc.indexOf('async start(') < sensorSrc.indexOf('getUserMedia('),
+  );
+  // Comment-aware, like the scan above: sensor.ts's own prose says "never
+  // `enabled = false`", and a mention is not a call site.
+  const sensorCode = sensorSrc
+    .split('\n')
+    .filter((l) => {
+      const t = l.trim();
+      return !(t.startsWith('//') || t.startsWith('*') || t.startsWith('/*'));
+    })
+    .join('\n');
+  check(
+    'the sampler stops the hardware, not just the frames',
+    sensorCode.includes('.stop()') && !sensorCode.includes('enabled = false'),
+  );
+  check('enumerateDevices is never called', !sensorSrc.includes('enumerateDevices'));
 }
 
 console.log(failures === 0 ? '\nwirecheck: all ok' : `\nwirecheck: ${failures} FAILED`);

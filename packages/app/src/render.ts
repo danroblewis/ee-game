@@ -602,6 +602,40 @@ export function drawElement(d: DrawCtx, e: ElementSpec) {
       twoPinDots();
       break;
     }
+    case 'Photocell': {
+      // A resistor body in a circle with two arrows coming IN — the IEC
+      // light-dependent-resistor symbol. The circle brightens with the
+      // reading, which is a number from the server, never a local guess: a
+      // client whose camera is off still watches everyone else's cell move.
+      const l = Math.max(0, Math.min(1, e.kind.light ?? 0));
+      const e1 = add(mid, u, -s * 0.4);
+      const e2 = add(mid, u, s * 0.4);
+      stroke(ctx, voltageColor(v(0)), [A, e1]);
+      stroke(ctx, voltageColor(v(1)), [e2, B]);
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(mid[0], mid[1], s * 0.52, 0, Math.PI * 2);
+      // Dark is a hollow ring; lit fills with a warm glow proportional to
+      // the illumination, so "how bright is it here" is legible at a glance.
+      ctx.fillStyle = `rgba(255, 214, 122, ${0.08 + 0.5 * l})`;
+      ctx.fill();
+      ctx.lineWidth = 1.4;
+      ctx.strokeStyle = l > 0.02 ? '#ffd67a' : '#6d7c86';
+      ctx.stroke();
+      ctx.restore();
+      zigzag(ctx, e1, e2, v(0), v(1), s);
+      // Two incoming arrows, at 45° off the body, on the opposite side from
+      // wherever the schematic runs.
+      const ar = norm([-n[0] - u[0], -n[1] - u[1]] as Px);
+      for (const k of [-0.3, 0.25]) {
+        const tip = add(add(mid, n, s * -0.55), u, s * k);
+        const tail = add(tip, ar, -s * 0.55);
+        stroke(ctx, l > 0.02 ? '#ffd67a' : '#77878f', [tail, tip]);
+        arrowHead(ctx, tip, ar, s * 0.16, l > 0.02 ? '#ffd67a' : '#77878f');
+      }
+      twoPinDots();
+      break;
+    }
     case 'Potentiometer': {
       const C = P[2]!;
       const uAC = norm(sub(C, A));

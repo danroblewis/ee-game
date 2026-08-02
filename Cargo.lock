@@ -1286,6 +1286,7 @@ name = "sim-golden"
 version = "0.1.0"
 dependencies = [
  "libm",
+ "serde_json",
  "sim-core",
  "sim-math",
 ]

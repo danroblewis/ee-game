@@ -10,8 +10,8 @@ pub mod validate;
 pub use constraint::{constraint_of, Constraint, ConstraintKey};
 pub use engine::{AdvanceReport, ElemFrame, ElemTap, Engine, GMIN};
 pub use netlist::{
-    DocOp, ElementKind, ElementSpec, InteractOp, ParamWrite, Point, DEFAULT_OPAMP_ISC, MAX_PINS,
-    MAX_TIER,
+    photocell_ohms, DocOp, ElementKind, ElementSpec, InteractOp, ParamWrite, Point,
+    DEFAULT_OPAMP_ISC, MAX_PINS, MAX_TIER,
 };
 pub use validate::{check_document, Reject, SmallIds};
 

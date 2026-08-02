@@ -23,8 +23,8 @@
 //! template *should* ship with the binary it is one entry in `BUILTINS`.
 
 use crate::{
-    demo_room_circuit, hoist_fixture_at, sane_rect, Panel, ProbeKind, SaveFile, SavedProbe,
-    HOIST_RECT, MAX_ELEMENTS, MAX_PANELS, MAX_PROBES,
+    demo_room_circuit, hoist_fixture_at, sane_rect, Layer, Panel, ProbeKind, SaveFile, SavedProbe,
+    HOIST_RECT, MAX_ELEMENTS, MAX_LAYERS, MAX_PANELS, MAX_PROBES,
 };
 use damage::DamageModel;
 use machine::Hoist;
@@ -130,6 +130,10 @@ pub struct RoomSetup {
     pub next_pid: u32,
     pub panels: Vec<Panel>,
     pub next_plid: u32,
+    /// Sensor layers. Their RECTANGLES are room state and persist; who is
+    /// driving one never does.
+    pub layers: Vec<Layer>,
+    pub next_lid: u32,
     pub machine: MachineSpec,
     pub view: View,
     pub damage: DamageModel,
@@ -143,6 +147,8 @@ impl Default for RoomSetup {
             next_pid: 1,
             panels: Vec::new(),
             next_plid: 1,
+            layers: Vec::new(),
+            next_lid: 1,
             machine: MachineSpec::None,
             view: View::default(),
             damage: DamageModel::new(),
@@ -187,6 +193,11 @@ impl RoomSetup {
         self.next_plid = self
             .next_plid
             .max(self.panels.iter().map(|p| p.plid + 1).max().unwrap_or(1))
+            .max(1);
+        self.layers.truncate(MAX_LAYERS);
+        self.next_lid = self
+            .next_lid
+            .max(self.layers.iter().map(|l| l.lid + 1).max().unwrap_or(1))
             .max(1);
         if let MachineSpec::Hoist { rect, state } = self.machine {
             self.machine = MachineSpec::Hoist {

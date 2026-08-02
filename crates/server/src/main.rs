@@ -939,6 +939,62 @@ struct Panel {
     name: String,
 }
 
+/// A SENSOR LAYER: a rectangle of the world that a player's browser points a
+/// real-world source at (a camera today; a microphone spectrum strip and a
+/// gamepad diagram are the same rectangle with a different provider).
+///
+/// Room state, exactly like `Panel`, and for the same reason: everybody has
+/// to see where the light is. Only the rectangle and the name are stored —
+/// WHICH parts read it is re-derived from element geometry every frame, never
+/// persisted, so dragging a photocell onto the layer wires it up live.
+///
+/// What is deliberately NOT here: any device identity. No device id, no
+/// label, no capability blob, no resolution, no frame. The layer is a hole in
+/// the world; whose eye is behind it is per-session and lives in
+/// `Room::claims`.
+#[derive(Clone, Debug, serde::Serialize, Deserialize)]
+struct Layer {
+    lid: u32,
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+    name: String,
+}
+
+const MAX_LAYERS: usize = 32;
+const MAX_LAYER_NAME: usize = 28;
+/// Smallest accepted layer in grid units. Bigger than a panel's: a sensor
+/// layer has to be large enough to aim a part at a REGION of it.
+const MIN_LAYER_SPAN: f64 = 4.0;
+
+#[derive(Clone, Deserialize)]
+#[serde(tag = "t", rename_all = "lowercase")]
+enum LayerOp {
+    Add {
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+        #[serde(default)]
+        name: Option<String>,
+    },
+    Remove {
+        lid: u32,
+    },
+    Rect {
+        lid: u32,
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+    },
+    Rename {
+        lid: u32,
+        name: String,
+    },
+}
+
 /// Document budget. The world is meant to hold enormous circuits (whole
 /// districts), so this is a guard against a runaway client, not a design
 /// limit. NOTE: the sim is the real ceiling long before this — sim-core
@@ -1027,6 +1083,12 @@ fn supersede(cmds: &mut Vec<Cmd>) {
                 op: InteractOp::SetSwitch { .. },
                 ..
             } => Some((*id, 2)),
+            // Slot 3: external-input readings. A client sampling a camera at
+            // 60 fps, or a gamepad at 240 Hz, delivers several of these per
+            // part per tick and exactly one survives — the tick IS the
+            // decimator, so every external input is a 30 Hz signal with 15 Hz
+            // of bandwidth whatever the hardware does.
+            Cmd::Sensor { id, .. } => Some((*id, 3)),
             _ => None,
         }
     }
@@ -1035,6 +1097,7 @@ fn supersede(cmds: &mut Vec<Cmd>) {
     fn touches(c: &Cmd) -> Option<u32> {
         match c {
             Cmd::Interact { id, .. } => Some(*id),
+            Cmd::Sensor { id, .. } => Some(*id),
             Cmd::Edit { op, .. } => Some(match op {
                 DocOp::Add { spec } => spec.id,
                 DocOp::Remove { id } | DocOp::Move { id, .. } | DocOp::SetKind { id, .. } => *id,
@@ -1103,6 +1166,29 @@ enum Cmd {
     Panel {
         op: PanelOp,
     },
+    Layer {
+        op: LayerOp,
+    },
+    /// Take (or drop) the right to drive a sensor layer with your own camera.
+    /// Session-scoped and never persisted: `who` is `next_client.fetch_add`,
+    /// so it does not survive a reload, and a claim that outlived the browser
+    /// tab would be a lie about who is looking.
+    LayerClaim {
+        who: u32,
+        lid: u32,
+        /// false = release.
+        claim: bool,
+    },
+    /// One external-input reading: element `id` reads `q`/65535 of full
+    /// scale. NOT an `InteractOp` and deliberately so — it must not run the
+    /// placement gate, must not recompile, must not clear quarantine, must
+    /// not enter anyone's undo history and must not be confused with a
+    /// player's edit. See the tick-boundary handler.
+    Sensor {
+        who: u32,
+        id: u32,
+        q: u16,
+    },
     /// Lower the crate to the floor and re-arm the hoist's goal.
     MachineReset,
     /// Drag the whole hoist assembly by an integer grid delta (the player has
@@ -1118,7 +1204,11 @@ enum Cmd {
         id: u32,
     },
     Join,
-    Leave,
+    /// `who` so a departure can drop that player's layer claims and fail
+    /// every sensor they were driving to dark, on the next tick.
+    Leave {
+        who: u32,
+    },
     /// Stop the sim task: park (checkpoint: true, graceful shutdown) or
     /// evict (checkpoint: false, the room is being deleted and a checkpoint
     /// would resurrect its file).
@@ -1137,9 +1227,16 @@ struct Room {
     probes: std::sync::Mutex<Vec<Probe>>,
     /// Room-scoped control-panel regions (shared, same rationale as probes).
     panels: std::sync::Mutex<Vec<Panel>>,
+    /// Room-scoped sensor layers (shared: everybody sees where the light is).
+    layers: std::sync::Mutex<Vec<Layer>>,
+    /// Who is currently driving each layer, `(lid, who)`. Live only — NEVER
+    /// checkpointed, never in a template: a claim is a browser tab with a
+    /// camera open, and no such thing survives a restart.
+    claims: std::sync::Mutex<Vec<(u32, u32)>>,
     next_client: AtomicU32,
     next_pid: AtomicU32,
     next_plid: AtomicU32,
+    next_lid: AtomicU32,
     population: AtomicU32,
     /// Set when the document changes; the sim task checkpoints to disk.
     dirty: std::sync::atomic::AtomicBool,
@@ -1187,6 +1284,17 @@ struct SaveFile {
     panels: Vec<Panel>,
     #[serde(default)]
     next_plid: u32,
+    /// Sensor layers: WHERE in the world a real-world source is pointed.
+    /// Defaulted, so every save written before external inputs existed loads
+    /// with no layers, which is exactly what it had.
+    ///
+    /// The rectangle persists; the reading does not, and neither does the
+    /// claim. A restored room has its camera hole exactly where it was, with
+    /// nothing behind it until a player opts in again.
+    #[serde(default)]
+    layers: Vec<Layer>,
+    #[serde(default)]
+    next_lid: u32,
     /// The machine this room arms, if any — the field that makes the hoist
     /// OPTIONAL and per room. Three states, deliberately distinguishable:
     ///   absent          legacy save: fall back to `hoist` / `hoist_rect`
@@ -1246,6 +1354,8 @@ impl Default for SaveFile {
             next_pid: 1,
             panels: Vec::new(),
             next_plid: 1,
+            layers: Vec::new(),
+            next_lid: 1,
             machine: None,
             view: View::default(),
             // Not [0;4]: an absent footprint means "where the hoist has
@@ -1275,6 +1385,8 @@ impl SaveFile {
             next_pid: self.next_pid.max(1),
             panels: self.panels,
             next_plid: self.next_plid.max(1),
+            layers: self.layers,
+            next_lid: self.next_lid.max(1),
             machine,
             view: self.view,
             damage: self.damage,
@@ -1306,6 +1418,8 @@ impl SaveFile {
             next_pid: s.next_pid,
             panels: s.panels.clone(),
             next_plid: s.next_plid,
+            layers: s.layers.clone(),
+            next_lid: s.next_lid,
             machine: Some(s.machine),
             view: s.view.clone(),
             hoist,
@@ -1477,6 +1591,20 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
     // silence costs nothing.
     let mut damage_shown = false;
 
+    // ---- external inputs. All three of these are LIVE state: none of them
+    // is persisted, none of them is in the document, and none of them
+    // survives the room going quiet. That is the point — a reading is world
+    // state, like the crate's height, not document state like its resistance
+    // range.
+    //
+    // `driven` is what is currently being driven and by whom; `sensor_out` is
+    // the changed-only broadcast queue for this tick; `ext_driven` latches
+    // "this room's goal has been driven from outside since the last reset",
+    // which is the anti-cheat badge, not a refusal.
+    let mut driven: Vec<Driven> = Vec::new();
+    let mut sensor_out: Vec<(u32, u16)> = Vec::new();
+    let mut ext_driven = false;
+
     let tick = std::time::Duration::from_secs_f64(1.0 / TICK_HZ);
     let mut interval = tokio::time::interval(tick);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1554,6 +1682,14 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
         // Set by Cmd::Stop. Handled AFTER the drain: the receiver cannot be
         // moved out of while it is being borrowed by `try_recv`.
         let mut stop: Option<bool> = None;
+        // Readings that landed this tick, applied together after the drain
+        // so the whole tick costs ONE forced refactorization however many
+        // sensors are bound (`factor_valid = false` is idempotent).
+        let mut readings: Vec<(u32, u32, u16)> = Vec::new();
+        // Parts that must be written to DARK this tick: their driver left,
+        // released the claim, deleted the layer, or simply stopped sending.
+        let mut to_dark: Vec<u32> = Vec::new();
+        sensor_out.clear();
         let mut drained: Vec<Cmd> = Vec::new();
         while let Ok(cmd) = cmds.try_recv() {
             drained.push(cmd);
@@ -1593,6 +1729,10 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
                 Cmd::MachineReset => {
                     // A room with no machine has nothing to reset.
                     if has_machine {
+                        // A reset re-arms the goal, so it also clears the
+                        // "externally driven" badge: the next attempt is
+                        // judged on its own.
+                        ext_driven = false;
                         hoist.reset();
                         room.dirty.store(true, Ordering::Relaxed);
                     }
@@ -1742,7 +1882,85 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
                             .send(json!({"t": "panels", "list": *panels}).to_string());
                     }
                 }
-                Cmd::Join | Cmd::Leave => {
+                Cmd::Layer { op } => {
+                    // A removed layer takes its claim with it, and everything
+                    // it was driving goes dark on this tick.
+                    let removed = match &op {
+                        LayerOp::Remove { lid } => Some(*lid),
+                        _ => None,
+                    };
+                    let changed = {
+                        let mut layers = room.layers.lock().unwrap();
+                        apply_layer_op(&mut layers, &room.next_lid, &op)
+                    };
+                    if changed {
+                        if let Some(lid) = removed {
+                            room.claims.lock().unwrap().retain(|(l, _)| *l != lid);
+                            fail_dark(&room, &mut driven, &mut to_dark);
+                        }
+                        room.dirty.store(true, Ordering::Relaxed);
+                        let layers = room.layers.lock().unwrap();
+                        let claims = room.claims.lock().unwrap();
+                        let _ = room.events.send(layers_msg(&layers, &claims));
+                    }
+                }
+                Cmd::LayerClaim { who, lid, claim } => {
+                    let known = room.layers.lock().unwrap().iter().any(|l| l.lid == lid);
+                    let mut changed = false;
+                    {
+                        let mut claims = room.claims.lock().unwrap();
+                        if claim {
+                            // First come, one at a time. A second claimant is
+                            // refused rather than silently taking over: two
+                            // cameras fighting over one part would look like
+                            // a broken part.
+                            if known && !claims.iter().any(|(l, _)| *l == lid) {
+                                claims.push((lid, who));
+                                changed = true;
+                            }
+                        } else if let Some(k) =
+                            claims.iter().position(|(l, w)| *l == lid && *w == who)
+                        {
+                            claims.remove(k);
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        // Releasing a claim (or losing the camera) must fail
+                        // its parts to DARK immediately, not freeze them at
+                        // the last frame.
+                        if !claim {
+                            fail_dark(&room, &mut driven, &mut to_dark);
+                        }
+                        let layers = room.layers.lock().unwrap();
+                        let claims = room.claims.lock().unwrap();
+                        let _ = room.events.send(layers_msg(&layers, &claims));
+                    }
+                }
+                Cmd::Sensor { who, id, q } => {
+                    // The hoist fixture is server-owned: no camera may drive
+                    // ids 900-999, the same guard `Cmd::Interact` has.
+                    if reserved_id(id) {
+                        continue;
+                    }
+                    readings.push((who, id, q));
+                }
+                Cmd::Leave { who } => {
+                    // Fail safe, loudly. Whatever this player was driving
+                    // goes dark on this tick, and everybody sees it go dark,
+                    // so a circuit that stops doing anything has a visible
+                    // reason rather than a mysterious one.
+                    if drop_claims_of(&room, who, &mut driven, &mut to_dark) {
+                        let layers = room.layers.lock().unwrap();
+                        let claims = room.claims.lock().unwrap();
+                        let _ = room.events.send(layers_msg(&layers, &claims));
+                    }
+                    let n = room.population.load(Ordering::Relaxed);
+                    let _ = room
+                        .events
+                        .send(json!({"t": "presence", "n": n}).to_string());
+                }
+                Cmd::Join => {
                     let n = room.population.load(Ordering::Relaxed);
                     let _ = room
                         .events
@@ -1752,6 +1970,96 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
                     // Last one wins: a delete arriving after a park request
                     // must not write the file back out.
                     stop = Some(checkpoint);
+                }
+            }
+        }
+
+        // ---- external inputs, applied at the tick boundary.
+        //
+        // Everything above has already run, so a reading lands on the
+        // document as it stands after this tick's edits and never races one.
+        // Every write here is a `ParamWrite::Light`: no gate, no compile, no
+        // quarantine clear, no BE re-arm. The whole batch costs at most ONE
+        // forced refactorization, because `factor_valid = false` is
+        // idempotent and every write lands before `advance`.
+        {
+            // A reading is only honoured when the part is a photocell, sits
+            // over a layer, and that layer is claimed by the sender. There is
+            // no binding table to consult: the answer is re-derived from the
+            // document's own geometry, so moving the part off the layer
+            // unbinds it with no op at all.
+            let mut accepted: Vec<(u32, u32, u16)> = Vec::new();
+            {
+                let layers = room.layers.lock().unwrap();
+                let claims = room.claims.lock().unwrap();
+                let elems = room.elements.lock().unwrap();
+                for (who, id, q) in readings.drain(..) {
+                    let Some(e) = elems.iter().find(|e| e.id == id) else {
+                        continue;
+                    };
+                    if !matches!(e.kind, ElementKind::Photocell { .. }) {
+                        continue;
+                    }
+                    let Some(lid) = layer_under(&layers, e) else {
+                        continue;
+                    };
+                    if !claims.iter().any(|(l, w)| *l == lid && *w == who) {
+                        continue;
+                    }
+                    accepted.push((who, id, q));
+                }
+            }
+            for (who, id, q) in accepted {
+                let light = f64::from(q) / SENSOR_FULL_SCALE;
+                if !eng.write_param(id, ParamWrite::Light { light }) {
+                    continue;
+                }
+                match driven.iter_mut().find(|d| d.id == id) {
+                    Some(d) => {
+                        let changed = d.q != q;
+                        d.q = q;
+                        d.who = who;
+                        d.stale = 0;
+                        if changed {
+                            sensor_out.push((id, q));
+                        }
+                    }
+                    None => {
+                        driven.push(Driven {
+                            id,
+                            who,
+                            q,
+                            stale: 0,
+                        });
+                        sensor_out.push((id, q));
+                    }
+                }
+                // The anti-cheat BADGE, not a refusal. A player may drive a
+                // circuit from the outside world — that is the feature — but
+                // a goal reached with a JavaScript control loop closing
+                // through a "photocell" is not the goal this room sets, so
+                // the run says so on the card from the first write until the
+                // next reset. See `machine_msg`.
+                ext_driven = true;
+            }
+            // Watchdog: a driver that went quiet. Not an error and not a
+            // disconnect — a laptop lid, a tab switch, a dropped frame — and
+            // the answer to all of them is the same as the answer to leaving.
+            for d in driven.iter_mut() {
+                d.stale += 1;
+            }
+            for d in driven.iter() {
+                if d.stale > SENSOR_STALE_TICKS {
+                    to_dark.push(d.id);
+                }
+            }
+            driven.retain(|d| d.stale <= SENSOR_STALE_TICKS);
+            // And the parts that lost their driver, however they lost it.
+            to_dark.sort_unstable();
+            to_dark.dedup();
+            for id in to_dark.drain(..) {
+                if eng.write_param(id, ParamWrite::Light { light: 0.0 }) {
+                    sensor_out.push((id, 0));
                 }
             }
         }
@@ -1976,6 +2284,16 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
             if let Some(msg) = damage_msg(&damage, &mut damage_shown) {
                 let _ = room.events.send(msg);
             }
+            // Sensor readings, CHANGED ONLY. Twelve bytes per moved sensor
+            // per tick, and a camera pointed at a still wall sends nothing at
+            // all. This is the only thing about a player's camera that any
+            // other player ever receives — there is no code path here that
+            // can serialize a frame, because the server never had one.
+            if !sensor_out.is_empty() {
+                let _ = room
+                    .events
+                    .send(json!({"t": "sensors", "s": sensor_out}).to_string());
+            }
             // Same flat layout as the WASM facade:
             // [id, npins, v0..v5, i0..i5, power].
             let e: Vec<[f64; 15]> = fr
@@ -2013,7 +2331,8 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
             // that HAS one. A machineless room never mentions it.
             if has_machine {
                 let _ = room.events.send(
-                    machine_msg(&hoist, hoist_rect, motor_i, impact, motor_i_max()).to_string(),
+                    machine_msg(&hoist, hoist_rect, motor_i, impact, motor_i_max(), ext_driven)
+                        .to_string(),
                 );
             }
         }
@@ -2058,9 +2377,21 @@ fn machine_msg(
     motor_i: f64,
     impact: f64,
     i_max: f64,
+    // Has anything in this room been driven from outside since the last
+    // reset? The card says so from the first sensor write, rather than
+    // discovering it at win time.
+    ext: bool,
 ) -> serde_json::Value {
     let s = hoist.sensors();
     json!({
+        // Anti-cheat is a POLICY, not a lock: the measurement was
+        // always safe (`win` latches off an integral of a real MNA branch
+        // unknown, and the fixture ids are unwritable), but a 30 Hz
+        // actuator plus a 30 Hz frame feed lets a player close the control
+        // loop in JavaScript instead of in the circuit — which is the
+        // lesson the goal exists to teach. So the run is BADGED, visibly,
+        // from the first external write.
+        "ext": ext,
         "imax": i_max,
         "t": "machine",
         "id": MOTOR_ID,
@@ -2343,6 +2674,257 @@ fn apply_panel_op(panels: &mut Vec<Panel>, next_plid: &AtomicU32, op: &PanelOp) 
     }
 }
 
+// ------------------------------------------------------- external inputs
+//
+// EVERYTHING ABOUT THIS FEATURE THAT MATTERS IS A NEGATIVE. `sim-core` never
+// learns that a webcam exists; it learns that element #42's illumination is
+// 0.31, the way it already learns that a motor's back-EMF is 1.4 V. No pixel
+// and no audio sample crosses the socket in either direction — the client
+// sends a `u16` per driven part per tick and nothing else, and there is no
+// server-side media type for one to be smuggled into.
+//
+// The write path is `ParamWrite::Light`, applied at the tick boundary next to
+// `machine_step`, NOT `Cmd::Interact`. The reason is not speed (though the
+// gate is 0.4-1.2 ms on a 150-element room and the client pays a second copy
+// on its render thread): `Engine::interact` ends in `compile()`, which clears
+// `quarantined` and re-arms `be_steps`. A part driven through it would
+// resurrect a diverged room 30 times a second and pin the integrator in
+// first-order backward Euler forever. `write_param` sets a field and
+// invalidates the factorization; that is all it is allowed to do.
+//
+// The guarantee is made at PLACEMENT time instead, exactly as it is for the
+// hoist's mechanism (see `machine_step`): `check_document` layer 4 trials the
+// photocell at BOTH ends of its range (`validate::pin_at_peak`), so every
+// matrix a camera can ask the room to factor has already been factored once
+// before the part was accepted.
+
+/// Full scale of a sensor reading on the wire. A `u16` mapped onto 0..1 —
+/// integer, so there is no float-formatting ambiguity, 2 bytes per sample,
+/// and a reading is a canonical value rather than a printed double.
+const SENSOR_FULL_SCALE: f64 = 65_535.0;
+
+/// Most readings one message may carry. A client drives at most one part per
+/// photocell it owns; this is a bound on a hostile message, not a design
+/// limit.
+const MAX_SENSOR_BATCH: usize = 64;
+
+/// Ticks a driven part may go without a fresh reading before it falls dark.
+/// Three ticks is 100 ms: long enough to ride out a dropped frame from a
+/// 20 fps camera, short enough that a closed laptop lid is visible
+/// immediately.
+///
+/// A FROZEN SENSOR IS NEVER ACCEPTABLE. Holding the last sample when nobody
+/// is looking is a lie about the world in exactly the way `machine_step`
+/// argues a refused limit-switch write would be — and it would silently
+/// preserve a circuit state that nothing is driving any more.
+const SENSOR_STALE_TICKS: u32 = 3;
+
+/// One part currently driven from outside, and by whom.
+struct Driven {
+    id: u32,
+    who: u32,
+    /// Last reading applied, for the `sensors` broadcast (changed-only).
+    q: u16,
+    /// Ticks since the last reading landed.
+    stale: u32,
+}
+
+/// A leaky-bucket rate limiter for one connection. No clock in sim-core's
+/// sense — this lives in the server, which is allowed one.
+struct TokenBucket {
+    tokens: f64,
+    per_sec: f64,
+    burst: f64,
+    last: std::time::Instant,
+}
+
+impl TokenBucket {
+    fn new(per_sec: f64, burst: f64) -> Self {
+        TokenBucket {
+            tokens: burst,
+            per_sec,
+            burst,
+            last: std::time::Instant::now(),
+        }
+    }
+    /// True if this message is within budget. Over budget is DROPPED, not
+    /// queued: an external input is a stream of the freshest value, so the
+    /// right thing to do with a late one is throw it away.
+    fn take(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        self.tokens = (self.tokens + now.duration_since(self.last).as_secs_f64() * self.per_sec)
+            .min(self.burst);
+        self.last = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn clean_layer_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_LAYER_NAME)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+fn norm_layer_rect(x0: f64, y0: f64, x1: f64, y1: f64) -> Option<(f64, f64, f64, f64)> {
+    if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite()) {
+        return None;
+    }
+    let (ax, bx) = (x0.min(x1), x0.max(x1));
+    let (ay, by) = (y0.min(y1), y0.max(y1));
+    if bx - ax < MIN_LAYER_SPAN || by - ay < MIN_LAYER_SPAN {
+        return None;
+    }
+    Some((ax, ay, bx, by))
+}
+
+/// Apply a layer op. Returns false to drop it (bad rect, unknown lid, budget).
+fn apply_layer_op(layers: &mut Vec<Layer>, next_lid: &AtomicU32, op: &LayerOp) -> bool {
+    match op {
+        LayerOp::Add {
+            x0,
+            y0,
+            x1,
+            y1,
+            name,
+        } => {
+            let Some((x0, y0, x1, y1)) = norm_layer_rect(*x0, *y0, *x1, *y1) else {
+                return false;
+            };
+            if layers.len() >= MAX_LAYERS {
+                return false;
+            }
+            let lid = next_lid.fetch_add(1, Ordering::Relaxed);
+            let name = name
+                .as_deref()
+                .map(clean_layer_name)
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| format!("CAMERA {lid}"));
+            layers.push(Layer {
+                lid,
+                x0,
+                y0,
+                x1,
+                y1,
+                name,
+            });
+            true
+        }
+        LayerOp::Remove { lid } => {
+            let before = layers.len();
+            layers.retain(|l| l.lid != *lid);
+            layers.len() != before
+        }
+        LayerOp::Rect {
+            lid,
+            x0,
+            y0,
+            x1,
+            y1,
+        } => {
+            let Some((x0, y0, x1, y1)) = norm_layer_rect(*x0, *y0, *x1, *y1) else {
+                return false;
+            };
+            let Some(l) = layers.iter_mut().find(|l| l.lid == *lid) else {
+                return false;
+            };
+            (l.x0, l.y0, l.x1, l.y1) = (x0, y0, x1, y1);
+            true
+        }
+        LayerOp::Rename { lid, name } => {
+            let name = clean_layer_name(name);
+            if name.is_empty() {
+                return false;
+            }
+            let Some(l) = layers.iter_mut().find(|l| l.lid == *lid) else {
+                return false;
+            };
+            l.name = name;
+            true
+        }
+    }
+}
+
+/// The layer a part reads: the SMALLEST layer whose rectangle contains the
+/// part's pin centroid (lowest lid breaks a tie, so every client and the
+/// server agree). None = the part is not over any layer.
+///
+/// Derived from geometry, every time, never stored — the same rule
+/// `panel_members` and `scopeOwner` already follow. Dragging a photocell off
+/// the layer unbinds it; there is no binding op to get out of sync, and no
+/// binding UI anywhere in the game. You place a part on a thing.
+fn layer_under(layers: &[Layer], e: &ElementSpec) -> Option<u32> {
+    if e.pins.is_empty() {
+        return None;
+    }
+    let n = e.pins.len() as f64;
+    let cx = e.pins.iter().map(|p| f64::from(p.0)).sum::<f64>() / n;
+    let cy = e.pins.iter().map(|p| f64::from(p.1)).sum::<f64>() / n;
+    let mut best: Option<(&Layer, f64)> = None;
+    for l in layers {
+        if cx < l.x0 || cx > l.x1 || cy < l.y0 || cy > l.y1 {
+            continue;
+        }
+        let area = (l.x1 - l.x0) * (l.y1 - l.y0);
+        match best {
+            Some((b, a)) if a < area || (a == area && b.lid <= l.lid) => {}
+            _ => best = Some((l, area)),
+        }
+    }
+    best.map(|(l, _)| l.lid)
+}
+
+/// Drop every entry in `driven` whose layer is no longer claimed by the
+/// player who was driving it, and record the parts that must be written dark.
+///
+/// This is the ONE rule that makes a shared room honest about an unshared
+/// device: the part is room state and everybody sees its value, but the value
+/// only exists while somebody with a camera is standing behind the layer it
+/// sits on. The instant that stops being true, it reads dark — visibly, to
+/// everyone, on the same tick.
+fn fail_dark(room: &Room, driven: &mut Vec<Driven>, to_dark: &mut Vec<u32>) {
+    let layers = room.layers.lock().unwrap();
+    let claims = room.claims.lock().unwrap();
+    let elems = room.elements.lock().unwrap();
+    driven.retain(|d| {
+        let still = elems
+            .iter()
+            .find(|e| e.id == d.id)
+            .and_then(|e| layer_under(&layers, e))
+            .is_some_and(|lid| claims.iter().any(|(l, w)| *l == lid && *w == d.who));
+        if !still {
+            to_dark.push(d.id);
+        }
+        still
+    });
+}
+
+/// A player left, or dropped their camera: release their claims, then fail
+/// everything they were driving. Returns true when a claim actually went
+/// away, so the caller can tell the room — a layer whose driver walked out
+/// must read UNCLAIMED to everyone else, not keep their name on it.
+fn drop_claims_of(room: &Room, who: u32, driven: &mut Vec<Driven>, to_dark: &mut Vec<u32>) -> bool {
+    let dropped = {
+        let mut claims = room.claims.lock().unwrap();
+        let before = claims.len();
+        claims.retain(|(_, w)| *w != who);
+        claims.len() != before
+    };
+    fail_dark(room, driven, to_dark);
+    dropped
+}
+
+fn layers_msg(layers: &[Layer], claims: &[(u32, u32)]) -> String {
+    json!({"t": "layers", "list": layers, "claims": claims}).to_string()
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "t", rename_all = "lowercase")]
 enum ClientMsg {
@@ -2365,6 +2947,22 @@ enum ClientMsg {
     },
     Panel {
         op: PanelOp,
+    },
+    Layer {
+        op: LayerOp,
+    },
+    /// Take or drop the right to drive a sensor layer.
+    LayerClaim {
+        lid: u32,
+        claim: bool,
+    },
+    /// External-input readings: `[[element_id, q], ...]`, `q` a u16 over the
+    /// part's full scale. THIS IS THE ENTIRE EGRESS SURFACE OF THE CAMERA AND
+    /// MICROPHONE FEATURE. It deserializes into `Vec<(u32, u16)>` and nothing
+    /// else; a message carrying a frame, a buffer, a device id or a string
+    /// fails to parse and is dropped, because there is no field for one.
+    Sensor {
+        s: Vec<(u32, u16)>,
     },
     Cursor {
         x: f64,
@@ -2424,6 +3022,8 @@ fn hello_msg(handle: &RoomHandle, me: u32) -> String {
     let elems = room.elements.lock().unwrap();
     let probes = room.probes.lock().unwrap();
     let panels = room.panels.lock().unwrap();
+    let layers = room.layers.lock().unwrap();
+    let claims = room.claims.lock().unwrap();
     let view = handle.view.lock().unwrap();
     json!({
         "t": "hello", "you": me,
@@ -2433,6 +3033,11 @@ fn hello_msg(handle: &RoomHandle, me: u32) -> String {
         },
         "elements": *elems,
         "probes": *probes, "panels": *panels,
+        // The rectangles, and who is currently driving each. Never a device
+        // id, never a resolution, never a frame: a late joiner learns WHERE
+        // the hole in the world is and WHOSE eye is behind it, and nothing
+        // else about anybody's hardware.
+        "layers": *layers, "claims": *claims,
         "view": *view,
         // False means "this room has no goal card": the client hides the
         // hoist chrome instead of latching it forever.
@@ -2460,10 +3065,16 @@ async fn client_session(mut socket: WebSocket, reg: Arc<Registry>, handle: Arc<R
         return;
     }
 
+    // One token bucket per connection, for the one message type a client is
+    // expected to send continuously. 45/s sustained with a burst of 10 is
+    // half again the tick rate — enough that a 60 fps sampler never trips it
+    // and a runaway one is throttled at the socket rather than at the queue.
+    let mut sensor_budget = TokenBucket::new(45.0, 10.0);
+
     let hello = hello_msg(&handle, me);
     if socket.send(Message::Text(hello.into())).await.is_err() {
         reg.leave(&handle);
-        let _ = room.cmds.send(Cmd::Leave);
+        let _ = room.cmds.send(Cmd::Leave { who: me });
         return;
     }
 
@@ -2508,6 +3119,28 @@ async fn client_session(mut socket: WebSocket, reg: Arc<Registry>, handle: Arc<R
                         Ok(ClientMsg::Panel { op }) => {
                             let _ = room.cmds.send(Cmd::Panel { op });
                         }
+                        Ok(ClientMsg::Layer { op }) => {
+                            let _ = room.cmds.send(Cmd::Layer { op });
+                        }
+                        Ok(ClientMsg::LayerClaim { lid, claim }) => {
+                            let _ = room.cmds.send(Cmd::LayerClaim { who: me, lid, claim });
+                        }
+                        Ok(ClientMsg::Sensor { s }) => {
+                            // INGRESS RATE LIMIT. Before external inputs,
+                            // high-rate streaming from a client was a
+                            // theoretical DoS; now it is routine client
+                            // behaviour, so it gets a budget. `cmds` is an
+                            // UNBOUNDED channel: without this a client could
+                            // fill memory faster than the 30 Hz tick drains
+                            // it, and `supersede` would collapse the WORK
+                            // while the queue still grew.
+                            if !sensor_budget.take() {
+                                continue;
+                            }
+                            for (id, q) in s.into_iter().take(MAX_SENSOR_BATCH) {
+                                let _ = room.cmds.send(Cmd::Sensor { who: me, id, q });
+                            }
+                        }
                         Ok(ClientMsg::MachineReset) => {
                             let _ = room.cmds.send(Cmd::MachineReset);
                         }
@@ -2530,7 +3163,9 @@ async fn client_session(mut socket: WebSocket, reg: Arc<Registry>, handle: Arc<R
     }
 
     reg.leave(&handle);
-    let _ = room.cmds.send(Cmd::Leave);
+    // `who` matters here: leaving drops this player's layer claims and fails
+    // every part they were driving to dark on the very next tick.
+    let _ = room.cmds.send(Cmd::Leave { who: me });
 }
 
 #[tokio::main]
@@ -3109,6 +3744,9 @@ mod tests {
             next_client: AtomicU32::new(1),
             next_pid: AtomicU32::new(1),
             next_plid: AtomicU32::new(1),
+            layers: std::sync::Mutex::new(Vec::new()),
+            claims: std::sync::Mutex::new(Vec::new()),
+            next_lid: AtomicU32::new(1),
             population: AtomicU32::new(0),
             dirty: std::sync::atomic::AtomicBool::new(false),
         };
@@ -3162,7 +3800,7 @@ mod tests {
         hoist.hold = 2.5;
         hoist.landings = 3;
         hoist.joules = 12.5;
-        let v = machine_msg(&hoist, HOIST_RECT, 0.94, 1.75, motor_i_max());
+        let v = machine_msg(&hoist, HOIST_RECT, 0.94, 1.75, motor_i_max(), false);
         assert_eq!(v["t"], "machine");
         // The nameplate current the package engraves comes from the damage
         // table, and it has to bracket the motor's two operating points: the
@@ -3540,6 +4178,9 @@ mod tests {
             next_client: AtomicU32::new(1),
             next_pid: AtomicU32::new(1),
             next_plid: AtomicU32::new(1),
+            layers: std::sync::Mutex::new(Vec::new()),
+            claims: std::sync::Mutex::new(Vec::new()),
+            next_lid: AtomicU32::new(1),
             population: AtomicU32::new(0),
             dirty: std::sync::atomic::AtomicBool::new(false),
         }
@@ -5222,7 +5863,207 @@ mod tests {
         assert_eq!(check_room_doc(&full_room()), Ok(()));
     }
 
-    /// A tick's worth of commands, coalesced: the drag frames a later frame
+    #[test]
+    fn a_sensor_reading_is_one_write_per_part_per_tick() {
+        // The property the whole rate story rests on: a client sampling at
+        // 60, 240 or 12500 Hz delivers one SURVIVING write per part per tick,
+        // because the tick is the decimator and it already existed.
+        let sens = |id: u32, q: u16| Cmd::Sensor { who: 1, id, q };
+        let mut v = vec![sens(5, 10), sens(5, 20), sens(6, 7), sens(5, 30), sens(6, 9)];
+        supersede(&mut v);
+        let got: Vec<(u32, u16)> = v
+            .iter()
+            .map(|c| match c {
+                Cmd::Sensor { id, q, .. } => (*id, *q),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(got, [(5, 30), (6, 9)], "only the freshest reading survives");
+
+        // ...and it does not coalesce past anything else touching the part.
+        // A reading arriving in the same tick as a Remove keeps its order,
+        // exactly like every other superseder.
+        let mut v = vec![
+            sens(5, 10),
+            Cmd::Edit {
+                who: 1,
+                op: DocOp::Remove { id: 5 },
+            },
+            sens(5, 20),
+        ];
+        supersede(&mut v);
+        assert_eq!(v.len(), 3, "a Remove in the same tick suspends coalescing");
+    }
+
+    #[test]
+    fn a_part_reads_the_layer_it_sits_on_and_no_other() {
+        let layers = vec![
+            Layer {
+                lid: 1,
+                x0: 0.0,
+                y0: 0.0,
+                x1: 40.0,
+                y1: 30.0,
+                name: "big".into(),
+            },
+            Layer {
+                lid: 2,
+                x0: 10.0,
+                y0: 10.0,
+                x1: 20.0,
+                y1: 20.0,
+                name: "small".into(),
+            },
+        ];
+        let cell = |a: (i32, i32), b: (i32, i32)| {
+            ElementSpec::two(
+                7,
+                ElementKind::Photocell {
+                    r_dark: 1e6,
+                    r_lit: 1e3,
+                    light: 0.0,
+                },
+                a,
+                b,
+            )
+        };
+        // Inside the small one: the SMALLEST containing layer wins, so a
+        // nested layer is a finer instrument and not an ambiguity.
+        assert_eq!(layer_under(&layers, &cell((14, 14), (16, 14))), Some(2));
+        // Inside the big one only.
+        assert_eq!(layer_under(&layers, &cell((30, 5), (32, 5))), Some(1));
+        // Off both: no layer, and therefore no reading. Dragging a part out
+        // of the light unbinds it with no op at all.
+        assert_eq!(layer_under(&layers, &cell((90, 90), (92, 90))), None);
+    }
+
+    #[test]
+    fn layers_persist_but_readings_and_claims_do_not() {
+        // The whole persistence policy of this feature, asserted rather than
+        // described: a saved room keeps WHERE the camera hole is and forgets
+        // everything about the camera.
+        let setup = RoomSetup {
+            elements: vec![ElementSpec::two(
+                7,
+                ElementKind::Photocell {
+                    r_dark: 1e6,
+                    r_lit: 1e3,
+                    // A room saved while fully lit...
+                    light: 1.0,
+                },
+                (2, 2),
+                (2, 6),
+            )],
+            layers: vec![Layer {
+                lid: 3,
+                x0: 0.0,
+                y0: 0.0,
+                x1: 20.0,
+                y1: 15.0,
+                name: "CAMERA 3".into(),
+            }],
+            next_lid: 4,
+            ..RoomSetup::default()
+        };
+        let json = serde_json::to_string(&SaveFile::from_setup(&setup)).unwrap();
+        assert!(json.contains("CAMERA 3"), "the rectangle is document state");
+        assert!(
+            !json.contains("\"light\""),
+            "a reading reached the save file: {json}"
+        );
+        assert!(!json.contains("claim"), "a claim reached the save file");
+
+        let back: SaveFile = serde_json::from_str(&json).unwrap();
+        let setup = back.into_setup().normalize().unwrap();
+        assert_eq!(setup.layers.len(), 1);
+        assert_eq!(setup.layers[0].lid, 3);
+        // ...loads DARK.
+        match setup.elements[0].kind {
+            ElementKind::Photocell { light, r_dark, .. } => {
+                assert_eq!(light, 0.0, "a saved room loaded with a light nobody is shining");
+                assert_eq!(r_dark, 1e6, "the calibration must survive");
+            }
+            _ => panic!("wrong kind"),
+        }
+
+        // And a save written before any of this existed still loads.
+        let old = r#"{"elements":[],"probes":[],"panels":[]}"#;
+        let s: SaveFile = serde_json::from_str(old).unwrap();
+        let s = s.into_setup().normalize().unwrap();
+        assert!(s.layers.is_empty());
+        assert_eq!(s.next_lid, 1);
+    }
+
+    #[test]
+    fn a_layer_op_is_validated_the_way_a_panel_op_is() {
+        let next = AtomicU32::new(1);
+        let mut layers: Vec<Layer> = Vec::new();
+        // Too small: a stray click must not make a sensor layer.
+        assert!(!apply_layer_op(
+            &mut layers,
+            &next,
+            &LayerOp::Add {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 1.0,
+                y1: 1.0,
+                name: None
+            }
+        ));
+        // Non-finite: dropped, never stored.
+        assert!(!apply_layer_op(
+            &mut layers,
+            &next,
+            &LayerOp::Add {
+                x0: 0.0,
+                y0: 0.0,
+                x1: f64::NAN,
+                y1: 20.0,
+                name: None
+            }
+        ));
+        assert!(layers.is_empty());
+        assert!(apply_layer_op(
+            &mut layers,
+            &next,
+            &LayerOp::Add {
+                x0: 20.0,
+                y0: 15.0,
+                x1: 0.0,
+                y1: 0.0,
+                name: Some("  my \u{7} cam  ".into())
+            }
+        ));
+        assert_eq!((layers[0].x0, layers[0].y1), (0.0, 15.0), "rect normalized");
+        assert_eq!(layers[0].name, "my  cam", "control characters stripped");
+        // The budget.
+        while layers.len() < MAX_LAYERS {
+            assert!(apply_layer_op(
+                &mut layers,
+                &next,
+                &LayerOp::Add {
+                    x0: 0.0,
+                    y0: 0.0,
+                    x1: 10.0,
+                    y1: 10.0,
+                    name: None
+                }
+            ));
+        }
+        assert!(!apply_layer_op(
+            &mut layers,
+            &next,
+            &LayerOp::Add {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 10.0,
+                y1: 10.0,
+                name: None
+            }
+        ));
+    }
+
+/// A tick's worth of commands, coalesced: the drag frames a later frame
     /// replaces are dropped, and nothing else is.
     #[test]
     fn superseding_drops_only_replaced_drag_frames() {

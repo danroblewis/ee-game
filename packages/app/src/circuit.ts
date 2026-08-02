@@ -26,6 +26,12 @@ export type ElementKind =
   | { t: 'Ota' }
   | { t: 'Timer555' }
   | { t: 'Potentiometer'; ohms: number; wiper: number }
+  /** Light-dependent resistor. `r_dark`/`r_lit` are the CALIBRATION and are
+   *  document state; `light` is the READING and is not — the server never
+   *  sends it inside an element and never saves it, so it arrives (if at all)
+   *  on the separate `sensors` message and a fresh document reads dark.
+   *  Optional here for exactly that reason. */
+  | { t: 'Photocell'; r_dark: number; r_lit: number; light?: number }
   // `seed` picks WHICH noise, `volts` how loud. Two sources with the same
   // seed are the same signal, so each placement gets its own (catalog.ts).
   | { t: 'Noise'; volts: number; ohms: number; seed: number }
@@ -92,6 +98,8 @@ export function pinLabels(kind: ElementKind): string[] {
       return ['+'];
     case 'Noise':
       return ['out', 'ref'];
+    case 'Photocell':
+      return ['a', 'b'];
     default:
       return ['a', 'b'];
   }

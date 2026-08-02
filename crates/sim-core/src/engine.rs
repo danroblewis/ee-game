@@ -512,6 +512,15 @@ impl Engine {
                     invalidate = true;
                 }
             }
+            (ParamWrite::Light { light: new }, ElementKind::Photocell { light, .. }) => {
+                // Conductance only. The `!=` guard is what makes a still
+                // scene free: an unchanged reading refactors nothing.
+                let new = if new.is_finite() { new.clamp(0.0, 1.0) } else { 0.0 };
+                if *light != new {
+                    *light = new;
+                    invalidate = true;
+                }
+            }
             (ParamWrite::Switch { closed }, ElementKind::Switch { closed: c }) => {
                 if *c != closed {
                     *c = closed;
@@ -965,6 +974,21 @@ impl Engine {
                         let r2 = (ohms * (1.0 - wiper)).max(1e-3);
                         self.stamp_g(node[0], node[1], 1.0 / r1);
                         self.stamp_g(node[1], node[2], 1.0 / r2);
+                    }
+                }
+                // A photocell IS a resistor here. The only difference is
+                // where the ohms came from, and the matrix cannot tell.
+                ElementKind::Photocell {
+                    r_dark,
+                    r_lit,
+                    light,
+                } => {
+                    if need_factor {
+                        self.stamp_g(
+                            node[0],
+                            node[1],
+                            1.0 / crate::photocell_ohms(r_dark, r_lit, light),
+                        );
                     }
                 }
                 ElementKind::Capacitor { farads } => {
@@ -1603,6 +1627,11 @@ impl Engine {
                 ElementKind::Resistor { ohms }
                 | ElementKind::Lamp { ohms, .. }
                 | ElementKind::Speaker { ohms } => two(v01 / ohms),
+                ElementKind::Photocell {
+                    r_dark,
+                    r_lit,
+                    light,
+                } => two(v01 / crate::photocell_ohms(r_dark, r_lit, light)),
                 ElementKind::Potentiometer { ohms, wiper } => {
                     let r1 = (ohms * wiper).max(1e-3);
                     let r2 = (ohms * (1.0 - wiper)).max(1e-3);
