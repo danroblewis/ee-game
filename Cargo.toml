@@ -7,6 +7,7 @@ members = [
     "crates/sim-wasm",
     "crates/machine",
     "crates/server",
+    "crates/sim-gpu-spike",
 ]
 
 [workspace.package]
