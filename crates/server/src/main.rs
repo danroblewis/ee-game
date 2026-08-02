@@ -380,10 +380,24 @@ fn demo_room_circuit() -> Vec<ElementSpec> {
 // A crate hangs on a platform in a vertical shaft, driven by a DC motor
 // whose two leads are real wire-able terminals. A green band is painted
 // across the shaft; the package's title band reads "CRATE IN BAND".
-// Wiring a constant voltage lifts the crate but cannot hold it — voltage
-// buys speed, not position — so holding it needs feedback from the
-// position sensor. There is no quest log and nothing to accept: the goal
-// is measured from solver quantities and nothing else.
+// There is no quest log and nothing to accept: the goal is measured from
+// solver quantities and nothing else.
+//
+// WHAT THE GOAL TEACHES. Voltage sets a SPEED, not a height:
+// ω_ss = (K·V/R − m·g·r)/(K²/R + b). At exactly V₀ = m·g·r·R/K = 1.88 V that
+// speed is zero, and since ω = 0 is asymptotically stable (back-EMF brakes
+// with slope −(K²/R + b)), a CONSTANT V₀ holds the crate still — wherever it
+// already is. Height is the integral of speed, so what a constant voltage
+// cannot do is CHOOSE a height: V₀ holds where you already are, and any other
+// voltage drifts into a stop. Two open-loop wins therefore exist and both are
+// legitimate discoveries of the torque balance rather than of feedback:
+// drive up and hand-dial to V₀ (`the_balance_voltage_holds_the_band_open_loop`),
+// or creep with a V in (V₀, 1.9842 V] so slowly that crossing the 40 mm band
+// takes longer than the 5 s hold — 42 s at best, 234 s at 1.90 V, out of a
+// 100 mV window. Feedback is what makes the crate find the height instead of
+// the player finding the voltage, and what keeps it there when the load moves.
+// The goal card says exactly that; it used to say a constant voltage "cannot
+// hold the band", which is false.
 
 /// The hoist's footprint SIZE in grid units. Fixed: the assembly MOVES (a
 /// player drags the chip, see `move_machine`), it does not resize.
@@ -2673,10 +2687,13 @@ mod tests {
         );
         assert!(top_switch, "LIM-TOP must have been reached");
 
-        // The design pillar, measured: voltage buys speed, not position. The
-        // crate crosses the 40 mm band at 0.80 m/s (50 ms of credit) and then
-        // parks 60 mm above it, so the hold drains back to nothing.
-        assert!(!run.hoist.win, "constant voltage must never win");
+        // Voltage buys SPEED: 12 V commands 0.80 m/s, so the crate crosses
+        // the 40 mm band in 50 ms and parks 60 mm above it, and the hold
+        // drains back to nothing. Note the claim is about THIS voltage, not
+        // about constant voltages — see
+        // `the_balance_voltage_holds_the_band_open_loop` for the one that
+        // does hold, and the module header for why both are true.
+        assert!(!run.hoist.win, "12 V open loop must never win");
         assert_eq!(run.hoist.hold, 0.0, "hold must drain at the head stop");
         assert_eq!(run.hoist.landings, 0, "it never came down");
         assert!(
@@ -2686,6 +2703,62 @@ mod tests {
         );
         eprintln!(
             "12 V open loop: i={i_free:.4} A, top at {t_top:.4} s, {:.2} J",
+            run.hoist.joules
+        );
+    }
+
+    /// THE OTHER HALF OF THE TRUTH, and the reason the goal card no longer
+    /// claims a constant voltage "cannot hold the band".
+    ///
+    /// ω = 0 is an *asymptotically stable* equilibrium of
+    /// J·ω̇ = K(V − K·ω)/R − m·g·r − b·ω: the derivative in ω is
+    /// −(K²/R + b) < 0, so the electrical brake actively pulls the speed back
+    /// to whatever the applied voltage commands. At exactly
+    /// V₀ = m·g·r·R/K = 1.88352 V that commanded speed is ZERO, and the crate
+    /// therefore sits still — wherever it happens to be, band included.
+    ///
+    /// What a constant voltage cannot do is *choose* a height: `y` is a pure
+    /// integrator of ω, so V₀ holds you where you already are and any other
+    /// voltage drifts until it meets a stop. That distinction is the lesson,
+    /// and this test is what keeps the card honest about it.
+    #[test]
+    fn the_balance_voltage_holds_the_band_open_loop() {
+        let v0 = machine::LOAD_TORQUE * machine::R_ARM / machine::K;
+        assert!((v0 - 1.88352).abs() < 1e-9, "V0 = {v0}");
+        let (mp, mm) = motor_pins();
+        let (sp, sm) = ((mp.0 - 9, mp.1), (mm.0 - 9, mm.1));
+        let mut run = HoistRun::new(vec![
+            spec(1, dc(v0), sp, sm),
+            spec(2, K::Wire, sp, mp),
+            spec(3, K::Wire, sm, mm),
+            gnd(4, sm),
+        ]);
+        // Start where a player who drove up and then dialled the supply back
+        // would be: mid-band, still. No feedback of any kind is wired.
+        run.hoist.y = (machine::BAND_LO + machine::BAND_HI) / 2.0;
+
+        let mut drift = 0.0f64;
+        for _ in 0..(6.0 / MACHINE_H) as u32 {
+            run.step();
+            drift = drift.max((run.hoist.y - 0.32).abs());
+            if run.hoist.win {
+                break;
+            }
+        }
+        assert!(
+            run.hoist.win,
+            "the balance voltage DOES hold the band: hold={:.4} s y={:.5} m",
+            run.hoist.hold, run.hoist.y
+        );
+        assert!(
+            drift < 1e-4,
+            "and it holds to within a tenth of a millimetre: drift {drift:.3e} m"
+        );
+        assert_eq!(run.hoist.landings, 0);
+        eprintln!(
+            "V0 = {v0:.5} V open loop: won at {:.3} s, y = {:.5} m, drift {drift:.2e} m, {:.2} J",
+            run.eng.time(),
+            run.hoist.y,
             run.hoist.joules
         );
     }

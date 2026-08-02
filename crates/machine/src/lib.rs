@@ -65,9 +65,17 @@ pub const WIPER_MAX: f64 = 0.98;
 
 /// Gravity load torque at the drum (N·m) = m·g·r.
 pub const LOAD_TORQUE: f64 = CRATE_M * G * DRUM_R;
-/// Armature current that exactly balances gravity (A) = m·g·r/K. Holding
-/// the crate still requires this current and therefore feedback: a constant
-/// voltage sets a speed, not a position.
+/// Armature current that exactly balances gravity (A) = m·g·r/K, and the
+/// terminal voltage that produces it from rest, `HOLD_CURRENT * R_ARM` =
+/// 1.88352 V.
+///
+/// Holding the crate still requires this current — but NOT feedback. ω = 0 is
+/// an asymptotically stable equilibrium of `tick`'s rotor equation (the
+/// derivative in ω is −(K²/R + b) < 0), so a constant terminal voltage of
+/// m·g·r·R/K holds the crate wherever it already is. A constant voltage sets a
+/// SPEED; what it cannot do is choose the height, because height is that
+/// speed's integral. Feedback is what finds the height for you, and what
+/// re-finds the balance when the load changes.
 pub const HOLD_CURRENT: f64 = LOAD_TORQUE / K;
 /// Mechanical time constant (s) = J/(K²/R + b) — the electrical brake
 /// dominates the viscous term. 24.8 ms, i.e. 39× the 640 µs machine tick,

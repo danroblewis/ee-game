@@ -3,24 +3,37 @@
 // A freight hoist stands in the world beside the demo vignettes: a crate on a
 // platform in a vertical shaft, lifted by a DC motor whose two leads are real
 // wire-able terminals. The player has to hold the crate inside a painted green
-// band for five continuous seconds. A constant voltage lifts it but cannot
-// hold it (voltage buys speed, not position), so the goal is only reachable by
-// wiring feedback off the position sensor — and since parts have safety limits
-// now, a bare supply across M+/M− does not merely fail, it burns the motor out
-// (a stalled armature draws V/R). The nameplate and the goal card say so, and
-// the rating they print is the server's own.
+// band for five continuous seconds.
+//
+// WHAT IT ACTUALLY TEACHES. Voltage sets a SPEED, not a height:
+// ω_ss = (K·V/R − m·g·r)/(K²/R + b). One voltage makes that speed zero —
+// V₀ = m·g·r·R/K = 1.88 V — and because ω = 0 is an asymptotically stable
+// equilibrium (back-EMF is a brake), a CONSTANT V₀ does hold the crate still,
+// wherever it already is. What it cannot do is choose the height: height is
+// the integral of speed, so V₀ holds and everything else drifts into a stop.
+// The discovery is therefore the torque balance first and the loop second —
+// find V₀ by hand and you are the feedback; wire SNS W into the drive and the
+// crate finds the height for itself, and keeps finding it when the load
+// changes. (The card used to claim a constant voltage "cannot hold the band".
+// It can. See `hintText` and the server's
+// `the_balance_voltage_holds_the_band_open_loop`.) Parts have safety limits,
+// so a bare supply across M+/M− does not merely miss the band, it burns the
+// motor out once the crate parks on a stop (a stalled armature draws V/R).
+// The nameplate and the goal card say so, and the rating they print is the
+// server's own.
 //
 // THE MACHINE IS A CHIP. It is drawn as a package with nine pins on legs
 // OUTSIDE the body, exactly the 555's grammar, with the live physics inside.
 // That is not a skin: playing the old cabinet made it obvious that a player
 // wires OUT from a machine no matter what it looks like, so the symbol should
 // present its terminals the way every other multi-pin part does. chip.ts owns
-// the package and machines/hoist.ts owns what goes inside it; THIS file owns
-// the machine as a live object in the room:
+// the package, machines/ owns what goes inside it (and which machine that
+// is); THIS file owns the machine as a live object in the room:
 //
-//   * the STATE — the server's message plus the few quantities the client
-//     integrates from it (drum angle from `vel`, dust from `impact`, flash
-//     ages), handed to the chip renderer each frame;
+//   * the MACHINE — built from the registry by the `kind` the server sends,
+//     fed one message per tick, advanced once per frame and drawn once per
+//     frame. Its state type is sealed inside it, so nothing here is written
+//     against the hoist in particular;
 //   * the GOAL CARD, an HTML overlay in the same visual language as the
 //     control-panel windows (.pwin) in index.html, now with a PINOUT tab that
 //     the package's own ⓘ badge opens;
@@ -36,19 +49,22 @@
 // every number drawn or printed comes out of that message (design pillar: no
 // faked electrical behaviour).
 //
-// Dev mock: with no server half in reach, `?hoistmock` in the URL (or calling
-// window.__hoistMock() from the console) synthesises machine messages from a
-// scripted lift/fall so the package, the landing event and the win state can
-// be exercised locally. It only ever calls the same onMachine() the socket
-// does.
+// Dev flags. `?hoistmock` (or window.__hoistMock() from the console)
+// synthesises machine messages from a scripted lift/fall, so the package, the
+// landing event and the win state can be exercised with no server half in
+// reach; it only ever calls the same onMachine() the socket does. `?chip=KIND`
+// forces a registered presentation onto whatever the room broadcasts, which is
+// how a machine the server does not ask for yet gets reviewed in the real room
+// (today: `?chip=conveyor`).
 
-import { chipZoneAt, renderChip, type ChipSpec } from './chip';
-import { chipFor } from './machines';
-import { ratedA, type Dust, type HoistState, type MachineMsg } from './machines/hoist';
+import type { PinoutRow } from './chip';
+import { machineFor, type Machine } from './machines';
+import { ratedA } from './machines/hoist';
+import type { MachineFrame, MachineMsg } from './machines/seam';
 import type { ElemLive, ElementSpec } from './circuit';
 import type { Camera, DamageState, DotFlow } from './render';
 
-export type { MachineMsg } from './machines/hoist';
+export type { MachineMsg } from './machines/seam';
 
 /** Footprint in grid units, corners normalized: [x0, y0, x1, y1]. */
 export type MachineRect = [number, number, number, number];
@@ -123,11 +139,6 @@ export interface Hoist {
   clear(): void;
 }
 
-/** Drum radius, metres (machine constant): only used to turn the server's
- * `vel` into a rotation angle. Never displayed. */
-const DRUM_R = 0.02;
-/** Impact speed that saturates the landing effects, m/s. */
-const LAND_FULL = 2.0;
 /** No machine message for this long = the link is gone, not the machine. */
 const STALE_MS = 1500;
 /** How long a released drag's placement outlives the gesture, waiting for the
@@ -181,20 +192,41 @@ function fmtSI(v: number, unit: string): string {
 
 /** The instruction on the goal card.
  *
- * It used to read "wire a constant voltage to M+/M−", which is now the way to
- * destroy the machine: a stalled armature draws V/R (12 V across 2 Ω is 6 A),
- * so a bare supply cooks the motor within seconds of the crate reaching the
- * head stop. The card therefore asks for a CONTROLLED drive and names the two
- * numbers that make the point — the nameplate current, and where the stall
- * current comes from. Both are the machine's own constants; the live current
- * beside it is the solver's. */
+ * IT USED TO SAY SOMETHING FALSE, and that is worth spelling out because the
+ * lesson underneath it is the whole reason the machine exists.
+ *
+ * The old line was "a constant voltage buys speed, not position: it cannot
+ * hold the band". Half of that is true and the conclusion is not. Voltage
+ * does buy speed: the steady state of J·ω̇ = K(V − K·ω)/R − m·g·r − b·ω is
+ * ω_ss = (K·V/R − m·g·r)/(K²/R + b), a SPEED set by V. But ω = 0 is one of
+ * those steady states, and it is asymptotically stable — d/dω of the
+ * right-hand side is −(K²/R + b) < 0, so back-EMF is a brake that actively
+ * pulls the shaft back to the commanded speed. At exactly
+ * V₀ = m·g·r·R/K = 1.88 V the commanded speed is zero and the crate sits
+ * still, band included, with no feedback anywhere (server test
+ * `the_balance_voltage_holds_the_band_open_loop`).
+ *
+ * What a constant voltage cannot do is CHOOSE a height. Height is the
+ * integral of speed, so V₀ holds the crate wherever it already is, and any
+ * other voltage drifts at (V − V₀)·K/(K²/R + b)·r until it meets a stop.
+ * That is the honest lesson, and it is a better one: find the voltage where
+ * the torques balance, then notice that finding it by hand is you being the
+ * feedback — and that it moves the moment the load does.
+ *
+ * The card therefore states the balance, not a prohibition, and still names
+ * the two numbers that keep the motor alive: the nameplate current, and where
+ * the stall current comes from. Both are machine constants; the live current
+ * beside them on the card is the solver's. */
 function hintText(m: MachineMsg | null): string {
   return (
     `M+/M− drive the drum — ${ratedA(m)} max, and a stalled rotor draws V/R\n` +
     'SNS W reads height (12.5 mV/mm) · TOP / BOT are the end stops\n' +
-    'A constant voltage buys speed, not position: it cannot hold the band,\n' +
-    'and parked against a stop it burns the motor out. Close the loop and\n' +
-    'keep the current inside the nameplate.\n' +
+    'Voltage sets a SPEED, not a height: torque balances gravity at exactly\n' +
+    'one voltage (m·g·r·R/K), and the crate then holds wherever it already is.\n' +
+    'Above it the crate climbs into a stop, below it the crate sinks. Find\n' +
+    'that voltage by hand and you are the feedback; close the loop off SNS W\n' +
+    'and the crate finds the height instead. Keep M+ inside the nameplate:\n' +
+    'parked against a stop, a bare supply burns the motor out.\n' +
     'drag the chip to move the whole machine · ⌘Z undoes it · ⓘ for the pinout.'
   );
 }
@@ -207,9 +239,13 @@ const div = (cls: string, parent?: HTMLElement): HTMLDivElement => {
 };
 
 interface Card {
-  /** `stale` = no machine message recently: the numbers are frozen, and the
-   * card says so instead of passing old values off as live. */
-  onState(s: HoistState, spec: ChipSpec<HoistState>): void;
+  /** `at.stale` = no machine message recently: the numbers are frozen, and the
+   * card says so instead of passing old values off as live.
+   *
+   * `pinout` is a thunk because it is only wanted when the PINOUT tab is
+   * showing, and building nine rows of solver readings 60 times a second for
+   * a pane nobody is looking at is pure garbage. */
+  onState(at: MachineFrame, pinout: () => PinoutRow[]): void;
   /** Take the card off screen and re-arm it, so the next room's first
    * machine message (if it ever has one) brings it back fresh. */
   hide(): void;
@@ -346,26 +382,26 @@ function buildCard(root: HTMLElement, reset: () => void): Card {
       tab = 'pins';
       applyTab();
     },
-    onState(s: HoistState, spec: ChipSpec<HoistState>) {
-      const m = s.m;
+    onState(at: MachineFrame, pinout: () => PinoutRow[]) {
+      const m = at.m;
       if (!shown) {
         shown = true;
         el.style.display = 'block';
       }
-      const flip = m.win !== lastWin || s.stale !== lastStale;
-      if (!flip && s.now - lastAt < UPDATE_MS) return;
-      lastAt = s.now;
+      const flip = m.win !== lastWin || at.stale !== lastStale;
+      if (!flip && at.now - lastAt < UPDATE_MS) return;
+      lastAt = at.now;
       lastWin = m.win;
-      lastStale = s.stale;
-      el.classList.toggle('stale', s.stale);
+      lastStale = at.stale;
+      el.classList.toggle('stale', at.stale);
 
       title.textContent = `CRATE IN BAND — HOLD ${m.need.toFixed(1)} s`;
       const frac = m.need > 0 ? clamp(m.hold / m.need, 0, 1) : 0;
       fill.style.width = `${(frac * 100).toFixed(1)}%`;
       barTxt.textContent = `${m.hold.toFixed(2)} / ${m.need.toFixed(2)} s`;
       const inBand = m.y >= m.band[0] && m.y <= m.band[1];
-      badge.textContent = s.stale ? 'NO LINK' : m.win ? 'HELD' : inBand ? 'IN BAND' : 'OUT';
-      badge.className = `goal-badge${s.stale ? '' : m.win ? ' win' : inBand ? ' in' : ''}`;
+      badge.textContent = at.stale ? 'NO LINK' : m.win ? 'HELD' : inBand ? 'IN BAND' : 'OUT';
+      badge.className = `goal-badge${at.stale ? '' : m.win ? ' win' : inBand ? ' in' : ''}`;
 
       vHeight.textContent = `${(m.y * 1000).toFixed(1)} mm`;
       vVel.textContent = `${(m.vel * 1000).toFixed(0)} mm/s`;
@@ -388,7 +424,7 @@ function buildCard(root: HTMLElement, reset: () => void): Card {
       // The pinout is the chip's own table, so it can never disagree with
       // the labels engraved on the package.
       if (tab === 'pins') {
-        const rows = spec.pinout(s);
+        const rows = pinout();
         while (pinRows.length < rows.length) {
           const r = div('goal-pin', pins);
           const name = document.createElement('b');
@@ -419,17 +455,24 @@ function buildCard(root: HTMLElement, reset: () => void): Card {
 // ------------------------------------------------------------------ module
 
 export function createHoist(root: HTMLElement, opts: { reset: () => void }): Hoist {
+  const params = new URLSearchParams(location.search);
+  /** `?chip=<kind>` forces a presentation onto whatever machine the room
+   * broadcasts — review scaffolding for a registry entry the server does not
+   * ask for yet (today: `?chip=conveyor`). Never consulted unless present, so
+   * a normal session cannot land here. */
+  const chipOverride = params.get('chip') ?? undefined;
+
   const card = buildCard(root, () => {
     if (mock) mock.reset();
     else opts.reset();
   });
 
   let m: MachineMsg | null = null;
-  let spin = 0;
-  let landAge = Infinity;
-  let landV = 0;
-  let dust: Dust[] = [];
-  let winAge = Infinity;
+  /** The live machine, built from the first message's `kind` and rebuilt if
+   * the room ever swaps presentations under us. Its state type is sealed
+   * inside it (machines/index.ts), which is what lets this file drive ANY
+   * registered machine without naming one. */
+  let machine: Machine | null = null;
   let mock: Mock | null = null;
   /** Wall clock of the last message: the card must not pass a frozen state
    * off as live if the socket drops. */
@@ -453,48 +496,10 @@ export function createHoist(root: HTMLElement, opts: { reset: () => void }): Hoi
     // Comparing rects rather than counting acknowledgements means a move by
     // ANOTHER player also lands cleanly.
     if (!localHeld && localRect && sameRect(localRect, normRect(next.rect))) localRect = null;
-    if (m && !m.win && next.win) winAge = 0;
-    if (!m) winAge = next.win ? 0 : Infinity;
-    if (next.impact > 0) {
-      landAge = 0;
-      landV = next.impact;
-      spawnDust(next.impact);
-    }
+    const kind = chipOverride ?? next.kind;
+    if (!machine || machine.kind !== (kind ?? 'hoist')) machine = machineFor(kind);
+    machine.onMessage(next);
     m = next;
-  }
-
-  function spawnDust(impact: number) {
-    const n = Math.round(clamp(impact / LAND_FULL, 0.15, 1) * 16);
-    for (let k = 0; k < n; k++) {
-      const side = k % 2 === 0 ? -1 : 1;
-      const r = (k * 0.618) % 1; // cheap deterministic spread, no RNG needed
-      dust.push({
-        u: 0.5 + side * (0.12 + 0.3 * r),
-        w: 0.01 + 0.03 * r,
-        du: side * (0.25 + 0.55 * r) * clamp(impact / LAND_FULL, 0.3, 1.4),
-        dw: (0.35 + 0.5 * r) * clamp(impact / LAND_FULL, 0.3, 1.4),
-        age: 0,
-        life: 0.5 + 0.5 * r,
-      });
-    }
-    if (dust.length > 80) dust = dust.slice(dust.length - 80);
-  }
-
-  function advance(dtSec: number) {
-    const mm = m;
-    if (!mm) return;
-    // Drum spin: omega = vel / r. Visual only — see DRUM_R.
-    spin = (spin + (mm.vel / DRUM_R) * dtSec) % (Math.PI * 2);
-    if (landAge !== Infinity) landAge += dtSec;
-    if (winAge !== Infinity) winAge += dtSec;
-    for (const d of dust) {
-      d.age += dtSec;
-      d.u += d.du * dtSec;
-      d.w += d.dw * dtSec;
-      d.dw -= 1.2 * dtSec; // settle back down
-      d.du *= 1 - Math.min(1, 2.5 * dtSec);
-    }
-    if (dust.length > 0) dust = dust.filter((d) => d.age < d.life);
   }
 
   /** The footprint in play: this client's optimistic one while it drags the
@@ -512,27 +517,17 @@ export function createHoist(root: HTMLElement, opts: { reset: () => void }): Hoi
     return m ? normRect(m.rect) : null;
   }
 
-  /** The chip presentation this machine is drawn with. */
-  const spec = (): ChipSpec<HoistState> => chipFor(m?.kind);
-
-  function stateAt(now: number): HoistState | null {
-    if (!m) return null;
-    return {
-      m,
-      now,
-      spin,
-      landAge,
-      landV,
-      winAge,
-      dust,
-      stale: performance.now() - lastMsgAt > STALE_MS,
-    };
-  }
+  /** The moment being drawn, in the form every machine reads it. */
+  const frameAt = (mm: MachineMsg, now: number): MachineFrame => ({
+    m: mm,
+    now,
+    stale: performance.now() - lastMsgAt > STALE_MS,
+  });
 
   function zoneAt(cam: Camera, x: number, y: number): MachineZone | null {
     const r = rect();
-    if (!r) return null;
-    return chipZoneAt(cam, spec(), r, x, y);
+    if (!r || !machine) return null;
+    return machine.zoneAt(cam, r, x, y);
   }
 
   function draw(
@@ -543,21 +538,21 @@ export function createHoist(root: HTMLElement, opts: { reset: () => void }): Hoi
     view: MachineView,
   ) {
     const r = rect();
-    if (!m || !r) return;
-    advance(Math.min(0.1, dtSec));
-    const st = stateAt(now);
-    if (!st) return;
-    const sp = spec();
-    card.onState(st, sp);
-
+    if (!m || !r || !machine) return;
+    const mm = machine;
+    machine.advance(Math.min(0.1, dtSec));
+    const at = frameAt(m, now);
     const children = new Map<number, ElementSpec>();
     for (const c of view.children) children.set(c.id, c);
-    renderChip({
+    // The card first: it must show the same frame the package does, and the
+    // pinout thunk closes over THIS frame's live map so the datasheet reads
+    // the solver rather than a nominal (chip.ts's `ChipMeas`).
+    card.onState(at, () => mm.pinout(at, view.live));
+    machine.draw({
       ctx,
       cam,
-      spec: sp,
       rect: r,
-      state: st,
+      at,
       children,
       live: view.live,
       damage: view.damage,
@@ -590,19 +585,19 @@ export function createHoist(root: HTMLElement, opts: { reset: () => void }): Hoi
       mock?.stop();
       mock = null;
       m = null;
+      // Drop the machine and its animation goes with it — drum spin, dust and
+      // the landing/win clocks now live inside the machine's own closure, not
+      // here. The next message rebuilds it from `kind`, which is also how a
+      // room that swaps presentations gets a clean one.
+      machine = null;
       localRect = null;
       localHeld = false;
-      dust = [];
-      spin = 0;
-      landAge = Infinity;
-      winAge = Infinity;
       lastMsgAt = -Infinity;
       card.hide();
     },
   };
 
   // ---- dev mock (see the file header): URL flag or console call.
-  const params = new URLSearchParams(location.search);
   if (params.has('hoistmock')) mock = startMock(onMachine, params.get('hoistmock'));
   (window as unknown as { __hoistMock: (rect?: string | null) => void }).__hoistMock = (rect) => {
     mock?.stop();

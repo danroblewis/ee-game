@@ -31,59 +31,11 @@
 // assignment rather than of tuning. A second machine gets the same for free by
 // following the same rule.
 
-import type { ChipFrame, ChipSpec, PinoutRow } from '../chip';
+import type { ChipFrame, ChipMeas, ChipSpec, PinoutRow } from '../chip';
 import { atLeast } from '../chip';
+import type { MachineAnim, MachineDef, MachineFrame, MachineMsg } from './seam';
 
-/** Server -> client machine state, once per tick (protocol contract). */
-export interface MachineMsg {
-  /** Fixture id of the motor, i.e. which machine this is. */
-  id: number;
-  /** Which chip presentation to draw it with. Optional: a server from before
-   * the chip presentation existed still resolves to the hoist. */
-  kind?: string;
-  /** Footprint in GRID units: [x0, y0, x1, y1] — the machine's CELL. The
-   * package body is inset inside it and the legs point inward, so every pin
-   * is inside the box the server validated. */
-  rect: [number, number, number, number];
-  /** Shaft height, metres. */
-  h: number;
-  /** Goal band [lo, hi], metres. */
-  band: [number, number];
-  /** Crate height, metres (integral of a solver unknown). */
-  y: number;
-  /** Crate velocity, m/s. */
-  vel: number;
-  /** Motor current into pin 0, amps (a solver unknown). */
-  i: number;
-  /** Accumulated in-band time, seconds. */
-  hold: number;
-  /** Hold time the goal needs, seconds. */
-  need: number;
-  /** Landing speed, m/s — non-zero only on the tick the crate hits the floor. */
-  impact: number;
-  /** Hard landings so far. */
-  landings: number;
-  win: boolean;
-  /** Energy delivered by the player's sources, joules. */
-  joules: number;
-  /** The motor's nameplate current, amps — its safety limit, straight from
-   * the server's damage table. Optional so a server from before parts could
-   * break still renders (the faceplate then just omits the rating). */
-  imax?: number;
-  /** Position-sensor wiper, 0 at the head to 1 at the floor: EXACTLY the
-   * number written into the solver. The client must not derive it from `y`,
-   * because the two differ at the stops (the wiper clamps at 0.02/0.98) and
-   * drawing the tap from `y` would be a small lie about what the pot sees.
-   * Optional: an older server just gets the derived value. */
-  wiper?: number;
-  /** Limit-switch positions, as written into the solver. The document's copy
-   * of these is broadcast once at `hello` and never again, so a package that
-   * drew its switches from `ElementKind` would show state frozen at join. */
-  limt?: boolean;
-  limb?: boolean;
-  /** Limit trip heights [bottom, top], metres — where the blocks are bolted. */
-  lim?: [number, number];
-}
+export type { MachineMsg } from './seam';
 
 /** One landing dust particle, in shaft-normalised space (u across the shaft
  * in shaft widths, w up from the floor), so a zoom or a pan never moves it
@@ -498,25 +450,27 @@ export function ratedA(m: MachineMsg | null): string {
 export const HOIST_CHIP: ChipSpec<HoistState> = {
   kind: 'hoist',
   title: 'FREIGHT HOIST',
-  // MUST match the server's HOIST_W / HOIST_H.
-  size: [16, 15],
-  margin: { x: 1, y: 2 },
-  // Left is drive, right is information — and the right column is a vertical
-  // MAP OF THE SHAFT: top stop at the top, floor stop at the bottom, the
-  // sensor spanning between them with its wiper tap at mid-travel. The rows
-  // are not decorative: row 5 is where the interior draws the top of travel
-  // and row 11 the floor, so the sensor's two ends are literally at the two
-  // ends of the crate's travel.
+  // Declaration order only: WHERE each leg stands is read off the fixture
+  // element it names, so this table cannot disagree with the server about the
+  // footprint or the rows (chip.ts, "geometry is measured, not declared").
+  //
+  // The server lays them out left-is-drive, right-is-information, with the
+  // right column a vertical MAP OF THE SHAFT: top stop at the top, floor stop
+  // at the bottom, the sensor spanning between them with its wiper tap at
+  // mid-travel. The interior below draws the top of travel and the floor at
+  // the rows SNS A and SNS B actually land on, so the sensor's two ends are
+  // literally at the two ends of the crate's travel however the server lays
+  // the package out.
   pins: [
-    { ref: [MOTOR, 0], side: 'L', row: 3, label: 'M+' },
-    { ref: [MOTOR, 1], side: 'L', row: 5, label: 'M−' },
-    { ref: [LIM_TOP, 0], side: 'R', row: 2, label: 'TOP A' },
-    { ref: [LIM_TOP, 1], side: 'R', row: 3, label: 'TOP B' },
-    { ref: [SENSOR, 0], side: 'R', row: 5, label: 'SNS A' },
-    { ref: [SENSOR, 1], side: 'R', row: 8, label: 'SNS W' },
-    { ref: [SENSOR, 2], side: 'R', row: 11, label: 'SNS B' },
-    { ref: [LIM_BOT, 0], side: 'R', row: 12, label: 'BOT A' },
-    { ref: [LIM_BOT, 1], side: 'R', row: 13, label: 'BOT B' },
+    { ref: [MOTOR, 0], label: 'M+' },
+    { ref: [MOTOR, 1], label: 'M−' },
+    { ref: [LIM_TOP, 0], label: 'TOP A' },
+    { ref: [LIM_TOP, 1], label: 'TOP B' },
+    { ref: [SENSOR, 0], label: 'SNS A' },
+    { ref: [SENSOR, 1], label: 'SNS W' },
+    { ref: [SENSOR, 2], label: 'SNS B' },
+    { ref: [LIM_BOT, 0], label: 'BOT A' },
+    { ref: [LIM_BOT, 1], label: 'BOT B' },
   ],
 
   status(st) {
@@ -537,7 +491,14 @@ export const HOIST_CHIP: ChipSpec<HoistState> = {
   },
 
   interior(f, st) {
-    drawMechanism(f, MECH_CANON, st);
+    // The mechanism is written in MECH_CANON coordinates and painted into
+    // whatever die area the package ACTUALLY has this frame. On the shipped
+    // footprint those are the same box; if the server ever re-lays the
+    // package out, the shaft follows the walls instead of hanging off them.
+    // The bond leads go through the same map, so a lead written at the top of
+    // travel still leaves from the top of travel.
+    const fm = mapFrame(f, MECH_CANON, f.inner);
+    drawMechanism(fm, MECH_CANON, st);
     // Bond leads last, over the mechanism: they are what the player is
     // actually wiring to, so they must never be hidden by the crate.
     if (!atLeast(f.tier, 'text')) return; // 0.045 grid is sub-pixel below this
@@ -547,34 +508,34 @@ export const HOIST_CHIP: ChipSpec<HoistState> = {
     const vT = vy(lim[1]);
     const vB = vy(lim[0]);
     const vTap = TRAVEL_TOP + 6 * wiperOf(m);
-    f.lead(0, [[2.55, 3.0]]); // M+  : armature, straight out
-    f.lead(1, [
+    fm.lead(0, [[2.55, 3.0]]); // M+  : armature, straight out
+    fm.lead(1, [
       [3.4, 3.85],
       [3.4, 5.0],
     ]); // M−
-    f.lead(2, [
+    fm.lead(2, [
       [8.95, vT - 0.12],
       [9.2, vT - 0.12],
       [9.2, 2.0],
     ]); // TOP A
-    f.lead(3, [
+    fm.lead(3, [
       [8.95, vT + 0.12],
       [9.6, vT + 0.12],
       [9.6, 3.0],
     ]); // TOP B
-    f.lead(4, [[10.4, TRAVEL_TOP]]); // SNS A — the TOP of travel
-    f.lead(5, [
+    fm.lead(4, [[10.4, TRAVEL_TOP]]); // SNS A — the TOP of travel
+    fm.lead(5, [
       [11.0, vTap],
       [12.4, vTap],
       [12.4, 8.0],
     ]); // SNS W — pivots as the tap slides
-    f.lead(6, [[10.4, TRAVEL_BOT]]); // SNS B — the floor
-    f.lead(7, [
+    fm.lead(6, [[10.4, TRAVEL_BOT]]); // SNS B — the floor
+    fm.lead(7, [
       [8.95, vB - 0.12],
       [9.2, vB - 0.12],
       [9.2, 12.0],
     ]); // BOT A
-    f.lead(8, [
+    fm.lead(8, [
       [8.95, vB + 0.12],
       [9.6, vB + 0.12],
       [9.6, 13.0],
@@ -602,20 +563,109 @@ export const HOIST_CHIP: ChipSpec<HoistState> = {
     return null;
   },
 
-  pinout(st) {
+  /**
+   * THE DATASHEET, and where its numbers come from.
+   *
+   * The three sensor rows used to print `wiper × 5 V` captioned "at 5 V
+   * excitation" — a spec-sheet nominal in the column a player reads as a
+   * reading. With a 1 kΩ load on the wiper it said 2.40 V while a probe on
+   * that very node said 1.00 V, because a 10 kΩ pot loaded at 1 kΩ is not an
+   * ideal divider and the nominal cannot know that. The pot's loading IS the
+   * lesson there, and it is exactly what the solver already computes.
+   *
+   * So every row that states what a terminal is doing now states a MEASURED
+   * quantity: `meas` is this frame's solver frame for that leg. Rows that
+   * state a constant (the nameplate current, a trip height) stay constant —
+   * a datasheet may print a rating; it may not print a nominal and let it
+   * pass for an instrument.
+   */
+  pinout(st, meas) {
     const { m } = st;
-    const mv = (w: number) => `${(w * 5).toFixed(2)} V at 5 V excitation`;
+    const volts = (k: number) => {
+      const v = meas.v(k);
+      return v === null ? '—' : `${v.toFixed(2)} V`;
+    };
     const rows: PinoutRow[] = [
       ['M+', 'armature +, drives the drum', `${ratedA(m)} max · stall = V/R`],
       ['M−', 'armature −', `now ${(m.i * 1000).toFixed(0)} mA`],
       ['TOP A', 'head-stop switch', `closes at ${((m.lim?.[1] ?? m.h) * 1000).toFixed(0)} mm`],
       ['TOP B', 'head-stop switch', m.limt ? 'CLOSED' : 'open'],
-      ['SNS A', 'sensor track, TOP of travel', 'wire to the supply'],
-      ['SNS W', 'wiper — reads height', mv(1 - wiperOf(m))],
-      ['SNS B', 'sensor track, floor', 'wire to ground'],
+      ['SNS A', 'track top — wire to the supply', `now ${volts(4)}`],
+      ['SNS W', 'wiper — reads height', `now ${volts(5)} · tap ${(100 * (1 - wiperOf(m))).toFixed(0)}% up`],
+      ['SNS B', 'track floor — wire to ground', `now ${volts(6)}`],
       ['BOT A', 'floor-stop switch', `closes at ${((m.lim?.[0] ?? 0) * 1000).toFixed(0)} mm`],
       ['BOT B', 'floor-stop switch', m.limb ? 'CLOSED' : 'open'],
     ];
     return rows;
   },
+};
+
+// ------------------------------------------------------------- the machine
+
+/** The hoist's client-side animator.
+ *
+ * Everything it holds is an INTEGRAL of something the server sent: the drum
+ * angle from `vel`, the dust from `impact`, the two flash clocks from the
+ * ticks those events arrived on. It simulates nothing. */
+function createHoistAnim(): MachineAnim<HoistState> {
+  let m: MachineMsg | null = null;
+  let spin = 0;
+  let landAge = Infinity;
+  let landV = 0;
+  let winAge = Infinity;
+  let dust: Dust[] = [];
+
+  function spawnDust(impact: number) {
+    const n = Math.round(clamp(impact / LAND_FULL, 0.15, 1) * 16);
+    for (let k = 0; k < n; k++) {
+      const side = k % 2 === 0 ? -1 : 1;
+      const r = (k * 0.618) % 1; // cheap deterministic spread, no RNG needed
+      dust.push({
+        u: 0.5 + side * (0.12 + 0.3 * r),
+        w: 0.01 + 0.03 * r,
+        du: side * (0.25 + 0.55 * r) * clamp(impact / LAND_FULL, 0.3, 1.4),
+        dw: (0.35 + 0.5 * r) * clamp(impact / LAND_FULL, 0.3, 1.4),
+        age: 0,
+        life: 0.5 + 0.5 * r,
+      });
+    }
+    if (dust.length > 80) dust = dust.slice(dust.length - 80);
+  }
+
+  return {
+    onMessage(next) {
+      if (m && !m.win && next.win) winAge = 0;
+      if (!m) winAge = next.win ? 0 : Infinity;
+      if (next.impact > 0) {
+        landAge = 0;
+        landV = next.impact;
+        spawnDust(next.impact);
+      }
+      m = next;
+    },
+    advance(dtSec) {
+      if (!m) return;
+      // Drum spin: omega = vel / r. Visual only — see DRUM_R.
+      spin = (spin + (m.vel / DRUM_R) * dtSec) % (Math.PI * 2);
+      if (landAge !== Infinity) landAge += dtSec;
+      if (winAge !== Infinity) winAge += dtSec;
+      for (const d of dust) {
+        d.age += dtSec;
+        d.u += d.du * dtSec;
+        d.w += d.dw * dtSec;
+        d.dw -= 1.2 * dtSec; // settle back down
+        d.du *= 1 - Math.min(1, 2.5 * dtSec);
+      }
+      if (dust.length > 0) dust = dust.filter((d) => d.age < d.life);
+    },
+    frame(at: MachineFrame): HoistState {
+      return { m: at.m, now: at.now, spin, landAge, landV, winAge, dust, stale: at.stale };
+    },
+  };
+}
+
+/** The hoist, as the registry sees it. */
+export const HOIST: MachineDef<HoistState> = {
+  spec: HOIST_CHIP,
+  create: createHoistAnim,
 };

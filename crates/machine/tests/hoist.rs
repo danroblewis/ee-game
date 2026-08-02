@@ -76,8 +76,10 @@ fn twelve_volts_lifts_at_the_closed_form_speed() {
         h.omega
     );
 
-    // The design pillar, measured: constant voltage buys speed, not
-    // position — it flies through the band and parks out of it.
+    // Voltage buys SPEED: 12 V commands 0.80 m/s, so the crate flies through
+    // the band and parks out of it. Scoped to 12 V on purpose — the balance
+    // voltage m·g·r·R/K holds the band open loop (see HOLD_CURRENT's docs and
+    // the server's `the_balance_voltage_holds_the_band_open_loop`).
     assert!(!h.win, "constant 12 V must never satisfy the hold");
     assert_eq!(h.hold, 0.0, "hold must have drained at the head stop");
     eprintln!("12 V: ω={omega_free:.4} rad/s v={vel:.4} m/s t_top={t_top:.4} s");

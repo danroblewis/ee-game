@@ -7,12 +7,13 @@
 // internal leads that tie each moving thing to the leg the player wires to.
 //
 // The one decision everything else follows from: the server's footprint rect
-// is the machine's CELL on the grid, not its body. The pin columns sit one
-// unit inside the rect and the body is inset a leg-length further, so the
-// legs point INWARD from pin to body wall. Every pin therefore still lies
-// inside the rect the server broadcasts — which is why the server's "every
-// fixture pin is inside HOIST_RECT" invariant, the persistence, the move
-// validation and the undo machinery all survived this change untouched.
+// is the machine's CELL on the grid, not its body. The server puts the pin
+// columns inside the rect and the body is inset a leg-length further in from
+// wherever they landed, so the legs point INWARD from pin to body wall. Every
+// pin therefore still lies inside the rect the server broadcasts — which is
+// why the server's "every fixture pin is inside HOIST_RECT" invariant, the
+// persistence, the move validation and the undo machinery all survived this
+// change untouched.
 //
 //   ┌──────────────────────────────────────────┐  the footprint: the server's
 //   │  ●──┤ FREIGHT HOIST                 ⓘ ├──●  │  rect, the machine's cell
@@ -25,13 +26,25 @@
 //   └──────────────────────────────────────────┘
 //
 // SEAM. Nothing in this file knows what a hoist is. A machine supplies a
-// `ChipSpec`: a pin table (which locked element+pin each leg belongs to, its
-// side, its row and its ≤5-character name), a title/status/plate, and an
-// `interior()` that draws the mechanism into a `ChipFrame` of body-local grid
-// coordinates. `renderChip` owns everything else — geometry, legs in solver
-// colour, the body, the two bands, the ⓘ badge, pin labels, the LOD form,
-// current dots and the damage overlay. See machines/hoist.ts for the first
-// one and machines/index.ts for the registry.
+// `ChipSpec`: a pin table (which locked element+pin each leg belongs to and
+// its ≤5-character name), a title/status/plate, and an `interior()` that
+// draws the mechanism into a `ChipFrame` of body-local grid coordinates.
+// `renderChip` owns everything else — geometry, legs in solver colour, the
+// body, the two bands, the ⓘ badge, pin labels, the LOD form, current dots
+// and the damage overlay. See machines/hoist.ts for the first one and
+// machines/index.ts for the registry.
+//
+// GEOMETRY IS MEASURED, NOT DECLARED. A ChipSpec used to declare its footprint
+// `size` and the inset of its pin columns, with a comment saying they had to
+// match the server's. They did not have to: nothing checked, and a spec whose
+// size was two units out drew its right-hand legs two units off the real
+// terminals — wires and legs silently stopped meeting. So the package no
+// longer declares any of it. The footprint comes from the rect the server
+// broadcast and every leg is placed at the child element's OWN pin, read out
+// of the document and expressed in footprint-local units (`chipLegs`). Body,
+// rails, bands and label lanes are all derived from those legs. A machine
+// therefore CANNOT put a leg anywhere but on its terminal, and the second
+// machine's first bug is a bug that no longer exists.
 
 import {
   drawDots,
@@ -84,7 +97,8 @@ export const atLeast = (t: Tier, min: Tier) => RANK[t] >= RANK[min];
 // ------------------------------------------------------------------ layout
 //
 // All of these are grid units, and all of them are derived — a machine
-// declares its footprint and its pin rows, never a body box.
+// declares neither a footprint nor a body box. The only inputs are the rect
+// the server broadcast and where the child elements' pins actually are.
 
 /** Leg length: the 555's `min(0.9, w * 0.25)`, and the reason the pin handle
  * stands clear of the package instead of being a pad printed on its face. */
@@ -113,19 +127,106 @@ const BAND_LINE = '#2b2b36';
 const LOD_BODY = '#70727f';
 const BROKEN_MARK = '#ff6a3d';
 
-/** One leg of the package. */
+/** One leg of the package, as DECLARED: which terminal it is and what it is
+ * called. Deliberately no coordinates — see "geometry is measured" above. */
 export interface ChipPin {
   /** Which locked element and pin this leg actually belongs to. The leg's
-   * colour, its current dots and its damage all come from that element's own
-   * solver frame — which is why a nine-pin machine needs no change to
-   * MAX_PINS: the chip is a VIEW over four ordinary elements. */
+   * colour, its current dots, its POSITION and its damage all come from that
+   * element — which is why a nine-pin machine needs no change to MAX_PINS:
+   * the chip is a VIEW over four ordinary elements. */
   ref: [elemId: number, pin: number];
-  side: 'L' | 'R';
-  /** Row in footprint-local grid units (integer, so wires run on-grid). */
-  row: number;
   /** ≤ 5 characters: the label lane between the bond rail and the wall is
    * exactly one grid unit wide. */
   label: string;
+}
+
+/** A leg RESOLVED against the document: the declaration plus where the
+ * terminal actually is, in footprint-local grid units.
+ *
+ * This is the only place a leg's position comes from, and it comes from the
+ * element the player wires to. A machine that "moved" a pin without the
+ * server moving it would not draw a leg in the wrong place — there is no
+ * other place for it to draw one. */
+export interface ChipLeg {
+  /** Index into `spec.pins`: the machine's own stable numbering, which is what
+   * `interior()`'s `lead(k, …)` and `pinout`'s measurements are keyed by. */
+  k: number;
+  ref: [elemId: number, pin: number];
+  label: string;
+  /** Which pin column, from which half of the footprint the terminal is in. */
+  side: 'L' | 'R';
+  /** The terminal itself, footprint-local. */
+  col: number;
+  row: number;
+}
+
+/** The legs of a package standing on `rect`, in declaration order.
+ *
+ * A pin whose element (or whose pin index) is not in the document yields no
+ * leg: the package must never show a terminal that nothing is attached to,
+ * and a document that has not finished arriving is exactly that case. */
+export function chipLegs<S>(
+  spec: ChipSpec<S>,
+  rect: [number, number, number, number],
+  children: Map<number, ElementSpec>,
+): ChipLeg[] {
+  const mid = (rect[0] + rect[2]) / 2;
+  const legs: ChipLeg[] = [];
+  spec.pins.forEach((p, k) => {
+    const at = children.get(p.ref[0])?.pins[p.ref[1]];
+    if (!at) return;
+    // The server's own invariant is that every fixture pin is inside the rect
+    // it broadcast. If that is ever false the package would draw a leg outside
+    // its own cell, so say so once and loudly rather than render it quietly.
+    if (at[0] < rect[0] || at[0] > rect[2] || at[1] < rect[1] || at[1] > rect[3]) {
+      warnOnce(
+        `${spec.kind}: pin ${p.label} (element ${p.ref[0]}.${p.ref[1]}) is at ` +
+          `${at[0]},${at[1]}, outside the machine's footprint ${rect.join(',')}`,
+      );
+    }
+    legs.push({
+      k,
+      ref: p.ref,
+      label: p.label,
+      side: at[0] <= mid ? 'L' : 'R',
+      col: at[0] - rect[0],
+      row: at[1] - rect[1],
+    });
+  });
+  return legs;
+}
+
+/** A geometry complaint is a bug in the machine, not in the frame: say it once
+ * per distinct message instead of 60 times a second. */
+const WARNED = new Set<string>();
+function warnOnce(msg: string) {
+  if (WARNED.has(msg)) return;
+  WARNED.add(msg);
+  console.error(`[chip] ${msg}`);
+}
+
+/** What the solver says about a leg this frame, keyed by the machine's own
+ * pin index. `null` where there is no element or no frame yet: a machine must
+ * print "—" there rather than a zero it did not measure. */
+export interface ChipMeas {
+  v(k: number): number | null;
+  i(k: number): number | null;
+}
+
+/** Measurements for one package, from the legs and the live frame. */
+export function chipMeas(legs: ChipLeg[], live: Map<number, ElemLive>): ChipMeas {
+  const read = (k: number, f: (l: ElemLive, pin: number) => number | undefined) => {
+    const leg = legs.find((l) => l.k === k);
+    if (!leg) return null;
+    const l = live.get(leg.ref[0]);
+    if (!l) return null;
+    const v = f(l, leg.ref[1]);
+    return v === undefined || !Number.isFinite(v) ? null : v;
+  };
+  return {
+    v: (k) => read(k, (l, p) => l.v[p]),
+    i: (k) => read(k, (l, p) => l.i[p]),
+  };
 }
 
 /** A row of the ⓘ card's pinout table. */
@@ -139,10 +240,8 @@ export interface ChipSpec<S> {
   kind: string;
   /** Engraved on the title band. */
   title: string;
-  /** Footprint in grid units. MUST equal the server's own W/H. */
-  size: [w: number, h: number];
-  /** Footprint edge -> pin column (x) and -> first usable row (y). */
-  margin: { x: number; y: number };
+  /** The legs, in the order they are numbered. Nothing here says WHERE they
+   * are: `chipLegs` reads that off the document. */
   pins: ChipPin[];
   /** Title band, right-hand side: [colour, text]. */
   status(s: S): [string, string];
@@ -158,8 +257,13 @@ export interface ChipSpec<S> {
    * cooking. Without it the mark lands on that device's bond-rail lane,
    * which is still ITS lane — so a second machine may skip this entirely. */
   deviceAt?(elemId: number): [number, number] | null;
-  /** The ⓘ card's pinout table, in pin order. */
-  pinout(s: S): PinoutRow[];
+  /** The ⓘ card's pinout table, in pin order.
+   *
+   * `meas` is this frame's SOLVER reading for each leg, keyed by pin index.
+   * A datasheet may of course print nameplate constants (a resistance, a
+   * rating) — but where a row states what a terminal is doing right now, that
+   * number comes from here and not from a nominal the machine computed. */
+  pinout(s: S, meas: ChipMeas): PinoutRow[];
 }
 
 /** Body-local drawing surface handed to `interior()`.
@@ -219,10 +323,6 @@ export interface ChipFrame {
 
 /** Derived package geometry, in footprint-local grid units. */
 export interface ChipGeom {
-  w: number;
-  h: number;
-  colL: number;
-  colR: number;
   body: { u0: number; u1: number; v0: number; v1: number };
   rail: { l: number; r: number };
   inner: { u0: number; u1: number; v0: number; v1: number };
@@ -230,26 +330,40 @@ export interface ChipGeom {
   badge: [number, number];
 }
 
-/** Everything about the package's shape, from its declaration alone. */
-export function chipGeom(spec: ChipSpec<unknown>): ChipGeom {
-  const [w, h] = spec.size;
-  const colL = spec.margin.x;
-  const colR = w - spec.margin.x;
-  const u0 = colL + STUB;
-  const u1 = colR - STUB;
+/** Smallest body a package is drawn with, in grid units: two units across
+ * leaves the two bond rails distinct, and three down leaves one unit of die
+ * between the title and plate bands. Only a degenerate machine (every pin in
+ * one column, or all on one row) can reach these. */
+const MIN_BODY_W = 2;
+const MIN_BODY_H = 3;
+
+/** Everything about the package's shape, from where its terminals ACTUALLY
+ * are. Null when the document has no terminals to stand it on — a package
+ * with no legs is not a package, and drawing an empty body over the grid
+ * would be inventing a machine that is not in the document yet. */
+export function chipGeom(legs: ChipLeg[]): ChipGeom | null {
+  if (legs.length === 0) return null;
+  let colL = Infinity;
+  let colR = -Infinity;
   let lo = Infinity;
   let hi = -Infinity;
-  for (const p of spec.pins) {
-    if (p.row < lo) lo = p.row;
-    if (p.row > hi) hi = p.row;
+  for (const l of legs) {
+    if (l.col < colL) colL = l.col;
+    if (l.col > colR) colR = l.col;
+    if (l.row < lo) lo = l.row;
+    if (l.row > hi) hi = l.row;
   }
-  const v0 = lo - OVERHANG;
-  const v1 = hi + OVERHANG;
+  // The legs point INWARD from the pin columns, so the body wall is one leg
+  // length inside each column and the overhang tops and tails it.
+  const cu = (colL + colR) / 2;
+  const halfW = Math.max((colR - colL) / 2 - STUB, MIN_BODY_W / 2);
+  const cv = (lo + hi) / 2;
+  const halfH = Math.max((hi - lo) / 2 + OVERHANG, MIN_BODY_H / 2);
+  const u0 = cu - halfW;
+  const u1 = cu + halfW;
+  const v0 = cv - halfH;
+  const v1 = cv + halfH;
   return {
-    w,
-    h,
-    colL,
-    colR,
     body: { u0, u1, v0, v1 },
     rail: { l: u0 + RAIL_INSET, r: u1 - RAIL_INSET },
     // The title and plate bands are one unit each, and they are pin-free by
@@ -271,15 +385,19 @@ const BADGE_R = (scale: number) => Math.max(8, scale * 0.3);
  *            the leg corridors are not machine zones by construction, so the
  *            package can never swallow a click aimed at a terminal.
  * Callers must still hit-test pins and child elements first.
+ *
+ * Takes the same resolved legs the renderer drew with, so the box you can
+ * grab is the box you can see, by construction.
  */
 export function chipZoneAt(
   cam: Camera,
-  spec: ChipSpec<unknown>,
+  legs: ChipLeg[],
   rect: [number, number, number, number],
   x: number,
   y: number,
 ): 'body' | 'info' | null {
-  const g = chipGeom(spec);
+  const g = chipGeom(legs);
+  if (!g) return null;
   const s = cam.scale;
   const ox = cam.ox + rect[0] * s;
   const oy = cam.oy + rect[1] * s;
@@ -303,9 +421,11 @@ export interface ChipDraw<S> {
   /** The footprint in grid units: the server's, or an optimistic drag's. */
   rect: [number, number, number, number];
   state: S;
-  /** The machine's locked child elements, by id. A leg whose element is not
-   * in the document is not drawn: the package must never show a terminal
-   * that nothing is actually attached to. */
+  /** The machine's locked child elements, by id. This is where the package's
+   * whole geometry comes from (`chipLegs`), and a leg whose element is not in
+   * the document is not drawn: the package must never show a terminal that
+   * nothing is actually attached to — and with no legs at all there is no
+   * package to draw yet. */
   children: Map<number, ElementSpec>;
   live: Map<number, ElemLive>;
   damage: Map<number, DamageState>;
@@ -322,19 +442,14 @@ export interface ChipDraw<S> {
  * and the capacitor's second-lead convention is `id + 1_000_000` (>= 2e6). */
 const dotKey = (id: number, pin: number) => id * 16 + pin;
 
-/** The legs that actually have an element behind them. A machine's fixtures
- * are injected by the server and can never be removed, so this is normally
- * every pin — but a document that has not finished arriving (or a legacy
- * save) must not grow a terminal with nothing attached to it. */
-const bonded = <S,>(d: ChipDraw<S>): ChipPin[] =>
-  d.spec.pins.filter((p) => d.children.has(p.ref[0]));
-
 /** Draw a machine as a package. Returns silently if the footprint is off
  * screen or degenerate — a machine at the far zoom is still cheap. */
 export function renderChip<S>(d: ChipDraw<S>): void {
   const { ctx, cam, spec, rect, state } = d;
   const s = cam.scale;
-  const g = chipGeom(spec);
+  const legs = chipLegs(spec, rect, d.children);
+  const g = chipGeom(legs);
+  if (!g) return;
   const ox = cam.ox + rect[0] * s;
   const oy = cam.oy + rect[1] * s;
   const W = (rect[2] - rect[0]) * s;
@@ -344,34 +459,32 @@ export function renderChip<S>(d: ChipDraw<S>): void {
 
   const tier = tierFor(s);
   const at = (u: number, v: number): Px => [ox + u * s, oy + v * s];
-  const f = makeFrame(d, g, at, tier);
-  const pins = bonded(d);
+  const f = makeFrame(d, g, legs, at, tier);
 
   if (tier === 'lod') {
-    drawLod(d, g, at, f, pins);
+    drawLod(d, g, at, f, legs);
     return;
   }
 
-  const volts = (p: ChipPin) => d.live.get(p.ref[0])?.v[p.ref[1]] ?? 0;
+  const volts = (p: ChipLeg) => d.live.get(p.ref[0])?.v[p.ref[1]] ?? 0;
 
-  // ---- legs, one per pin, each in its OWN solver colour and pointing in
-  // from the pin to the body wall. A part is not at one potential, so the
+  // ---- legs, one per pin, each in its OWN solver colour and running from the
+  // terminal in to the body wall. A part is not at one potential, so the
   // colour belongs to the lead and never to the package (render.ts:1126).
   ctx.lineWidth = Math.max(2, s * 0.07);
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
-  for (const p of pins) {
+  for (const p of legs) {
     const wall = p.side === 'L' ? g.body.u0 : g.body.u1;
-    const col = p.side === 'L' ? g.colL : g.colR;
     ctx.strokeStyle = voltageColor(volts(p));
     ctx.beginPath();
-    ctx.moveTo(...at(col, p.row));
+    ctx.moveTo(...at(p.col, p.row));
     ctx.lineTo(...at(wall, p.row));
     ctx.stroke();
   }
 
   // ---- body, painted over any leg overshoot.
-  const anyBroken = pins.some((p) => d.damage.get(p.ref[0])?.broken);
+  const anyBroken = legs.some((p) => d.damage.get(p.ref[0])?.broken);
   ctx.fillStyle = BODY_FILL;
   ctx.strokeStyle = anyBroken ? BROKEN_MARK : d.hot ? BODY_LINE_HOT : BODY_LINE;
   ctx.beginPath();
@@ -399,29 +512,29 @@ export function renderChip<S>(d: ChipDraw<S>): void {
 
   if (atLeast(tier, 'text')) {
     drawBands(d, g, f, anyBroken);
-    drawLabels(d, g, at, pins);
+    drawLabels(d, g, at, legs);
   }
 
   // ---- current dots on every leg, from that leg's own element frame. Each
   // leg reads its OWN element, which is exactly why a nine-pin machine needs
   // no change to MAX_PINS.
-  for (const p of pins) {
+  for (const p of legs) {
     const i = d.live.get(p.ref[0])?.i[p.ref[1]] ?? 0;
     if (i === 0) continue;
     const wall = p.side === 'L' ? g.body.u0 : g.body.u1;
-    const col = p.side === 'L' ? g.colL : g.colR;
     const phase = d.dots.advance(dotKey(p.ref[0], p.ref[1]), i, d.dtSec);
-    drawDots(ctx, cam, at(col, p.row), at(wall, p.row), phase, i);
+    drawDots(ctx, cam, at(p.col, p.row), at(wall, p.row), phase, i);
   }
 
   // ---- damage: the package owns its children's glyphs now, so it owns
   // saying they are cooking or dead.
-  drawHeat(d, g, at, pins);
+  drawHeat(d, g, at, legs);
 }
 
 function makeFrame<S>(
   d: ChipDraw<S>,
   g: ChipGeom,
+  legs: ChipLeg[],
   at: (u: number, v: number) => Px,
   tier: Tier,
 ): ChipFrame {
@@ -506,8 +619,8 @@ function makeFrame<S>(
     lead(k, pts) {
       // Indexed into the FULL pin table, so a machine's `interior()` can
       // name its leads by declaration order and never see them renumber.
-      const p = d.spec.pins[k];
-      if (!p || pts.length < 1 || !d.children.has(p.ref[0])) return;
+      const p = legs.find((l) => l.k === k);
+      if (!p || pts.length < 1) return;
       const rail = p.side === 'L' ? g.rail.l : g.rail.r;
       const full: [number, number][] = [...pts, [rail, p.row]];
       const v = d.live.get(p.ref[0])?.v[p.ref[1]] ?? 0;
@@ -584,7 +697,7 @@ function drawLabels<S>(
   d: ChipDraw<S>,
   g: ChipGeom,
   at: (u: number, v: number) => Px,
-  pins: ChipPin[],
+  pins: ChipLeg[],
 ) {
   const { ctx, cam } = d;
   const s = cam.scale;
@@ -611,7 +724,7 @@ function drawHeat<S>(
   d: ChipDraw<S>,
   g: ChipGeom,
   at: (u: number, v: number) => Px,
-  pins: ChipPin[],
+  pins: ChipLeg[],
 ) {
   const { ctx, cam, spec } = d;
   const s = cam.scale;
@@ -667,7 +780,7 @@ function drawLod<S>(
   g: ChipGeom,
   at: (u: number, v: number) => Px,
   f: ChipFrame,
-  pins: ChipPin[],
+  pins: ChipLeg[],
 ) {
   const { ctx, cam, spec } = d;
   const s = cam.scale;
@@ -676,8 +789,7 @@ function drawLod<S>(
   ctx.lineWidth = Math.max(1, s * 0.12);
   ctx.lineCap = 'butt';
   for (const p of pins) {
-    const col = p.side === 'L' ? g.colL : g.colR;
-    const [x, y] = at(col, p.row);
+    const [x, y] = at(p.col, p.row);
     const [cx, cy] = at(cu, cv);
     ctx.strokeStyle = voltageColor(d.live.get(p.ref[0])?.v[p.ref[1]] ?? 0);
     ctx.beginPath();
