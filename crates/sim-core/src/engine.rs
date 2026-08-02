@@ -2088,6 +2088,22 @@ impl Engine {
                     //    exception needed.
                     let mut pi = [0.0f64; MAX_PINS];
                     {
+                        // REPORT THE STATE THAT WAS SOLVED, NOT THE ONE JUST
+                        // DECIDED. `vs` came out of a solve stamped with `d0`;
+                        // `logic_eval` above may already have advanced `d` for
+                        // the NEXT substep. Pairing the new conductances with
+                        // the old voltages invents current out of nothing: on a
+                        // transition substep an output reported 0.500 W where
+                        // the settled value is 0.001 W, the frame KCL error at
+                        // the driven node reached 0.1 A, and the damage model —
+                        // which judges parts from exactly these numbers —
+                        // destroyed a 3-inverter ring whose supply was
+                        // delivering 765 µW to the entire room.
+                        //
+                        // `pin_i` is reporting only and is read after the solve,
+                        // so this cannot change any answer: no golden digest
+                        // moves. The next substep stamps `d` and reports `d`.
+                        let d = d0;
                         let mut add = |a: usize, b: usize, g: f64| {
                             let i = (vs[a] - vs[b]) * g;
                             pi[a] += i;
