@@ -147,6 +147,7 @@ impl RoomHandle {
             machine: *machine,
             view: self.view.lock().unwrap().clone(),
             damage: damage.clone(),
+            ext: self.room.ext.load(Ordering::Relaxed),
         };
         let mut save = SaveFile::from_setup(&setup).with_identity("room", &meta.id, &meta.name);
         save.template = meta.template;
@@ -182,6 +183,10 @@ impl RoomHandle {
     pub fn as_template_setup(&self, view: Option<View>) -> RoomSetup {
         let machine = *self.machine.lock().unwrap();
         RoomSetup {
+            // A TEMPLATE IS A STARTING POINT, NOT A PLAYTHROUGH. Saving a room
+            // that happened to be driven from outside must not brand every
+            // room later made from it.
+            ext: false,
             elements: self.room.elements.lock().unwrap().clone(),
             probes: self
                 .room
@@ -593,6 +598,7 @@ pub fn build_handle(path: PathBuf, meta: RoomMeta, setup: RoomSetup) -> Arc<Room
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (event_tx, _) = broadcast::channel(256);
     let RoomSetup {
+        ext,
         mut elements,
         probes,
         next_pid,
@@ -625,6 +631,7 @@ pub fn build_handle(path: PathBuf, meta: RoomMeta, setup: RoomSetup) -> Arc<Room
         next_lid: AtomicU32::new(next_lid.max(1)),
         population: AtomicU32::new(0),
         dirty: AtomicBool::new(false),
+        ext: AtomicBool::new(ext),
     });
     let (life, _) = watch::channel(Life::Parked);
     Arc::new(RoomHandle {

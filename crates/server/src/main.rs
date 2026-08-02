@@ -1240,6 +1240,13 @@ struct Room {
     population: AtomicU32,
     /// Set when the document changes; the sim task checkpoints to disk.
     dirty: std::sync::atomic::AtomicBool,
+    /// Has an external input ever driven this room? Lives HERE, on the shared
+    /// `Room`, and not as a local in `sim_task`, because a local dies when the
+    /// task returns at park while `hoist.win` is checkpointed — so a room won
+    /// under a JavaScript control loop came back from a park reading
+    /// `{"win": true, "ext": false}`. The qualifier has to be at least as
+    /// durable as the claim it qualifies.
+    ext: std::sync::atomic::AtomicBool,
 }
 
 /// Room checkpoint: the document, probes and panels survive server restarts
@@ -1322,6 +1329,17 @@ struct SaveFile {
     /// written before parts could break still loads (everything healthy).
     #[serde(default)]
     damage: DamageModel,
+    /// Did an external input ever drive this room? Latches true on the first
+    /// `ParamWrite::Light` and is cleared only by a machine reset.
+    ///
+    /// THIS MUST BE AS DURABLE AS `hoist.win`, and it was not. `ext_driven`
+    /// used to be a local in `sim_task`, so it died when the task returned at
+    /// park -- while the win it qualifies is checkpointed. A room won with a
+    /// JavaScript control loop, parked for 30 s and rejoined came back reading
+    /// `{"win": true, "ext": false}` with nothing on disk recording how it had
+    /// been won. A badge that outlives its subject is worse than no badge.
+    #[serde(default)]
+    ext: bool,
 }
 
 fn default_hoist_rect() -> [i32; 4] {
@@ -1341,6 +1359,7 @@ struct SavedProbe {
 impl Default for SaveFile {
     fn default() -> Self {
         SaveFile {
+            ext: false,
             v: SAVE_VERSION,
             kind: "room".into(),
             id: String::new(),
@@ -1380,6 +1399,7 @@ impl SaveFile {
             state: self.hoist,
         });
         RoomSetup {
+            ext: self.ext,
             elements: self.elements,
             probes: self.probes,
             next_pid: self.next_pid.max(1),
@@ -1425,6 +1445,10 @@ impl SaveFile {
             hoist,
             hoist_rect,
             damage: s.damage.clone(),
+            // Explicit, NOT left to `..default()` — default is `false`, so
+            // omitting this line silently drops the badge on every write and
+            // the whole durability fix would look done and do nothing.
+            ext: s.ext,
             ..SaveFile::default()
         }
     }
@@ -1603,7 +1627,9 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
     // which is the anti-cheat badge, not a refusal.
     let mut driven: Vec<Driven> = Vec::new();
     let mut sensor_out: Vec<(u32, u16)> = Vec::new();
-    let mut ext_driven = false;
+    // Seeded from the room, not from `false`: this flag has to survive a park
+    // because the `win` it qualifies does. See `Room::ext`.
+    let mut ext_driven = room.ext.load(Ordering::Relaxed);
 
     let tick = std::time::Duration::from_secs_f64(1.0 / TICK_HZ);
     let mut interval = tokio::time::interval(tick);
@@ -1733,6 +1759,8 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
                         // "externally driven" badge: the next attempt is
                         // judged on its own.
                         ext_driven = false;
+                        room.ext.store(false, Ordering::Relaxed);
+                        room.dirty.store(true, Ordering::Relaxed);
                         hoist.reset();
                         room.dirty.store(true, Ordering::Relaxed);
                     }
@@ -2041,6 +2069,11 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
                 // the run says so on the card from the first write until the
                 // next reset. See `machine_msg`.
                 ext_driven = true;
+                if !room.ext.swap(true, Ordering::Relaxed) {
+                    // First external write since the last reset: make it
+                    // durable now rather than hoping a later edit does it.
+                    room.dirty.store(true, Ordering::Relaxed);
+                }
             }
             // Watchdog: a driver that went quiet. Not an error and not a
             // disconnect — a laptop lid, a tab switch, a dropped frame — and
@@ -3749,6 +3782,7 @@ mod tests {
             next_lid: AtomicU32::new(1),
             population: AtomicU32::new(0),
             dirty: std::sync::atomic::AtomicBool::new(false),
+            ext: std::sync::atomic::AtomicBool::new(false),
         };
 
         let (mp, _) = motor_pins();
@@ -4094,6 +4128,40 @@ mod tests {
         assert_eq!(sane_rect(save.hoist_rect), HOIST_RECT);
     }
 
+    /// A win is checkpointed, so the badge saying HOW it was won must be too.
+    ///
+    /// The regression this pins: `ext_driven` was a local in `sim_task`, which
+    /// dies when the task returns at park. A room won with a JavaScript control
+    /// loop, parked for 30 s and rejoined came back `{"win": true,
+    /// "ext": false}` — the disk file recorded the achievement and forgot the
+    /// asterisk. A badge that outlives its own subject is worse than none.
+    ///
+    /// Also pins the failure mode that nearly shipped inside the fix itself:
+    /// `SaveFile::from_setup` ends in `..SaveFile::default()`, and `default()`
+    /// is `ext: false`. Omitting one explicit line there drops the flag on
+    /// every single write while every other part of the plumbing looks right.
+    #[test]
+    fn the_externally_driven_badge_survives_a_checkpoint() {
+        let setup = RoomSetup {
+            ext: true,
+            elements: vec![spec(1, K::Wire, (0, 0), (0, 4))],
+            ..RoomSetup::default()
+        };
+        let save = SaveFile::from_setup(&setup);
+        assert!(save.ext, "from_setup dropped the badge (the ..default() trap)");
+
+        let json = serde_json::to_string(&save).unwrap();
+        assert!(json.contains("\"ext\":true"), "badge never reached the disk: {json}");
+
+        let reloaded: SaveFile = serde_json::from_str(&json).unwrap();
+        assert!(reloaded.ext, "badge did not survive the round trip");
+        assert!(reloaded.into_setup().ext, "badge was lost on the way back to a room");
+
+        // And a save written before any of this existed loads unbranded.
+        let legacy: SaveFile = serde_json::from_str(r#"{"elements":[]}"#).unwrap();
+        assert!(!legacy.ext, "an old save must not come back branded");
+    }
+
     #[test]
     fn a_saved_footprint_survives_a_restart_and_is_sanitized() {
         // Round trip: the rect a drag left behind comes back byte-identical.
@@ -4183,6 +4251,7 @@ mod tests {
             next_lid: AtomicU32::new(1),
             population: AtomicU32::new(0),
             dirty: std::sync::atomic::AtomicBool::new(false),
+            ext: std::sync::atomic::AtomicBool::new(false),
         }
     }
 

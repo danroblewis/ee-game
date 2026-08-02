@@ -125,6 +125,10 @@ impl View {
 /// per-run identity — which is why a checkpoint IS a template.
 #[derive(Clone, Debug)]
 pub struct RoomSetup {
+    /// Has this room ever been driven from outside? Travels with the setup so
+    /// `snapshot -> SaveFile` carries it; a TEMPLATE always resets it to false,
+    /// because a template is a starting point, not a playthrough.
+    pub ext: bool,
     pub elements: Vec<ElementSpec>,
     pub probes: Vec<SavedProbe>,
     pub next_pid: u32,
@@ -142,6 +146,7 @@ pub struct RoomSetup {
 impl Default for RoomSetup {
     fn default() -> Self {
         RoomSetup {
+            ext: false,
             elements: Vec::new(),
             probes: Vec::new(),
             next_pid: 1,

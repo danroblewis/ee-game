@@ -53,7 +53,11 @@ import type { Probe } from './scope';
 
 // This file runs under node (see package.json), never in the browser, and the
 // repo carries no @types/node — one honest declaration beats a dependency.
-declare function require(m: string): { readFileSync(p: string, enc: string): string };
+declare function require(m: string): {
+  readFileSync(p: string, enc: string): string;
+  readdirSync(p: string): string[];
+  statSync(p: string): { isDirectory(): boolean };
+};
 declare const process: { cwd(): string; exitCode: number };
 
 // ------------------------------------------------------------------ harness
@@ -568,12 +572,31 @@ console.log('privacy — the client has no way to transmit media, and cannot gro
     'toBlob',
     'FileReader',
   ];
-  const files = [
-    'main.ts', 'net.ts', 'sensor.ts', 'sensor-worker.ts', 'panel.ts', 'render.ts',
-    'audio.ts', 'audio-worklet.ts', 'scope.ts', 'rooms.ts', 'dock.ts', 'hoist.ts',
-    'chip.ts', 'catalog.ts', 'circuit.ts', 'history.ts', 'spatial.ts', 'sfx.ts',
-  ];
   const fs = require('fs');
+  // WALK THE DIRECTORY — never a hand-written list. This scan is the guard
+  // that camera pixels never leave the machine, and it was naming 18 files
+  // while `src/` held 25. The two it missed were `layer.ts`, the file that
+  // actually draws camera frames onto the shared canvas, and `store.ts`. A
+  // `toDataURL` added in exactly the file that has the pixels would have
+  // sailed past the check written to catch it. A guard with a manual
+  // inventory silently stops guarding the moment someone adds a file.
+  const srcDir = ['src/', 'packages/app/src/'].find((d) => {
+    try {
+      return fs.statSync(d).isDirectory();
+    } catch {
+      return false;
+    }
+  });
+  // The ONE exclusion, and it is not a shipped file: this checker is compiled
+  // by `tsc` and run under node, never bundled and never loaded by a browser,
+  // so the banned names in its own `banned` array are data, not call sites.
+  // Every file that CAN reach a browser is scanned.
+  const files: string[] = srcDir
+    ? fs
+        .readdirSync(srcDir)
+        .filter((f: string) => f.endsWith('.ts') && !f.endsWith('.d.ts') && f !== 'wirecheck.ts')
+    : [];
+  if (files.length < 20) throw new Error(`wirecheck: only found ${files.length} sources — refusing to certify a scan that may have missed files`);
   const hits: string[] = [];
   let read = 0;
   for (const f of files) {
