@@ -672,7 +672,7 @@ const net = connect({
     onReject(r) {
     // Only the sender acts on it; everyone else's document never changed.
     //
-    // This should be RARE now: `gateOrExplain` runs the identical Rust gate
+    // This should be RARE now: `refused()` runs the identical Rust gate
     // before we send, so a refusal here means either a race (someone else's
     // edit landed first) or a path the client cannot pre-check — a machine
     // move, or an op from a client that predates the pre-send gate. Say what

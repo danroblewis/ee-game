@@ -120,8 +120,19 @@ pub const MIN_OPAMP_ISC: f64 = 1e-6;
 ///
 /// The real fix is not a bigger cap, it is the two quadratics in the compile
 /// path (`Engine::compile` interns junctions with a linear scan;
-/// `set_elements` restores per-element state with another), which dominate
-/// long before the LU does. With those replaced the cap rises or disappears.
+/// `set_elements` restores per-element state with another). Measured
+/// (release, this tree), the trial is not even the expensive half:
+///
+/// ```text
+///   elements     linear      nonlinear (trial runs)
+///        53      32 us       44 us
+///       203     309 us      478 us
+///       503    2057 us     2091 us
+///      1003    9694 us     9359 us
+/// ```
+///
+/// The two columns converge because the COMPILES dominate, not the solve.
+/// Replace the quadratics and the cap rises or disappears.
 pub const TRIAL_MAX_ELEMENTS: usize = 400;
 
 /// Up to four element ids carried by a [`Reject`], so the client can flash
@@ -148,7 +159,7 @@ impl SmallIds {
         self.len == 0
     }
 
-    fn from_slice(all: &[u32]) -> Self {
+    fn of(all: &[u32]) -> Self {
         let mut s = SmallIds {
             len: all.len().min(u8::MAX as usize) as u8,
             ..Default::default()
@@ -158,10 +169,6 @@ impl SmallIds {
             s.stored += 1;
         }
         s
-    }
-
-    fn of(items: &[u32]) -> Self {
-        Self::from_slice(items)
     }
 }
 
@@ -686,7 +693,11 @@ fn blame_for_divergence(eng: &Engine, specs: &[ElementSpec]) -> Option<u32> {
         ) {
             continue;
         }
-        let (_, n) = nodes.iter().find(|(id, _)| *id == s.id)?;
+        // A malformed element is dropped by `set_elements`, so it may not be
+        // in the compiled list at all: skip it, do not abandon the search.
+        let Some((_, n)) = nodes.iter().find(|(id, _)| *id == s.id) else {
+            continue;
+        };
         let pair = if n[0] <= n[1] {
             (n[0], n[1])
         } else {
@@ -773,6 +784,10 @@ pub fn check_document(specs: &[ElementSpec], dt: f64) -> Result<(), Reject> {
         .collect();
     if any_open {
         eng.set_elements(&closed);
+        // `diagnose` first purely as a shortcut: everything it names is also
+        // singular, so it is O(E + G²) standing in front of an O(n³)
+        // factorization on the reject path. The VERDICT is the same either
+        // way, which is why both arms return the one generic code.
         if diagnose(&eng).is_err() || !eng.probe_solvable() {
             return Err(Reject::UnsolvableWhenSwitched);
         }

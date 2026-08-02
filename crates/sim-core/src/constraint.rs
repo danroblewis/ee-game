@@ -184,9 +184,22 @@ impl Constraint {
         self.a == self.b
     }
 
-    /// The DC level of the canonical constraint, for the conflict message.
+    /// The DC level this constraint puts on the net, for the conflict
+    /// message: the voltage of the HIGHER-numbered node relative to the
+    /// lower, which is `-dc` because canonicalization sorts the pair.
+    ///
+    /// The direction matters for readability, not just for sign hygiene.
+    /// Node 0 is always the lowest, so anything referenced to ground reads
+    /// as the number on the part: a 5 V battery to ground reports `5 V`, not
+    /// `-5 V`. Two constraints on one pair are still measured the SAME way,
+    /// so they stay directly comparable — an anti-parallel pair reports
+    /// `5 V` and `-5 V`, which is exactly the physical situation.
     pub fn nominal(&self) -> f64 {
-        self.dc
+        if self.dc == 0.0 {
+            0.0 // never render "-0 V"
+        } else {
+            -self.dc
+        }
     }
 }
 
