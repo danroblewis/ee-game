@@ -71,9 +71,21 @@ impl Sim {
         self.engine.time()
     }
 
+    /// Is ANY build in the document down? Quarantine is per island, so this
+    /// is a room-level "something here has stopped solving" and nothing
+    /// more — the rest of the document is still being solved every substep.
+    /// Prefer [`Sim::quarantined_islands`] for anything a player reads.
     #[wasm_bindgen(js_name = isQuarantined)]
     pub fn is_quarantined(&self) -> bool {
         self.engine.is_quarantined()
+    }
+
+    /// How many builds have stopped solving. The number a status line should
+    /// show: "1 of 12 builds has stopped" is true and actionable where "the
+    /// simulation is quarantined" is neither.
+    #[wasm_bindgen(js_name = quarantinedIslands)]
+    pub fn quarantined_islands(&self) -> usize {
+        self.engine.quarantined_islands()
     }
 
     #[wasm_bindgen(js_name = stateHash)]

@@ -1366,8 +1366,13 @@ const RT_ALPHA: f64 = 0.2;
 /// can fix that. Reported so the client can say "the circuit is too heavy"
 /// instead of "the sound is broken".
 ///
-/// A quarantined solver advances no sim time at all, so this correctly falls
-/// to 0: there is no audio being produced.
+/// This measures the CLOCK, not the solver's health. Since quarantine went
+/// per island a diverging build stops its own island and nothing else: the
+/// world clock keeps advancing at full rate, so this keeps reading 1.0x and
+/// is right to. What is down is reported separately and by count — see the
+/// `q` field of the frame message, from `Engine::quarantined_islands`. Only
+/// a room with no live islands left stalls the clock, and then this falls to
+/// 0 because there is genuinely no audio being produced.
 fn blend_realtime(prev: f64, advanced: f64, wall: f64) -> f64 {
     // A wall gap of zero (or a clock that went backwards, or a sim time that
     // did — a room reload) carries no information: keep the last estimate.
@@ -1843,6 +1848,22 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
         } else {
             Vec::new()
         };
+        // Tell the solver which elements a player is watching faster than
+        // the tick. Those islands stay on the room dt, so no scope trace and
+        // no speaker waveform is ever integrated on a coarsened grid — see
+        // `Engine::set_sampled`. Re-declared every tick because the probe
+        // set is, and because an edit rebuilds the island partition.
+        {
+            let mut watched: Vec<u32> = Vec::with_capacity(probes.len() * 2 + taps.len());
+            for p in probes.iter() {
+                watched.push(p.elem);
+                if let Some((re, _)) = p.r {
+                    watched.push(re);
+                }
+            }
+            watched.extend(taps.iter().map(|(id, _)| *id));
+            eng.set_sampled(&watched);
+        }
         let budget = steps_per_tick.min(MAX_STEPS_PER_TICK);
         // Machine + goal state the tick reports afterwards. `motor_i` is
         // seeded from the current netlist so a tick that quarantines still
@@ -1893,8 +1914,15 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
                 }
                 // A quarantined solver has no current to report, so the
                 // machine freezes with it rather than coasting on stale
-                // numbers.
-                if has_machine && (c + 1) % per_machine == 0 && !eng.is_quarantined() {
+                // numbers — but only if it is the MOTOR'S island that went
+                // down. The hoist is co-simulated against one armature
+                // branch; a diverging build on the other side of the room
+                // shares no unknown with it and has nothing to say about
+                // whether its current is real.
+                if has_machine
+                    && (c + 1) % per_machine == 0
+                    && !eng.element_quarantined(MOTOR_ID)
+                {
                     motor_i = eng.pin_current(MOTOR_ID, 0).unwrap_or(0.0);
                     writes = Some(machine_step(&mut eng, &mut hoist, &sources));
                     impact = impact.max(hoist.impact);
@@ -1922,17 +1950,35 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
             // and desyncs nothing (the client bridges small time gaps and
             // re-primes on large ones).
             //
-            // A QUARANTINED solver is a different matter: `advance` is a
-            // no-op with time frozen, so this tick's samples are the same
-            // stale value with the same t0 as last tick's, forever. Sending
-            // them made every chunk trip the client's discontinuity check
-            // and read as "audio never buffers" (permanent priming). Not
-            // sending is the honest signal — the stream STOPS, the client
-            // fades out and reports STALLED, and rt falls to 0 to say why.
-            if !taps.is_empty() && !eng.is_quarantined() {
+            // A QUARANTINED solver is a different matter: that island's
+            // `advance` is a no-op with its state frozen, so this tick's
+            // samples are the same stale value with the same t0 as last
+            // tick's, forever. Sending them made every chunk trip the
+            // client's discontinuity check and read as "audio never buffers"
+            // (permanent priming). Not sending is the honest signal — the
+            // stream STOPS, the client fades out and reports STALLED.
+            //
+            // PER TAP, because quarantine is per island. The reason above is
+            // a property of the SPEAKER's own island, not of the room: one
+            // diverging build across the map must not silence a working
+            // synth. A tap whose island is down is dropped along with its
+            // buffer, and the message goes out if anything survived.
+            let live: Vec<(u32, sim_core::ElemTap)> = taps
+                .iter()
+                .zip(abufs.iter())
+                .filter(|((id, _), _)| !eng.element_quarantined(*id))
+                .map(|(t, _)| *t)
+                .collect();
+            if !live.is_empty() {
+                let bufs: Vec<Vec<f64>> = taps
+                    .iter()
+                    .zip(abufs)
+                    .filter(|((id, _), _)| !eng.element_quarantined(*id))
+                    .map(|(_, b)| b)
+                    .collect();
                 let _ =
                     room.events
-                        .send(audio_message(t0, DT * AUDIO_EVERY as f64, rt, &taps, abufs));
+                        .send(audio_message(t0, DT * AUDIO_EVERY as f64, rt, &live, bufs));
             }
         }
 
@@ -1953,23 +1999,25 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
 
         // ---- damage: one frame per tick, shared with the broadcast below.
         //
-        // The document is swept ONCE here. A quarantined solver publishes no
-        // new numbers, so nothing accumulates stress from stale ones — a
-        // frozen circuit cannot cook a part.
+        // The document is swept ONCE here. Parts whose island is quarantined
+        // publish no new numbers and accumulate no stress — `damage.tick`
+        // skips them per part, from `ElemFrame::quarantined`. It is per part
+        // and not per room on purpose: gating the whole sweep on "is
+        // anything quarantined" would let a player make an overloaded part
+        // immortal by building something that diverges on the far side of
+        // the map.
         let fr = eng.frame();
-        if !eng.is_quarantined() {
-            for b in damage.tick(&fr, eng.time() - tick_t0) {
-                // The mechanism: sim-core now stamps this part as an open
-                // circuit. Everything else about the failure lives outside it.
-                eng.set_broken(b.id, true);
-                room.dirty.store(true, Ordering::Relaxed);
-                tracing::info!(
-                    "{} #{} released its magic smoke ({:.1}x its limit)",
-                    b.kind,
-                    b.id,
-                    b.load
-                );
-            }
+        for b in damage.tick(&fr, eng.time() - tick_t0) {
+            // The mechanism: sim-core now stamps this part as an open
+            // circuit. Everything else about the failure lives outside it.
+            eng.set_broken(b.id, true);
+            room.dirty.store(true, Ordering::Relaxed);
+            tracing::info!(
+                "{} #{} released its magic smoke ({:.1}x its limit)",
+                b.kind,
+                b.id,
+                b.load
+            );
         }
 
         if room.events.receiver_count() > 0 {
@@ -2004,8 +2052,16 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
                 // `rt` rides every frame so the client's status strip can
                 // report dilation without a speaker in the room (the
                 // audio stream carries its own copy for rate matching).
+                //
+                // `q` is how many builds have stopped solving, and it rides
+                // alongside for the same reason. It is a COUNT because
+                // quarantine is per island: "the room is quarantined" has
+                // not been a true sentence since islands landed, and a
+                // status strip that said it would be describing a room that
+                // is, for everybody else in it, working fine.
                 json!({"t": "frame", "time": eng.time(), "e": e,
-                           "rt": (rt * 1000.0).round() / 1000.0})
+                           "rt": (rt * 1000.0).round() / 1000.0,
+                           "q": eng.quarantined_islands()})
                 .to_string(),
             );
 
@@ -2631,9 +2687,9 @@ mod tests {
     /// broke as open — the same order, and the same single sweep, as the
     /// tick in `sim_task`.
     fn damage_tick(eng: &mut Engine, dmg: &mut DamageModel, t0: f64, broke: &mut Vec<(f64, u32)>) {
-        if eng.is_quarantined() {
-            return; // no new numbers: a frozen circuit cooks nothing
-        }
+        // No quarantine gate here either: `damage.tick` skips the parts
+        // whose own island stopped solving and cooks everything else, which
+        // is what the room loop does.
         let fr = eng.frame();
         for b in dmg.tick(&fr, eng.time() - t0) {
             eng.set_broken(b.id, true);
@@ -2742,6 +2798,36 @@ mod tests {
             }
         }
 
+        /// Same fixture, without the placement assertion.
+        ///
+        /// Only one test uses this, and it needs to: the point of
+        /// `a_quarantined_island_cannot_freeze_the_machine` is to put an
+        /// UNPLACEABLE build in the room and show that the hoist does not
+        /// care, and a build the gate would refuse is exactly what that
+        /// takes. (A live room reaches the same state without the gate's
+        /// help — a part breaking open, or a machine write, can leave a
+        /// previously fine island singular.)
+        fn new_ungated(player_circuit: Vec<ElementSpec>) -> Self {
+            let mut elems = hoist_fixture();
+            elems.extend(player_circuit);
+            let sources = source_ids(&elems);
+            let mut eng = Engine::new(DT);
+            eng.set_elements(&elems);
+            let mut dmg = DamageModel::new();
+            dmg.set_document(&elems);
+            HoistRun {
+                eng,
+                hoist: Hoist::default(),
+                sources,
+                elems,
+                rect: HOIST_RECT,
+                dmg,
+                owed: 0.0,
+                last_sweep: 0.0,
+                broke: Vec::new(),
+            }
+        }
+
         /// Drag the assembly, exactly the way the sim task does it: one
         /// `move_machine`, then recompile the netlist. The player's own parts
         /// are NOT part of the assembly, so the test slides them along itself
@@ -2764,9 +2850,12 @@ mod tests {
         /// Returns the armature current the machine just used (A).
         fn step(&mut self) -> f64 {
             self.eng.advance(MACHINE_SUBSTEPS);
+            // Per island, like the room loop: what has to be healthy for the
+            // machine to step is the MOTOR'S solve. A player who builds
+            // something singular in the far corner has not broken the hoist.
             assert!(
-                !self.eng.is_quarantined(),
-                "solver quarantined at t={:.4} s (y={:.4} m)",
+                !self.eng.element_quarantined(MOTOR_ID),
+                "the motor's island quarantined at t={:.4} s (y={:.4} m)",
                 self.eng.time(),
                 self.hoist.y
             );
@@ -3715,6 +3804,119 @@ mod tests {
                 pins: vec![(4, 4), (5, 4)], rot: None }
         ));
         assert!(!apply_doc_op(&room, &DocOp::Remove { id: 12_345_678 }));
+    }
+
+    /// A build that diverges takes down its own island and NOTHING else.
+    ///
+    /// sim-core got this right when islands landed; its consumers did not,
+    /// and one of them was `damage`, which was gated on
+    /// `Engine::is_quarantined()` — a flag that is true when ANY island in
+    /// the room is down. That is not a bug, it is an exploit: a player could
+    /// make an overloaded part immortal by building something singular on
+    /// the other side of the map and letting the whole room's damage model
+    /// switch off while their own circuit kept dissipating real power.
+    ///
+    /// A resistor 10x over its rating breaks at the same tick, to the
+    /// millisecond, with or without a diverging build somewhere else.
+    #[test]
+    fn a_quarantined_island_cannot_switch_damage_off_for_the_room() {
+        // 9 V across 16 ohms = 5.06 W into a half-watt part.
+        let cooking = |offset: i32| {
+            vec![
+                spec(1, dc(9.0), (offset, 0), (offset, 8)),
+                spec(2, r(16.0), (offset, 0), (offset, 8)),
+                gnd(3, (offset, 8)),
+            ]
+        };
+        // An ideal source around an ideal loop with an LED in it: the NR
+        // ladder cannot save it, and the island quarantines. Far away, on
+        // its own island, sharing nothing but ground.
+        let saboteur = vec![
+            spec(91, dc(9.0), (500, 0), (500, 8)),
+            spec(92, K::Led { color: 0 }, (500, 0), (504, 0)),
+            spec(93, K::Wire, (504, 0), (500, 8)),
+            gnd(94, (500, 8)),
+        ];
+
+        let mut alone = DamageRun::new(&cooking(0));
+        let t_alone = alone.run_until_break(2, 5.0).expect("it must cook");
+
+        let mut both_specs = cooking(0);
+        both_specs.extend(saboteur);
+        let mut both = DamageRun::new(&both_specs);
+        // Short of the break, so the state being asserted is the room the
+        // exploit needs: one island down, everything else running.
+        both.run(0.3);
+        assert_eq!(
+            both.eng.quarantined_islands(),
+            1,
+            "the saboteur must actually be down"
+        );
+        assert!(
+            !both.eng.element_quarantined(2),
+            "the resistor's own island is healthy"
+        );
+        // The part on the DOWN island is not cooked from the stale numbers
+        // its solver left behind, either.
+        assert_eq!(both.dmg.stress(92), 0.0, "a frozen circuit cooks nothing");
+        assert!(both.dmg.stress(2) > 0.0, "the live one is heating");
+
+        let t_both = both.run_until_break(2, 5.0);
+        assert_eq!(
+            t_both,
+            Some(t_alone),
+            "an unrelated quarantine changed when an overloaded part breaks"
+        );
+    }
+
+    /// The same per-island rule for the co-simulated machine. The hoist is
+    /// driven from one armature branch current; an island that shares no
+    /// unknown with it has nothing to say about whether that current is
+    /// real, and freezing the machine because of it would stop a working
+    /// crane for a mistake made somewhere else in the room.
+    #[test]
+    fn a_quarantined_island_cannot_freeze_the_machine() {
+        let (mp, mm) = motor_pins();
+        let (sp, sm) = ((mp.0 - 9, mp.1), (mm.0 - 9, mm.1));
+        let drive = |sabotage: bool| {
+            let mut c = vec![
+                spec(1, dc(12.0), sp, sm),
+                spec(2, K::Wire, sp, mp),
+                spec(3, K::Wire, sm, mm),
+                gnd(4, sm),
+            ];
+            if sabotage {
+                c.extend(vec![
+                    spec(91, dc(9.0), (900, 0), (900, 8)),
+                    spec(92, K::Led { color: 0 }, (900, 0), (904, 0)),
+                    spec(93, K::Wire, (904, 0), (900, 8)),
+                    gnd(94, (900, 8)),
+                ]);
+            }
+            c
+        };
+        let mut clean = HoistRun::new_ungated(drive(false));
+        let mut sabotaged = HoistRun::new_ungated(drive(true));
+        for _ in 0..(0.6 / MACHINE_H) as u32 {
+            clean.step();
+            sabotaged.step();
+        }
+        assert!(
+            sabotaged.eng.is_quarantined(),
+            "the saboteur must actually be down"
+        );
+        assert!(
+            sabotaged.hoist.y > 0.1,
+            "the crate must still be climbing: y={}",
+            sabotaged.hoist.y
+        );
+        // Islands share no memory, so this is not "close": it is the same
+        // arithmetic on the same operands.
+        assert_eq!(
+            sabotaged.hoist.y, clean.hoist.y,
+            "a quarantine across the room moved the machine"
+        );
+        assert_eq!(sabotaged.hoist.joules, clean.hoist.joules);
     }
 
     #[test]

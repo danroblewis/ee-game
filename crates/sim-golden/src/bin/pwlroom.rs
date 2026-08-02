@@ -76,6 +76,7 @@ fn run(label: &str, specs: Vec<ElementSpec>) {
         let t = Instant::now();
         let report = eng.advance(SUBSTEPS);
         walls.push(t.elapsed().as_secs_f64());
+        let (sum_k, live) = eng.local_dt_spread();
         let cur = (
             eng.element_count(),
             eng.unknowns(),
@@ -84,6 +85,11 @@ fn run(label: &str, specs: Vec<ElementSpec>) {
             report.rescues,
             eng.state_hash(),
             eng.is_quarantined(),
+            eng.island_count(),
+            eng.static_islands(),
+            // Mean dt dilation over the islands that are still solving,
+            // rounded to hundredths so it is comparable across runs.
+            (100.0 * sum_k as f64 / live.max(1) as f64).round() as u64,
         );
         if let Some(prev) = last {
             assert_eq!(prev, cur, "{label}: run-to-run nondeterminism");
@@ -92,10 +98,13 @@ fn run(label: &str, specs: Vec<ElementSpec>) {
     }
     walls.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let wall = walls[REPS / 2];
-    let (elems, n, facts, nr, resc, state, q) = last.unwrap();
+    let (elems, n, facts, nr, resc, state, q, isl, asleep, k100) = last.unwrap();
     let sim = SUBSTEPS as f64 * DT;
     println!(
-        "{label:<28} elems={elems:<4} n={n:<4} facts={facts:<6} nr={nr:<6} resc={resc} wall={wall:.4}s realtime={:>7.3}x state=0x{state:016x} q={q}",
+        "{label:<28} elems={elems:<4} n={n:<4} isl={isl:<3} static={asleep:<3} k={:<5.2} \
+         facts={facts:<6} nr={nr:<6} resc={resc} wall={wall:.4}s realtime={:>8.3}x \
+         state=0x{state:016x} q={q}",
+        k100 as f64 / 100.0,
         sim / wall,
     );
 }

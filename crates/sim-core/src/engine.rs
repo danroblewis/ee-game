@@ -1,11 +1,127 @@
-//! The MNA engine: compile a netlist into a solvable system, advance it in
-//! fixed timesteps, keep every displayed number honest.
+//! The MNA engine: compile a netlist into independent per-island systems,
+//! advance them in fixed timesteps, keep every displayed number honest.
 //!
-//! Unknown vector layout: `[v_node1 .. v_nodeN, i_branch1 .. i_branchM]`
-//! where branches are voltage-source-like elements (sources, closed
-//! switches, op-amp outputs). Node 0 is ground and is not an unknown.
-//! Every node gets a `GMIN` leak to ground so floating circuits stay
-//! solvable (beginner-tolerant solver).
+//! ## Islands
+//!
+//! A document is partitioned into **islands**: connected components of the
+//! element graph with the ground node cut out. Every `Ground` ties into
+//! node 0, which is eliminated from the system, so two boards that share
+//! nothing but ground share nothing at all — they were already
+//! block-diagonal blocks of one matrix, and the coupling was a fiction of
+//! the data layout, not physics.
+//!
+//! Each [`Island`] owns its own unknown vector, dense matrix, LU
+//! factorization, `linear` flag, piecewise-linear factorization reuse,
+//! Newton-Raphson loop and convergence test, post-event backward-Euler
+//! counter, rescue ladder and quarantine flag. Consequences, all of them
+//! measured in `docs/scale-baseline.md`:
+//!
+//! - a diode in district 7 no longer costs district 3 a refactorization;
+//! - NR convergence stops being all-or-nothing (2.09 -> 1.03 iterations);
+//! - fill-in stays near 1.0x because island `n` stays small;
+//! - a diverging island quarantines alone. The world keeps running.
+//!
+//! sim-core owns no threads and no clock. `Engine::advance` steps the
+//! islands in order; a caller that wants them in parallel takes
+//! [`Engine::step_plan`], steps the slice however it likes (rayon lives in
+//! `crates/server`), and commits the world clock with
+//! [`Engine::commit_advance`]. The two are arithmetically identical: island
+//! state is disjoint memory, so the operand of every flop is the same in
+//! either order.
+//!
+//! ## Piecewise-linear factorization reuse
+//!
+//! An island whose matrix is constant between discrete events keeps its LU
+//! across substeps instead of refactoring: either the island is linear, or
+//! its only nonlinearities are piecewise-linear (op-amp rail regions, 555
+//! latches) — see [`Island::reusable`] and `ElementKind::is_discrete_nonlinear`.
+//! Reuse is EXACT: on a hit the retained L/U is bit-for-bit what a refactor
+//! would have recomputed, which `crates/sim-golden/tests/pwl_reuse.rs`
+//! asserts per island, on every golden, on the state hash AND on the raw
+//! matrix bits.
+//!
+//! Partitioning makes this strictly better rather than merely compatible.
+//! The disarming condition ("some device's conductance is a smooth function
+//! of the operating point") used to be one global flag, so one diode
+//! anywhere in the room forced every 555 and every op-amp in it to refactor
+//! on every Newton pass. It is per island now: a diode district disarms only
+//! itself, and the op-amp district next door keeps its factorization.
+//!
+//! ## Quiescence and local dt — the two multipliers on islands
+//!
+//! Islands cut the work *per substep*. Two further levers cut how much of
+//! the world is visited *at all*, and they only exist because islands do
+//! (you cannot skip part of one matrix).
+//!
+//! **Quiescence.** An island that has FINISHED MOVING is asleep: it stamps
+//! nothing, factors nothing and solves nothing, and every number read out of
+//! it is the DC state its last real solve produced. Nothing is invented — a
+//! held solution of a circuit that is not moving *is* the solution of the
+//! next substep. Three conditions, all of them held continuously for
+//! [`Tuning::quiescence_hold`] seconds of sim time, and each applied to the
+//! unknowns whose dimension it is stated in (node unknowns are volts, branch
+//! unknowns are amps):
+//!
+//! 1. a per-step slew under [`Tuning::quiescence_slew`] / `_slew_i` (the
+//!    criterion measured in `docs/scale-baseline.md`);
+//! 2. a total excursion across the whole window under
+//!    [`Tuning::quiescence_drift`] / `_drift_i` — a slow ramp passes the
+//!    per-step test forever while travelling arbitrarily far, and only the
+//!    window test catches it;
+//! 3. a bound on the travel it has LEFT, [`Tuning::quiescence_decay`]: the
+//!    decay between two consecutive windows says how fast this island is
+//!    converging, so `m1²/(m0-m1)` is everything still to come, and that —
+//!    not the travel already done — must be under the drift bound. (1) and
+//!    (2) together only say the island has gone quiet *lately*. Without (3)
+//!    a τ = 10 s tail sleeps 1 mV short of its own DC point and holds that
+//!    number forever.
+//!
+//! So the residual an island can freeze with is under `quiescence_drift`
+//! (1 µV) per node and `quiescence_drift_i` (1 nA) per branch — for any time
+//! constant, not just short ones. An island that cannot demonstrate the
+//! decay keeps solving: it is still moving, and local dt is what makes that
+//! cheap. An island holding any time-varying source is structurally
+//! ineligible — its equations depend on `t`, so freezing it would be a lie
+//! the moment the clock moves. So is an island holding a `Noise` source:
+//! its stream position is discrete state that only a solve advances.
+//!
+//! **Local dt.** Each island integrates at `h = k * dt`, `k` a power of two
+//! inside a configurable band, raised only from estimates computed from the
+//! island's own state — never from CPU load or a wall clock, which would
+//! destroy determinism. Two budgets, bounding the two ways a bigger step
+//! costs accuracy:
+//!
+//! - CURVATURE, [`Tuning::local_dt_err`] / `_err_i`: the second difference
+//!   of the unknown vector, which is the leading term of the BE/TR local
+//!   truncation error. This bounds the error made *inside* the step.
+//! - MOTION, [`Tuning::local_dt_slew`] / `_slew_i`: an island's step ends on
+//!   a world substep boundary, but the caller can stop the world anywhere,
+//!   so the island can be up to `(k-1)·dt` behind the number it reports.
+//!   That lag is first order in `h`, so it dominates everything the
+//!   curvature budget bounds, and capping the travel per local step at
+//!   `local_dt_slew · dt` is what holds it under `local_dt_slew · dt` volts
+//!   — a bound that shrinks with the room dt, which is what makes accuracy
+//!   monotone in dt.
+//!
+//! `k` collapses to 1 immediately on any perturbation: an edit, an interact,
+//! a parameter write, a discrete device transition (op-amp rail region, 555
+//! latch), an NR rescue, or either budget going over. An island sampled at a
+//! rate the player can see — a scope probe, a speaker tap, a co-simulated
+//! motor, a noise source feeding an audio worklet — is pinned to `k = 1`, so
+//! dt dilation can never coarsen a waveform anyone is looking at.
+//!
+//! Both levers are deterministic functions of deterministic state, so the
+//! cross-target harness is unaffected in kind (the hashes themselves move,
+//! because the trajectory legitimately changes — this is a documented
+//! tolerance-defined semantics, exactly as `docs/scale-parallelism.md` §5.2
+//! required). [`Tuning::off`] is the yardstick: with both levers off the
+//! engine is the pre-lever engine, bit for bit, on every golden.
+//!
+//! Unknown vector layout, per island: `[v_node1 .. v_nodeN, i_branch1 ..
+//! i_branchM]` where branches are voltage-source-like elements (sources,
+//! closed switches, op-amp outputs). Node 0 is ground, is shared by all
+//! islands, and is not an unknown anywhere. Every node gets a `GMIN` leak to
+//! ground so floating circuits stay solvable (beginner-tolerant solver).
 //!
 //! Sign conventions used throughout:
 //! - `pin_i[p]` is the current flowing INTO the element at pin `p`.
@@ -89,6 +205,168 @@ const BE_STEPS_AFTER_EVENT: u32 = 2;
 
 const TWO_PI: f64 = core::f64::consts::TAU;
 
+/// Tunable thresholds for the two work-skipping levers. Every field is a
+/// property of the *state*, never of the machine: nothing here may ever be
+/// derived from a wall clock, a load average or a thread count, because the
+/// simulation has to produce identical numbers on a phone and on a server.
+///
+/// The defaults are the criteria measured in `docs/scale-baseline.md`,
+/// tightened where the measurement could not rule out a slow drift.
+///
+/// ## Volts and amps are different quantities
+///
+/// The unknown vector holds node voltages AND branch currents. Every
+/// threshold below therefore comes in a pair: the `_i` field is the same
+/// criterion for the branch (current) unknowns. A volts threshold applied
+/// to an amp is not a conservative approximation, it is a category error —
+/// 0.05 "V/s" against a current ramp is 0.05 A/s, a thousand times looser
+/// than intended, and it is what let a source branch current ramp straight
+/// through the sleep test. The `_i` defaults are the voltage figure over a
+/// 1 kΩ reference impedance, which is the scale of the shipped catalogue's
+/// circuits (a 10 V rail through a kΩ-order resistor is a mA-order
+/// current).
+#[derive(Clone, Copy, Debug)]
+pub struct Tuning {
+    /// Skip islands that have gone electrically static.
+    pub quiescence: bool,
+    /// Volts per second. An island step whose largest NODE unknown moved
+    /// faster than this is moving. 0.05 V/s = 1 µV per 20 µs substep, the
+    /// figure the baseline sweep validated (0 exceptions across four
+    /// sweeps).
+    pub quiescence_slew: f64,
+    /// Amps per second: the same test for the BRANCH unknowns.
+    pub quiescence_slew_i: f64,
+    /// Volts. Total excursion of any node unknown allowed across a whole
+    /// `quiescence_hold` window. This is the guard the per-step slew test
+    /// cannot provide: a monotone crawl of 0.9 µV per substep passes the
+    /// slew test indefinitely while travelling half a volt.
+    ///
+    /// On its own this bound is NOT enough to make sleeping safe: a
+    /// first-order tail that is inside it can still be hiding
+    /// `quiescence_drift × τ / quiescence_hold` volts of unfinished travel,
+    /// which is 10 mV for τ = 100 s. [`Tuning::quiescence_decay`] is what
+    /// closes that gap; this field then sets the scale of the residual.
+    pub quiescence_drift: f64,
+    /// Amps: the same window test for the BRANCH unknowns.
+    pub quiescence_drift_i: f64,
+    /// Seconds of sim time both conditions must hold before a window
+    /// completes. 10 ms = the 500-substep window of the baseline
+    /// measurement.
+    pub quiescence_hold: f64,
+    /// The largest per-window decay ratio the settle test will trust, and
+    /// the switch that turns the test off (`>= 1.0` disables it, which is
+    /// exactly the criterion that shipped before it existed — the
+    /// regression tests use that to reproduce the trap).
+    ///
+    /// An island may sleep only once the travel it has LEFT is under
+    /// `quiescence_drift`. Slew and drift only bound the travel it has
+    /// recently DONE, which is a different quantity and a far weaker one:
+    /// a first-order tail inside the drift bound is still hiding
+    /// `drift × τ / quiescence_hold` volts of unfinished travel, 1 mV at
+    /// τ = 10 s and 10 mV at τ = 100 s, and sleeping makes that permanent.
+    ///
+    /// The travel left is measurable. Across two consecutive hold windows a
+    /// relaxing unknown travels `m0` then `m1 = ρ·m0`, and everything after
+    /// this window sums to `m1·ρ/(1-ρ) = m1²/(m0-m1)` — no model fitted,
+    /// just the island's own decay read off its own state. Two whole
+    /// windows is what makes it resolvable: a 10 ms baseline against a 20 µs
+    /// step is five hundred times more signal, and `m0-m1` is checked
+    /// against the f64 noise floor of the differences it came from before it
+    /// is believed.
+    ///
+    /// A ramp (`ρ = 1`), and any tail whose τ dwarfs the window badly enough
+    /// that `m0-m1` drowns in rounding, can never satisfy that — so they
+    /// keep solving. They are still moving; local dt is what makes it cheap.
+    pub quiescence_decay: f64,
+    /// Let islands integrate at multiples of the room dt.
+    pub local_dt: bool,
+    /// Volts of local truncation error per island step that the dt
+    /// controller is allowed to spend. Estimated by the second difference
+    /// of the unknown vector, which is `h² y''` — exactly the leading BE
+    /// error term and an upper bound on the TR one.
+    pub local_dt_err: f64,
+    /// Amps: the same budget for the BRANCH unknowns.
+    pub local_dt_err_i: f64,
+    /// Volts per second. The staleness governor, and the reason accuracy is
+    /// monotone in the room dt.
+    ///
+    /// An island that integrates at `h = k·dt` finishes its step on a world
+    /// substep boundary, but the caller can stop the world anywhere: the
+    /// island is then up to `(k-1)·dt` of world time behind what it
+    /// reports. That lag is a FIRST-order error (`slew × lag`), so it dwarfs
+    /// the truncation error the curvature controller bounds, and — because
+    /// the curvature budget is absolute — a finer room dt used to buy a
+    /// bigger `k` and leave the lag exactly where it was. Refining dt made
+    /// the answer worse.
+    ///
+    /// So `k` may only rise while the island's motion across one local step
+    /// stays under `local_dt_slew · dt`, i.e. while `slew · k ≤
+    /// local_dt_slew`. The read-out lag is then under `local_dt_slew · dt`
+    /// volts *whatever `k` is*: it shrinks linearly with the room dt and
+    /// vanishes with it, which is what makes total error monotone in dt.
+    /// At the shipped 20 µs that ceiling is 100 µV.
+    ///
+    /// The test is on the step just taken, so an island that accelerates
+    /// can overshoot it once, by whatever the acceleration was worth —
+    /// bounded in turn by `local_dt_err`, since curvature is what
+    /// acceleration is. One step later `k` is back at 1. The honest bound
+    /// on the lag is therefore `local_dt_slew · dt + local_dt_err`.
+    pub local_dt_slew: f64,
+    /// Amps per second: the same governor for the BRANCH unknowns.
+    pub local_dt_slew_i: f64,
+    /// Consecutive island steps comfortably inside budget before `k`
+    /// doubles. Deliberately slow to rise and instant to fall.
+    pub local_dt_hold: u32,
+    /// Hard ceiling on `k`.
+    pub local_dt_max_k: u32,
+    /// Seconds. Hard ceiling on any island's `h`, whatever `k` says. Bounds
+    /// how far behind world time an island may sit in TIME, where
+    /// `local_dt_slew` bounds it in volts: at 500 µs an island is at most 3%
+    /// of a 60 Hz frame stale.
+    pub local_dt_max: f64,
+    /// Samples per cycle guaranteed for an island holding a time-varying
+    /// source. The error controller would catch aliasing anyway; this is a
+    /// structural belt to its braces.
+    pub local_dt_min_samples: f64,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Tuning {
+            quiescence: true,
+            quiescence_slew: 0.05,
+            quiescence_slew_i: 5e-5,
+            quiescence_drift: 1e-6,
+            quiescence_drift_i: 1e-9,
+            quiescence_hold: 10e-3,
+            quiescence_decay: 0.9999,
+            local_dt: true,
+            local_dt_err: 1e-4,
+            local_dt_err_i: 1e-7,
+            local_dt_slew: 5.0,
+            local_dt_slew_i: 5e-3,
+            local_dt_hold: 64,
+            local_dt_max_k: 32,
+            local_dt_max: 500e-6,
+            local_dt_min_samples: 64.0,
+        }
+    }
+}
+
+impl Tuning {
+    /// Both levers off: the engine steps every island at the room dt, every
+    /// substep. The yardstick every measurement of the levers is taken
+    /// against, and the configuration an observational experiment must use
+    /// so it measures the world instead of its own skipping.
+    pub fn off() -> Self {
+        Tuning {
+            quiescence: false,
+            local_dt: false,
+            ..Tuning::default()
+        }
+    }
+}
+
 // ---------------------------------------------------------- noise stream
 //
 // A deterministic solver has no thermal agitation of its own, so a noise
@@ -160,7 +438,8 @@ struct ElemState {
 
 struct CompiledElem {
     spec: ElementSpec,
-    /// Electrical node index per pin (0 = ground; unused pins 0).
+    /// Electrical node index per pin, LOCAL to the owning island (0 =
+    /// ground, which every island shares; unused pins 0).
     node: [usize; MAX_PINS],
     /// Index into the branch-current unknowns for branch devices. Members of
     /// a merged ideal-constraint group all point at the SAME index.
@@ -191,10 +470,35 @@ struct CompiledElem {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AdvanceReport {
+    /// Substeps of world time taken: the most any island advanced.
     pub steps: u32,
+    /// Newton-Raphson iterations summed over every island.
     pub nr_iters: u32,
     pub rescues: u32,
+    /// True when at least one island is quarantined.
     pub quarantined: bool,
+    /// Islands that actually ran the solver.
+    pub islands: u32,
+    /// Islands that were asleep for this whole call and did no work at all.
+    /// Their reported state is the DC solution they last solved for.
+    pub static_islands: u32,
+    /// Island-level integration steps executed, summed over islands. With
+    /// local dt one such step covers `k` world substeps, so this — not
+    /// `steps` — is the divisor that turns `nr_iters` into iterations per
+    /// solve.
+    pub island_steps: u32,
+}
+
+impl AdvanceReport {
+    fn merge(&mut self, other: AdvanceReport) {
+        self.steps = self.steps.max(other.steps);
+        self.nr_iters += other.nr_iters;
+        self.rescues += other.rescues;
+        self.quarantined |= other.quarantined;
+        self.islands += other.islands;
+        self.static_islands += other.static_islands;
+        self.island_steps += other.island_steps;
+    }
 }
 
 /// An O(1) handle to one compiled element, for callers that sample the same
@@ -202,6 +506,7 @@ pub struct AdvanceReport {
 /// [`Engine::tap`]; invalidated by [`Engine::set_elements`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ElemTap {
+    island: usize,
     slot: usize,
 }
 
@@ -218,12 +523,33 @@ pub struct ElemFrame {
     pub i: [f64; MAX_PINS],
     /// Dissipated power (negative = delivering power).
     pub power: f64,
+    /// The island this element sits on has been quarantined: these numbers
+    /// are the last ones its solver produced and they are not moving again
+    /// until the build changes. A consumer that INTEGRATES a frame — the
+    /// damage model integrates dissipated power over sim time — must skip
+    /// these, or it is cooking a part on stale numbers. A consumer that
+    /// merely draws them is fine: they are the truth as far as it goes.
+    ///
+    /// Per element, because quarantine is per island: one diverging build in
+    /// the corner of the room must not switch anything off for the rest of
+    /// it.
+    pub quarantined: bool,
 }
 
-pub struct Engine {
+/// One electrically independent circuit and everything needed to solve it.
+///
+/// Islands share nothing: no matrix entry, no unknown, no factorization, no
+/// convergence verdict, no quarantine. That is what makes stepping them in
+/// any order — or on any number of threads — bit-identical to stepping them
+/// in this one.
+pub struct Island {
+    /// Elements that take part in the solve occupy `0..active`; the rest
+    /// (wires, grounds, broken parts, parts with every pin on ground) are
+    /// parked behind them. Parked elements are pure no-ops in stamping, NR
+    /// and accept, so the hot loops never visit them — in a real, wire-heavy
+    /// document that is about half the document.
     elems: Vec<CompiledElem>,
-    /// Junction (geometric point) -> electrical node.
-    junctions: Vec<(Point, usize)>,
+    active: usize,
     num_nodes: usize,
     num_branches: usize,
     n: usize,
@@ -231,99 +557,278 @@ pub struct Engine {
     b: Vec<f64>,
     x: Vec<f64>,
     lu: DenseLu,
+    /// Per-substep `ElemState` snapshots for the rescue ladder, one reusable
+    /// buffer per recursion depth so a substep allocates nothing.
+    saved: Vec<Vec<ElemState>>,
     /// Linear circuits factor once per edit and reuse. The factorization
     /// is only valid for the (step size, integration mode) it was stamped
-    /// with — companion conductances depend on both.
+    /// with — companion conductances depend on both. This is a property of
+    /// THIS island: a diode next door is not this island's problem.
     linear: bool,
-    /// True if ANY live element needs Newton iteration, i.e. writes into `a`
-    /// as a smooth function of the operating point (diode, BJT, MOS, OTA).
-    /// A world free of those has a matrix that is constant between discrete
-    /// events even when it is not linear — see `reusable`.
+    /// True if ANY live element IN THIS ISLAND needs Newton iteration, i.e.
+    /// writes into `a` as a smooth function of the operating point (diode,
+    /// BJT, MOS, OTA). An island free of those has a matrix that is constant
+    /// between discrete events even when it is not linear — see `reusable`.
+    ///
+    /// Per island is what makes it useful. As one global flag, a single
+    /// diode anywhere in the room disarmed factorization reuse for every
+    /// 555 and every op-amp in it.
     smooth_nonlinear: bool,
     factor_valid: bool,
     factored_h: f64,
     factored_be: bool,
-    /// Instrumentation/test knob: when false the piecewise-linear
-    /// factorization reuse is disabled and every substep refactors, exactly
-    /// as before the event-driven path existed. Solver output is identical
-    /// either way — `crates/sim-golden/tests/pwl_reuse.rs` asserts that on
-    /// every golden, both on the state hash and on the raw matrix bits,
-    /// which is what keeps the `is_discrete_nonlinear` classification honest
-    /// as devices are added.
+    /// Copy of [`Engine`]'s instrumentation knob, so `build` can read it
+    /// without reaching back out of the island. Written by `rebuild` and by
+    /// `Engine::set_reuse_pwl`, never by the solve.
     reuse_pwl: bool,
-    dt: f64,
-    time: f64,
     be_steps: u32,
     quarantined: bool,
     /// Count of numeric factorizations since construction (instrumentation
     /// only; never read by the solver, never hashed).
     factorizations: u64,
+
+    // ------------------------------------------- quiescence and local dt
+    tuning: Tuning,
+    /// `x` at the previous / second-previous accepted island step. The
+    /// first difference is the motion test, the second difference is the
+    /// integration-error estimate.
+    x_prev: Vec<f64>,
+    x_prev2: Vec<f64>,
+    /// `x` when the current run of quiet steps began: the window-drift test
+    /// measures against this, not against the previous step.
+    x_mark: Vec<f64>,
+    /// Per-unknown travel across the PREVIOUS completed quiet window. The
+    /// ratio between this and the current window's travel is the island's
+    /// own decay rate, which is what bounds the travel it has left — see
+    /// [`Tuning::quiescence_decay`].
+    win_prev: Vec<f64>,
+    /// Is `win_prev` a real measurement? False until one full quiet window
+    /// has completed, and again after anything breaks the run of quiet.
+    have_win: bool,
+    /// Accepted steps since the last event that invalidated the history
+    /// (compile, wake, `k` change, rescue). `x_prev`/`x_prev2` only mean
+    /// what they claim at 1 and 2.
+    hist: u8,
+    /// Sim seconds for which both quiescence conditions have held.
+    quiet_t: f64,
+    asleep: bool,
+    /// No time-varying source and no noise source in this island, so its
+    /// equations do not depend on `t` and freezing it cannot lose anything.
+    sleepable: bool,
+    /// Largest source frequency in this island, 0 when it is DC-only.
+    ac_hz: f64,
+    /// Structurally sampled faster than the tick: holds a speaker (audio
+    /// rate), a co-simulated motor (machine rate) or a noise source (one
+    /// fresh sample per substep, by specification).
+    pinned: bool,
+    /// A caller has told us a player is watching this island through an
+    /// instrument. Cleared and re-set by [`Engine::set_sampled`].
+    sampled: bool,
+    /// Local dt multiple: this island integrates at `h = k * dt`.
+    k: u32,
+    /// Consecutive accepted steps whose error estimate was comfortably
+    /// inside budget, counted towards doubling `k`.
+    good: u32,
+    /// World substeps this island owes. Non-zero only between calls, and
+    /// only when `k > 1`: an island that cannot afford a whole local step
+    /// yet carries the debt rather than taking a short one.
+    pending: u32,
+    /// A discrete device transition (op-amp rail region, 555 latch) happened
+    /// in the step just solved. Not a numeric quantity — a topology change,
+    /// and the sharpest "this island is not resting" signal there is.
+    discrete_moved: bool,
+}
+
+pub struct Engine {
+    islands: Vec<Island>,
+    /// Document order -> `(element id, island, slot)`. Everything the
+    /// outside world sees — `frame()`, `state_hash()`, id lookups — walks
+    /// this, so partitioning never reorders the document.
+    order: Vec<(u32, usize, usize)>,
+    /// Junction (geometric point) -> `(island, island-local node)`. Node 0
+    /// is ground in every island, so its island index is not meaningful.
+    junctions: Vec<(Point, usize, usize)>,
+    /// Factorizations performed by islands that no longer exist, so the
+    /// instrumentation counter keeps meaning "since construction" across
+    /// edits (which rebuild the partition from scratch).
+    retired_factorizations: u64,
+    dt: f64,
+    time: f64,
+    tuning: Tuning,
+    /// Instrumentation/test knob: when false the piecewise-linear
+    /// factorization reuse is disabled and every substep refactors, exactly
+    /// as before the event-driven path existed. Solver output is identical
+    /// either way — `crates/sim-golden/tests/pwl_reuse.rs` asserts that on
+    /// every golden, per island, both on the state hash and on the raw
+    /// matrix bits, which is what keeps the `is_discrete_nonlinear`
+    /// classification honest as devices are added.
+    ///
+    /// Authority lives here and is copied into every island at `rebuild`,
+    /// exactly like `tuning`.
+    reuse_pwl: bool,
+    /// Element ids a caller has declared it samples faster than the tick.
+    /// Kept on the engine (not the islands) because the partition is rebuilt
+    /// from scratch on every edit and the declaration must survive that.
+    sampled: Vec<u32>,
 }
 
 impl Engine {
     pub fn new(dt: f64) -> Self {
         Engine {
-            elems: Vec::new(),
+            islands: Vec::new(),
+            order: Vec::new(),
             junctions: Vec::new(),
-            num_nodes: 0,
-            num_branches: 0,
-            n: 0,
-            a: Vec::new(),
-            b: Vec::new(),
-            x: Vec::new(),
-            lu: DenseLu::new(0),
-            linear: true,
-            smooth_nonlinear: false,
-            factor_valid: false,
-            factored_h: 0.0,
-            factored_be: false,
-            reuse_pwl: true,
+            retired_factorizations: 0,
             dt,
             time: 0.0,
-            be_steps: 0,
-            quarantined: false,
-            factorizations: 0,
+            tuning: Tuning::default(),
+            reuse_pwl: true,
+            sampled: Vec::new(),
         }
+    }
+
+    // -------------------------------------------------------------- tuning
+
+    pub fn tuning(&self) -> Tuning {
+        self.tuning
+    }
+
+    /// Replace the quiescence / local-dt thresholds. Wakes every island and
+    /// resets every local dt, so the new settings take effect from a clean
+    /// state rather than from decisions the old ones made.
+    pub fn set_tuning(&mut self, tuning: Tuning) {
+        self.tuning = tuning;
+        for island in self.islands.iter_mut() {
+            island.tuning = tuning;
+            island.wake();
+        }
+    }
+
+    /// Declare the elements a player-visible instrument is reading faster
+    /// than the tick — scope probes, measurement chips, audio taps. The
+    /// islands that own them are pinned to `k = 1`, so no waveform anyone is
+    /// looking at is ever integrated on a coarsened grid. Replaces the
+    /// previous declaration; survives recompilation.
+    ///
+    /// Sleeping is deliberately *not* disabled for a sampled island: a
+    /// static island reports the DC state its last real solve produced, which
+    /// is exactly what an instrument on a circuit that is not moving must
+    /// show. Skipping arithmetic is not the same as inventing a number.
+    ///
+    /// That holds only because sleeping is gated on a bound, not on a
+    /// vibe: an island may sleep only once the travel it has LEFT is under
+    /// [`Tuning::quiescence_drift`] (1 µV / 1 nA), so the worst a probe on a
+    /// sleeping island can read is 1 µV short of the answer, forever. The
+    /// criterion that shipped before bounded the travel it had recently
+    /// DONE, which for a τ = 100 s tail let a probe sit 10 mV short of the
+    /// truth permanently — a solver number, but not the solver's answer.
+    pub fn set_sampled(&mut self, ids: &[u32]) {
+        self.sampled.clear();
+        self.sampled.extend_from_slice(ids);
+        self.apply_sampled();
+    }
+
+    fn apply_sampled(&mut self) {
+        for island in self.islands.iter_mut() {
+            island.sampled = false;
+        }
+        for id in self.sampled.clone() {
+            if let Some(&(_, isl, _)) = self.order.iter().find(|(eid, _, _)| *eid == id) {
+                self.islands[isl].sampled = true;
+            }
+        }
+    }
+
+    /// Wake every island: the next substep is solved in full, at the room
+    /// dt. The escape hatch for any coupling sim-core does not model yet —
+    /// when Bergeron corridors land (plan resolution 3), a corridor whose
+    /// boundary state moved calls this on the islands it joins.
+    pub fn wake_all(&mut self) {
+        for island in self.islands.iter_mut() {
+            island.wake();
+        }
+    }
+
+    /// Wake one island by index. Out-of-range indices are ignored.
+    pub fn wake_island(&mut self, island: usize) {
+        if let Some(i) = self.islands.get_mut(island) {
+            i.wake();
+        }
+    }
+
+    /// Wake the island owning an element. The hook every perturbation that
+    /// does not go through `compile()` must use.
+    pub fn wake_element(&mut self, id: u32) -> bool {
+        let Some(&(_, isl, _)) = self.order.iter().find(|(eid, _, _)| *eid == id) else {
+            return false;
+        };
+        self.islands[isl].wake();
+        true
+    }
+
+    /// Islands currently asleep.
+    pub fn static_islands(&self) -> usize {
+        self.islands.iter().filter(|i| i.asleep).count()
+    }
+
+    /// Sum of `k` over the islands that are awake and solving, and the count
+    /// of them: `(sum_k, islands)`. A cheap way for instrumentation to state
+    /// the mean dt dilation without walking the islands itself.
+    pub fn local_dt_spread(&self) -> (u64, usize) {
+        let mut sum = 0u64;
+        let mut live = 0usize;
+        for i in self.islands.iter() {
+            if i.n > 0 && !i.asleep && !i.quarantined {
+                sum += i.k as u64;
+                live += 1;
+            }
+        }
+        (sum, live)
     }
 
     // ------------------------------------------------------ instrumentation
     // Read-only views for the scale benchmark (`sim-golden`, bin `scale`).
     // None of these participate in the solve or in `state_hash`.
 
-    /// MNA unknowns: `num_nodes + num_branches`. There is exactly ONE
-    /// matrix for the whole world — disconnected islands share it.
+    /// Total MNA unknowns across every island. Partitioning does not change
+    /// this sum — it changes how many matrices it is spread over, which is
+    /// the whole point: cost is superlinear in the size of one matrix.
     pub fn unknowns(&self) -> usize {
-        self.n
+        self.islands.iter().map(|i| i.n).sum()
+    }
+
+    /// Unknowns in the largest island: the number that actually sets the
+    /// per-substep cost.
+    pub fn max_island_unknowns(&self) -> usize {
+        self.islands.iter().map(|i| i.n).max().unwrap_or(0)
+    }
+
+    pub fn island_count(&self) -> usize {
+        self.islands.len()
+    }
+
+    /// The islands, for instrumentation and for schedulers that want to
+    /// step them themselves (see [`Engine::step_plan`]).
+    pub fn islands(&self) -> &[Island] {
+        &self.islands
     }
 
     pub fn node_count(&self) -> usize {
-        self.num_nodes
+        self.islands.iter().map(|i| i.num_nodes).sum()
     }
 
     pub fn branch_count(&self) -> usize {
-        self.num_branches
+        self.islands.iter().map(|i| i.num_branches).sum()
     }
 
     pub fn element_count(&self) -> usize {
-        self.elems.len()
+        self.order.len()
     }
 
-    /// False if ANY element is nonlinear: the flag is global, so one diode
-    /// makes the entire world refactor on every NR iteration.
+    /// False if ANY island is nonlinear. The flag that matters is
+    /// [`Island::is_linear`]: refactorization is decided island by island.
     pub fn is_linear(&self) -> bool {
-        self.linear
-    }
-
-    /// True when the stamped matrix is constant between discrete events, so
-    /// an LU factorization can outlive the substep that produced it: either
-    /// the world is linear, or its only nonlinearities are piecewise-linear
-    /// (op-amp rail regions, 555 latches). One diode anywhere disarms it.
-    ///
-    /// This does not weaken anything: on a reuse hit the solver runs against
-    /// an L/U that a refactor would have recomputed to the same bits.
-    #[inline]
-    fn reusable(&self) -> bool {
-        self.linear || (self.reuse_pwl && !self.smooth_nonlinear)
+        self.islands.iter().all(|i| i.linear)
     }
 
     /// Test/instrumentation knob: disable piecewise-linear factorization
@@ -332,33 +837,69 @@ impl Engine {
     #[doc(hidden)]
     pub fn set_reuse_pwl(&mut self, on: bool) {
         self.reuse_pwl = on;
-        self.factor_valid = false;
+        for island in self.islands.iter_mut() {
+            island.reuse_pwl = on;
+            island.factor_valid = false;
+        }
     }
 
-    /// The last stamped MNA matrix, row-major `n x n`.
-    pub fn matrix(&self) -> &[f64] {
-        &self.a
-    }
-
-    /// Structural nonzeros in the last stamped matrix.
+    /// Structural nonzeros summed over every island's last stamped matrix.
     pub fn matrix_nnz(&self) -> usize {
-        self.a.iter().filter(|v| **v != 0.0).count()
+        self.islands.iter().map(|i| i.matrix_nnz()).sum()
     }
 
-    /// The last solved unknown vector.
-    pub fn solution(&self) -> &[f64] {
-        &self.x
-    }
-
-    /// Numeric factorizations performed since construction.
+    /// Numeric factorizations performed since construction, all islands.
     pub fn factorizations(&self) -> u64 {
-        self.factorizations
+        self.retired_factorizations + self.islands.iter().map(|i| i.factorizations).sum::<u64>()
     }
 
-    /// `(element id, node index per pin)` in element order — lets a caller
-    /// map unknowns back to the part of the world that owns them.
-    pub fn element_nodes(&self) -> Vec<(u32, [usize; MAX_PINS])> {
-        self.elems.iter().map(|e| (e.spec.id, e.node)).collect()
+    /// Prefix sums of the islands' node counts: `base[i]` is the first
+    /// GLOBAL node index island `i` owns, minus one.
+    ///
+    /// Islands number their nodes from 1 independently, so node 1 exists in
+    /// every island. Anything that reasons about the document as a whole —
+    /// `crate::validate`'s union-finds, its conflict reports — needs one
+    /// namespace, and this is the map into it. It is a bijection onto
+    /// `1..=node_count()`, which is all those consumers require.
+    fn node_base(&self) -> Vec<usize> {
+        let mut base = Vec::with_capacity(self.islands.len());
+        let mut acc = 0usize;
+        for i in self.islands.iter() {
+            base.push(acc);
+            acc += i.num_nodes;
+        }
+        base
+    }
+
+    /// Island-local node -> document-global node. Ground (0) stays 0.
+    #[inline]
+    fn global_node(base: &[usize], island: usize, local: usize) -> usize {
+        if local == 0 {
+            0
+        } else {
+            base[island] + local
+        }
+    }
+
+    /// `(element id, island, GLOBAL node index per pin)` in document order —
+    /// lets a caller map unknowns back to the part of the world that owns
+    /// them.
+    ///
+    /// The node indices are globalised (see [`Engine::node_base`]) so a
+    /// caller comparing two elements' nodes gets the right answer whether or
+    /// not they landed on the same island. The island index is handed over
+    /// beside them for callers that want the partition itself.
+    pub fn element_nodes(&self) -> Vec<(u32, usize, [usize; MAX_PINS])> {
+        let base = self.node_base();
+        self.doc()
+            .map(|(isl, e)| {
+                let mut nd = [0usize; MAX_PINS];
+                for (k, v) in nd.iter_mut().enumerate() {
+                    *v = Self::global_node(&base, isl, e.node[k]);
+                }
+                (e.spec.id, isl, nd)
+            })
+            .collect()
     }
 
     /// Every ideal zero-impedance constraint the compiled document imposes,
@@ -368,11 +909,29 @@ impl Engine {
     /// ground merging — so `crate::validate` can say WHICH parts conflict and
     /// WHICH ones close a loop, instead of watching the LU return one
     /// anonymous "singular". Broken parts are skipped: they impose nothing.
+    ///
+    /// Node indices are GLOBALISED. Islands renumber from 1 each, so a 1 V
+    /// source on one board and a 5 V source on another would both report
+    /// `(1, 0)` and be reported to the player as conflicting supplies. The
+    /// constraint is still computed from the island-local nodes the solver
+    /// actually stamps — which is what keeps the grouping in `rebuild`
+    /// island-local — and only the indices handed out are lifted.
     pub fn ideal_constraints(&self) -> Vec<(u32, Constraint)> {
-        self.elems
-            .iter()
-            .filter(|e| !e.broken)
-            .filter_map(|e| constraint_of(&e.spec.kind, &e.node).map(|c| (e.spec.id, c)))
+        let base = self.node_base();
+        self.doc()
+            .filter(|(_, e)| !e.broken)
+            .filter_map(|(isl, e)| {
+                constraint_of(&e.spec.kind, &e.node).map(|c| {
+                    (
+                        e.spec.id,
+                        Constraint {
+                            a: Self::global_node(&base, isl, c.a),
+                            b: Self::global_node(&base, isl, c.b),
+                            ..c
+                        },
+                    )
+                })
+            })
             .collect()
     }
 
@@ -384,8 +943,77 @@ impl Engine {
         self.time
     }
 
+    /// True when at least one island has been quarantined. One bad build
+    /// does not stop the room: the other islands keep solving, the world
+    /// clock keeps advancing, and every number outside that island keeps
+    /// being produced by a solver that is still running.
+    ///
+    /// Which is exactly why this is almost never the question a caller
+    /// wants. "Is anything in the room broken" is a status line; "is THIS
+    /// part's circuit still being solved" is
+    /// [`Engine::element_quarantined`], and that is the one that decides
+    /// whether a consequence — damage, a machine step — may fire. Gating a
+    /// consequence on this flag makes one diverging build in the corner of
+    /// the room switch that consequence off for everybody.
     pub fn is_quarantined(&self) -> bool {
-        self.quarantined
+        self.islands.iter().any(|i| i.quarantined)
+    }
+
+    /// How many islands are down. The honest player-facing number: "3 of 51
+    /// builds have stopped solving" is actionable, "the room is quarantined"
+    /// has not been true since islands landed.
+    pub fn quarantined_islands(&self) -> usize {
+        self.islands.iter().filter(|i| i.quarantined).count()
+    }
+
+    /// Is the island this element sits on quarantined? Unknown ids read
+    /// false. The per-element form of the question every consumer of
+    /// [`Engine::frame`] is really asking; `ElemFrame::quarantined` carries
+    /// the same answer for a whole sweep without the id lookup.
+    pub fn element_quarantined(&self, id: u32) -> bool {
+        self.find(id)
+            .map(|(isl, _)| self.islands[isl].quarantined)
+            .unwrap_or(false)
+    }
+
+    // ---------------------------------------------------------- document
+
+    /// Elements in document order, with the island each belongs to.
+    fn doc(&self) -> impl Iterator<Item = (usize, &CompiledElem)> + '_ {
+        self.order
+            .iter()
+            .map(move |&(_, i, s)| (i, &self.islands[i].elems[s]))
+    }
+
+    fn find(&self, id: u32) -> Option<(usize, &CompiledElem)> {
+        let &(_, i, s) = self.order.iter().find(|(eid, _, _)| *eid == id)?;
+        Some((i, &self.islands[i].elems[s]))
+    }
+
+    fn find_mut(&mut self, id: u32) -> Option<(usize, &mut CompiledElem)> {
+        let &(_, i, s) = self.order.iter().find(|(eid, _, _)| *eid == id)?;
+        Some((i, &mut self.islands[i].elems[s]))
+    }
+
+    /// Move every element out of its island, back into document order. The
+    /// islands themselves are dropped, so their factorization counters are
+    /// retired into the engine's running total first.
+    fn take_doc(&mut self) -> Vec<CompiledElem> {
+        let mut islands = core::mem::take(&mut self.islands);
+        self.retired_factorizations += islands.iter().map(|i| i.factorizations).sum::<u64>();
+        let mut slots: Vec<Vec<Option<CompiledElem>>> = islands
+            .iter_mut()
+            .map(|i| {
+                core::mem::take(&mut i.elems)
+                    .into_iter()
+                    .map(Some)
+                    .collect()
+            })
+            .collect();
+        core::mem::take(&mut self.order)
+            .into_iter()
+            .filter_map(|(_, i, s)| slots[i][s].take())
+            .collect()
     }
 
     /// Replace the document and recompile. Continuous state (cap voltage,
@@ -396,21 +1024,21 @@ impl Engine {
         // edit and on every block the placement gate trials, and the scan this
         // replaces was O(elements²). First writer wins, which is what
         // `Vec::find` did, so a document that repeats an id carries the same
-        // state across as before. Ordered map for the same reason `compile`
+        // state across as before. Ordered map for the same reason `rebuild`
         // uses one: no hasher, no platform RNG, identical on wasm32.
-        let old_state: BTreeMap<u32, (ElemState, bool)> = self
-            .elems
+        let old = self.take_doc();
+        let old_state: BTreeMap<u32, (ElemState, bool)> = old
             .iter()
             .rev()
             .map(|e| (e.spec.id, (e.state, e.broken)))
             .collect();
-        self.elems.clear();
+        let mut doc = Vec::with_capacity(specs.len());
         for s in specs {
             if s.pins.len() != s.kind.pin_count() {
                 continue; // malformed element: drop rather than panic
             }
             let (state, broken) = old_state.get(&s.id).copied().unwrap_or_default();
-            self.elems.push(CompiledElem {
+            doc.push(CompiledElem {
                 spec: s.clone(),
                 node: [0; MAX_PINS],
                 branch: None,
@@ -421,7 +1049,7 @@ impl Engine {
                 broken,
             });
         }
-        self.compile();
+        self.rebuild(doc);
     }
 
     /// Break a part open, or repair it. Returns false when the id is unknown.
@@ -439,7 +1067,7 @@ impl Engine {
     /// released its magic smoke has no charge or flux left, and a repaired one
     /// is a new part out of the drawer.
     pub fn set_broken(&mut self, id: u32, broken: bool) -> bool {
-        let Some(e) = self.elems.iter_mut().find(|e| e.spec.id == id) else {
+        let Some((_, e)) = self.find_mut(id) else {
             return false;
         };
         if e.broken == broken {
@@ -453,11 +1081,11 @@ impl Engine {
 
     /// Has this part failed open? Unknown ids read false.
     pub fn is_broken(&self, id: u32) -> bool {
-        self.elems.iter().any(|e| e.spec.id == id && e.broken)
+        self.find(id).map(|(_, e)| e.broken).unwrap_or(false)
     }
 
     pub fn interact(&mut self, id: u32, op: InteractOp) {
-        let Some(e) = self.elems.iter_mut().find(|e| e.spec.id == id) else {
+        let Some((_, e)) = self.find_mut(id) else {
             return;
         };
         match (op, &mut e.spec.kind) {
@@ -495,48 +1123,91 @@ impl Engine {
     /// diverged circuit every 640 µs and hide the failure forever; re-arming
     /// BE would silently keep the integrator in first order.
     pub fn write_param(&mut self, id: u32, write: ParamWrite) -> bool {
-        let Some(e) = self.elems.iter_mut().find(|e| e.spec.id == id) else {
+        let Some((island, e)) = self.find_mut(id) else {
             return false;
         };
         let mut invalidate = false;
         let mut topology = false;
+        let mut changed = false;
         match (write, &mut e.spec.kind) {
             (ParamWrite::Bemf { volts }, ElementKind::Motor { bemf, .. }) => {
                 // RHS only: `build()` rewrites b[branch] every step.
-                *bemf = volts;
+                if *bemf != volts {
+                    *bemf = volts;
+                    changed = true;
+                }
             }
             (ParamWrite::Wiper { frac }, ElementKind::Potentiometer { wiper, .. }) => {
                 let new = frac.clamp(0.01, 0.99);
                 if *wiper != new {
                     *wiper = new;
                     invalidate = true;
+                    changed = true;
                 }
             }
             (ParamWrite::Switch { closed }, ElementKind::Switch { closed: c }) => {
                 if *c != closed {
                     *c = closed;
                     topology = true;
+                    changed = true;
                 }
             }
             _ => return false,
         }
+        // A machine write that moved a number is a perturbation: the island
+        // must be solving again on the very next substep, at full
+        // resolution. This is the wake path for co-simulation — `interact()`
+        // and `set_broken()` get theirs for free from `compile()`, which
+        // rebuilds the partition and so hands back islands that are awake by
+        // construction.
+        //
+        // A write that moved nothing wakes nothing, which is the same
+        // promise the rest of this method already makes: a machine mirroring
+        // an unchanged back-EMF at 1.5 kHz must cost exactly what silence
+        // costs, or a stalled motor could never let its island go still.
+        if changed {
+            self.islands[island].wake();
+        }
         if invalidate {
-            self.factor_valid = false;
+            // Only the island that owns the part loses its factorization.
+            self.islands[island].factor_valid = false;
         }
         if topology {
             // A branch appears/disappears: only the compile path can
-            // renumber the unknowns. Carry the solver's health flags across
-            // it untouched.
-            let (be_steps, quarantined) = (self.be_steps, self.quarantined);
+            // renumber the unknowns. Carry every island's solver health
+            // flags across it untouched.
+            let flags: Vec<(u32, bool)> = self
+                .islands
+                .iter()
+                .map(|i| (i.be_steps, i.quarantined))
+                .collect();
             self.compile();
-            self.be_steps = be_steps;
-            self.quarantined = quarantined;
+            // The partition itself cannot move: an element ties its own
+            // nodes into one island whatever its switch is doing, so the
+            // island order is a function of the document's geometry alone
+            // and the flags land back where they came from. If that ever
+            // stops holding, they stay at their post-compile defaults
+            // rather than being attached to the wrong island.
+            if flags.len() == self.islands.len() {
+                for (island, (be, q)) in self.islands.iter_mut().zip(flags) {
+                    island.be_steps = be;
+                    island.quarantined = q;
+                }
+            }
         }
         true
     }
 
-    /// Wire closure + node numbering + unknown layout.
+    /// Recompile the current document (an in-place edit changed a value, a
+    /// switch or a broken flag).
     fn compile(&mut self) {
+        let doc = self.take_doc();
+        self.rebuild(doc);
+    }
+
+    /// Wire closure, node numbering, island partition and per-island unknown
+    /// layout. Everything downstream of this is per island.
+    fn rebuild(&mut self, mut doc: Vec<CompiledElem>) {
         // 1. Junctions: unique endpoints, interned in first-seen order.
         //
         //    The index a point gets is exactly the one a linear scan would
@@ -546,15 +1217,15 @@ impl Engine {
         //    map: no hasher seed, no platform RNG, nothing that could differ
         //    between native and wasm32.
         //
-        //    It matters because `compile` is not a rare event. Every edit,
+        //    It matters because `rebuild` is not a rare event. Every edit,
         //    every switch flip, every knob turn, every machine move and every
         //    trial the placement gate runs recompiles the document, and the
         //    scan this replaces was O(points²): 69 us on a 400-element room,
         //    against 25 us here (measured, release, this tree).
         let mut points: Vec<Point> = Vec::new();
         let mut index_of: BTreeMap<Point, usize> = BTreeMap::new();
-        let mut ends: Vec<Vec<usize>> = Vec::with_capacity(self.elems.len());
-        for e in &self.elems {
+        let mut ends: Vec<Vec<usize>> = Vec::with_capacity(doc.len());
+        for e in &doc {
             ends.push(
                 e.spec
                     .pins
@@ -573,14 +1244,7 @@ impl Engine {
         //    virtual ground root.
         let ground_root = points.len();
         let mut parent: Vec<usize> = (0..=points.len()).collect();
-        fn find(parent: &mut [usize], mut i: usize) -> usize {
-            while parent[i] != i {
-                parent[i] = parent[parent[i]];
-                i = parent[i];
-            }
-            i
-        }
-        for (e, je) in self.elems.iter().zip(ends.iter()) {
+        for (e, je) in doc.iter().zip(ends.iter()) {
             // A broken part is an OPEN circuit — it must not merge nodes any
             // more than it stamps. `damage::rating` returns None for Wire and
             // Ground today so nothing here can break yet; the guard goes in
@@ -622,7 +1286,114 @@ impl Engine {
             })
             .collect();
 
-        // 4. Branch unknowns for voltage-source-likes.
+        // 4. Global node per pin, and the island partition: an element ties
+        //    all of ITS non-ground nodes into one component. Ground is not a
+        //    coupling — it is the reference every island shares.
+        //
+        //    A broken part still ties its nodes together even though it
+        //    stamps nothing. That is conservative (it can only make an island
+        //    larger than physics requires) and it keeps every pin of a part in
+        //    one island, which is what `pin_voltage` on a dead part needs.
+        let mut np: Vec<usize> = (0..=num_nodes).collect();
+        for (e, je) in doc.iter_mut().zip(ends.iter()) {
+            e.node = [0; MAX_PINS];
+            let mut first = 0usize;
+            for (k, j) in je.iter().enumerate() {
+                let nd = node_of_junction[*j];
+                e.node[k] = nd; // global for now; localized in step 6
+                if nd == 0 {
+                    continue;
+                }
+                if first == 0 {
+                    first = nd;
+                } else {
+                    let (ra, rb) = (find(&mut np, first), find(&mut np, nd));
+                    np[ra] = rb;
+                }
+            }
+        }
+
+        // 5. Island ids and island-local node numbers, both in ascending
+        //    global-node order — so island membership and the layout inside
+        //    an island are a deterministic function of the document alone.
+        //
+        //    A one-island document therefore gets exactly the numbering the
+        //    unpartitioned engine gave it: `local_of_node[nd] == nd`. That is
+        //    what makes partitioning bit-exact on every golden circuit.
+        let mut island_of_root: Vec<usize> = vec![usize::MAX; num_nodes + 1];
+        let mut island_of_node: Vec<usize> = vec![usize::MAX; num_nodes + 1];
+        let mut local_of_node: Vec<usize> = vec![0; num_nodes + 1];
+        let mut island_nodes: Vec<usize> = Vec::new();
+        for nd in 1..=num_nodes {
+            let r = find(&mut np, nd);
+            if island_of_root[r] == usize::MAX {
+                island_of_root[r] = island_nodes.len();
+                island_nodes.push(0);
+            }
+            let isl = island_of_root[r];
+            island_of_node[nd] = isl;
+            island_nodes[isl] += 1;
+            local_of_node[nd] = island_nodes[isl];
+        }
+
+        // 6. Assign every element to an island, localize its nodes, and split
+        //    the document into the parts that solve and the parts that do not.
+        //    Wires and grounds stamp nothing, accept nothing and converge
+        //    nothing; a broken part is an open circuit; a part with every pin
+        //    on ground has no unknown to influence. All three are parked.
+        let mut ground_island = usize::MAX;
+        let mut island_count = island_nodes.len();
+        let mut owner: Vec<usize> = Vec::with_capacity(doc.len());
+        let mut solves: Vec<bool> = Vec::with_capacity(doc.len());
+        for e in doc.iter_mut() {
+            let mut isl = usize::MAX;
+            for k in 0..e.spec.pins.len() {
+                let nd = e.node[k];
+                if nd != 0 && isl == usize::MAX {
+                    isl = island_of_node[nd];
+                }
+                e.node[k] = if nd == 0 { 0 } else { local_of_node[nd] };
+            }
+            let wiring = matches!(e.spec.kind, ElementKind::Wire | ElementKind::Ground);
+            let active = !e.broken && !wiring && isl != usize::MAX;
+            if isl == usize::MAX {
+                // Nothing but ground: park it in the (zero-unknown) island
+                // that collects the document's pure wiring.
+                if ground_island == usize::MAX {
+                    ground_island = island_count;
+                    island_count += 1;
+                }
+                isl = ground_island;
+            }
+            if !active {
+                // No solve will ever write to it, so it must not keep
+                // reporting what the last one did.
+                e.state.v_prev = 0.0;
+                e.state.i_prev = 0.0;
+                e.state.pin_i = [0.0; MAX_PINS];
+            }
+            owner.push(isl);
+            solves.push(active);
+        }
+
+        // 7. Bucket the document per island, solving elements first (so the
+        //    hot loops are a prefix), each group in document order.
+        let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); island_count];
+        for (di, isl) in owner.iter().enumerate() {
+            if solves[di] {
+                buckets[*isl].push(di);
+            }
+        }
+        let actives: Vec<usize> = buckets.iter().map(|b| b.len()).collect();
+        for (di, isl) in owner.iter().enumerate() {
+            if !solves[di] {
+                buckets[*isl].push(di);
+            }
+        }
+
+        // 8. Branch unknowns, numbered PER ISLAND in document order — and
+        //    ideal-constraint merging, grouped per island for the same
+        //    reason.
         //
         //    Ideal, zero-impedance constraints (sources, rails, closed
         //    switches — see `crate::constraint`) that reduce to the SAME
@@ -632,6 +1403,16 @@ impl Engine {
         //    parallel. Without this they are a singular matrix and the whole
         //    document is unplaceable — which is why two-way lighting used to
         //    be refused.
+        //
+        //    The grouping runs INSIDE the per-island loop, and that is not a
+        //    tidiness choice. A constraint's key is built from node indices,
+        //    and islands renumber from 1 each: two unrelated 5 V supplies on
+        //    two unrelated boards would produce the same key and get merged
+        //    onto one branch row spanning two matrices. That is a corrupt
+        //    system, not a slow one, and grouping per island makes it
+        //    structurally impossible rather than defended against. With one
+        //    island this is bit-identical to the unpartitioned engine,
+        //    because the bucket IS the document.
         //
         //    Grouping is by exact equality of an integer key, found with a
         //    linear scan in DOCUMENT ORDER. No hashing and no float
@@ -644,98 +1425,192 @@ impl Engine {
         //    constraints), so this cannot merge anything that was well-posed
         //    before: every document it changes is one the placement gate
         //    rejected as `Unsolvable`.
-        let mut num_branches = 0usize;
-        // (canonical key, branch index, leader's drawn orientation)
-        let mut groups: Vec<(ConstraintKey, usize, bool)> = Vec::new();
-        // Per element: which group slot it joined, if any.
-        let mut group_of: Vec<Option<usize>> = Vec::with_capacity(self.elems.len());
-        for (e, je) in self.elems.iter_mut().zip(ends.iter()) {
-            e.node = [0; MAX_PINS];
-            for (i, j) in je.iter().enumerate() {
-                e.node[i] = node_of_junction[*j];
-            }
-            e.share_n = 1;
-            e.share_sign = 1.0;
-            e.stamps = true;
-            // A broken part owns no unknown: it is an open circuit that
-            // happens to still be drawn on the schematic.
-            if e.broken || !e.spec.kind.is_branch() {
-                e.branch = None;
-                group_of.push(None);
-                continue;
-            }
-            let Some(c) = constraint_of(&e.spec.kind, &e.node) else {
-                // A branch device that is not an ideal constraint (motor,
-                // op-amp, 555): always its own unknown.
-                e.branch = Some(num_branches);
-                num_branches += 1;
-                group_of.push(None);
-                continue;
-            };
-            let key = c.key();
-            match groups.iter().position(|(k, _, _)| *k == key) {
-                Some(g) => {
-                    // Same net as an earlier element: alias onto its row and
-                    // stay silent. Reading the shared current needs the sign
-                    // of this member's drawn orientation relative to the
-                    // leader's, because the leader's row defines which way
-                    // the branch current is positive.
-                    let (_, bi, leader_flipped) = groups[g];
-                    e.branch = Some(bi);
-                    e.stamps = false;
-                    e.share_sign = if c.flipped == leader_flipped { 1.0 } else { -1.0 };
-                    group_of.push(Some(g));
+        let mut branches = vec![0usize; island_count];
+        let mut branch_of: Vec<Option<usize>> = vec![None; doc.len()];
+        let mut share_n: Vec<u32> = vec![1; doc.len()];
+        let mut share_sign: Vec<f64> = vec![1.0; doc.len()];
+        let mut stamps: Vec<bool> = vec![true; doc.len()];
+        for (isl, bucket) in buckets.iter().enumerate() {
+            // (canonical key, branch index, leader's drawn orientation)
+            let mut groups: Vec<(ConstraintKey, usize, bool)> = Vec::new();
+            // (document index, group slot) for every member that joined one.
+            let mut group_of: Vec<(usize, usize)> = Vec::new();
+            for &di in bucket[..actives[isl]].iter() {
+                if !doc[di].spec.kind.is_branch() {
+                    continue;
                 }
-                None => {
-                    e.branch = Some(num_branches);
-                    groups.push((key, num_branches, c.flipped));
-                    group_of.push(Some(groups.len() - 1));
-                    num_branches += 1;
+                let Some(c) = constraint_of(&doc[di].spec.kind, &doc[di].node) else {
+                    // A branch device that is not an ideal constraint (motor,
+                    // op-amp, 555): always its own unknown.
+                    branch_of[di] = Some(branches[isl]);
+                    branches[isl] += 1;
+                    continue;
+                };
+                let key = c.key();
+                match groups.iter().position(|(k, _, _)| *k == key) {
+                    Some(g) => {
+                        // Same net as an earlier element: alias onto its row
+                        // and stay silent. Reading the shared current needs
+                        // the sign of this member's drawn orientation
+                        // relative to the leader's, because the leader's row
+                        // defines which way the branch current is positive.
+                        let (_, bi, leader_flipped) = groups[g];
+                        branch_of[di] = Some(bi);
+                        stamps[di] = false;
+                        share_sign[di] = if c.flipped == leader_flipped { 1.0 } else { -1.0 };
+                        group_of.push((di, g));
+                    }
+                    None => {
+                        branch_of[di] = Some(branches[isl]);
+                        groups.push((key, branches[isl], c.flipped));
+                        group_of.push((di, groups.len() - 1));
+                        branches[isl] += 1;
+                    }
+                }
+            }
+            // How many members each group ended up with, for the current split.
+            if !groups.is_empty() {
+                let mut counts = vec![0u32; groups.len()];
+                for (_, g) in group_of.iter() {
+                    counts[*g] += 1;
+                }
+                for (di, g) in group_of.iter() {
+                    share_n[*di] = counts[*g];
                 }
             }
         }
-        // How many members each group ended up with, for the current split.
-        if !groups.is_empty() {
-            let mut counts = vec![0u32; groups.len()];
-            for g in group_of.iter().flatten() {
-                counts[*g] += 1;
+
+        // 9. Move the elements into their islands and record document order.
+        let mut cells: Vec<Option<CompiledElem>> = doc.into_iter().map(Some).collect();
+        let mut order = vec![(0u32, 0usize, 0usize); cells.len()];
+        let mut islands: Vec<Island> = Vec::with_capacity(island_count);
+        for (isl, bucket) in buckets.into_iter().enumerate() {
+            let mut elems: Vec<CompiledElem> = Vec::with_capacity(bucket.len());
+            for (slot, di) in bucket.into_iter().enumerate() {
+                let mut e = cells[di].take().expect("each element lands in one island");
+                e.branch = branch_of[di];
+                e.share_n = share_n[di];
+                e.share_sign = share_sign[di];
+                e.stamps = stamps[di];
+                order[di] = (e.spec.id, isl, slot);
+                elems.push(e);
             }
-            for (e, g) in self.elems.iter_mut().zip(group_of.iter()) {
-                if let Some(g) = g {
-                    e.share_n = counts[*g];
+            let active = actives[isl];
+            let num_nodes = if isl < island_nodes.len() {
+                island_nodes[isl]
+            } else {
+                0
+            };
+            let num_branches = branches[isl];
+            let n = num_nodes + num_branches;
+            // A broken nonlinear device stamps nothing, so it cannot make the
+            // system nonlinear: the last dead LED in a room hands the solver
+            // its single-pass linear path back. (Broken parts are parked
+            // outside the active prefix, so they are already excluded.)
+            let linear = !elems[..active].iter().any(|e| e.spec.kind.is_nonlinear());
+            // ...and the last dead diode also hands back cross-substep
+            // factorization reuse to an island that still has op-amps and
+            // 555s in it, whose matrix only moves when a region or a latch
+            // flips. Per island, so a diode next door never disarms it.
+            let smooth_nonlinear = elems[..active].iter().any(|e| e.spec.kind.needs_newton());
+            // The two structural properties the levers key off. Both are
+            // functions of the netlist alone, so they cost one pass per
+            // edit and nothing per substep.
+            //
+            // `ac_hz`: a source whose value depends on `t`. `hz == 0` is a
+            // constant `dc + amp·sin(phase)`, which is DC.
+            // `pinned`: a device somebody samples faster than the tick — a
+            // speaker feeds an audio worklet, a motor is co-simulated by the
+            // machine model at its own fixed rate, a noise source is
+            // specified as one fresh sample per substep. None may be handed
+            // a coarsened integration grid.
+            let mut ac_hz = 0.0f64;
+            let mut pinned = false;
+            let mut has_noise = false;
+            for e in elems[..active].iter() {
+                match e.spec.kind {
+                    ElementKind::VoltageSource { amp, hz, .. }
+                    | ElementKind::Rail { amp, hz, .. } => {
+                        if amp != 0.0 && hz != 0.0 {
+                            ac_hz = ac_hz.max(hz.abs());
+                        }
+                    }
+                    ElementKind::Speaker { .. } | ElementKind::Motor { .. } => pinned = true,
+                    // A noise source carries DISCRETE state — its position in
+                    // its own PRNG stream — that only a solve advances, and
+                    // `state_hash` watches it. Sleeping would stop the hiss
+                    // and freeze a counter two engines could then disagree
+                    // about; `k > 1` would decimate a stream specified as one
+                    // sample per substep (at k = 8 a 25 kHz generator becomes
+                    // a 3 kHz zero-order hold, which is a player-audible
+                    // number no longer coming from the model it was written
+                    // as). So: pinned, and never sleepable.
+                    ElementKind::Noise { .. } => {
+                        pinned = true;
+                        has_noise = true;
+                    }
+                    _ => {}
                 }
             }
+            let tuning = self.tuning;
+            let reuse_pwl = self.reuse_pwl;
+            islands.push(Island {
+                elems,
+                active,
+                num_nodes,
+                num_branches,
+                n,
+                a: vec![0.0; n * n],
+                b: vec![0.0; n],
+                x: vec![0.0; n],
+                lu: DenseLu::new(n),
+                saved: vec![Vec::new(); RESCUE_DEPTH as usize + 1],
+                linear,
+                smooth_nonlinear,
+                factor_valid: false,
+                factored_h: 0.0,
+                factored_be: false,
+                reuse_pwl,
+                be_steps: BE_STEPS_AFTER_EVENT,
+                quarantined: false,
+                factorizations: 0,
+                tuning,
+                x_prev: vec![0.0; n],
+                x_prev2: vec![0.0; n],
+                x_mark: vec![0.0; n],
+                win_prev: vec![0.0; n],
+                have_win: false,
+                hist: 0,
+                quiet_t: 0.0,
+                asleep: false,
+                sleepable: ac_hz == 0.0 && !has_noise,
+                ac_hz,
+                pinned,
+                sampled: false,
+                k: 1,
+                good: 0,
+                pending: 0,
+                discrete_moved: false,
+            });
         }
 
         self.junctions = points
             .iter()
             .zip(node_of_junction.iter())
-            .map(|(p, n)| (*p, *n))
+            .map(|(p, nd)| {
+                if *nd == 0 {
+                    (*p, 0, 0)
+                } else {
+                    (*p, island_of_node[*nd], local_of_node[*nd])
+                }
+            })
             .collect();
-        self.num_nodes = num_nodes;
-        self.num_branches = num_branches;
-        self.n = num_nodes + num_branches;
-        self.a.resize(self.n * self.n, 0.0);
-        self.b.resize(self.n, 0.0);
-        self.x.resize(self.n, 0.0);
-        self.lu.resize(self.n);
-        // A broken nonlinear device stamps nothing, so it cannot make the
-        // system nonlinear: the last dead LED in a room hands the solver its
-        // single-pass linear path back.
-        self.linear = !self
-            .elems
-            .iter()
-            .any(|e| !e.broken && e.spec.kind.is_nonlinear());
-        // ...and the last dead diode also hands back cross-substep
-        // factorization reuse to a room that still has op-amps and 555s in
-        // it, whose matrix only moves when a region or a latch flips.
-        self.smooth_nonlinear = self
-            .elems
-            .iter()
-            .any(|e| !e.broken && e.spec.kind.needs_newton());
-        self.factor_valid = false;
-        self.quarantined = false;
-        self.be_steps = BE_STEPS_AFTER_EVENT;
+        self.order = order;
+        self.islands = islands;
+        // The partition just changed, so which island owns a sampled element
+        // may have too. Every island is born awake at k = 1, which is also
+        // the correct answer to "the document was edited".
+        self.apply_sampled();
     }
 
     /// Stamp and LU-factor the system for the current document WITHOUT
@@ -750,35 +1625,464 @@ impl Engine {
     /// the solution vector are untouched; the trial factorization is
     /// discarded so a subsequent step re-stamps from scratch.
     pub fn probe_solvable(&mut self) -> bool {
-        if self.n == 0 {
-            return true; // an empty world is trivially solvable
+        let (t, dt) = (self.time, self.dt);
+        let mut ok = true;
+        for island in self.islands.iter_mut() {
+            if island.n == 0 {
+                continue; // an empty island is trivially solvable
+            }
+            // Clear BEFORE as well as after. `build()` skips stamping AND
+            // factoring when a retained factorization is still valid, so
+            // probing with one armed would answer `true` without testing
+            // anything — the probe must always do the work it claims to cost.
+            island.factor_valid = false;
+            ok &= island.build(t + dt, dt, true).is_ok();
+            island.factor_valid = false;
         }
-        // Clear BEFORE as well as after. `build()` skips stamping AND
-        // factoring when a retained factorization is still valid, so probing
-        // with one armed would answer `true` without testing anything — the
-        // probe must always do the work it claims to cost.
-        self.factor_valid = false;
-        let ok = self.build(self.time + self.dt, self.dt, true).is_ok();
-        self.factor_valid = false;
         ok
     }
 
     /// Advance up to `max_steps` fixed-dt substeps. The caller owns the
     /// wall-clock budget (Falstad's rule: heavy circuits slow sim time,
     /// never the UI).
+    ///
+    /// Islands are stepped one after another here. They are independent, so
+    /// this is exactly the serial spelling of [`Engine::step_plan`] — see
+    /// that method for the parallel one.
     pub fn advance(&mut self, max_steps: u32) -> AdvanceReport {
+        let (t0, dt) = (self.time, self.dt);
+        let mut report = AdvanceReport::default();
+        for island in self.islands.iter_mut() {
+            report.merge(island.advance(t0, dt, max_steps));
+        }
+        self.commit_advance(report.steps);
+        report
+    }
+
+    /// The islands and the clock to step them against: `(world time, dt,
+    /// islands)`. sim-core spawns no threads and reads no clock, so a caller
+    /// that wants per-island parallelism (rayon lives in `crates/server`)
+    /// takes this, calls [`Island::advance`] on each element of the slice in
+    /// any order or on any thread, and then calls [`Engine::commit_advance`]
+    /// with the largest `steps` any island reported.
+    ///
+    /// Bit-identical to `advance()`: island state is disjoint memory, so
+    /// every flop has the same operands in the same order either way.
+    pub fn step_plan(&mut self) -> (f64, f64, &mut [Island]) {
+        (self.time, self.dt, &mut self.islands)
+    }
+
+    /// Move the world clock on by `steps` substeps, after stepping the
+    /// islands externally. `advance()` does this for you.
+    pub fn commit_advance(&mut self, steps: u32) {
+        for _ in 0..steps {
+            self.time += self.dt;
+        }
+    }
+}
+
+impl Island {
+    // ------------------------------------------------------ instrumentation
+
+    /// MNA unknowns in this island: `nodes + branches`.
+    pub fn unknowns(&self) -> usize {
+        self.n
+    }
+
+    pub fn node_count(&self) -> usize {
+        self.num_nodes
+    }
+
+    pub fn branch_count(&self) -> usize {
+        self.num_branches
+    }
+
+    /// Elements in this island, including the parked ones (wires, grounds,
+    /// broken parts) that never reach the solve.
+    pub fn element_count(&self) -> usize {
+        self.elems.len()
+    }
+
+    /// Elements this island actually visits every substep.
+    pub fn active_count(&self) -> usize {
+        self.active
+    }
+
+    /// False if any element IN THIS ISLAND is nonlinear. A diode next door
+    /// costs this island nothing.
+    pub fn is_linear(&self) -> bool {
+        self.linear
+    }
+
+    pub fn is_quarantined(&self) -> bool {
+        self.quarantined
+    }
+
+    /// The last stamped MNA matrix, row-major `n x n`.
+    pub fn matrix(&self) -> &[f64] {
+        &self.a
+    }
+
+    /// Structural nonzeros in the last stamped matrix.
+    pub fn matrix_nnz(&self) -> usize {
+        self.a.iter().filter(|v| **v != 0.0).count()
+    }
+
+    /// The last solved unknown vector.
+    pub fn solution(&self) -> &[f64] {
+        &self.x
+    }
+
+    /// Numeric factorizations performed since construction.
+    pub fn factorizations(&self) -> u64 {
+        self.factorizations
+    }
+
+    /// True when THIS island's stamped matrix is constant between discrete
+    /// events, so an LU factorization can outlive the substep that produced
+    /// it: either the island is linear, or its only nonlinearities are
+    /// piecewise-linear (op-amp rail regions, 555 latches). One diode in
+    /// this island disarms it — and, since islands landed, only in this one.
+    ///
+    /// This does not weaken anything: on a reuse hit the solver runs against
+    /// an L/U that a refactor would have recomputed to the same bits.
+    #[inline]
+    fn reusable(&self) -> bool {
+        self.linear || (self.reuse_pwl && !self.smooth_nonlinear)
+    }
+
+    // ----------------------------------------- quiescence and local dt
+
+    /// Is this island asleep? A sleeping island does no arithmetic; the
+    /// values it reports are the ones its last real solve produced.
+    pub fn is_static(&self) -> bool {
+        self.asleep
+    }
+
+    /// This island's local dt multiple: it integrates at `k * dt`.
+    pub fn local_dt_k(&self) -> u32 {
+        self.k
+    }
+
+    /// Whether an instrument or a co-simulated machine samples this island
+    /// faster than the tick, pinning it to `k = 1`.
+    pub fn is_pinned(&self) -> bool {
+        self.pinned || self.sampled
+    }
+
+    /// Can this island ever go static? False when it holds a time-varying
+    /// source, whose equations depend on `t`, or a noise source, whose
+    /// stream only a solve advances.
+    pub fn is_sleepable(&self) -> bool {
+        self.sleepable
+    }
+
+    /// Return to "just perturbed": awake, at the room dt, with no history to
+    /// draw conclusions from. Everything that can change this island's
+    /// trajectory from outside routes through here.
+    ///
+    /// Deliberately does NOT clear `factor_valid`: a sleeping island ran no
+    /// `build()`, so its retained matrix and LU are still exactly what its
+    /// last real solve stamped, and nothing about the circuit changed while
+    /// it slept. If it slept at `k > 1` the reset to `k = 1` moves `h`, and
+    /// `build`'s `factored_h == h` test refactors on its own.
+    pub fn wake(&mut self) {
+        self.asleep = false;
+        self.quiet_t = 0.0;
+        self.have_win = false;
+        self.k = 1;
+        self.good = 0;
+        self.hist = 0;
+        self.x_mark.copy_from_slice(&self.x);
+    }
+
+    /// Back to the room dt, with the error history invalidated: the next
+    /// two steps re-establish an evenly spaced triple before the controller
+    /// is allowed another opinion.
+    fn drop_to_room_dt(&mut self) {
+        self.good = 0;
+        if self.k > 1 {
+            self.k = 1;
+            self.hist = 1;
+        }
+    }
+
+    /// The largest `k` this island may use at room step `dt`. Powers of two
+    /// only, so every island's step boundary is also a world substep
+    /// boundary and no island can ever land between two of them.
+    fn k_cap(&self, dt: f64) -> u32 {
+        if !self.tuning.local_dt || self.pinned || self.sampled || dt <= 0.0 {
+            return 1;
+        }
+        let mut cap = self.tuning.local_dt_max_k.max(1);
+        // Absolute ceiling on h: bounds how stale an island may be.
+        let by_time = (self.tuning.local_dt_max / dt) as u32;
+        cap = cap.min(by_time.max(1));
+        // Nyquist-with-margin for a time-varying source.
+        if self.ac_hz > 0.0 {
+            let by_hz = (1.0 / (self.ac_hz * self.tuning.local_dt_min_samples * dt)) as u32;
+            cap = cap.min(by_hz.max(1));
+        }
+        // Round down to a power of two.
+        1u32 << (31 - cap.max(1).leading_zeros())
+    }
+
+    /// Has every unknown finished travelling, to within the residual
+    /// [`Tuning::quiescence_drift`] allows?
+    ///
+    /// This is the question sleeping actually turns on, and it is NOT the
+    /// question the slew and drift tests answer. Those bound the travel an
+    /// island has recently done; freezing it makes the travel it has LEFT
+    /// permanent, and for a long tail those two numbers differ by `τ /
+    /// quiescence_hold` — four orders of magnitude for a 100 s time
+    /// constant.
+    ///
+    /// Called only at the end of a completed quiet window, with `x_mark` the
+    /// state one whole window ago and `win_prev` the travel of the window
+    /// before that. For an unknown relaxing towards a DC point the
+    /// per-window travel is geometric — `m1 = ρ·m0` — so everything still
+    /// to come sums to `m1·ρ/(1-ρ)`, which in terms of what we measured is
+    /// `m1² / (m0 - m1)`. Nothing is fitted and nothing is assumed about the
+    /// circuit: the island's own two windows say how fast it is converging
+    /// and therefore how far it has left to go.
+    fn window_settled(&self) -> bool {
+        let t = self.tuning;
+        if t.quiescence_decay >= 1.0 {
+            return true; // test disabled (the pre-fix criterion)
+        }
+        for i in 0..self.n {
+            let (x, mark) = (self.x[i], self.x_mark[i]);
+            let m1 = (x - mark).abs();
+            let scale = x.abs().max(mark.abs());
+            // Below a few ulps the trajectory has stopped moving in f64 at
+            // all: a BE/TR update whose increment is under half an ulp
+            // returns the same bits forever, so continuing to solve would
+            // hold this number exactly as firmly as sleeping does.
+            if m1 <= 4.0 * f64::EPSILON * scale {
+                continue;
+            }
+            if !self.have_win {
+                return false;
+            }
+            let m0 = self.win_prev[i];
+            let d = m0 - m1;
+            // `m0` and `m1` are differences of numbers of size `scale`, so
+            // they each carry ~eps·scale of rounding and their difference
+            // carries a few of those. Believing a `d` at that level would be
+            // reading an extrapolation off noise, so an unknown whose decay
+            // is not resolvable simply does not qualify — it keeps solving.
+            let noise = 64.0 * f64::EPSILON * (scale + m0);
+            if m1 > t.quiescence_decay * m0 || d <= noise {
+                return false;
+            }
+            // Travel remaining, `m1²/d`, against the residual budget for
+            // this unknown's dimension. Multiplied out: no division, and no
+            // way to trip over a zero `d` that the guard above already
+            // excluded.
+            let tol = if i < self.num_nodes {
+                t.quiescence_drift
+            } else {
+                t.quiescence_drift_i
+            };
+            if m1 * m1 > tol * d {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Post-step bookkeeping for both levers: one pass over `x` produces the
+    /// motion, the window drift and the integration-error estimate — each
+    /// split by the KIND of unknown, because the node unknowns are volts and
+    /// the branch unknowns are amps — and the decisions fall out of them.
+    ///
+    /// `h` is the step just taken, `dt` the room substep the caller is
+    /// counting in. Both matter: the quiescence tests are rates over the
+    /// island's own step, while the staleness governor is a bound on how far
+    /// the island may be from WORLD time, which is measured in `dt`.
+    fn after_step(&mut self, h: f64, dt: f64, nr: u32) {
+        // |x - x_prev|, motion this step; |x - x_mark|, motion across the
+        // quiet window; |x - 2x_prev + x_prev2| ~= h² y'', the LTE. Volts
+        // (node unknowns) and amps (branch unknowns) never mix.
+        let (mut dv, mut mv, mut cv) = (0.0f64, 0.0f64, 0.0f64);
+        let (mut di, mut mi, mut ci) = (0.0f64, 0.0f64, 0.0f64);
+        for i in 0..self.n {
+            let (x, p1, p2, m) = (self.x[i], self.x_prev[i], self.x_prev2[i], self.x_mark[i]);
+            let (d, mm, c) = ((x - p1).abs(), (x - m).abs(), (x - p1 - p1 + p2).abs());
+            if i < self.num_nodes {
+                dv = dv.max(d);
+                mv = mv.max(mm);
+                cv = cv.max(c);
+            } else {
+                di = di.max(d);
+                mi = mi.max(mm);
+                ci = ci.max(c);
+            }
+        }
+        let t = self.tuning;
+        // Three points equally spaced by the CURRENT `h` are what makes the
+        // second difference an error estimate. `hist` counts how many of
+        // them we have; below two, `cmax` is a mixture of step sizes and
+        // means nothing, and acting on it is what makes a naive multirate
+        // controller oscillate between k and 1 forever.
+        let warm = self.hist >= 2;
+        // A discrete transition or a rescue means the trajectory just did
+        // something the previous two samples know nothing about. That is a
+        // fact about the devices, not an estimate, so it always counts.
+        let disturbed = self.discrete_moved || nr > 1;
+
+        // --- local dt. Raise only on a sustained, comfortable margin;
+        //     collapse to the room dt the instant either estimate says the
+        //     error would not fit, so a transient is never integrated
+        //     coarsely. `4·c` is the curvature estimate at twice the step
+        //     (the error term is h², so doubling h quadruples it) and `2·d`
+        //     the motion at twice the step (first order, so it doubles).
+        //
+        //     TWO budgets, and the motion one is not redundant: curvature
+        //     bounds the truncation error inside the step, motion bounds the
+        //     read-out lag at the end of it. A constant-slope ramp has zero
+        //     curvature and unbounded lag, which is exactly the shape the
+        //     curvature test alone waves through.
+        if t.local_dt {
+            let curvy = warm && (cv > t.local_dt_err || ci > t.local_dt_err_i);
+            let racing = dv > t.local_dt_slew * dt || di > t.local_dt_slew_i * dt;
+            let room = 4.0 * cv <= t.local_dt_err
+                && 4.0 * ci <= t.local_dt_err_i
+                && 2.0 * dv <= t.local_dt_slew * dt
+                && 2.0 * di <= t.local_dt_slew_i * dt;
+            if disturbed || curvy || racing {
+                self.drop_to_room_dt();
+            } else if warm && room {
+                self.good += 1;
+            } else if warm {
+                self.good = 0;
+            }
+        }
+
+        // --- quiescence. Every condition in physical units, so the verdict
+        //     does not change when `h` does, and every condition applied to
+        //     the unknowns whose dimension it is stated in.
+        if t.quiescence && self.sleepable {
+            let quiet = !disturbed
+                && dv <= t.quiescence_slew * h
+                && di <= t.quiescence_slew_i * h
+                && mv <= t.quiescence_drift
+                && mi <= t.quiescence_drift_i;
+            if quiet && warm {
+                self.quiet_t += h;
+                if self.quiet_t >= t.quiescence_hold {
+                    if self.window_settled() {
+                        self.asleep = true;
+                    } else {
+                        // Quiet, but not yet demonstrably finished. Close
+                        // this window, remember how far it travelled, and
+                        // let the next one measure the decay against it.
+                        for i in 0..self.n {
+                            self.win_prev[i] = (self.x[i] - self.x_mark[i]).abs();
+                        }
+                        self.have_win = true;
+                        self.x_mark.copy_from_slice(&self.x);
+                        self.quiet_t = 0.0;
+                    }
+                }
+            } else {
+                self.quiet_t = 0.0;
+                self.have_win = false;
+                self.x_mark.copy_from_slice(&self.x);
+            }
+        }
+
+        // Roll the history forward.
+        self.x_prev2.copy_from_slice(&self.x_prev);
+        self.x_prev.copy_from_slice(&self.x);
+        self.hist = self.hist.saturating_add(1);
+        self.discrete_moved = false;
+    }
+
+    // ------------------------------------------------------------ stepping
+
+    /// Advance this island by `max_steps` substeps of the room `dt`, from
+    /// world time `t0`. The island holds no clock of its own: `t0` is what
+    /// time-varying sources are evaluated against.
+    ///
+    /// The island may execute those substeps as fewer, larger integration
+    /// steps (`h = k·dt`), or — if it has gone static — as none at all. It
+    /// still *consumes* every substep it was given either way, so the world
+    /// clock never depends on which islands were busy. The only state it
+    /// carries between calls is `pending`: world substeps it owes because
+    /// they did not add up to a whole local step yet, bounded by `k` and so
+    /// by `Tuning::local_dt_max`.
+    ///
+    /// A failure here quarantines THIS island and nothing else.
+    pub fn advance(&mut self, t0: f64, dt: f64, max_steps: u32) -> AdvanceReport {
         let mut report = AdvanceReport::default();
         if self.n == 0 || self.quarantined {
             report.quarantined = self.quarantined;
             return report;
         }
-        for _ in 0..max_steps {
+        // Where this island's own clock actually stands: behind world time
+        // by whatever it still owes. At k = 1 the debt is always zero and
+        // this is `t0` exactly, bit for bit.
+        let mut t = t0 - self.pending as f64 * dt;
+        self.pending += max_steps;
+
+        if self.asleep {
+            // Nothing is moving, so the held solution IS the solution of
+            // every substep skipped here. No stamping, no factor, no solve,
+            // no invented number: `x` and every device's state stay exactly
+            // as the last real solve left them.
+            self.pending = 0;
+            report.steps = max_steps;
+            report.static_islands = 1;
+            return report;
+        }
+
+        report.islands = 1;
+        let cap = self.k_cap(dt);
+        if self.k > cap {
+            // The caller changed `dt`, or an instrument was pointed at this
+            // island since the last call. Same history rule as any other
+            // step-size change.
+            self.k = cap;
+            self.good = 0;
+            self.hist = 1;
+        }
+        let mut advanced = 0u32;
+        while self.pending >= self.k {
+            let k = self.k;
+            let h = dt * k as f64;
             let be = self.be_steps > 0;
-            match self.step(self.dt, be, 0, &mut report) {
+            let nr0 = report.nr_iters;
+            let resc0 = report.rescues;
+            match self.step(t, h, be, 0, &mut report) {
                 Ok(()) => {
-                    self.time += self.dt;
+                    t += h;
+                    self.pending -= k;
+                    advanced += k;
                     self.be_steps = self.be_steps.saturating_sub(1);
-                    report.steps += 1;
+                    report.island_steps += 1;
+                    // A step that only survived the dt-halving ladder is the
+                    // loudest possible "this step was too big".
+                    if report.rescues > resc0 {
+                        self.drop_to_room_dt();
+                        self.quiet_t = 0.0;
+                    }
+                    self.after_step(h, dt, report.nr_iters - nr0);
+                    if self.asleep {
+                        break;
+                    }
+                    // Doubling is decided here, not in `after_step`, because
+                    // only the caller's `dt` knows the cap. `build()` refactors
+                    // on its own when `h` changes (the companion conductances
+                    // depend on it), so nothing else has to be invalidated.
+                    if self.good >= self.tuning.local_dt_hold && self.k < cap {
+                        self.k *= 2;
+                        self.good = 0;
+                        // One banked point: the step just taken ended where
+                        // the first step at the new `h` will begin, so two
+                        // more steps make three evenly spaced samples.
+                        self.hist = 1;
+                    }
                 }
                 Err(()) => {
                     self.quarantined = true;
@@ -786,18 +2090,39 @@ impl Engine {
                 }
             }
         }
+        report.steps = if self.quarantined {
+            advanced.min(max_steps)
+        } else {
+            // Every substep handed in has been accounted for: executed, or
+            // carried as debt that is smaller than one local step.
+            max_steps
+        };
+        if self.asleep {
+            self.pending = 0;
+        }
         report.quarantined = self.quarantined;
         report
     }
 
-    /// One accepted step of size `h`, recursing into halved BE steps if NR
-    /// fails. On success, device history state has been advanced.
-    fn step(&mut self, h: f64, be: bool, depth: u32, report: &mut AdvanceReport) -> Result<(), ()> {
-        let saved: Vec<ElemState> = self.elems.iter().map(|e| e.state).collect();
-        match self.solve_step(h, be, report) {
+    /// One accepted step of size `h` from time `t`, recursing into halved BE
+    /// steps if NR fails. On success, device history state has been advanced.
+    fn step(
+        &mut self,
+        t: f64,
+        h: f64,
+        be: bool,
+        depth: u32,
+        report: &mut AdvanceReport,
+    ) -> Result<(), ()> {
+        // One reusable snapshot buffer per recursion level: the rescue ladder
+        // is 4 deep, and a substep must not allocate.
+        let mut saved = core::mem::take(&mut self.saved[depth as usize]);
+        saved.clear();
+        saved.extend(self.elems[..self.active].iter().map(|e| e.state));
+        let out = match self.solve_step(t, h, be, report) {
             Ok(()) => Ok(()),
             Err(()) => {
-                for (e, s) in self.elems.iter_mut().zip(saved.iter()) {
+                for (e, s) in self.elems[..self.active].iter_mut().zip(saved.iter()) {
                     e.state = *s;
                 }
                 // The rollback restores discrete state (`region` lives in
@@ -808,28 +2133,36 @@ impl Engine {
                 // `write_param` could still resume stepping.
                 self.factor_valid = false;
                 if depth >= RESCUE_DEPTH {
-                    return Err(());
+                    Err(())
+                } else {
+                    report.rescues += 1;
+                    // Backward Euler at half the step, twice: robust against
+                    // both nonconvergence and trapezoidal ringing.
+                    self.step(t, h * 0.5, true, depth + 1, report)
+                        .and_then(|()| self.step(t, h * 0.5, true, depth + 1, report))
+                        .map(|()| self.factor_valid = false)
                 }
-                report.rescues += 1;
-                // Backward Euler at half the step, twice: robust against
-                // both nonconvergence and trapezoidal ringing.
-                self.step(h * 0.5, true, depth + 1, report)?;
-                self.step(h * 0.5, true, depth + 1, report)?;
-                self.factor_valid = false;
-                Ok(())
             }
-        }
+        };
+        self.saved[depth as usize] = saved;
+        out
     }
 
     /// Newton-Raphson (single pass for linear circuits) at t + h.
-    fn solve_step(&mut self, h: f64, be: bool, report: &mut AdvanceReport) -> Result<(), ()> {
+    fn solve_step(
+        &mut self,
+        t: f64,
+        h: f64,
+        be: bool,
+        report: &mut AdvanceReport,
+    ) -> Result<(), ()> {
         let iters = if self.linear { 1 } else { NR_MAX_ITERS };
         let mut converged = self.linear;
         // Reset per-pass discrete-state-change budgets for the op-amp rail
         // region and the 555 latch (lastv[0] doubles as the counter for
         // both; neither has MOS damping state).
         // The same pre-pass draws each noise source's sample for this step.
-        for e in self.elems.iter_mut() {
+        for e in self.elems[..self.active].iter_mut() {
             let kind = e.spec.kind;
             if matches!(kind, ElementKind::OpAmp { .. } | ElementKind::Timer555) {
                 e.state.lastv[0] = 0.0;
@@ -851,7 +2184,7 @@ impl Engine {
         }
         for _ in 0..iters {
             report.nr_iters += 1;
-            self.build(self.time + h, h, be)?;
+            self.build(t + h, h, be)?;
             self.x.copy_from_slice(&self.b);
             self.lu.solve(&mut self.x);
             if self.x.iter().any(|v| !v.is_finite()) {
@@ -914,8 +2247,8 @@ impl Engine {
         }
     }
 
-    /// Stamp the full system for time `t_new` and step `h`. Factors the
-    /// matrix unless a valid linear factorization is being reused.
+    /// Stamp this island's system for time `t_new` and step `h`. Factors the
+    /// matrix unless a valid retained factorization is being reused.
     fn build(&mut self, t_new: f64, h: f64, be: bool) -> Result<(), ()> {
         let need_factor = !(self.reusable()
             && self.factor_valid
@@ -933,14 +2266,11 @@ impl Engine {
             }
         }
 
-        for ei in 0..self.elems.len() {
-            let (kind, node, branch, state, broken, stamps) = {
+        for ei in 0..self.active {
+            let (kind, node, branch, state, stamps) = {
                 let e = &self.elems[ei];
-                (e.spec.kind, e.node, e.branch, e.state, e.broken, e.stamps)
+                (e.spec.kind, e.node, e.branch, e.state, e.stamps)
             };
-            if broken {
-                continue; // failed open: stamps nothing at all
-            }
             if !stamps {
                 // A merged member of an ideal-constraint group. The leader
                 // already wrote the row and the RHS; writing again would
@@ -1300,23 +2630,23 @@ impl Engine {
     }
 
     /// Post-solve NR bookkeeping: limit and store each nonlinear device's
-    /// new operating-point guess. Returns true when every device agrees
-    /// with its previous guess (converged).
+    /// new operating-point guess. Returns true when every device in THIS
+    /// island agrees with its previous guess (converged) — convergence is no
+    /// longer all-or-nothing across the world.
     fn update_guesses(&mut self) -> bool {
         let mut converged = true;
         // Set when a piecewise-linear device ACTUALLY moves its discrete
         // state. That, and only that, is what makes a retained
-        // factorization stale: this is the "event" in event-driven.
+        // factorization stale: this is the "event" in event-driven. It is
+        // also the sharpest "this island is not resting" signal there is,
+        // and the two levers read it as one — a rail flip is both.
         let mut discrete_flip = false;
         let close = |a: f64, b: f64| (a - b).abs() < NR_ABSTOL + NR_RELTOL * a.abs().max(b.abs());
-        for ei in 0..self.elems.len() {
-            let (kind, node, broken) = {
+        for ei in 0..self.active {
+            let (kind, node) = {
                 let e = &self.elems[ei];
-                (e.spec.kind, e.node, e.broken)
+                (e.spec.kind, e.node)
             };
-            if broken {
-                continue; // no operating point to iterate: it stamps nothing
-            }
             match kind {
                 ElementKind::Diode | ElementKind::Led { .. } | ElementKind::Zener { .. } => {
                     let (is, nvt, voff) = diode_params(&kind);
@@ -1543,34 +2873,23 @@ impl Engine {
             }
         }
         if discrete_flip {
+            // Two consumers, one event, neither derived from the other: the
+            // retained LU no longer describes the region set that is now in
+            // force, and an island whose comparator just tripped is not
+            // resting.
             self.factor_valid = false;
+            self.discrete_moved = true;
         }
         converged
     }
 
     /// Commit device history and pin currents from the solved unknowns.
     fn accept(&mut self, h: f64, be: bool) {
-        for ei in 0..self.elems.len() {
-            let (kind, node, branch, broken, share_n, share_sign) = {
+        for ei in 0..self.active {
+            let (kind, node, branch, share_n, share_sign) = {
                 let e = &self.elems[ei];
-                (
-                    e.spec.kind,
-                    e.node,
-                    e.branch,
-                    e.broken,
-                    e.share_n,
-                    e.share_sign,
-                )
+                (e.spec.kind, e.node, e.branch, e.share_n, e.share_sign)
             };
-            if broken {
-                // Carries nothing, stores nothing. Reported as exactly zero so
-                // no display can show a stale current for a dead part.
-                let st = &mut self.elems[ei].state;
-                st.pin_i = [0.0; MAX_PINS];
-                st.v_prev = 0.0;
-                st.i_prev = 0.0;
-                continue;
-            }
             let v01 = self.xv(node[0]) - self.xv(node[1]);
             // The branch unknown, oriented and split for THIS member.
             //
@@ -1736,26 +3055,57 @@ impl Engine {
         }
     }
 
-    /// Voltage at an electrical node from the last solve.
-    pub fn node_voltage(&self, node: usize) -> f64 {
-        self.xv(node)
+    /// Deterministic digest of this island's state, for a caller checking
+    /// that a parallel run matches a serial one island by island.
+    pub fn state_hash(&self) -> u64 {
+        use xxhash_rust::xxh3::Xxh3;
+        let mut h = Xxh3::new();
+        let mut put = |x: f64| h.update(&sim_math::canon(x).to_bits().to_le_bytes());
+        for v in &self.x {
+            put(*v);
+        }
+        for e in &self.elems {
+            put(e.state.v_prev);
+            put(e.state.i_prev);
+            put(e.state.vg1);
+            put(e.state.vg2);
+            put(e.state.region as f64);
+            for p in 0..MAX_PINS {
+                put(e.state.lastv[p]);
+                put(e.state.pin_i[p]);
+            }
+            if matches!(e.spec.kind, ElementKind::Noise { .. }) {
+                put((e.state.noise_n >> 32) as u32 as f64);
+                put((e.state.noise_n & 0xffff_ffff) as u32 as f64);
+            }
+        }
+        h.digest()
+    }
+}
+
+impl Engine {
+    // ---------------------------------------------------------- read-out
+
+    /// Voltage at an island-local node from the last solve.
+    pub fn node_voltage(&self, island: usize, node: usize) -> f64 {
+        self.islands.get(island).map(|i| i.xv(node)).unwrap_or(0.0)
     }
 
     /// Voltage at a geometric point, if it is a junction.
     pub fn voltage_at(&self, p: Point) -> Option<f64> {
         self.junctions
             .iter()
-            .find(|(q, _)| *q == p)
-            .map(|(_, node)| self.xv(*node))
+            .find(|(q, _, _)| *q == p)
+            .map(|(_, isl, node)| self.islands[*isl].xv(*node))
     }
 
     /// Voltage at one pin of an element, from the last solve.
     pub fn pin_voltage(&self, id: u32, pin: usize) -> Option<f64> {
-        let e = self.elems.iter().find(|e| e.spec.id == id)?;
+        let (isl, e) = self.find(id)?;
         if pin >= e.spec.pins.len() {
             return None;
         }
-        Some(self.xv(e.node[pin]))
+        Some(self.islands[isl].xv(e.node[pin]))
     }
 
     /// Resolve an element id to a handle for repeated sampling. `pin_voltage`
@@ -1766,8 +3116,8 @@ impl Engine {
     /// The handle is INVALIDATED by `set_elements` — resolve it again after
     /// any document edit. A stale handle reads 0, it never panics.
     pub fn tap(&self, id: u32) -> Option<ElemTap> {
-        let slot = self.elems.iter().position(|e| e.spec.id == id)?;
-        Some(ElemTap { slot })
+        let &(_, island, slot) = self.order.iter().find(|(eid, _, _)| *eid == id)?;
+        Some(ElemTap { island, slot })
     }
 
     /// `v(pin a) - v(pin b)` at a tap, from the last accepted step, in O(1).
@@ -1776,26 +3126,32 @@ impl Engine {
     /// Out-of-range slots/pins read 0 so a tap on a deleted element goes
     /// silent instead of panicking.
     pub fn tap_delta(&self, t: ElemTap, a: usize, b: usize) -> f64 {
-        let Some(e) = self.elems.get(t.slot) else {
+        let Some(island) = self.islands.get(t.island) else {
+            return 0.0;
+        };
+        let Some(e) = island.elems.get(t.slot) else {
             return 0.0;
         };
         let n = e.spec.pins.len();
-        let va = if a < n { self.xv(e.node[a]) } else { 0.0 };
-        let vb = if b < n { self.xv(e.node[b]) } else { 0.0 };
+        let va = if a < n { island.xv(e.node[a]) } else { 0.0 };
+        let vb = if b < n { island.xv(e.node[b]) } else { 0.0 };
         va - vb
     }
 
     /// The element id a tap currently points at, for callers that want to
     /// confirm a handle still means what they resolved it from.
     pub fn tap_id(&self, t: ElemTap) -> Option<u32> {
-        self.elems.get(t.slot).map(|e| e.spec.id)
+        self.islands
+            .get(t.island)
+            .and_then(|i| i.elems.get(t.slot))
+            .map(|e| e.spec.id)
     }
 
     /// Current into one pin of an element, from the last accepted step.
     /// NOTE: wires get their current from KCL propagation, which only runs
     /// in `frame()` — for a wire probe, sample via `frame()` instead.
     pub fn pin_current(&self, id: u32, pin: usize) -> Option<f64> {
-        let e = self.elems.iter().find(|e| e.spec.id == id)?;
+        let (_, e) = self.find(id)?;
         if pin >= e.spec.pins.len() {
             return None;
         }
@@ -1803,23 +3159,22 @@ impl Engine {
     }
 
     pub fn is_wire(&self, id: u32) -> bool {
-        self.elems
-            .iter()
-            .any(|e| e.spec.id == id && matches!(e.spec.kind, ElementKind::Wire))
+        self.find(id)
+            .map(|(_, e)| matches!(e.spec.kind, ElementKind::Wire))
+            .unwrap_or(false)
     }
 
-    /// Per-element render frame. Wire currents are recovered by KCL
-    /// propagation over junctions (wires are node-merged so they have no
-    /// unknown of their own).
+    /// Per-element render frame, in document order. Wire currents are
+    /// recovered by KCL propagation over junctions (wires are node-merged so
+    /// they have no unknown of their own).
     pub fn frame(&self) -> Vec<ElemFrame> {
         let mut out: Vec<ElemFrame> = self
-            .elems
-            .iter()
-            .map(|e| {
+            .doc()
+            .map(|(isl, e)| {
                 let npins = e.spec.pins.len();
                 let mut v = [0.0; MAX_PINS];
                 for (i, val) in v.iter_mut().enumerate().take(npins) {
-                    *val = self.xv(e.node[i]);
+                    *val = self.islands[isl].xv(e.node[i]);
                 }
                 let i = e.state.pin_i;
                 let power = elem_power(&e.spec.kind, npins, &v, &i);
@@ -1829,6 +3184,7 @@ impl Engine {
                     v,
                     i,
                     power,
+                    quarantined: self.islands[isl].quarantined,
                 }
             })
             .collect();
@@ -1841,17 +3197,25 @@ impl Engine {
     /// Pure-wire loops are ambiguous and settle at 0 (harmless: dots just
     /// don't move there).
     fn solve_wire_currents(&self, frames: &mut [ElemFrame]) {
+        // Point -> junction index. `BTreeMap`, not a hash map, for the same
+        // reason `rebuild` uses one: no hasher seed, no platform RNG. Only
+        // lookups happen through it, so it is a pure speed-up over the linear
+        // `position()` scan it replaces.
+        let mut jix: BTreeMap<Point, usize> = BTreeMap::new();
+        for (j, (p, _, _)) in self.junctions.iter().enumerate() {
+            jix.insert(*p, j);
+        }
+        let kinds: Vec<ElementKind> = self.doc().map(|(_, e)| e.spec.kind).collect();
         let mut incident: Vec<Vec<(usize, usize)>> = vec![Vec::new(); self.junctions.len()];
-        let jix = |p: Point| self.junctions.iter().position(|(q, _)| *q == p);
-        for (i, e) in self.elems.iter().enumerate() {
+        for (i, (_, e)) in self.doc().enumerate() {
             for (t, p) in e.spec.pins.iter().enumerate() {
-                if let Some(j) = jix(*p) {
-                    incident[j].push((i, t));
+                if let Some(j) = jix.get(p) {
+                    incident[*j].push((i, t));
                 }
             }
         }
-        let is_wire = |i: usize| matches!(self.elems[i].spec.kind, ElementKind::Wire);
-        let mut known: Vec<bool> = (0..self.elems.len()).map(|i| !is_wire(i)).collect();
+        let is_wire = |i: usize| matches!(kinds[i], ElementKind::Wire);
+        let mut known: Vec<bool> = (0..kinds.len()).map(|i| !is_wire(i)).collect();
         loop {
             let mut progressed = false;
             for inc in incident.iter() {
@@ -1859,7 +3223,7 @@ impl Engine {
                 // not solvable by balance.
                 if inc
                     .iter()
-                    .any(|(i, _)| matches!(self.elems[*i].spec.kind, ElementKind::Ground))
+                    .any(|(i, _)| matches!(kinds[*i], ElementKind::Ground))
                 {
                     continue;
                 }
@@ -1896,10 +3260,12 @@ impl Engine {
         let mut h = Xxh3::new();
         let mut put = |x: f64| h.update(&sim_math::canon(x).to_bits().to_le_bytes());
         put(self.time);
-        for v in &self.x {
-            put(*v);
+        for island in &self.islands {
+            for v in &island.x {
+                put(*v);
+            }
         }
-        for e in &self.elems {
+        for (_, e) in self.doc() {
             put(e.state.v_prev);
             put(e.state.i_prev);
             put(e.state.vg1);
@@ -1934,6 +3300,15 @@ impl Engine {
         }
         h.digest()
     }
+}
+
+/// Union-find with path halving, over a parent array.
+fn find(parent: &mut [usize], mut i: usize) -> usize {
+    while parent[i] != i {
+        parent[i] = parent[parent[i]];
+        i = parent[i];
+    }
+    i
 }
 
 /// What a part DISSIPATES this instant, in watts.
@@ -2142,7 +3517,7 @@ mod noise_tests {
         let mut eng = Engine::new(20e-6);
         eng.set_elements(&open_noise(1.0, 4242));
         eng.advance(100);
-        let saved: Vec<ElemState> = eng.elems.iter().map(|e| e.state).collect();
+        let saved: Vec<ElemState> = eng.islands[0].elems.iter().map(|e| e.state).collect();
         let saved_time = eng.time;
         let hash = eng.state_hash();
         let first: Vec<f64> = (0..200)
@@ -2152,9 +3527,12 @@ mod noise_tests {
             })
             .collect();
         assert_ne!(eng.state_hash(), hash, "200 steps must move the digest");
-        for (e, s) in eng.elems.iter_mut().zip(saved.iter()) {
+        for (e, s) in eng.islands[0].elems.iter_mut().zip(saved.iter()) {
             e.state = *s;
         }
+        // The rescue path restores state and re-solves; a sleeping island
+        // would skip the re-solve and the replay would prove nothing.
+        eng.islands[0].wake();
         eng.time = saved_time;
         let again: Vec<f64> = (0..200)
             .map(|_| {
@@ -2227,12 +3605,22 @@ mod noise_tests {
         eng.set_elements(&open_noise(1.0, 1));
         eng.advance(1);
         assert!(
-            eng.linear,
+            eng.islands[0].linear,
             "a noise source must not make a circuit nonlinear"
         );
         eng.advance(5000);
-        assert!(eng.factor_valid, "the factorization must survive the stream");
+        assert!(
+            eng.islands[0].factor_valid,
+            "the factorization must survive the stream"
+        );
         assert!(!eng.is_quarantined(), "noise must never diverge the solver");
+        // ...and the island never went to sleep on the way: a noise source
+        // is discrete state that only a solve advances, so it pins its
+        // island awake and at the room dt.
+        assert!(!eng.islands[0].is_sleepable());
+        assert!(eng.islands[0].is_pinned());
+        assert_eq!(eng.static_islands(), 0);
+        assert_eq!(eng.islands[0].local_dt_k(), 1);
     }
 
     /// Nothing in the advance may touch a float, and the [-1, 1) map must be
@@ -2266,10 +3654,13 @@ mod noise_tests {
         eng.advance(10);
         let v = eng.voltage_at((0, 0)).unwrap();
         assert!(v.abs() < 1e-9, "a dead source must stop driving, got {v}");
-        let n_after = eng.elems[0].state.noise_n;
+        // A broken part is parked behind its island's active prefix, so the
+        // counter is read through the document order rather than off slot 0.
+        let stream = |eng: &Engine| eng.find(1).unwrap().1.state.noise_n;
+        let n_after = stream(&eng);
         eng.advance(100);
         assert_eq!(
-            eng.elems[0].state.noise_n,
+            stream(&eng),
             n_after,
             "a dead source must not advance its stream"
         );
