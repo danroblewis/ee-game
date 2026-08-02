@@ -136,7 +136,8 @@ Three things to notice:
   so there is nothing to roll back and no undo entry for an edit that never
   happened. Because the client's gate is the same compiled Rust, a server-side
   reject is only reachable via a race with another player, a document past the
-  client's 800-element gate cap, or an old client. (Honest wrinkle: a comment in
+  client's 800-element gate cap, a machine move (which the client bounds-checks
+  but does not electrically pre-gate), or an old client. (Honest wrinkle: a comment in
   `net.ts` still says the sender "rolls back" on reject; the code only selects the
   implicated parts and toasts. Prevention is the design; the comment is stale.)
 - **Two-phase commit on the server.** Every mutating path — edit, interact, repair,
@@ -240,7 +241,7 @@ detail: [`docs/asbuilt_cosim-machines.md`](docs/asbuilt_cosim-machines.md).
 The Freight Hoist's mechanics are **not in the solver**. The electrical half is one
 ordinary MNA element (a motor: resistance, inductance, and a back-EMF *parameter*).
 The mechanical half is `crates/machine`: two state variables (rotor speed, platform
-height), gravity, limit switches with 2 mm hysteresis — ~200 lines, no physics
+height), gravity, limit switches with 2 mm hysteresis — under 300 lines, no physics
 engine, same determinism rules as sim-core.
 
 ```mermaid
@@ -251,7 +252,7 @@ sequenceDiagram
     loop every 32 substeps
         S->>E: advance(32) — last writes held constant
         E-->>S: pin_current(motor) — one solved branch current
-        S->>H: tick(i, 640 µs) — integrate ω, y; latch limit switches
+        S->>H: tick(i, 640 µs) — integrate ω, y · latch limit switches
         H-->>S: Writes { bemf, wiper, lim_top, lim_bot }
         S->>E: 4 × write_param — take effect over the NEXT 32 substeps
     end
@@ -376,8 +377,9 @@ to 467× at 4 500 elements of golden tiles (Apple M4, release,
 circuits that have gone static) and per-island local dt as the multipliers that the
 3 000-element target actually requires — the measured per-element bookkeeping floor
 means most of the world must not be *visited* at all. None of this runs in the live
-solver yet: an integration branch (`wf/islands-integrate`) exists with no commits
-beyond main at the time of writing. The same mathematics *is* already shipped in
+solver yet: the implementation exists on the unmerged integration branch
+`wf/islands-integrate` (commit `760c2c3`, "Per-island partitioning: one world
+becomes N independent solvers", 2 Aug 2026) and is not in main. The same mathematics *is* already shipped in
 one place: the placement gate judges documents one MNA block at a time. Detail in
 [`docs/asbuilt_determinism-scale.md`](docs/asbuilt_determinism-scale.md).
 

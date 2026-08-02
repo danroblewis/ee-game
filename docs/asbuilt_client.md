@@ -51,7 +51,7 @@ not at one potential.
 
 ```mermaid
 flowchart LR
-    A["&lt; 2 px/unit<br/>LOD_CHAIN<br/>one segment per element"] --> B["2–6 px/unit<br/>batched LOD band:<br/>neutral body + per-pin<br/>voltage-coloured legs"]
+    A["below LOD_CHAIN (2 px/unit)<br/>one segment per element"] --> B["2–6 px/unit<br/>batched LOD band:<br/>neutral body + per-pin<br/>voltage-coloured legs"]
     B --> C["≥ 6 px/unit — LOD_FULL<br/>full schematic symbols,<br/>current dots, probe flags,<br/>panel tabs, machine interior"]
 ```
 

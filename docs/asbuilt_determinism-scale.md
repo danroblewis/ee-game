@@ -90,8 +90,9 @@ configuration a number belongs to.
 `Engine::unknowns`' doc comment says so in as many words; disconnected islands
 share it. Everything in §4–5 is measured in benchmark harnesses
 (`sim-golden/tests/scale.rs` and the scale docs) but **not merged into the live
-solver**. An integration branch (`wf/islands-integrate`) exists with no commits
-beyond main at the time of writing.
+solver**. The implementation exists on the unmerged integration branch
+`wf/islands-integrate` (commit `760c2c3`, "Per-island partitioning: one world
+becomes N independent solvers", 2 Aug 2026); main does not contain it.
 
 The measured pain (Apple M4, release, dt = 20 µs, `docs/scale-baseline.md`):
 

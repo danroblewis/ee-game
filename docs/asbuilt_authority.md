@@ -167,7 +167,8 @@ block-diagonal system *is* Newton per block; and the rescue ladder only ever giv
 a block a smaller step than it would take alone — "the verdict is the same, which
 is the whole licence for doing this." Cost: Σnᵢ³ instead of (Σnᵢ)³. In-code
 records: the whole gate at 400 elements went 42.9 ms → 0.91 ms; the shipped
-147-element hoist room is 61 unknowns in 14 blocks, widest 7.
+147-element hoist room is 61 unknowns in 14 blocks whose biggest is 7 nodes
+(9 unknowns — the two in-code comments count nodes and unknowns respectively).
 
 **Depth is bought, not assumed.** Each block's trial depth comes from an integer
 cost model (`block_step_cost(u) = 1 + u²/16` — integer arithmetic so every target
