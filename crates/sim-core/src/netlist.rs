@@ -7,8 +7,26 @@
 
 pub type Point = (i32, i32);
 
-/// Largest pin count of any element (the 555 timer is 6-pin).
-pub const MAX_PINS: usize = 6;
+/// Largest pin count of any element.
+///
+/// 10, set by the widest members of the CMOS logic family: a 4-bit shift
+/// register is `[VCC, GND, CLK, SER, RST, Q0..Q3]` = 9, and a 4:1 mux is
+/// `[VCC, GND, I0..I3, S0, S1, Y]` = 9. The spare pin is headroom for an
+/// output-enable, not slack.
+///
+/// It is deliberately the SMALLEST ceiling the part list fits in, because
+/// the cost is paid by every element in the room and not just the wide
+/// ones: `ElemFrame` is `2 · MAX_PINS` numbers per element per broadcast
+/// tick, so a two-pin resistor ships eight unused voltage slots and eight
+/// unused current slots at this setting. 8-bit shift registers are
+/// therefore NOT a part — you cascade two 4-bit ones, which is how a real
+/// 74HC595 chain is built and is a lesson rather than a compromise.
+///
+/// Raising it is now safe by construction: `state_hash` iterates
+/// `pin_count()` rather than this constant, so no golden digest moves, and
+/// `FRAME_STRIDE` is derived from it in one place that both transports
+/// call.
+pub const MAX_PINS: usize = 10;
 
 /// Short-circuit output current a legacy (field-less) `OpAmp` deserialises
 /// to: a 741/LM358-class jellybean. See `ElementKind::OpAmp`.

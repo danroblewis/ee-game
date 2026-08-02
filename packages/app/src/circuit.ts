@@ -123,9 +123,11 @@ export interface ElemLive {
   power: number;
 }
 
-/** [id, npins, v0..v5, i0..i5, power] — MAX_PINS is 6 (the 555 timer). */
-export const FRAME_STRIDE = 15;
-export const MAX_PINS = 6;
+/** `[id, npins, v0..vN, i0..iN, power]` — the TS mirror of
+ *  `sim_core::FRAME_STRIDE` and `sim_core::MAX_PINS`. 10 is set by the
+ *  widest logic parts (4-bit shift register, 4:1 mux, both 9 pins). */
+export const MAX_PINS = 10;
+export const FRAME_STRIDE = 3 + 2 * MAX_PINS;
 
 export function unpackFrame(flat: ArrayLike<number>): Map<number, ElemLive> {
   const out = new Map<number, ElemLive>();
