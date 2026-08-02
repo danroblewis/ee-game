@@ -197,12 +197,17 @@ export function seriesExplainer(name: SeriesName = 'E24'): string[] {
       ` standard values that repeats in every decade: 10, 12, 15, 18, 22, 27, 33, 39, 47, 56,` +
       ` 68, 82 — then 100, 120, 150, and so on. That ladder is called E12. ${name} is the same` +
       ` idea with ${n} rungs per decade.`,
-    `The rungs are spaced by a constant RATIO, not a constant amount. Each E12 rung is 21%` +
-      ` above the one below it, because 21% is the twelfth root of ten. That is the whole` +
-      ` trick: a 10%-tolerance part is anything within ±10% of its printed value, so` +
-      ` neighbouring rungs' ranges meet exactly. Every value you could want is covered by` +
-      ` something on the shelf, using the fewest possible different parts. ${name} rungs are` +
-      ` spaced for ±${tol}% parts.`,
+    `The rungs are spaced by a constant RATIO, not a constant amount. Twelve equal ratio` +
+      ` steps have to multiply up to exactly 10 across a decade, so each step is the twelfth` +
+      ` root of ten — 1.2115, about 21% up each time. That is the whole trick: a` +
+      ` 10%-tolerance part is anything within ±10% of its printed value, so consecutive` +
+      ` rungs very nearly cover the gap between them. Every value you could want is close to` +
+      ` something on the shelf, using the fewest different parts. ${name} rungs are spaced` +
+      ` for ±${tol}% parts.`,
+    `"Very nearly" is doing real work there, and the tidied-up version of this story usually` +
+      ` skips it. Half a 21.2% step is 10.1%, a hair more than the ±10% a part promises, so` +
+      ` there is a sliver between rungs that nothing is guaranteed to reach — around` +
+      ` 1.32–1.35, for instance. In practice parts beat their tolerance and nobody notices.`,
     `That is where 4.7 comes from. It is really 10^(8/12) = 4.6416, rounded so it fits on a` +
       ` resistor body. A few of the rungs were rounded further than the maths says — 3.162` +
       ` became 3.3 — because those values were already in warehouses when the standard was` +

@@ -178,6 +178,15 @@ const PART_HOTKEYS: Record<string, string> = {
   t: 'Potentiometer',
 };
 
+// Read `?stdvalues=` BEFORE anything can rewrite the query string. `rooms.ts`
+// replaces `location.search` with `?room=<id>` once it has joined, and the only
+// other caller of `stdValuesMode()` is the property editor — which a player
+// cannot open until long after that rewrite. So the flag's own stickiness
+// (mode → localStorage) never got the chance to arm itself, and the documented
+// URL opt-in silently did nothing. The call is idempotent; this one is for its
+// side effect.
+stdValuesMode();
+
 await init();
 
 // ---------------------------------------------------------------- state
