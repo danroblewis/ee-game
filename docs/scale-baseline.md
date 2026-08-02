@@ -169,6 +169,14 @@ The linear rows isolate this exactly. At 5,000 elements, 50 districts:
 1,650 µs/substep linear vs 17,027 µs/substep with 4.7% nonlinear devices —
 a **10.3x** penalty for the same topology and the same n.
 
+> **Partly fixed since this baseline was measured** — see "Structural win 3"
+> below. The gate is no longer `linear` but `linear || !smooth_nonlinear`:
+> an op-amp or a 555 is piecewise-linear, so it no longer forces a refactor
+> on substeps where nothing flipped. A **diode/zener/LED/BJT/MOSFET/OTA**
+> anywhere still does exactly what this section describes, so every row of
+> the table above (30% nonlinear blocks, drawn from a pool that is 4/5
+> smooth devices) is unchanged and still valid.
+
 ### 2. Newton-Raphson iteration count grows with world size
 
 NR mean per substep: 1.05 (516 elems) → 1.19 (1,023) → 2.02 (2,040) → 2.08
@@ -360,3 +368,59 @@ What none of these do is lift the per-element bookkeeping floor measured in
 most of the world is **not visited at all** on most substeps — which is
 exactly what islands + quiescence + local dt buy, and what a faster solver
 cannot.
+
+## Structural win 3 (BUILT): event-driven piecewise-linear reuse
+
+Measured after the fact, on this same machine, and reported here because it
+changes the premise of §1 for one specific — and, for the game, central —
+circuit class: op-amps and 555s.
+
+An op-amp's and a 555's contribution to **A** is a function of a *discrete*
+state (rail region, RS latch), not of the operating point. Between two flips
+the matrix is constant, so the previous substep's LU is the factorization of
+the same matrix, bit for bit. `ElementKind::needs_newton()` now separates
+those two devices from the genuinely smooth ones (diode, zener, LED, BJT,
+MOSFET, OTA), and `Engine::reusable()` keeps the factorization until
+`update_guesses` sees a region or latch actually move.
+
+A 555 astable at 480 Hz flips 957 times per simulated second against 50,000
+substeps: **98.1% of substeps reuse**. Op-amp Schmitt relaxation: 909 flips,
+98.2%. An op-amp in negative feedback never leaves region 0 at all.
+
+Medians of 5 runs, each 50,000 substeps at dt = 20 µs = 1.000 s simulated
+(`cargo run --release -p sim-golden --bin pwlroom`). "room" = the districts
+generator in `sim_golden::scale` at 0% nonlinear, so the padding is what a
+room of other people's passive builds looks like.
+
+| world | elements | n | before | after |
+|---|---:|---:|---:|---:|
+| 555 astable alone | 14 | 6 | 61.2x | **91.7x** |
+| op-amp Schmitt alone | 12 | 4 | 94.5x | **122.6x** |
+| 555 + room | 172 | 51 | 1.89x | **5.08x** |
+| Schmitt + room | 170 | 49 | 2.03x | **5.35x** |
+| both + room | 184 | 55 | 1.62x | **4.43x** |
+| 555 + room (one connected circuit) | 154 | 32 | 3.80x | **7.63x** |
+| 555 + room + ONE led (control) | 176 | 54 | 1.70x | 1.71x |
+| linear room only (control) | 158 | 45 | 6.63x | 6.75x |
+
+Largest 555 room that holds real time (log-log interpolation between the
+239- and 342-element rows before, the 342- and 518-element rows after):
+**243 elements (n≈70) → 486 elements (n≈136)**. Exactly 2x the room, and it
+multiplies with islands rather than overlapping it: islands shrinks n per
+matrix, this removes ~98% of the factorizations.
+
+Output is **bit-identical**, not merely close: the reused L/U is the
+factorization of a matrix that a refactor would have rebuilt to the same
+bits. `crates/sim-golden/tests/pwl_reuse.rs` asserts that directly — it
+compares `Engine::matrix()` word for word between a reusing engine and a
+refactor-every-substep engine at every substep of every golden, plus the
+state hash, the NR pass count, the rescue count and the quarantine flag,
+including under live edits and under damage that reclassifies a world
+mid-run. `tools/determinism.sh` still reports native == wasm32 with the same
+hashes as before the change.
+
+What it does **not** do: help any world containing a diode, zener, LED, BJT,
+MOSFET or OTA (measured: 1.00x, correctly — freezing a diode's conductance
+would be approximating the physics), or move the per-element bookkeeping
+floor of §7. After the change the O(n²) triangular solve is the ceiling for
+these circuits.

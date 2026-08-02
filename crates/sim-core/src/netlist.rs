@@ -236,6 +236,32 @@ impl ElementKind {
                 | ElementKind::Timer555
         )
     }
+
+    /// The subset of `is_nonlinear` whose contribution to the MNA **matrix**
+    /// is a function of a DISCRETE state (an op-amp's rail region, a 555's
+    /// RS latch) rather than of the continuous operating point. Between two
+    /// flips of that state the matrix is literally constant, so a
+    /// factorization survives — see `Engine::reusable`.
+    ///
+    /// The invariant every member owes: every write this device makes into
+    /// `a` in `Engine::build` depends only on node/branch indices, on
+    /// compile-time constants, and on `ElemState::region`. Never on `x`, on
+    /// `t`, or on continuous history (`v_prev`, `i_prev`, `vg1`, `vg2`).
+    pub fn is_discrete_nonlinear(&self) -> bool {
+        matches!(self, ElementKind::OpAmp { .. } | ElementKind::Timer555)
+    }
+
+    /// Devices that genuinely need Newton iteration: their conductance is a
+    /// smooth function of the operating point (`libm::exp`/`tanh`), so the
+    /// matrix moves on every NR pass and no factorization can be reused.
+    ///
+    /// Deliberately DERIVED from `is_nonlinear` rather than written as a
+    /// third whitelist: a new nonlinear device that its author forgets to
+    /// classify lands on the safe side (treated as smooth, forfeiting reuse,
+    /// costing only speed) instead of silently reusing a stale matrix.
+    pub fn needs_newton(&self) -> bool {
+        self.is_nonlinear() && !self.is_discrete_nonlinear()
+    }
 }
 
 /// Highest tier index a document may carry. sim-core owns only the

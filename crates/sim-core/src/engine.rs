@@ -235,9 +235,22 @@ pub struct Engine {
     /// is only valid for the (step size, integration mode) it was stamped
     /// with — companion conductances depend on both.
     linear: bool,
+    /// True if ANY live element needs Newton iteration, i.e. writes into `a`
+    /// as a smooth function of the operating point (diode, BJT, MOS, OTA).
+    /// A world free of those has a matrix that is constant between discrete
+    /// events even when it is not linear — see `reusable`.
+    smooth_nonlinear: bool,
     factor_valid: bool,
     factored_h: f64,
     factored_be: bool,
+    /// Instrumentation/test knob: when false the piecewise-linear
+    /// factorization reuse is disabled and every substep refactors, exactly
+    /// as before the event-driven path existed. Solver output is identical
+    /// either way — `crates/sim-golden/tests/pwl_reuse.rs` asserts that on
+    /// every golden, both on the state hash and on the raw matrix bits,
+    /// which is what keeps the `is_discrete_nonlinear` classification honest
+    /// as devices are added.
+    reuse_pwl: bool,
     dt: f64,
     time: f64,
     be_steps: u32,
@@ -260,9 +273,11 @@ impl Engine {
             x: Vec::new(),
             lu: DenseLu::new(0),
             linear: true,
+            smooth_nonlinear: false,
             factor_valid: false,
             factored_h: 0.0,
             factored_be: false,
+            reuse_pwl: true,
             dt,
             time: 0.0,
             be_steps: 0,
@@ -297,6 +312,27 @@ impl Engine {
     /// makes the entire world refactor on every NR iteration.
     pub fn is_linear(&self) -> bool {
         self.linear
+    }
+
+    /// True when the stamped matrix is constant between discrete events, so
+    /// an LU factorization can outlive the substep that produced it: either
+    /// the world is linear, or its only nonlinearities are piecewise-linear
+    /// (op-amp rail regions, 555 latches). One diode anywhere disarms it.
+    ///
+    /// This does not weaken anything: on a reuse hit the solver runs against
+    /// an L/U that a refactor would have recomputed to the same bits.
+    #[inline]
+    fn reusable(&self) -> bool {
+        self.linear || (self.reuse_pwl && !self.smooth_nonlinear)
+    }
+
+    /// Test/instrumentation knob: disable piecewise-linear factorization
+    /// reuse and refactor unconditionally, as the solver did before it
+    /// existed. Both settings must produce bit-identical results.
+    #[doc(hidden)]
+    pub fn set_reuse_pwl(&mut self, on: bool) {
+        self.reuse_pwl = on;
+        self.factor_valid = false;
     }
 
     /// The last stamped MNA matrix, row-major `n x n`.
@@ -690,6 +726,13 @@ impl Engine {
             .elems
             .iter()
             .any(|e| !e.broken && e.spec.kind.is_nonlinear());
+        // ...and the last dead diode also hands back cross-substep
+        // factorization reuse to a room that still has op-amps and 555s in
+        // it, whose matrix only moves when a region or a latch flips.
+        self.smooth_nonlinear = self
+            .elems
+            .iter()
+            .any(|e| !e.broken && e.spec.kind.needs_newton());
         self.factor_valid = false;
         self.quarantined = false;
         self.be_steps = BE_STEPS_AFTER_EVENT;
@@ -757,13 +800,19 @@ impl Engine {
                 for (e, s) in self.elems.iter_mut().zip(saved.iter()) {
                     e.state = *s;
                 }
+                // The rollback restores discrete state (`region` lives in
+                // `ElemState`), so the retained factorization may now
+                // describe a region set that no longer exists. Drop it
+                // before anything can look at it — including on the
+                // give-up path below, where quarantine follows but a live
+                // `write_param` could still resume stepping.
+                self.factor_valid = false;
                 if depth >= RESCUE_DEPTH {
                     return Err(());
                 }
                 report.rescues += 1;
                 // Backward Euler at half the step, twice: robust against
                 // both nonconvergence and trapezoidal ringing.
-                self.factor_valid = false;
                 self.step(h * 0.5, true, depth + 1, report)?;
                 self.step(h * 0.5, true, depth + 1, report)?;
                 self.factor_valid = false;
@@ -868,8 +917,10 @@ impl Engine {
     /// Stamp the full system for time `t_new` and step `h`. Factors the
     /// matrix unless a valid linear factorization is being reused.
     fn build(&mut self, t_new: f64, h: f64, be: bool) -> Result<(), ()> {
-        let need_factor =
-            !(self.linear && self.factor_valid && self.factored_h == h && self.factored_be == be);
+        let need_factor = !(self.reusable()
+            && self.factor_valid
+            && self.factored_h == h
+            && self.factored_be == be);
         if need_factor {
             self.a.iter_mut().for_each(|v| *v = 0.0);
         }
@@ -1132,11 +1183,19 @@ impl Engine {
                     // Quiescent supply current: the chip's own bias
                     // network, so the rails carry current even with the
                     // output unloaded and KCL stays sane.
-                    self.stamp_g(vcc, gp, T555_G_QUIESCENT);
-                    // Discharge pin: saturated transistor to GND while the
-                    // latch is low, open circuit while it is high.
-                    if state.region == 0 {
-                        self.stamp_g(dis, gp, T555_G_DIS);
+                    // NOTE: every write into `a` below is guarded by
+                    // `need_factor`. The matrix is only re-zeroed when it is
+                    // about to be refactored, so an unguarded `+= 1.0` would
+                    // accumulate into a retained matrix on every reuse hit.
+                    // The RHS (`b`) is re-zeroed every pass and must always
+                    // be written.
+                    if need_factor {
+                        self.stamp_g(vcc, gp, T555_G_QUIESCENT);
+                        // Discharge pin: saturated transistor to GND while
+                        // the latch is low, open circuit while it is high.
+                        if state.region == 0 {
+                            self.stamp_g(dis, gp, T555_G_DIS);
+                        }
                     }
                     // Totem-pole output as a branch voltage source, referred
                     // to the rail it is working against: high sources from
@@ -1149,13 +1208,15 @@ impl Engine {
                     } else {
                         (gp, T555_VSAT_LOW)
                     };
-                    if out > 0 {
-                        self.a[(out - 1) * n + bi] += 1.0;
-                        self.a[bi * n + (out - 1)] += 1.0;
-                    }
-                    if ret > 0 {
-                        self.a[(ret - 1) * n + bi] -= 1.0;
-                        self.a[bi * n + (ret - 1)] -= 1.0;
+                    if need_factor {
+                        if out > 0 {
+                            self.a[(out - 1) * n + bi] += 1.0;
+                            self.a[bi * n + (out - 1)] += 1.0;
+                        }
+                        if ret > 0 {
+                            self.a[(ret - 1) * n + bi] -= 1.0;
+                            self.a[bi * n + (ret - 1)] -= 1.0;
+                        }
                     }
                     self.b[bi] = drop;
                 }
@@ -1164,8 +1225,9 @@ impl Engine {
                     let (p, m, out) = (node[0], node[1], node[2]);
                     // Output branch current column. The branch unknown is
                     // the current INTO the out pin, so an op-amp SOURCING
-                    // current carries a negative branch value.
-                    if out > 0 {
+                    // current carries a negative branch value. Guarded like
+                    // the 555's stamps: `a` survives a reuse hit, `b` does not.
+                    if need_factor && out > 0 {
                         self.a[(out - 1) * n + bi] += 1.0;
                     }
                     // Constraint row depends on the output-stage region:
@@ -1174,20 +1236,22 @@ impl Engine {
                     //  ±2   limited    i_out = ±isc, vout free
                     match state.region {
                         0 => {
-                            if p > 0 {
-                                self.a[bi * n + (p - 1)] += OPAMP_GAIN;
-                            }
-                            if m > 0 {
-                                self.a[bi * n + (m - 1)] -= OPAMP_GAIN;
-                            }
-                            if out > 0 {
-                                self.a[bi * n + (out - 1)] -= 1.0;
+                            if need_factor {
+                                if p > 0 {
+                                    self.a[bi * n + (p - 1)] += OPAMP_GAIN;
+                                }
+                                if m > 0 {
+                                    self.a[bi * n + (m - 1)] -= OPAMP_GAIN;
+                                }
+                                if out > 0 {
+                                    self.a[bi * n + (out - 1)] -= 1.0;
+                                }
                             }
                             // vout = A(vp - vm + Voff)
                             self.b[bi] = -OPAMP_GAIN * OPAMP_VOFF;
                         }
                         r if r.abs() == 1 => {
-                            if out > 0 {
+                            if need_factor && out > 0 {
                                 self.a[bi * n + (out - 1)] += 1.0;
                             }
                             self.b[bi] = r as f64 * rail;
@@ -1225,7 +1289,7 @@ impl Engine {
             if !ok {
                 return Err(());
             }
-            if self.linear {
+            if self.reusable() {
                 self.factor_valid = true;
                 self.factored_h = h;
                 self.factored_be = be;
@@ -1240,6 +1304,10 @@ impl Engine {
     /// with its previous guess (converged).
     fn update_guesses(&mut self) -> bool {
         let mut converged = true;
+        // Set when a piecewise-linear device ACTUALLY moves its discrete
+        // state. That, and only that, is what makes a retained
+        // factorization stale: this is the "event" in event-driven.
+        let mut discrete_flip = false;
         let close = |a: f64, b: f64| (a - b).abs() < NR_ABSTOL + NR_RELTOL * a.abs().max(b.abs());
         for ei in 0..self.elems.len() {
             let (kind, node, broken) = {
@@ -1374,6 +1442,7 @@ impl Engine {
                         st.lastv[0] += 1.0;
                         converged = false;
                         st.region = latch;
+                        discrete_flip = true;
                     }
                 }
                 ElementKind::OpAmp { rail, isc } => {
@@ -1466,11 +1535,15 @@ impl Engine {
                             st.lastv[0] += 1.0;
                             converged = false;
                             st.region = new_region;
+                            discrete_flip = true;
                         }
                     }
                 }
                 _ => {}
             }
+        }
+        if discrete_flip {
+            self.factor_valid = false;
         }
         converged
     }
