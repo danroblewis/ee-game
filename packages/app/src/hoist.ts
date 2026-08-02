@@ -137,6 +137,16 @@ export interface Hoist {
   endLocalDrag(): void;
   /** Light up the grab bar (pointer is over it, or a drag is in progress). */
   setHot(hot: boolean): void;
+  /**
+   * Forget the machine entirely: no state, no footprint, no goal card.
+   *
+   * Called when the client changes ROOM. Not every room has a hoist — a
+   * template declares whether it owns a machine — and the card used to latch
+   * visible forever after the first message, so joining a sandbox from the
+   * hoist would have left a frozen objective on screen for a machine that is
+   * no longer anywhere in the world.
+   */
+  clear(): void;
 }
 
 // ------------------------------------------------------------------ layout
@@ -279,6 +289,9 @@ interface Card {
   /** `stale` = no machine message recently: the numbers are frozen, and the
    * card says so instead of passing old values off as live. */
   onState(m: MachineMsg, now: number, stale: boolean): void;
+  /** Take the card off screen and re-arm it, so the next room's first
+   * machine message (if it ever has one) brings it back fresh. */
+  hide(): void;
 }
 
 function buildCard(root: HTMLElement, reset: () => void): Card {
@@ -358,6 +371,14 @@ function buildCard(root: HTMLElement, reset: () => void): Card {
   let shown = false;
 
   return {
+    hide() {
+      shown = false;
+      el.style.display = 'none';
+      el.classList.remove('win');
+      lastAt = -Infinity;
+      lastWin = false;
+      lastStale = false;
+    },
     onState(m: MachineMsg, now: number, stale: boolean) {
       if (!shown) {
         shown = true;
@@ -1006,6 +1027,21 @@ export function createHoist(root: HTMLElement, opts: { reset: () => void }): Hoi
       localAt = performance.now();
     },
     setHot: (v) => (hot = v),
+    clear: () => {
+      // The dev mock is a machine too: leaving it running would keep feeding
+      // a hoist into a room that has none.
+      mock?.stop();
+      mock = null;
+      m = null;
+      localRect = null;
+      localHeld = false;
+      dust = [];
+      spin = 0;
+      landAge = Infinity;
+      winAge = Infinity;
+      lastMsgAt = -Infinity;
+      card.hide();
+    },
   };
 
   // ---- dev mock (see the file header): URL flag or console call.

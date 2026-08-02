@@ -4,7 +4,35 @@
 import type { DocOp, ElementSpec, InteractOp } from './circuit';
 import type { MachineMsg } from './hoist';
 import type { Panel, PanelOp } from './panel';
-import type { Probe } from './scope';
+import type { Probe, SeedScope } from './scope';
+
+/** Where a room wants the camera, and which in-place scopes it ships with.
+ * Both are client-local concerns, which is why they ride the hello rather
+ * than being replicated room state. */
+export interface RoomView {
+  /** Grid rect `[x0, y0, x1, y1]` framed on first join; absent = the
+   * client's own default district. */
+  home?: [number, number, number, number];
+  scopes?: SeedScope[];
+}
+
+/** Which room this socket landed in. Null against a pre-rooms server, which
+ * is the one case where the client genuinely cannot say where it is. */
+export interface RoomHello {
+  /** The 6-char code: immutable, the filename, and the `?room=` value. */
+  id: string;
+  name: string;
+  /** The template it was created from — provenance, never a live link. */
+  template: string;
+  players: number;
+  /** True when the room owns a machine, i.e. its goal card belongs on
+   * screen. False means "no goal here": hide it instead of latching it. */
+  machine: boolean;
+  view: RoomView | null;
+}
+
+/** Why a socket is being turned away from a room. */
+export type GoneReason = 'deleted' | 'unknown' | string;
 
 export interface ServerFrame {
   time: number;
@@ -16,7 +44,22 @@ export interface ServerFrame {
 }
 
 export interface NetHandlers {
-  onHello(you: number, elements: ElementSpec[], probes: Probe[], panels: Panel[]): void;
+  /** The late-join payload. `room` is null only against a server from before
+   * rooms existed — everything else about that server still works. */
+  onHello(
+    you: number,
+    elements: ElementSpec[],
+    probes: Probe[],
+    panels: Panel[],
+    room: RoomHello | null,
+  ): void;
+  /** The room was renamed by somebody (possibly us): every open chip, tab
+   * title and browser row updates from this, not from the PATCH's reply. */
+  onRoomMeta(id: string, name: string): void;
+  /** This socket is not going to get a room: it was deleted under us, or the
+   * code is unknown. The server closes right after, so the reconnect loop
+   * must be pointed somewhere else before it fires. */
+  onRoomGone(id: string, reason: GoneReason): void;
   onFrame(f: ServerFrame): void;
   onOp(id: number, op: InteractOp): void;
   onDoc(op: DocOp): void;
@@ -63,34 +106,79 @@ export interface Net {
    * is allowed on the server-owned hoist fixture. */
   sendRepair(id: number): void;
   sendCursor(x: number, y: number): void;
+  /** Switch rooms in place: drop this socket and open one on `code` (null =
+   * the server's default room). No page navigation — see `resetForRoom` in
+   * main.ts for the state that has to be dropped with the old room. */
+  join(code: string | null): void;
+  /** The code this socket is in, or trying to be in. */
+  code(): string | null;
 }
 
 const RECONNECT_MS = 2500;
 
 /** Connect with automatic reconnection: a server restart mid-session
- * drops the client to the local sim, then transparently rejoins. */
-export function connect(h: NetHandlers): Net {
+ * drops the client to the local sim, then transparently rejoins — the same
+ * room it was in, because the code is what the retry loop is pointed at. */
+export function connect(h: NetHandlers, room: string | null = null): Net {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   let ws: WebSocket | null = null;
   let wasOpen = false;
+  /** The room we want to be in. Null = "whatever the server calls default",
+   * which is exactly how a bare `/ws` behaved before rooms existed. */
+  let want = room;
+  let retry = 0;
 
   const open = () => {
-    ws = new WebSocket(`${proto}://${location.host}/ws`);
-    ws.onopen = () => (wasOpen = true);
-    ws.onclose = () => {
+    retry = 0;
+    const q = want ? `?room=${encodeURIComponent(want)}` : '';
+    const sock = new WebSocket(`${proto}://${location.host}/ws${q}`);
+    ws = sock;
+    sock.onopen = () => (wasOpen = true);
+    sock.onclose = () => {
+      // A socket we deliberately abandoned in join() is no longer `ws`: its
+      // death is not an outage and must not drop the client to the local sim
+      // or schedule a retry against a room we have already left.
+      if (sock !== ws) return;
       if (wasOpen) h.onClose();
       wasOpen = false;
-      setTimeout(open, RECONNECT_MS);
+      retry = window.setTimeout(open, RECONNECT_MS);
     };
-    ws.onerror = () => ws?.close();
-    ws.onmessage = onMessage;
+    sock.onerror = () => sock.close();
+    sock.onmessage = onMessage;
+  };
+
+  const join = (code: string | null) => {
+    want = code;
+    if (retry) {
+      clearTimeout(retry);
+      retry = 0;
+    }
+    const old = ws;
+    ws = null; // marks `old` as superseded for its own onclose
+    if (old) {
+      old.onmessage = null;
+      old.onerror = null;
+      old.close();
+    }
+    wasOpen = false;
+    open();
   };
 
   const onMessage = (ev: MessageEvent) => {
     const m = JSON.parse(ev.data as string);
     switch (m.t) {
       case 'hello':
-        h.onHello(m.you, m.elements, m.probes ?? [], m.panels ?? []);
+        // A server that predates rooms sends no `room` key: null, not a
+        // fabricated one — "I don't know which room" is honest, and the chip
+        // says so rather than showing a made-up code.
+        h.onHello(m.you, m.elements, m.probes ?? [], m.panels ?? [], m.room ?? null);
+        if (m.room && typeof m.room.id === 'string') want = m.room.id;
+        break;
+      case 'roommeta':
+        h.onRoomMeta(m.id, m.name);
+        break;
+      case 'roomgone':
+        h.onRoomGone(m.id ?? '', m.reason ?? 'unknown');
         break;
       case 'frame':
         h.onFrame(m);
@@ -146,5 +234,7 @@ export function connect(h: NetHandlers): Net {
       send({ t: 'machinemove', dx: Math.round(dx), dy: Math.round(dy) }),
     sendRepair: (id) => send({ t: 'repair', id }),
     sendCursor: (x, y) => send({ t: 'cursor', x, y }),
+    join,
+    code: () => want,
   };
 }

@@ -48,6 +48,14 @@
 //                         parked inside a region becomes a widget in that
 //                         panel's window; drag it out to detach it again
 //   H / shift+H           frame the home district / the whole document
+//   ⇧R                    the room browser: which room you are in, every
+//                         other room on the server (join / rename / delete),
+//                         and "new room" from a TEMPLATE — a whole room
+//                         setup, parts + panels + scope channels + camera +
+//                         whether it comes with a machine. The chip in the
+//                         top-right corner always says where you are and
+//                         opens the same browser; a room switch reconnects
+//                         the socket in place, it never reloads the page.
 //   wheel zoom (over a scope: timebase) · pan: middle-drag, ctrl+drag, space+drag
 //
 // The world is large (tens of thousands of parts): the draw loop and the
@@ -70,7 +78,8 @@ import { AudioPlayer } from './audio';
 import { CATALOG, CATEGORIES, makePins, partsInCategory, type PartDef } from './catalog';
 import { History, isTypingTarget } from './history';
 import { createHoist, type MachineRect } from './hoist';
-import { connect } from './net';
+import { connect, type RoomHello } from './net';
+import { claimSeed, createRooms } from './rooms';
 import {
   applyPanelOp,
   drawPanelGhost,
@@ -83,6 +92,7 @@ import {
   resizePanelRect,
   roundRectPath,
   scopeOwner,
+  setPanelRoom,
   type Panel,
   type PanelHandle,
   type PanelOp,
@@ -105,6 +115,8 @@ import {
   renderScopeInto,
   scopeChannels,
   scopeControlAt,
+  scopeToSeed,
+  seedToScope,
   TraceStore,
   type FloatScope,
   type Probe,
@@ -356,9 +368,97 @@ function moveMachineBy(dx: number, dy: number) {
   else localSim.setElements(elements); // offline: the local netlist follows
 }
 
-let firstHello = true;
+// -------------------------------------------------------------- the room
+//
+// Which room this client is in, and the chrome for changing that. The chip
+// and the browser live in rooms.ts; everything below is the wiring, and the
+// one piece that must be right: what gets THROWN AWAY when the room changes.
+
+/** The room we are currently rendering ('' = a server with no room list).
+ * Compared against every hello, because a hello also arrives on reconnect
+ * and re-entering the SAME room must not yank the camera or bin the undo
+ * stack the player still has a use for. */
+let roomKey: string | null = null;
+
+const roomsUI = createRooms({
+  join: (code) => net.join(code),
+  // The camera and the in-place scopes are this client's own state: the
+  // server has never seen them, so a template can only get them from here.
+  view: () => ({
+    home: camRect(),
+    scopes: floatScopes.map(scopeToSeed),
+  }),
+  toast: (m) => toast(m),
+});
+
+/**
+ * Leave a room. Every line here is state that is scoped to ONE room and
+ * would be wrong — not merely stale — in the next one:
+ *
+ *   * undo entries carry element ids and captured specs from a document that
+ *     no longer exists; replaying one would re-add a stranger's part;
+ *   * traces, probe selections and scope channels are keyed by pid;
+ *   * the clipboard, the cursors and the audio tap all point at the old room;
+ *   * the goal card latches visible, so a machineless room would inherit a
+ *     frozen objective for a machine that is nowhere in the world.
+ *
+ * This is the cost of switching in place instead of reloading the page, and
+ * paying it explicitly is what makes the in-place switch correct.
+ */
+function resetForRoom(room: RoomHello | null) {
+  history.clear();
+  floatScopes = [];
+  sidCounter = 1;
+  traces.prune(new Set());
+  selectedIds.clear();
+  selectedProbe = null;
+  selectedMachine = false;
+  cursors.clear();
+  clipboard = [];
+  pasting = null;
+  placing = null;
+  panelTool = false;
+  repairing = false;
+  canvas.style.cursor = 'default';
+  listenWanted = null;
+  audio.stop();
+  damage = new Map();
+  damageSeen = false;
+  // A room that SAYS it has no machine has no goal card and no fixture to
+  // hit-test. `room === null` is a different thing — a server from before
+  // rooms existed, which has told us nothing either way — so leave the
+  // machine alone there rather than hiding a hoist that is really running.
+  if (room && !room.machine) hoist.clear();
+  // Panel window positions are per plid, and plids are room-scoped ids.
+  setPanelRoom(room?.id ?? null);
+
+  const home = room?.view?.home;
+  if (home && home.length === 4) {
+    homeRect = { x0: home[0]!, y0: home[1]!, x1: home[2]!, y1: home[3]! };
+  } else {
+    homeRect = { ...DEFAULT_HOME };
+  }
+  fitHome();
+
+  // Seed the room's in-place scopes ONCE per room per browser: after that
+  // they are the player's instruments, and re-joining must not re-litter the
+  // bench with copies of them.
+  const seeds = room?.view?.scopes ?? [];
+  if (room && seeds.length > 0 && claimSeed(room.id)) {
+    for (const s of seeds) floatScopes.push(seedToScope(s, sidCounter++));
+  }
+}
+
+/** `?room=CODE` in the address bar is an invite link: it is where a shared
+ * URL lands, and it is what a reload comes back to. No code = the server's
+ * default room, exactly as a bare `/ws` behaved before rooms existed. */
+const roomFromUrl = (): string | null => {
+  const c = new URLSearchParams(location.search).get('room');
+  return c && c.trim() ? c.trim().toUpperCase() : null;
+};
+
 const net = connect({
-  onHello(you, serverElements, serverProbes, serverPanels) {
+  onHello(you, serverElements, serverProbes, serverPanels, room) {
     online = true;
     myId = you;
     elements = serverElements;
@@ -372,10 +472,15 @@ const net = connect({
     // parts that were already dead when we joined).
     damage = new Map();
     damageSeen = false;
-    if (firstHello) {
-      firstHello = false;
-      fitHome();
+    // A hello also arrives on every reconnect. Only a DIFFERENT room is a
+    // room change: re-entering this one must not bin the undo stack or yank
+    // the camera back to the district the player deliberately left.
+    const key = room?.id ?? '';
+    if (key !== roomKey) {
+      roomKey = key;
+      resetForRoom(room);
     }
+    roomsUI.onHello(room);
   },
   onFrame(f) {
     simTime = f.time;
@@ -460,6 +565,21 @@ const net = connect({
   },
   onPresence(n) {
     population = n;
+    roomsUI.onPresence(n);
+  },
+  onRoomMeta(id, name) {
+    roomsUI.onRoomMeta(id, name);
+  },
+  onRoomGone(id, reason) {
+    // The room we are standing in is not going to answer again — it was
+    // deleted, or the code in the URL is not on this server. Drop what
+    // belonged to it BEFORE rooms.ts moves us, so nothing survives the
+    // handover; `roomKey` is cleared so the landing hello counts as a
+    // change and re-fits the camera.
+    roomKey = null;
+    resetForRoom(null);
+    hoist.clear(); // whatever machine that room had, it is not ours any more
+    roomsUI.onGone(id, reason);
   },
   onCursor(who, x, y) {
     if (who !== myId) cursors.set(who, { x, y, seen: performance.now() });
@@ -475,9 +595,10 @@ const net = connect({
       damage = new Map();
       damageSeen = false;
       repairing = false;
+      roomsUI.onOffline();
     }
   },
-});
+}, roomFromUrl());
 
 // ------------------------------------------------------- damage + repair
 //
@@ -687,8 +808,23 @@ const MAX_SCALE = 200;
 
 /** The starter district: joining frames THIS, not the whole document, so a
  * world with a 40k-element city two thousand units east still opens on the
- * demo bench. 'H' returns here, shift+H frames everything. */
-const HOME_RECT = { x0: -10, y0: -10, x1: 60, y1: 60 };
+ * demo bench. 'H' returns here, shift+H frames everything.
+ *
+ * It is ROOM DATA now, not a constant: a template says where its own world
+ * begins (`view.home` in the hello), so THE HOIST frames the cabinet and the
+ * bench in front of it rather than the showcase two hundred units away. The
+ * literal below is only the fallback — offline, and against a server from
+ * before rooms existed. */
+const DEFAULT_HOME = { x0: -10, y0: -10, x1: 60, y1: 60 };
+let homeRect = { ...DEFAULT_HOME };
+
+/** The rect the camera is looking at right now, in grid units. This is the
+ * `view.home` a template gets when the player saves this room as one. */
+const camRect = (): [number, number, number, number] => {
+  const [x0, y0] = toGrid(0, 0);
+  const [x1, y1] = toGrid(window.innerWidth, window.innerHeight);
+  return [x0, y0, x1, y1];
+};
 
 /** Frame a grid-space rect, with margin, clamped to a usable zoom band. */
 function fitRect(x0: number, y0: number, x1: number, y1: number, loScale = 4, hiScale = 60) {
@@ -718,16 +854,15 @@ function pinBounds(list: ElementSpec[]): [number, number, number, number] | null
  * itself when it is still empty). */
 function fitHome() {
   const inHome = space
-    .query(HOME_RECT.x0, HOME_RECT.y0, HOME_RECT.x1, HOME_RECT.y1)
+    .query(homeRect.x0, homeRect.y0, homeRect.x1, homeRect.y1)
     .filter((e) =>
       e.pins.every(
-        ([x, y]) =>
-          x >= HOME_RECT.x0 && x <= HOME_RECT.x1 && y >= HOME_RECT.y0 && y <= HOME_RECT.y1,
+        ([x, y]) => x >= homeRect.x0 && x <= homeRect.x1 && y >= homeRect.y0 && y <= homeRect.y1,
       ),
     );
   const b = pinBounds(inHome);
   if (b) fitRect(...b, 8, 60);
-  else fitRect(HOME_RECT.x0, HOME_RECT.y0, HOME_RECT.x1, HOME_RECT.y1, MIN_SCALE, 60);
+  else fitRect(homeRect.x0, homeRect.y0, homeRect.x1, homeRect.y1, MIN_SCALE, 60);
 }
 
 /** shift+H: frame the whole document, however far it sprawls. */
@@ -1464,8 +1599,24 @@ function canvasMenu(x: number, y: number): MenuItem[] {
     { label: 'Control panel here', hint: 'J', run: () => (panelTool = true) },
     { sep: true },
     { label: 'Select all', run: selectAll },
+    { sep: true },
+    { label: 'Rooms', sub: roomsMenu },
   );
   return items;
+}
+
+/** The room cascade. The chip in the corner is the always-visible answer to
+ * "where am I"; this is the same three doors from where the player's hand
+ * already is. */
+function roomsMenu(): MenuItem[] {
+  const here = roomsUI.current();
+  return [
+    { head: here ? `${here.name} · ${here.id}` : 'no room list on this server' },
+    { label: 'Switch room…', hint: '⇧R', run: () => roomsUI.open('rooms') },
+    { label: 'New room from a template…', run: () => roomsUI.open('new') },
+    { sep: true },
+    { label: 'Save this room as a template…', run: () => roomsUI.open('save') },
+  ];
 }
 
 // ------------------------------------------------------------------ drags
@@ -2147,6 +2298,7 @@ window.addEventListener('keydown', (ev) => {
     return;
   }
   if (panelHost.owns(ev.target)) return; // typing in a panel window
+  if (roomsUI.owns(ev.target)) return; // typing in the room browser
 
   // Clipboard first: ⌘/Ctrl+C copies, ⌘/Ctrl+V arms pasting at the cursor.
   if (ev.metaKey || ev.ctrlKey) {
@@ -2197,7 +2349,12 @@ window.addEventListener('keydown', (ev) => {
     return;
   }
   if (ev.key === 'Escape') {
-    // Peel one layer at a time: menu, then editor, then tools/selection.
+    // Peel one layer at a time: browser, then menu, then editor, then
+    // tools/selection. The browser is a modal, so it comes off first.
+    if (roomsUI.isOpen()) {
+      roomsUI.close();
+      return;
+    }
     if (ctxIsOpen()) {
       closeCtxMenu();
       return;
@@ -2215,6 +2372,14 @@ window.addEventListener('keydown', (ev) => {
     selectedProbe = null;
     selectedMachine = false;
     canvas.style.cursor = 'default';
+    return;
+  }
+  if (ev.key === 'R') {
+    // ⇧R: the room browser. Shift, because every bare letter in this app is
+    // a part — 'r' is the resistor and must stay the resistor.
+    if (roomsUI.isOpen()) roomsUI.close();
+    else roomsUI.open('rooms');
+    ev.preventDefault();
     return;
   }
   if (ev.key === 'h' || ev.key === 'H') {
@@ -2875,10 +3040,13 @@ function frame(now: number) {
   const hints = hintsOpen
     ? `\nparts: R C L W G V D N P M A U 5 S B T Z E F I · ⇧V rail · drag part = move · drag the hoist cabinet = move the machine · dbl-click = edit values · right-click = menu` +
       `\ndrag pin = reshape part · W then drag = wire · drag empty = select · Q rotate · ⌘Z undo · ⌘C/⌘V copy/paste · 1/2 probe · 3 listen · 0 ref · O scope · \` dock · J panel · K repair · X delete` +
-      `\nH home district · shift+H fit everything · wheel = zoom (0.4–200 px/unit) · pan: middle / ctrl+drag / space+drag · ? hides this`
+      `\nH home district · shift+H fit everything · ⇧R rooms · wheel = zoom (0.4–200 px/unit) · pan: middle / ctrl+drag / space+drag · ? hides this`
     : `\n? controls`;
+  // Which room, first thing on the status line — the clickable version of
+  // the same fact is the chip in the top-right corner.
+  const where = roomsUI.hudLabel();
   hud.textContent =
-    `EE Game   sim t = ${simTime.toFixed(2)} s   ` +
+    `EE Game   ${where ? `${where}   ` : ''}sim t = ${simTime.toFixed(2)} s   ` +
     (online ? `● ONLINE — ${population} player${population === 1 ? '' : 's'}` : '○ offline (local sim)') +
     `   ${perf.drawn}/${perf.total} parts drawn @ ${cam.scale.toFixed(1)} px/unit (cull ${perf.cull.toFixed(2)} ms)` +
     (mode ? `   ${mode}` : '') +
