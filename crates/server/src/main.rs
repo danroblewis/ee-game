@@ -1,4 +1,15 @@
-//! Room server: one authoritative simulation, many browsers.
+//! Room server: MANY authoritative simulations (one per room), many browsers.
+//!
+//! A room is a code + a name + a template it was born from + a document +
+//! its instruments + optionally a machine. Rooms live one JSON file each
+//! under `$EE_ROOMS`, are created from templates (`templates.rs`), are
+//! created/listed/renamed/deleted over `/api` (`lobby.rs`), and are held by
+//! the registry (`registry.rs`), which owns their lifecycle: a room with
+//! nobody in it has no sim task at all.
+//!
+//! A socket joins with `/ws?room=CODE`; no code lands in the default room,
+//! which is what makes a bare `http://host/` behave exactly like the
+//! single-room server it grew out of.
 //!
 //! M4-lite protocol (JSON over WebSocket, upgraded to the three-class
 //! binary transport in M4/M5):
@@ -22,16 +33,33 @@
 //! worth drawing (dead parts first), so a client replaces its whole damage
 //! map from it and a dropped message costs one frame of staleness. A room
 //! with nothing stressed sends none at all.
+//!
+//! Room-aware additions, all server -> client and all ADDITIVE (a client
+//! that ignores unknown `t` values keeps working):
+//!   hello{..., room:{id, name, template, players}, view:{home, scopes},
+//!         machine: bool}   — which room this is, where the camera lands,
+//!                            and whether the room has a goal at all
+//!   roommeta{id, name}     — a rename, broadcast to everyone inside
+//!   roomgone{id, reason}   — "deleted" | "unknown", then the socket closes
+//!
+//! `machine{...}` is now sent ONLY by rooms that have a machine. A room
+//! whose template declares none (a sandbox, a synth world) never mentions
+//! the hoist and never gets ids 900-999 injected into it.
+
+mod lobby;
+mod registry;
+mod templates;
 
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
-    extract::State,
+    extract::{Query, State},
     response::IntoResponse,
     routing::get,
     Router,
 };
 use damage::DamageModel;
 use machine::Hoist;
+use registry::{Life, Parked, Registry, RoomHandle};
 use serde::Deserialize;
 use serde_json::json;
 use sim_core::{DocOp, ElementKind, ElementSpec, Engine, InteractOp, ParamWrite};
@@ -39,6 +67,7 @@ use std::sync::{
     atomic::{AtomicU32, Ordering},
     Arc,
 };
+use templates::{MachineSpec, RoomSetup, View};
 use tokio::sync::{broadcast, mpsc};
 use tower_http::services::{ServeDir, ServeFile};
 
@@ -620,7 +649,7 @@ fn machine_step(eng: &mut Engine, hoist: &mut Hoist, sources: &[u32]) -> machine
     w
 }
 
-#[derive(Clone, Copy, PartialEq, serde::Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum ProbeKind {
     V,
@@ -636,6 +665,28 @@ struct Probe {
     /// Optional reference point for differential voltage measurement:
     /// the trace shows v(pin) - v(ref). None = referenced to ground.
     r: Option<(u32, usize)>,
+}
+
+impl Probe {
+    fn from_saved(p: &SavedProbe) -> Probe {
+        Probe {
+            pid: p.pid,
+            elem: p.elem,
+            pin: p.pin,
+            kind: p.kind,
+            r: p.r,
+        }
+    }
+
+    fn saved(&self) -> SavedProbe {
+        SavedProbe {
+            pid: self.pid,
+            elem: self.elem,
+            pin: self.pin,
+            kind: self.kind,
+            r: self.r,
+        }
+    }
 }
 
 /// Sim substeps between waveform samples: dt=20 µs × 16 → 3.125 kHz
@@ -709,7 +760,7 @@ fn wire_sample(v: f64) -> f64 {
 /// panel one player draws is a shared instrument. Only the rectangle is
 /// stored — membership is re-derived from element geometry by the client,
 /// never persisted (moving a part in or out re-wires the panel live).
-#[derive(Clone, serde::Serialize, Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, Deserialize)]
 struct Panel {
     plid: u32,
     x0: f64,
@@ -794,6 +845,12 @@ enum Cmd {
     },
     Join,
     Leave,
+    /// Stop the sim task: park (checkpoint: true, graceful shutdown) or
+    /// evict (checkpoint: false, the room is being deleted and a checkpoint
+    /// would resurrect its file).
+    Stop {
+        checkpoint: bool,
+    },
 }
 
 struct Room {
@@ -816,8 +873,36 @@ struct Room {
 
 /// Room checkpoint: the document, probes and panels survive server restarts
 /// (the continuous electrical state re-settles within milliseconds).
+///
+/// ALSO the template format. A template is a checkpoint with the identity and
+/// the playthrough stripped, which is what makes "save this running room as a
+/// template" one function rather than a second serializer. `kind` says which
+/// one a file is; every field added since the single-room days defaults, so
+/// a `room-save.json` written before rooms existed still loads.
 #[derive(serde::Serialize, Deserialize)]
 struct SaveFile {
+    /// Format version. Absent (0) = the flat single-room save.
+    #[serde(default)]
+    v: u32,
+    /// "room" | "template".
+    #[serde(default)]
+    kind: String,
+    /// Room code, or template id.
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    name: String,
+    /// Templates only: the one-liner the create dialog shows.
+    #[serde(default)]
+    blurb: String,
+    /// Rooms only: which template this room was made from (provenance; a room
+    /// is never re-linked to it).
+    #[serde(default)]
+    template: String,
+    #[serde(default)]
+    created: u64,
+    #[serde(default)]
+    played: u64,
     elements: Vec<ElementSpec>,
     #[serde(default)]
     probes: Vec<SavedProbe>,
@@ -828,8 +913,21 @@ struct SaveFile {
     panels: Vec<Panel>,
     #[serde(default)]
     next_plid: u32,
+    /// The machine this room arms, if any — the field that makes the hoist
+    /// OPTIONAL and per room. Three states, deliberately distinguishable:
+    ///   absent          legacy save: fall back to `hoist` / `hoist_rect`
+    ///   {"kind":"none"} this room has no machine at all
+    ///   {"kind":"hoist", "rect": [...], "state": {...}}
+    #[serde(default)]
+    machine: Option<MachineSpec>,
+    /// Where the camera lands and which in-place scopes the room seeds.
+    #[serde(default)]
+    view: View,
     /// Mechanical state of the hoist. Defaulted so saves written before the
     /// hoist existed still load (crate on the floor, goal armed).
+    ///
+    /// LEGACY: superseded by `machine`, still written as a mirror of it so a
+    /// file written by this server can still be read by the single-room one.
     #[serde(default)]
     hoist: Hoist,
     /// Where the hoist stands, in GRID units. Defaulted so saves written
@@ -848,7 +946,7 @@ fn default_hoist_rect() -> [i32; 4] {
     HOIST_RECT
 }
 
-#[derive(serde::Serialize, Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, Deserialize)]
 struct SavedProbe {
     pid: u32,
     elem: u32,
@@ -858,45 +956,123 @@ struct SavedProbe {
     r: Option<(u32, usize)>,
 }
 
-fn save_path() -> String {
+impl Default for SaveFile {
+    fn default() -> Self {
+        SaveFile {
+            v: SAVE_VERSION,
+            kind: "room".into(),
+            id: String::new(),
+            name: String::new(),
+            blurb: String::new(),
+            template: String::new(),
+            created: 0,
+            played: 0,
+            elements: Vec::new(),
+            probes: Vec::new(),
+            next_pid: 1,
+            panels: Vec::new(),
+            next_plid: 1,
+            machine: None,
+            view: View::default(),
+            // Not [0;4]: an absent footprint means "where the hoist has
+            // always stood", the same answer `default_hoist_rect` gives the
+            // deserializer.
+            hoist_rect: HOIST_RECT,
+            hoist: Hoist::default(),
+            damage: DamageModel::new(),
+        }
+    }
+}
+
+const SAVE_VERSION: u32 = 1;
+
+impl SaveFile {
+    /// A save/template file as a room setup. This is where a LEGACY file (no
+    /// `machine` key) gets its hoist back: absent means "the single-room
+    /// server wrote this, and that server always had a hoist".
+    fn into_setup(self) -> RoomSetup {
+        let machine = self.machine.unwrap_or(MachineSpec::Hoist {
+            rect: sane_rect(self.hoist_rect),
+            state: self.hoist,
+        });
+        RoomSetup {
+            elements: self.elements,
+            probes: self.probes,
+            next_pid: self.next_pid.max(1),
+            panels: self.panels,
+            next_plid: self.next_plid.max(1),
+            machine,
+            view: self.view,
+            damage: self.damage,
+        }
+    }
+
+    fn from_setup(s: &RoomSetup) -> SaveFile {
+        // The legacy hoist fields are written as a MIRROR of `machine`, never
+        // as a second source of truth: a file this server writes stays
+        // readable by the single-room server, and the two copies cannot
+        // disagree because one is derived from the other.
+        let (hoist, hoist_rect) = match s.machine {
+            MachineSpec::Hoist { rect, state } => (state, rect),
+            MachineSpec::None => (Hoist::default(), HOIST_RECT),
+        };
+        SaveFile {
+            elements: s.elements.clone(),
+            probes: s
+                .probes
+                .iter()
+                .map(|p| SavedProbe {
+                    pid: p.pid,
+                    elem: p.elem,
+                    pin: p.pin,
+                    kind: p.kind,
+                    r: p.r,
+                })
+                .collect(),
+            next_pid: s.next_pid,
+            panels: s.panels.clone(),
+            next_plid: s.next_plid,
+            machine: Some(s.machine),
+            view: s.view.clone(),
+            hoist,
+            hoist_rect,
+            damage: s.damage.clone(),
+            ..SaveFile::default()
+        }
+    }
+
+    fn with_identity(mut self, kind: &str, id: &str, name: &str) -> SaveFile {
+        self.kind = kind.into();
+        self.id = id.into();
+        self.name = name.into();
+        self
+    }
+
+    fn with_blurb(mut self, blurb: &str) -> SaveFile {
+        self.blurb = blurb.into();
+        self
+    }
+}
+
+/// The pre-rooms single-file save. Read once at boot and migrated into the
+/// rooms directory; never written again.
+fn legacy_save_path() -> String {
     std::env::var("EE_SAVE").unwrap_or_else(|_| "room-save.json".into())
 }
 
-fn load_room() -> Option<SaveFile> {
-    let data = std::fs::read_to_string(save_path()).ok()?;
-    serde_json::from_str(&data).ok()
+fn rooms_dir() -> String {
+    std::env::var("EE_ROOMS").unwrap_or_else(|_| "rooms".into())
 }
 
-fn checkpoint(room: &Room, hoist: &Hoist, hoist_rect: [i32; 4], damage: &DamageModel) {
-    let save = SaveFile {
-        hoist: *hoist,
-        hoist_rect,
-        damage: damage.clone(),
-        elements: room.elements.lock().unwrap().clone(),
-        probes: room
-            .probes
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|p| SavedProbe {
-                pid: p.pid,
-                elem: p.elem,
-                pin: p.pin,
-                kind: p.kind,
-                r: p.r,
-            })
-            .collect(),
-        next_pid: room.next_pid.load(Ordering::Relaxed),
-        panels: room.panels.lock().unwrap().clone(),
-        next_plid: room.next_plid.load(Ordering::Relaxed),
-    };
-    if let Ok(json) = serde_json::to_string(&save) {
-        let path = save_path();
-        let tmp = format!("{path}.tmp");
-        if std::fs::write(&tmp, json).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
-        }
-    }
+fn templates_dir() -> String {
+    std::env::var("EE_TEMPLATES").unwrap_or_else(|_| "templates".into())
+}
+
+/// Template a fresh server (and an unqualified `POST /api/rooms`) starts
+/// from. "demo" is the showcase + hoist, i.e. exactly what the single-room
+/// server booted into.
+fn default_template() -> String {
+    std::env::var("EE_DEFAULT_TEMPLATE").unwrap_or_else(|_| "demo".into())
 }
 
 /// Smoothing for the realtime ratio: one EMA pole at 0.2 is ~5 ticks (170 ms),
@@ -963,17 +1139,41 @@ fn audio_message(
     json!({"t": "audio", "t0": t0, "dts": dts, "rt": rt, "s": s}).to_string()
 }
 
-/// The sim task: sole owner of the Engine. Ops apply between ticks —
+/// The sim task: sole owner of THIS ROOM's Engine. Ops apply between ticks —
 /// the "tick boundary" rule from the plan, at demo scale.
-async fn sim_task(
-    room: Arc<Room>,
-    mut cmds: mpsc::UnboundedReceiver<Cmd>,
-    mut hoist: Hoist,
+///
+/// One task and one Engine PER ROOM, so a room that quarantines, or one
+/// carrying a circuit heavy enough to eat its whole step budget, dilates its
+/// own sim clock and nothing else's. The tick budget is per task by
+/// construction (`MAX_STEPS_PER_TICK`), and an empty room has no task at all
+/// (see the park path at the top of the loop).
+///
+/// The mechanism is OPTIONAL: `machine` comes from the room's template, so a
+/// machineless room (sandbox, a synth world) runs the same loop with no
+/// co-simulation and no hoist telemetry on the wire.
+async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
+    let Parked {
+        rx: mut cmds,
+        machine,
+        mut damage,
+    } = parked;
+    let room = handle.room.clone();
     // The hoist's footprint: owned here, beside the mechanism it belongs to,
     // so a move and a machine tick can never interleave.
-    mut hoist_rect: [i32; 4],
-    mut damage: DamageModel,
-) {
+    let (mut hoist, mut hoist_rect, has_machine) = match machine {
+        MachineSpec::Hoist { rect, state } => (state, rect, true),
+        MachineSpec::None => (Hoist::default(), HOIST_RECT, false),
+    };
+    let spec_now = |hoist: &Hoist, rect: [i32; 4]| {
+        if has_machine {
+            MachineSpec::Hoist {
+                rect,
+                state: *hoist,
+            }
+        } else {
+            MachineSpec::None
+        }
+    };
     let mut eng = Engine::new(DT);
     let mut sources;
     {
@@ -1007,9 +1207,40 @@ async fn sim_task(
     let mut rt_ready = false;
     let mut last_wall = std::time::Instant::now();
     let mut last_sim = eng.time();
+    // Consecutive ticks with nobody in the room. An empty room is parked, not
+    // stepped forever: N rooms x a 30 Hz solver is the difference between a
+    // room selector and a box that melts.
+    let mut empty_ticks: u32 = 0;
 
     loop {
         interval.tick().await;
+
+        // ---- park when empty. The population check and the handover both
+        // happen under `handle.parked`, the same lock `Registry::enter`
+        // takes, so "the task parked while a player was joining" cannot
+        // happen: whoever gets the lock first wins and the other sees the
+        // decision already made.
+        if room.population.load(Ordering::SeqCst) == 0 {
+            empty_ticks += 1;
+        } else {
+            empty_ticks = 0;
+        }
+        if empty_ticks >= registry::PARK_AFTER_TICKS {
+            let mut slot = handle.parked.lock().unwrap();
+            if room.population.load(Ordering::SeqCst) == 0 {
+                let machine = spec_now(&hoist, hoist_rect);
+                handle.checkpoint(&machine, &damage);
+                *slot = Some(Parked {
+                    rx: cmds,
+                    machine,
+                    damage,
+                });
+                handle.life.send_replace(Life::Parked);
+                tracing::info!("room {} parked", handle.meta().id);
+                return;
+            }
+            empty_ticks = 0;
+        }
 
         {
             let now = std::time::Instant::now();
@@ -1028,11 +1259,14 @@ async fn sim_task(
         ticks_since_save += 1;
         if ticks_since_save >= 150 && room.dirty.swap(false, Ordering::Relaxed) {
             ticks_since_save = 0;
-            checkpoint(&room, &hoist, hoist_rect, &damage);
+            handle.checkpoint(&spec_now(&hoist, hoist_rect), &damage);
         }
 
         // Assembly moves arriving this tick, summed and applied once below.
         let mut pending_move = (0i32, 0i32);
+        // Set by Cmd::Stop. Handled AFTER the drain: the receiver cannot be
+        // moved out of while it is being borrowed by `try_recv`.
+        let mut stop: Option<bool> = None;
         while let Ok(cmd) = cmds.try_recv() {
             match cmd {
                 Cmd::Interact { id, op } => {
@@ -1048,8 +1282,14 @@ async fn sim_task(
                         .send(json!({"t": "op", "id": id, "op": op}).to_string());
                 }
                 Cmd::MachineReset => {
-                    hoist.reset();
-                    room.dirty.store(true, Ordering::Relaxed);
+                    // A room with no machine has nothing to reset.
+                    if has_machine {
+                        hoist.reset();
+                        room.dirty.store(true, Ordering::Relaxed);
+                    }
+                }
+                Cmd::MachineMove { dx, dy } if !has_machine => {
+                    let _ = (dx, dy);
                 }
                 Cmd::MachineMove { dx, dy } => {
                     // Coalesced, not applied here: a drag sends ~2 ops per
@@ -1161,6 +1401,34 @@ async fn sim_task(
                         .events
                         .send(json!({"t": "presence", "n": n}).to_string());
                 }
+                Cmd::Stop { checkpoint } => {
+                    // Last one wins: a delete arriving after a park request
+                    // must not write the file back out.
+                    stop = Some(checkpoint);
+                }
+            }
+        }
+
+        // ---- stop: graceful shutdown (checkpoint, then park) or eviction
+        // (the room is gone; write nothing).
+        if let Some(cp) = stop {
+            let machine = spec_now(&hoist, hoist_rect);
+            if !cp {
+                return; // evicted
+            }
+            handle.checkpoint(&machine, &damage);
+            // Park only if the room is actually empty — same lock, same
+            // re-check as the timer path. A park request that raced a join
+            // must not leave a player sitting in a room whose clock stopped.
+            let mut slot = handle.parked.lock().unwrap();
+            if room.population.load(Ordering::SeqCst) == 0 {
+                *slot = Some(Parked {
+                    rx: cmds,
+                    machine,
+                    damage,
+                });
+                handle.life.send_replace(Life::Parked);
+                return;
             }
         }
 
@@ -1213,7 +1481,11 @@ async fn sim_task(
         // Machine + goal state the tick reports afterwards. `motor_i` is
         // seeded from the current netlist so a tick that quarantines still
         // reports the last honest reading rather than zero.
-        let mut motor_i = eng.pin_current(MOTOR_ID, 0).unwrap_or(0.0);
+        let mut motor_i = if has_machine {
+            eng.pin_current(MOTOR_ID, 0).unwrap_or(0.0)
+        } else {
+            0.0
+        };
         let mut impact = 0.0f64;
         let won_before = hoist.win;
         // The machine's last write-back this tick, mirrored into the stored
@@ -1256,7 +1528,7 @@ async fn sim_task(
                 // A quarantined solver has no current to report, so the
                 // machine freezes with it rather than coasting on stale
                 // numbers.
-                if (c + 1) % per_machine == 0 && !eng.is_quarantined() {
+                if has_machine && (c + 1) % per_machine == 0 && !eng.is_quarantined() {
                     motor_i = eng.pin_current(MOTOR_ID, 0).unwrap_or(0.0);
                     writes = Some(machine_step(&mut eng, &mut hoist, &sources));
                     impact = impact.max(hoist.impact);
@@ -1353,21 +1625,29 @@ async fn sim_task(
                     ]
                 })
                 .collect();
-            let _ = room
-                .events
-                .send(
-                    // `rt` rides every frame so the client's status strip can
-                    // report dilation without a speaker in the room (the
-                    // audio stream carries its own copy for rate matching).
-                    json!({"t": "frame", "time": eng.time(), "e": e,
+            let _ = room.events.send(
+                // `rt` rides every frame so the client's status strip can
+                // report dilation without a speaker in the room (the
+                // audio stream carries its own copy for rate matching).
+                json!({"t": "frame", "time": eng.time(), "e": e,
                            "rt": (rt * 1000.0).round() / 1000.0})
-                    .to_string(),
-                );
+                .to_string(),
+            );
 
-            // The hoist, once per tick alongside the frame.
-            let _ = room
-                .events
-                .send(machine_msg(&hoist, hoist_rect, motor_i, impact, motor_i_max()).to_string());
+            // The hoist, once per tick alongside the frame — only in a room
+            // that HAS one. A machineless room never mentions it.
+            if has_machine {
+                let _ = room.events.send(
+                    machine_msg(&hoist, hoist_rect, motor_i, impact, motor_i_max()).to_string(),
+                );
+            }
+        }
+        // Keep the handle's machine mirror current (footprint AND mechanism).
+        // The sim task is authoritative while the room is live; the lobby
+        // reads this mirror to save a room as a template, and a cabinet
+        // dragged one second ago has to be where the template says it is.
+        if has_machine {
+            *handle.machine.lock().unwrap() = spec_now(&hoist, hoist_rect);
         }
         // A win is worth a checkpoint even if nobody edited anything.
         if hoist.win && !won_before {
@@ -1667,34 +1947,99 @@ enum ClientMsg {
     },
 }
 
-async fn ws_handler(ws: WebSocketUpgrade, State(room): State<Arc<Room>>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| client_session(socket, room))
+#[derive(Deserialize)]
+struct WsQuery {
+    /// Room code. Absent = the default room, so a bare `/ws` behaves exactly
+    /// like the single-room server did.
+    #[serde(default)]
+    room: Option<String>,
 }
 
-async fn client_session(mut socket: WebSocket, room: Arc<Room>) {
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(reg): State<Arc<Registry>>,
+    Query(q): Query<WsQuery>,
+) -> impl IntoResponse {
+    let handle = reg.resolve(q.room.as_deref());
+    let asked = q.room.unwrap_or_default();
+    ws.on_upgrade(move |socket| async move {
+        match handle {
+            Some(h) => client_session(socket, reg, h).await,
+            // Accept the upgrade and say WHY: a bad or expired code has to
+            // reach the client as a reason it can show, not as an opaque
+            // failed handshake.
+            None => no_such_room(socket, &asked).await,
+        }
+    })
+}
+
+async fn no_such_room(mut socket: WebSocket, asked: &str) {
+    let msg = json!({"t": "roomgone", "id": asked, "reason": "unknown"}).to_string();
+    let _ = socket.send(Message::Text(msg.into())).await;
+    let _ = socket.send(Message::Close(None)).await;
+}
+
+/// The late-join payload: the whole room, including WHICH room it is.
+fn hello_msg(handle: &RoomHandle, me: u32) -> String {
+    let room = &handle.room;
+    let meta = handle.meta();
+    let elems = room.elements.lock().unwrap();
+    let probes = room.probes.lock().unwrap();
+    let panels = room.panels.lock().unwrap();
+    let view = handle.view.lock().unwrap();
+    json!({
+        "t": "hello", "you": me,
+        "room": {
+            "id": meta.id, "name": meta.name, "template": meta.template,
+            "players": room.population.load(Ordering::Relaxed),
+        },
+        "elements": *elems,
+        "probes": *probes, "panels": *panels,
+        "view": *view,
+        // False means "this room has no goal card": the client hides the
+        // hoist chrome instead of latching it forever.
+        "machine": handle.has_machine,
+    })
+    .to_string()
+}
+
+async fn client_session(mut socket: WebSocket, reg: Arc<Registry>, handle: Arc<RoomHandle>) {
+    let room = handle.room.clone();
     let me = room.next_client.fetch_add(1, Ordering::Relaxed);
-    room.population.fetch_add(1, Ordering::Relaxed);
+    // Counts the player AND resumes the room if it was parked.
+    reg.enter(&handle);
     let _ = room.cmds.send(Cmd::Join);
     let mut events = room.events.subscribe();
+    let mut life = handle.subscribe_life();
+    // A room deleted between resolving it and subscribing: `changed()` only
+    // fires on a change AFTER the subscribe, so the already-gone case has to
+    // be checked once by hand or the session would wait forever in a room
+    // with no sim task.
+    if matches!(*life.borrow(), Life::Gone) {
+        let msg = json!({"t": "roomgone", "id": handle.meta().id, "reason": "deleted"}).to_string();
+        let _ = socket.send(Message::Text(msg.into())).await;
+        reg.leave(&handle);
+        return;
+    }
 
-    let hello = {
-        let elems = room.elements.lock().unwrap();
-        let probes = room.probes.lock().unwrap();
-        let panels = room.panels.lock().unwrap();
-        json!({
-            "t": "hello", "you": me, "elements": *elems,
-            "probes": *probes, "panels": *panels,
-        })
-        .to_string()
-    };
+    let hello = hello_msg(&handle, me);
     if socket.send(Message::Text(hello.into())).await.is_err() {
-        room.population.fetch_sub(1, Ordering::Relaxed);
+        reg.leave(&handle);
         let _ = room.cmds.send(Cmd::Leave);
         return;
     }
 
     loop {
         tokio::select! {
+            _ = life.changed() => {
+                let gone = matches!(*life.borrow(), Life::Gone);
+                if gone {
+                    let msg = json!({"t": "roomgone", "id": handle.meta().id,
+                                     "reason": "deleted"}).to_string();
+                    let _ = socket.send(Message::Text(msg.into())).await;
+                    break;
+                }
+            },
             ev = events.recv() => match ev {
                 Ok(msg) => {
                     if socket.send(Message::Text(msg.into())).await.is_err() {
@@ -1746,7 +2091,7 @@ async fn client_session(mut socket: WebSocket, room: Arc<Room>) {
         }
     }
 
-    room.population.fetch_sub(1, Ordering::Relaxed);
+    reg.leave(&handle);
     let _ = room.cmds.send(Cmd::Leave);
 }
 
@@ -1754,76 +2099,24 @@ async fn client_session(mut socket: WebSocket, room: Arc<Room>) {
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-    let (event_tx, _) = broadcast::channel(256);
-    // Restore the room from the last checkpoint; fresh rooms start with
-    // the showcase circuit.
-    let saved = load_room();
-    let (mut elements, probes, next_pid, panels, next_plid, hoist, hoist_rect, damage) = match saved
-    {
-        Some(s) => {
-            tracing::info!(
-                "restored room from {} ({} elements)",
-                save_path(),
-                s.elements.len()
-            );
-            let probes = s
-                .probes
-                .iter()
-                .map(|p| Probe {
-                    pid: p.pid,
-                    elem: p.elem,
-                    pin: p.pin,
-                    kind: p.kind,
-                    r: p.r,
-                })
-                .collect();
-            // Never hand out a plid a restored panel already owns.
-            let next_plid = s
-                .next_plid
-                .max(s.panels.iter().map(|p| p.plid + 1).max().unwrap_or(1))
-                .max(1);
-            (
-                s.elements,
-                probes,
-                s.next_pid.max(1),
-                s.panels,
-                next_plid,
-                s.hoist,
-                sane_rect(s.hoist_rect),
-                s.damage,
-            )
-        }
-        None => (
-            demo_room_circuit(),
-            Vec::new(),
-            1,
-            Vec::new(),
-            1,
-            Hoist::default(),
-            HOIST_RECT,
-            DamageModel::new(),
-        ),
-    };
-    // The hoist fixture is not optional: a room without it has no goal. This
-    // also re-derives the children's pins from the restored footprint, so a
-    // save whose fixture pins were edited by hand cannot leave a terminal
-    // stranded outside the box.
-    ensure_fixture(&mut elements, hoist_rect);
-
-    let room = Arc::new(Room {
-        cmds: cmd_tx,
-        events: event_tx,
-        elements: std::sync::Mutex::new(elements),
-        probes: std::sync::Mutex::new(probes),
-        panels: std::sync::Mutex::new(panels),
-        next_client: AtomicU32::new(1),
-        next_pid: AtomicU32::new(next_pid),
-        next_plid: AtomicU32::new(next_plid),
-        population: AtomicU32::new(0),
-        dirty: std::sync::atomic::AtomicBool::new(false),
-    });
-    tokio::spawn(sim_task(room.clone(), cmd_rx, hoist, hoist_rect, damage));
+    // Every room on disk, loaded PARKED: a room costs a struct and a file
+    // until somebody joins it, and only then does it get a sim task.
+    let reg = Registry::open(rooms_dir(), templates_dir());
+    // A pre-rooms world moves into the rooms directory once, in place, with
+    // no flag: the owner's `room-save.json` becomes room "Main Room".
+    reg.import_legacy(std::path::Path::new(&legacy_save_path()));
+    // Still nothing? A fresh checkout boots into the same showcase + hoist it
+    // always did — now as a room with a name and a code.
+    reg.ensure_one(&default_template());
+    for r in reg.list() {
+        tracing::info!(
+            "room {} \"{}\" (template {}, {} parts)",
+            r.id,
+            r.name,
+            r.template,
+            r.parts
+        );
+    }
 
     let dist = std::env::var("EE_DIST").unwrap_or_else(|_| "packages/app/dist".into());
     // Two cache policies, split by path. Vite content-hashes everything under
@@ -1842,15 +2135,20 @@ async fn main() {
         axum::http::header::CACHE_CONTROL,
         axum::http::HeaderValue::from_static("no-cache"),
     );
-    let shell = ServeDir::new(&dist).not_found_service(ServeFile::new(format!("{dist}/index.html")));
+    let shell =
+        ServeDir::new(&dist).not_found_service(ServeFile::new(format!("{dist}/index.html")));
     let app = Router::new()
         .route("/ws", get(ws_handler))
+        // The lobby: create / choose / delete rooms, and the template
+        // registry. Plain HTTP, because it is what you talk to when you do
+        // not have a room socket yet.
+        .merge(lobby::routes())
         .nest_service(
             "/assets",
             axum::routing::get_service(ServeDir::new(format!("{dist}/assets"))).layer(immutable),
         )
         .fallback_service(axum::routing::get_service(shell).layer(revalidate))
-        .with_state(room);
+        .with_state(reg.clone());
 
     let addr = std::env::var("EE_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
@@ -1861,6 +2159,22 @@ async fn main() {
         })
         .await
         .unwrap();
+
+    // Park every live room on the way out. The old server checkpointed only
+    // every ~5 s and never on SIGINT, so a restart threw away up to five
+    // seconds of every room; asking each sim task to stop makes the shutdown
+    // path write the same checkpoint the tick loop would have.
+    let live: Vec<_> = reg.all().into_iter().filter(|h| h.is_live()).collect();
+    for h in &live {
+        let _ = h.room.cmds.send(Cmd::Stop { checkpoint: true });
+    }
+    for _ in 0..40 {
+        if live.iter().all(|h| !h.is_live()) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    tracing::info!("parked {} rooms", live.len());
 }
 
 #[cfg(test)]
@@ -2591,6 +2905,7 @@ mod tests {
             hoist: Hoist::default(),
             hoist_rect: rect,
             damage: DamageModel::new(),
+            ..SaveFile::default()
         })
         .unwrap();
         let back: SaveFile = serde_json::from_str(&json).unwrap();
@@ -3492,6 +3807,7 @@ mod tests {
             hoist: Hoist::default(),
             hoist_rect: HOIST_RECT,
             damage: warm.dmg.clone(),
+            ..SaveFile::default()
         };
         let json = serde_json::to_string(&save).unwrap();
         let back: SaveFile = serde_json::from_str(&json).unwrap();
@@ -3509,6 +3825,7 @@ mod tests {
             hoist: Hoist::default(),
             hoist_rect: HOIST_RECT,
             damage: dead,
+            ..SaveFile::default()
         })
         .unwrap();
         let mut back: SaveFile = serde_json::from_str(&json).unwrap();
