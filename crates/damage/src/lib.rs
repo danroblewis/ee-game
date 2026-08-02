@@ -266,6 +266,12 @@ const MOSFET: &[Tier] = &[
 const OPAMP: &[Tier] = &[Tier::new("DIP-8", Power, 0.35, 4.0)];
 const OTA: &[Tier] = &[Tier::new("LM13700", Current, 0.005, 2.0)];
 const TIMER555: &[Tier] = &[Tier::new("DIP-8 bipolar", Power, 0.35, 3.0)];
+/// The CMOS logic family. `Power`, and only `Power`, because the model made
+/// every failure mode dissipative — see the note on `K::Gate` in `tiers`.
+const LOGIC: &[Tier] = &[
+    Tier::new("DIP-14 74HC", Power, 0.35, 3.0),
+    Tier::new("DIP-16 74HC wide", Power, 0.5, 4.0),
+];
 const SUPPLY: &[Tier] = &[Tier::new("battery pack", Current, 2.0, 20.0)];
 
 /// The tier ladder for a kind, lowest rung first. Empty means the kind has
@@ -341,6 +347,39 @@ pub fn tiers(kind: &ElementKind) -> &'static [Tier] {
         // The 555 was always honest: its VCC and GND pins ARE modelled, so
         // the frame's power really is the chip's own dissipation.
         K::Timer555 => TIMER555,
+        // The logic family inherits that sentence verbatim, and goes one
+        // better: its model is a pure positive-conductance network between
+        // modelled supply pins, so `Σ v·i` is not merely its own dissipation
+        // but is PROVABLY non-negative (`Σ g·(Δv)²`). There is nothing here
+        // for an `elem_power` exception to fix.
+        //
+        // One metric is enough because the model made every failure mode
+        // dissipative, which was the point of giving it latch-up rather than
+        // a second rating:
+        //
+        //   shorted output to a rail  100 mA through 50 Ω = 500 mW  -> ~2 s
+        //   two outputs tied together 50 mA, node at vcc/2 = 125 mW -> warm,
+        //                             survives, and reads indeterminate,
+        //                             which is what two fighting 74HC
+        //                             outputs actually do
+        //   fanned out to 20 gates    20 x 1 GΩ = nothing, correctly
+        //   run from the 9 V rail     latch-up, 10 Ω across VCC-GND = 8.1 W
+        //                             -> 23x the package, gone at once
+        //   9 V logic into a 3.3 V
+        //   part's input              the VICTIM latches (1.1 W) and the
+        //                             driver sees a hard load and heats too
+        //
+        // 0.35 W is a DIP-14 in still air; the second rung is the wider
+        // package, which is a genuine thermal difference and nothing else.
+        // Absolute-maximum VOLTAGE is deliberately NOT a rung: it is a
+        // property of the die, so it lives in `sim_core` as a constant of
+        // the modelled family. `ElementSpec::tier` must never reach a stamp,
+        // and latch-up sets `dstate`, which is hashed.
+        K::Gate { .. }
+        | K::FlipFlop { .. }
+        | K::ShiftReg { .. }
+        | K::Counter { .. }
+        | K::Mux { .. } => LOGIC,
         // Sources: 2 A, down from 10 A. The old 10 A was policy ("generous,
         // so the LOAD dies first") dressed as a rating, and 10 A is not a
         // battery a beginner owns. The policy survives anyway, and now it
@@ -417,6 +456,28 @@ pub fn kind_name(kind: &ElementKind) -> &'static str {
         K::Potentiometer { .. } => "Potentiometer",
         K::Motor { .. } => "Motor",
         K::Noise { .. } => "Noise source",
+        // The gate names its own function, because "Gate released its magic
+        // smoke" tells a player nothing about which of the eight it was.
+        K::Gate { op, .. } => match op {
+            sim_core::GateOp::And => "AND gate",
+            sim_core::GateOp::Nand => "NAND gate",
+            sim_core::GateOp::Or => "OR gate",
+            sim_core::GateOp::Nor => "NOR gate",
+            sim_core::GateOp::Xor => "XOR gate",
+            sim_core::GateOp::Xnor => "XNOR gate",
+            sim_core::GateOp::Buf => "Buffer",
+            sim_core::GateOp::Not => "Inverter",
+        },
+        K::FlipFlop { edge } => {
+            if *edge {
+                "Flip-flop"
+            } else {
+                "Latch"
+            }
+        }
+        K::ShiftReg { .. } => "Shift register",
+        K::Counter { .. } => "Counter",
+        K::Mux { .. } => "Multiplexer",
     }
 }
 
@@ -826,6 +887,49 @@ mod tests {
                 isc: sim_core::DEFAULT_OPAMP_ISC,
             },
             K::Ota,
+            // The logic family. Listed one op at a time because `kind_name`
+            // names each gate individually, and a part whose failure toast
+            // says the wrong thing is a bug the compiler cannot see.
+            K::Gate {
+                op: sim_core::GateOp::And,
+                ins: 2,
+            },
+            K::Gate {
+                op: sim_core::GateOp::Nand,
+                ins: 2,
+            },
+            K::Gate {
+                op: sim_core::GateOp::Or,
+                ins: 3,
+            },
+            K::Gate {
+                op: sim_core::GateOp::Nor,
+                ins: 3,
+            },
+            K::Gate {
+                op: sim_core::GateOp::Xor,
+                ins: 2,
+            },
+            K::Gate {
+                op: sim_core::GateOp::Xnor,
+                ins: 2,
+            },
+            K::Gate {
+                op: sim_core::GateOp::Buf,
+                ins: 1,
+            },
+            K::Gate {
+                op: sim_core::GateOp::Not,
+                ins: 1,
+            },
+            K::FlipFlop { edge: true },
+            K::FlipFlop { edge: false },
+            K::ShiftReg { bits: 4 },
+            K::Counter {
+                bits: 4,
+                modulus: 16,
+            },
+            K::Mux { sel: 2 },
         ];
         for k in kinds {
             let r = rating(&k, 0).unwrap_or_else(|| panic!("{} has no rating", kind_name(&k)));

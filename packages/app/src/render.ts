@@ -2,8 +2,8 @@
 // current dots, proper schematic symbols for every device. (The WebGL
 // canvas package arrives with the S2 spike; this is the visual reference.)
 
-import { pinLabels } from './circuit';
-import type { ElemLive, ElementSpec, Point } from './circuit';
+import { logicPins, pinLabels } from './circuit';
+import type { ElemLive, ElementKind, ElementSpec, Point } from './circuit';
 
 export interface Camera {
   scale: number; // px per grid unit
@@ -852,6 +852,102 @@ export function drawElement(d: DrawCtx, e: ElementSpec) {
       drawDots(ctx, cam, at(x1, ly(Op_)), Op_, d.dots.advance(e.id, io, d.dtSec), io);
       break;
     }
+    case 'Gate':
+    case 'FlipFlop':
+    case 'ShiftReg':
+    case 'Counter':
+    case 'Mux': {
+      // One DIP symbol for the whole logic family, built on the same
+      // grammar as the 555 above: a package frame derived from the pins,
+      // stubs into the nearest edge, pin labels inside the wall past
+      // scale 24, and a part legend in the middle.
+      const lp = logicPins(e.kind)!;
+      const n = P.length;
+      const Vp = P[0]!;
+      const Gp = P[1]!;
+      // Local frame: y runs VCC -> GND down the left edge, x across the
+      // package. The x axis comes from whichever pin is furthest off the
+      // supply column, so the body spans the real footprint however the
+      // player dragged it out.
+      const ey = norm(sub(Gp, Vp));
+      const ex: Px = [-ey[1], ey[0]];
+      const h = mag(sub(Gp, Vp)) / s;
+      const lx = (p: Px) => dot(sub(p, Vp), ex) / s;
+      const ly = (p: Px) => dot(sub(p, Vp), ey) / s;
+      let w = 0;
+      for (const p of P) w = Math.max(w, Math.abs(lx(p)));
+      w = Math.max(w, 3);
+      const flip = P.some((p) => lx(p) < -0.5) ? -1 : 1;
+      const at = (x: number, y: number): Px => add(add(Vp, ex, flip * x * s), ey, y * s);
+      const stub = Math.min(0.9, w * 0.25);
+      const [x0, x1, y0, y1] = [stub, w - stub, -0.5, h + 0.5];
+
+      // Which side each leg leaves from, in the package's own frame.
+      const onLeft = (k: number) => Math.abs(lx(P[k]!)) < w * 0.5;
+      P.forEach((p, k) => {
+        stroke(ctx, voltageColor(v(k)), [p, at(onLeft(k) ? x0 : x1, ly(p))]);
+      });
+
+      ctx.fillStyle = '#181820';
+      ctx.strokeStyle = '#c9c9d4';
+      ctx.beginPath();
+      ctx.moveTo(...at(x0, y0));
+      ctx.lineTo(...at(x1, y0));
+      ctx.lineTo(...at(x1, y1));
+      ctx.lineTo(...at(x0, y1));
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+
+      if (cam.scale > 24) {
+        const labels = pinLabels(e.kind);
+        ctx.fillStyle = '#8a8a98';
+        ctx.font = `${Math.round(s * 0.2)}px ui-monospace`;
+        P.forEach((p, k) => {
+          const left = onLeft(k);
+          ctx.textAlign = left ? 'left' : 'right';
+          const [tx, ty] = at(left ? x0 + 0.16 : x1 - 0.16, ly(p) + 0.08);
+          ctx.fillText(labels[k] ?? '', tx, ty);
+        });
+        ctx.textAlign = 'center';
+        ctx.fillStyle = '#c9c9d4';
+        ctx.font = `${Math.round(s * 0.32)}px ui-monospace`;
+        ctx.fillText(logicLegend(e.kind), ...at(w * 0.5, h * 0.5 + 0.11));
+        ctx.textAlign = 'start';
+      }
+
+      // Live output state: a filled pip beside each driven output leg, lit
+      // when that output is high. Straight from the solver's pin voltage —
+      // the supply is read from the chip's own VCC/GND pins, so a chip on a
+      // 3 V rail reads correctly and a browned-out one goes dark.
+      if (cam.scale > 14 && d.live) {
+        const rail = v(0) - v(1);
+        if (rail > 0.5) {
+          for (let k = 0; k < lp.nOut; k++) {
+            const p = lp.out0 + k;
+            const hi = (v(p) - v(1)) / rail > 0.5;
+            ctx.fillStyle = hi ? '#7fe07f' : '#2c3a2c';
+            ctx.beginPath();
+            ctx.arc(...at(onLeft(p) ? x0 + 0.42 : x1 - 0.42, ly(P[p]!)), Math.max(1.5, s * 0.07), 0, Math.PI * 2);
+            ctx.fill();
+          }
+        }
+      }
+
+      // Current dots on the driven legs, so fan-out is visible as flow.
+      for (let k = 0; k < lp.nOut; k++) {
+        const p = lp.out0 + k;
+        const io = iPin(p);
+        drawDots(ctx, cam, at(onLeft(p) ? x0 : x1, ly(P[p]!)), P[p]!, d.dots.advance(e.id * 16 + p, io, d.dtSec), io);
+      }
+      // A mux has no driven output — Y is a pass gate — so its dots go on Y.
+      if (e.kind.t === 'Mux') {
+        const y = n - 1;
+        const io = iPin(y);
+        drawDots(ctx, cam, at(onLeft(y) ? x0 : x1, ly(P[y]!)), P[y]!, d.dots.advance(e.id * 16 + y, io, d.dtSec), io);
+      }
+      break;
+    }
     case 'Diode':
     case 'Zener':
     case 'Led': {
@@ -1220,6 +1316,26 @@ export function drawElement(d: DrawCtx, e: ElementSpec) {
 }
 
 const dot = (a: Px, b: Px) => a[0] * b[0] + a[1] * b[1];
+
+/** The word printed across a logic package's body. Short enough to fit a
+ *  6-unit-wide DIP at the label zoom, and it names the FUNCTION rather than
+ *  a part number, because the function is what a player is looking for. */
+function logicLegend(kind: ElementKind): string {
+  switch (kind.t) {
+    case 'Gate':
+      return kind.op === 'Buf' ? 'BUF' : kind.op === 'Not' ? 'INV' : kind.op.toUpperCase();
+    case 'FlipFlop':
+      return kind.edge ? 'DFF' : 'D-LAT';
+    case 'ShiftReg':
+      return `SR${kind.bits}`;
+    case 'Counter':
+      return `CTR${kind.modulus}`;
+    case 'Mux':
+      return `MUX${1 << kind.sel}`;
+    default:
+      return '';
+  }
+}
 
 // -------------------------------------------------------------- LOD grid
 //

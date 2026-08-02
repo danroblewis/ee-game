@@ -3695,6 +3695,62 @@ mod tests {
         assert!(apply_doc_op_to(&mut next, &op));
     }
 
+    /// The logic family did not disturb the save format, and its own parts
+    /// round-trip.
+    ///
+    /// The family added no field to any existing kind — five brand-new
+    /// variants only — so there is no `serde(default)` to get wrong and no
+    /// document written before it existed can read differently. The half
+    /// worth pinning is the other direction: a room containing logic must
+    /// survive a save and a reload with its parameters intact, because
+    /// `bits`, `ins` and `sel` decide PIN COUNTS, and a part that reloads
+    /// one pin narrower is a part `set_elements` silently drops.
+    #[test]
+    fn logic_parts_round_trip_and_old_rooms_are_unaffected() {
+        use sim_core::GateOp;
+        // A pre-logic room parses to exactly the same bytes it always did.
+        let old = r#"[
+            {"id":1,"kind":{"t":"Ground"},"pins":[[0,0]]},
+            {"id":2,"kind":{"t":"Timer555"},"pins":[[0,0],[0,4],[0,1],[0,3],[4,3],[4,1]]}
+        ]"#;
+        let elems: Vec<ElementSpec> = serde_json::from_str(old).expect("old rooms must load");
+        assert_eq!(check_room_doc(&elems), Ok(()));
+
+        for kind in [
+            K::Gate {
+                op: GateOp::Xnor,
+                ins: 3,
+            },
+            K::Gate {
+                op: GateOp::Not,
+                ins: 1,
+            },
+            K::FlipFlop { edge: false },
+            K::ShiftReg { bits: 4 },
+            K::Counter {
+                bits: 3,
+                modulus: 5,
+            },
+            K::Mux { sel: 2 },
+        ] {
+            let n = kind.pin_count();
+            let pins: Vec<(i32, i32)> = (0..n as i32).map(|k| (k * 2, 0)).collect();
+            let spec = ElementSpec::pins(1, kind, &pins);
+            let json = serde_json::to_string(&spec).unwrap();
+            let back: ElementSpec = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.kind, kind, "round trip: {json}");
+            assert_eq!(
+                back.kind.pin_count(),
+                n,
+                "a reloaded part must keep its width: {json}"
+            );
+            assert_eq!(back.pins.len(), n);
+            // A `GateOp` is a plain string in the document, which is what
+            // makes the TS mirror in `circuit.ts` a union of literals.
+            assert!(!json.contains("\"op\":{"), "GateOp must serialise flat");
+        }
+    }
+
     /// The world is big now (50k parts), but the budget is still a hard wall
     /// and malformed specs are still refused.
     #[test]

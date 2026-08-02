@@ -357,6 +357,21 @@ mod tests {
             ElementKind::Switch { closed: false },
             ElementKind::Button { closed: false },
             ElementKind::Resistor { ohms: 100.0 },
+            // The logic family owns no branch unknown at all — its output is
+            // a pair of switched conductances, not a source — so nothing in
+            // it is an ideal constraint and none of it may be merged into a
+            // constraint group.
+            ElementKind::Gate {
+                op: crate::GateOp::Nand,
+                ins: 2,
+            },
+            ElementKind::FlipFlop { edge: true },
+            ElementKind::ShiftReg { bits: 4 },
+            ElementKind::Counter {
+                bits: 4,
+                modulus: 16,
+            },
+            ElementKind::Mux { sel: 2 },
         ] {
             assert!(constraint_of(&k, &nodes(1, 2)).is_none(), "{k:?}");
         }

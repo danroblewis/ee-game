@@ -7,6 +7,20 @@
 
 pub type Point = (i32, i32);
 
+/// Clamp a logic part's declared width into the range the model supports.
+/// Used by `pin_count` and `logic_pins`, which must be TOTAL functions: they
+/// run before validation on documents this build did not write.
+#[inline]
+const fn logic_width(n: u8, lo: u8, hi: u8) -> usize {
+    if n < lo {
+        lo as usize
+    } else if n > hi {
+        hi as usize
+    } else {
+        n as usize
+    }
+}
+
 /// Largest pin count of any element.
 ///
 /// 10, set by the widest members of the CMOS logic family: a 4-bit shift
@@ -206,6 +220,156 @@ pub enum ElementKind {
         ohms: f64,
         seed: u32,
     },
+
+    // ------------------------------------------------------ the CMOS family
+    //
+    // Five kinds, one model. A logic chip here is a PASSIVE CONDUCTANCE
+    // NETWORK whose values are chosen by a discrete state — which is
+    // literally what CMOS is, and is where everything else comes from:
+    //
+    // * an output pin is a pull-up to the VCC PIN and a pull-down to the GND
+    //   PIN, one at 50 Ω and the other at 1 GΩ. The current a gate delivers
+    //   therefore comes out of the player's battery instead of out of
+    //   nowhere, which is the 555's lesson (`engine.rs`) reached without a
+    //   branch row: `is_branch()` is false for the whole family;
+    // * `Σ v·i` over the pins is exactly `Σ g·(Δv)²` over the internals, so
+    //   it is provably non-negative and IS the chip's own dissipation. The
+    //   op-amp's `elem_power` exception cannot recur here by construction;
+    // * the incidence pattern is identical in every discrete state — both
+    //   conductances are always stamped, only their values move — so
+    //   `validate::probe_solvable`, which factors exactly one cold state,
+    //   is sound for this family without being taught anything;
+    // * levels are fractions of the LIVE supply, never a hard-coded 5 V.
+    //
+    // Timing: every logic element is a one-substep delay. Its state advances
+    // in `accept()`, never during Newton. See `Engine::accept`.
+    /// Combinational gate. Pins: `[VCC, GND, in0..in(ins-1), Y]`.
+    ///
+    /// One kind covers eight gates at four widths, which is what lets the
+    /// family COMPOSE instead of enumerate: an SR latch is two cross-coupled
+    /// `Nand`s, a self-correcting ring counter is a `Nor` fed from a shift
+    /// register, and neither needs a part of its own.
+    Gate {
+        op: GateOp,
+        /// Input count, 1..=4 (forced to 1 for `Buf`/`Not`).
+        ins: u8,
+    },
+    /// D-type storage. Pins: `[VCC, GND, CLK, D, RST, Q, /Q]`. `RST` is
+    /// asynchronous and ACTIVE LOW, like every real part's `/CLR`.
+    ///
+    /// `edge = true` is a rising-edge-triggered flip-flop; `edge = false` is
+    /// a transparent latch (Q follows D while CLK is high, holds while it is
+    /// low). Level-versus-edge is the single most confusing distinction in
+    /// intro digital, and putting it behind one boolean means a player can
+    /// flip it in the properties panel on a live circuit and watch the
+    /// behaviour change.
+    FlipFlop {
+        edge: bool,
+    },
+    /// Serial-in, parallel-out shift register. Pins:
+    /// `[VCC, GND, CLK, SER, RST, Q0..Q(bits-1)]`, `bits` in 2..=4.
+    ///
+    /// All stages move from ONE clock edge, evaluated in one place in one
+    /// pass — there is no internal ripple, and that is the reason this is a
+    /// single element rather than `bits` composed flip-flops: a global LU
+    /// factorization is O(n³) over the whole room, so an internal ripple
+    /// would cost `bits` of them per edge instead of one.
+    ///
+    /// Cascade two for 8 bits (Q3 of the first into SER of the second),
+    /// which is how a real 74HC595 chain is built.
+    ShiftReg {
+        bits: u8,
+    },
+    /// Synchronous binary counter. Pins: `[VCC, GND, CLK, RST, Q0..]`,
+    /// `bits` in 2..=4, `modulus` in 2..=2^bits.
+    ///
+    /// Synchronous rather than ripple, and that is a stated deviation from a
+    /// 74HC393: a ripple counter's ~4 gate delays of inter-bit skew would
+    /// cost four factorizations per edge instead of one, for a skew no
+    /// player can use. What it earns over `ShiftReg` is BINARY WEIGHT —
+    /// divide a clock by 2/4/8 for octaves, or address a `Mux`.
+    Counter {
+        bits: u8,
+        modulus: u8,
+    },
+    /// Analog multiplexer (4051-class, not a 74HC153). Pins:
+    /// `[VCC, GND, I0..I(2^sel - 1), S0..S(sel-1), Y]`, `sel` in 1..=2.
+    ///
+    /// The selected input is connected to Y through 50 Ω and the rest
+    /// through 1 GΩ. Because that is a CONDUCTANCE and not a logic buffer it
+    /// passes ANALOG in both directions — a pot's control voltage goes
+    /// straight through it — which is worth far more in this game than a
+    /// digital-only mux and costs nothing extra in the model.
+    Mux {
+        sel: u8,
+    },
+}
+
+/// The combinational function a [`ElementKind::Gate`] computes.
+///
+/// Inversion is folded into the op rather than carried as a separate flag:
+/// a player picks "NAND", not "AND with invert set", and the properties
+/// panel gets one field instead of two.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum GateOp {
+    And,
+    #[default]
+    Nand,
+    Or,
+    Nor,
+    Xor,
+    Xnor,
+    /// Non-inverting buffer (`ins` forced to 1).
+    Buf,
+    /// Inverter (`ins` forced to 1).
+    Not,
+}
+
+impl GateOp {
+    /// Buffers and inverters take exactly one input whatever `ins` says.
+    /// Applied in `pin_count` as well as in the evaluator, so the pinout a
+    /// document declares and the pinout the solver expects cannot disagree.
+    #[inline]
+    pub fn fixed_ins(self) -> Option<u8> {
+        matches!(self, GateOp::Buf | GateOp::Not).then_some(1)
+    }
+
+    /// Evaluate against `n_hi` inputs high out of `ins`, and the parity of
+    /// the high count (which is what XOR/XNOR generalise to at width > 2).
+    #[inline]
+    pub fn eval(self, ins: usize, n_hi: usize) -> bool {
+        match self {
+            GateOp::And => n_hi == ins,
+            GateOp::Nand => n_hi != ins,
+            GateOp::Or | GateOp::Buf => n_hi > 0,
+            GateOp::Nor | GateOp::Not => n_hi == 0,
+            GateOp::Xor => n_hi % 2 == 1,
+            GateOp::Xnor => n_hi % 2 == 0,
+        }
+    }
+}
+
+/// Which pins of a logic chip do what, so `build`, `update_guesses` and
+/// `accept` cannot disagree about one part's pinout.
+///
+/// Three disjoint roles, and the split matters:
+/// * **inputs** are Schmitt-sensed and get a symmetric high-resistance leak
+///   to both rails;
+/// * **outputs** are driven — a switched pull-up/pull-down pair;
+/// * a `Mux`'s I pins are NEITHER. They are pass-gate terminals: analog,
+///   bidirectional, and not thresholded at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LogicPins {
+    /// Schmitt-sensed input pins, contiguous from `in0`.
+    pub n_in: usize,
+    pub in0: usize,
+    /// Driven output pins, contiguous from `out0`.
+    pub n_out: usize,
+    pub out0: usize,
+    /// Which INPUT (index into `0..n_in`) is the clock, for the sequential
+    /// parts. `None` for combinational ones.
+    pub clk: Option<usize>,
 }
 
 impl ElementKind {
@@ -221,8 +385,83 @@ impl ElementKind {
             | Pmos { .. }
             | OpAmp { .. }
             | Potentiometer { .. } => 3,
+            // The logic family: two supply pins plus its own signals. Every
+            // width here is CLAMPED rather than trusted, so `pin_count` stays
+            // total — a document carrying `bits: 99` resolves to a pin count
+            // this build can name, `set_elements` drops it for having the
+            // wrong number of pins, and `check_kind` says why.
+            Gate { op, ins } => 3 + logic_width(op.fixed_ins().unwrap_or(*ins), 1, 4),
+            FlipFlop { .. } => 7,
+            ShiftReg { bits } => 5 + logic_width(*bits, 2, 4),
+            Counter { bits, .. } => 4 + logic_width(*bits, 2, 4),
+            Mux { sel } => {
+                let s = logic_width(*sel, 1, 2);
+                3 + (1 << s) + s
+            }
             _ => 2,
         }
+    }
+
+    /// The pin roles for a logic chip. `None` for everything else.
+    pub fn logic_pins(&self) -> Option<LogicPins> {
+        use ElementKind::*;
+        Some(match self {
+            // [VCC, GND, in0..in(ins-1), Y]
+            Gate { op, ins } => {
+                let n = logic_width(op.fixed_ins().unwrap_or(*ins), 1, 4);
+                LogicPins {
+                    n_in: n,
+                    in0: 2,
+                    n_out: 1,
+                    out0: 2 + n,
+                    clk: None,
+                }
+            }
+            // [VCC, GND, CLK, D, RST, Q, /Q]
+            FlipFlop { .. } => LogicPins {
+                n_in: 3,
+                in0: 2,
+                n_out: 2,
+                out0: 5,
+                clk: Some(0),
+            },
+            // [VCC, GND, CLK, SER, RST, Q0..]
+            ShiftReg { bits } => LogicPins {
+                n_in: 3,
+                in0: 2,
+                n_out: logic_width(*bits, 2, 4),
+                out0: 5,
+                clk: Some(0),
+            },
+            // [VCC, GND, CLK, RST, Q0..]
+            Counter { bits, .. } => LogicPins {
+                n_in: 2,
+                in0: 2,
+                n_out: logic_width(*bits, 2, 4),
+                out0: 4,
+                clk: Some(0),
+            },
+            // [VCC, GND, I0.., S0.., Y] — the I pins are a pass gate, so
+            // they are neither inputs nor outputs here. Only the select
+            // lines are thresholded, and Y is driven by nothing.
+            Mux { sel } => {
+                let s = logic_width(*sel, 1, 2);
+                LogicPins {
+                    n_in: s,
+                    in0: 2 + (1 << s),
+                    n_out: 0,
+                    out0: 0,
+                    clk: None,
+                }
+            }
+            _ => return None,
+        })
+    }
+
+    /// The CMOS logic family: the parts that carry `ElemState::dstate` and
+    /// advance it once per accepted substep.
+    pub fn is_logic(&self) -> bool {
+        self.logic_pins().is_some()
     }
 
     /// Devices whose branch current is an MNA unknown.
@@ -252,21 +491,29 @@ impl ElementKind {
                 | ElementKind::OpAmp { .. }
                 | ElementKind::Ota
                 | ElementKind::Timer555
-        )
+        ) || self.is_logic()
     }
 
     /// The subset of `is_nonlinear` whose contribution to the MNA **matrix**
     /// is a function of a DISCRETE state (an op-amp's rail region, a 555's
-    /// RS latch) rather than of the continuous operating point. Between two
-    /// flips of that state the matrix is literally constant, so a
-    /// factorization survives — see `Engine::reusable`.
+    /// RS latch, a logic chip's `dstate`) rather than of the continuous
+    /// operating point. Between two flips of that state the matrix is
+    /// literally constant, so a factorization survives — see
+    /// `Engine::reusable`.
     ///
     /// The invariant every member owes: every write this device makes into
     /// `a` in `Engine::build` depends only on node/branch indices, on
-    /// compile-time constants, and on `ElemState::region`. Never on `x`, on
-    /// `t`, or on continuous history (`v_prev`, `i_prev`, `vg1`, `vg2`).
+    /// compile-time constants, and on DISCRETE state (`ElemState::region`
+    /// for the op-amp and the 555, `ElemState::dstate` for the logic
+    /// family). Never on `x`, on `t`, or on continuous history (`v_prev`,
+    /// `i_prev`, `vg1`, `vg2`).
+    ///
+    /// Getting this wrong for the logic family would be expensive rather
+    /// than merely slow: the flag it feeds (`Engine::smooth_nonlinear`) is
+    /// GLOBAL to the room, so one misclassified gate disarms reuse for every
+    /// op-amp and 555 sharing the matrix with it.
     pub fn is_discrete_nonlinear(&self) -> bool {
-        matches!(self, ElementKind::OpAmp { .. } | ElementKind::Timer555)
+        matches!(self, ElementKind::OpAmp { .. } | ElementKind::Timer555) || self.is_logic()
     }
 
     /// Devices that genuinely need Newton iteration: their conductance is a
@@ -343,6 +590,19 @@ impl ElementSpec {
             id,
             kind,
             pins: vec![a, b, c],
+            tier: 0,
+            rot: 0,
+        }
+    }
+
+    /// Any width. The 6-to-10-pin parts have no natural positional
+    /// constructor, so they take their pin list directly.
+    pub fn pins(id: u32, kind: ElementKind, pins: &[Point]) -> Self {
+        debug_assert_eq!(kind.pin_count(), pins.len());
+        ElementSpec {
+            id,
+            kind,
+            pins: pins.to_vec(),
             tier: 0,
             rot: 0,
         }

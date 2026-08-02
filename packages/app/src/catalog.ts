@@ -2,7 +2,7 @@
 // its placement geometry. Cost gates quantity/ratings later — never access
 // (design pillar): the full palette is available from minute one.
 
-import { DEFAULT_OPAMP_ISC } from './circuit';
+import { DEFAULT_OPAMP_ISC, logicPins } from './circuit';
 import type { ElementKind, Point } from './circuit';
 
 /** Menu categories, in the order the right-click submenu lists them. */
@@ -14,6 +14,9 @@ export const CATEGORIES = [
   'Diodes',
   'Transistors',
   'Chips',
+  // The logic family gets its own category rather than crowding into
+  // 'Chips': thirteen entries would have doubled that submenu.
+  'Logic',
 ] as const;
 export type Category = (typeof CATEGORIES)[number];
 
@@ -242,6 +245,116 @@ export const CATALOG: PartDef[] = [
     key: '5',
     make: () => ({ t: 'Timer555' }),
   },
+
+  // ------------------------------------------------------- the logic family
+  //
+  // Every one of these is a CMOS chip with real VCC and GND pins: its levels
+  // are fractions of whatever supply you put on it, its outputs source
+  // current out of that supply through 50 Ω, and it burns what it burns.
+  // Power one from the 9 V rail and it latches up and dies, which is what a
+  // 74HC part does.
+  {
+    name: 'NAND Gate',
+    keys: 'logic gate nand digital 7400 cmos',
+    cat: 'Logic',
+    key: '⇧D',
+    // NAND first, and it is the default `GateOp`, because it is the
+    // universal gate: two of them cross-coupled are an SR latch, and every
+    // other function is reachable from it.
+    make: () => ({ t: 'Gate', op: 'Nand', ins: 2 }),
+  },
+  {
+    name: 'AND Gate',
+    keys: 'logic gate and digital 7408 cmos',
+    cat: 'Logic',
+    make: () => ({ t: 'Gate', op: 'And', ins: 2 }),
+  },
+  {
+    name: 'OR Gate',
+    keys: 'logic gate or digital 7432 cmos',
+    cat: 'Logic',
+    make: () => ({ t: 'Gate', op: 'Or', ins: 2 }),
+  },
+  {
+    name: 'NOR Gate',
+    keys: 'logic gate nor digital 7402 cmos ring',
+    cat: 'Logic',
+    make: () => ({ t: 'Gate', op: 'Nor', ins: 2 }),
+  },
+  {
+    name: 'XOR Gate',
+    keys: 'logic gate xor exclusive digital 7486 cmos',
+    cat: 'Logic',
+    make: () => ({ t: 'Gate', op: 'Xor', ins: 2 }),
+  },
+  {
+    name: 'XNOR Gate',
+    keys: 'logic gate xnor digital cmos',
+    cat: 'Logic',
+    make: () => ({ t: 'Gate', op: 'Xnor', ins: 2 }),
+  },
+  {
+    name: 'Inverter',
+    keys: 'logic gate not inverter digital 7404 cmos schmitt',
+    cat: 'Logic',
+    key: '⇧I',
+    make: () => ({ t: 'Gate', op: 'Not', ins: 1 }),
+  },
+  {
+    name: 'Buffer',
+    keys: 'logic gate buffer driver digital 7407 cmos schmitt',
+    cat: 'Logic',
+    make: () => ({ t: 'Gate', op: 'Buf', ins: 1 }),
+  },
+  {
+    name: 'D Flip-Flop',
+    keys: 'logic flipflop dff register edge clock divide 7474 cmos',
+    cat: 'Logic',
+    key: '⇧F',
+    // Rising-edge triggered. Wire /Q back to D and it divides its clock by
+    // two — the first thing worth building out of one.
+    make: () => ({ t: 'FlipFlop', edge: true }),
+  },
+  {
+    name: 'D Latch',
+    keys: 'logic latch transparent level dff 7475 cmos',
+    cat: 'Logic',
+    key: '⇧L',
+    // The SAME part with `edge` off: Q follows D while the clock is high
+    // instead of sampling it once. Toggle the field on a live circuit and
+    // watch the difference, which is the point of it being one kind.
+    make: () => ({ t: 'FlipFlop', edge: false }),
+  },
+  {
+    name: 'Shift Register',
+    keys: 'logic shift register serial sequencer 595 cmos step',
+    cat: 'Logic',
+    key: '⇧S',
+    // 4 bits. Chain two (Q3 -> SER) for 8, exactly as a 74HC595 chain is
+    // built. Feed SER from NOR(Q0,Q1,Q2) and it is a self-starting one-hot
+    // ring — a step sequencer, in two chips.
+    make: () => ({ t: 'ShiftReg', bits: 4 }),
+  },
+  {
+    name: 'Counter',
+    keys: 'logic counter binary divide octave 4040 163 cmos',
+    cat: 'Logic',
+    key: '⇧C',
+    // Synchronous, so all four bits move on one edge. Binary WEIGHT is what
+    // it has that a shift register does not: divide a clock by 2/4/8/16, or
+    // address a mux.
+    make: () => ({ t: 'Counter', bits: 4, modulus: 16 }),
+  },
+  {
+    name: 'Multiplexer',
+    keys: 'logic mux multiplexer switch analog 4051 selector cmos',
+    cat: 'Logic',
+    key: '⇧U',
+    // A 4051, not a '153: the selected channel is CONNECTED to Y through
+    // 50 Ω, so it passes analog in both directions. Drive the select lines
+    // from a counter and it is a step sequencer's output stage.
+    make: () => ({ t: 'Mux', sel: 2 }),
+  },
 ];
 
 export const partsInCategory = (cat: Category): PartDef[] => CATALOG.filter((p) => p.cat === cat);
@@ -254,6 +367,9 @@ export function searchParts(q: string): PartDef[] {
   );
 }
 
+/** Pin count per kind. MUST mirror `sim_core::ElementKind::pin_count` — the
+ *  server drops any spec whose pin list is the wrong length, so a
+ *  disagreement here is a part that silently refuses to be placed. */
 export function pinCount(kind: ElementKind): number {
   switch (kind.t) {
     case 'Ground':
@@ -263,6 +379,17 @@ export function pinCount(kind: ElementKind): number {
       return 6;
     case 'Ota':
       return 4;
+    // The logic family: two supply pins plus its own signals.
+    case 'Gate':
+    case 'FlipFlop':
+    case 'ShiftReg':
+    case 'Counter':
+    case 'Mux': {
+      const lp = logicPins(kind)!;
+      // Mux: VCC, GND, 2^sel channels, sel selects, Y.
+      if (kind.t === 'Mux') return 3 + (1 << lp.nIn) + lp.nIn;
+      return 2 + lp.nIn + lp.nOut;
+    }
     case 'Npn':
     case 'Pnp':
     case 'Nmos':
@@ -294,6 +421,42 @@ export function makePins(kind: ElementKind, a: Point, b: Point): Point[] {
       a[1] + ux[1] * x + uy[1] * y,
     ];
     return [at(0, 0), at(0, 4), at(0, 1), at(0, 3), at(4, 3), at(4, 1)];
+  }
+  if (logicPins(kind)) {
+    // A DIP footprint sized to the part: supplies on the left column at top
+    // and bottom (VCC top, GND bottom, matching the 555 and the model's pin
+    // order), the remaining inputs down the left edge, and the outputs up
+    // the right edge so signal flows left to right.
+    const n = pinCount(kind);
+    const lp = logicPins(kind)!;
+    const dx = b[0] - a[0];
+    const dy = b[1] - a[1];
+    const horiz = Math.abs(dx) >= Math.abs(dy);
+    const ux: Point = horiz ? [Math.sign(dx) || 1, 0] : [0, Math.sign(dy) || 1];
+    const uy: Point = [-ux[1], ux[0]];
+    const at = (x: number, y: number): Point => [
+      a[0] + ux[0] * x + uy[0] * y,
+      a[1] + ux[1] * x + uy[1] * y,
+    ];
+    // Which edge each pin lands on, by ROLE rather than by index — the
+    // mux's pin order is [VCC, GND, I0..I3, S0, S1, Y], so its selects come
+    // AFTER its channels and a positional split would put them on the wrong
+    // side.
+    const right = (p: number) =>
+      lp.nOut > 0 ? p >= lp.out0 && p < lp.out0 + lp.nOut : p === n - 1;
+    const lefts: number[] = [];
+    const rights: number[] = [];
+    for (let p = 2; p < n; p++) (right(p) ? rights : lefts).push(p);
+    const h = Math.max(4, lefts.length + 1, rights.length + 1);
+    const w = 6;
+    const pins: Point[] = new Array<Point>(n);
+    pins[0] = at(0, 0); // VCC
+    pins[1] = at(0, h); // GND
+    lefts.forEach((p, k) => (pins[p] = at(0, 1 + k)));
+    // The right column runs bottom-up so Q0 sits nearest GND, matching the
+    // way a real register's outputs are numbered up the package.
+    rights.forEach((p, k) => (pins[p] = at(w, h - 1 - k)));
+    return pins;
   }
   if (kind.t === 'Ota') {
     // [in+, in-, out, bias]: inputs split at A, out at B. The bias pin sits

@@ -13,7 +13,9 @@
 //! - A dependence dI_p/dV_n stamps `a[p][n] += g`.
 
 use crate::constraint::{constraint_of, Constraint, ConstraintKey};
-use crate::netlist::{ElementKind, ElementSpec, InteractOp, ParamWrite, Point, MAX_PINS};
+use crate::netlist::{
+    ElementKind, ElementSpec, InteractOp, LogicPins, ParamWrite, Point, MAX_PINS,
+};
 use sim_math::DenseLu;
 use std::collections::BTreeMap;
 
@@ -77,6 +79,100 @@ const T555_G_QUIESCENT: f64 = 3.3e-4;
 /// internal 3-resistor divider.
 const T555_THR_FRAC: f64 = 2.0 / 3.0;
 const T555_TRIG_FRAC: f64 = 1.0 / 3.0;
+
+// ------------------------------------------------------- CMOS logic family
+//
+// The output stage is a PAIR OF SWITCHED CONDUCTANCES to the two supply
+// pins — literally what CMOS is — so a logic chip is a passive network whose
+// values are picked by discrete state. It owns no branch unknown and writes
+// nothing into `b`: it is a switch network, not a source. Three things fall
+// out of that, and they are the reasons the model is shaped this way:
+//
+//  * it cannot create energy, so `elem_power`'s default `Σ v·i` is exactly
+//    its own dissipation and this family needs no exception the way `OpAmp`
+//    does (`Σ v·i` = `Σ g·(Δv)²` ≥ 0, provably);
+//  * the a-matrix INCIDENCE PATTERN is identical in every discrete state
+//    (both conductances are always stamped, only the values move), which is
+//    what makes `validate::probe_solvable`'s single cold factorization sound
+//    for this family — the 555's region-dependent branch row is not;
+//  * no branch unknown means one fewer row per output than a 555-shaped
+//    model, and an O(n³) factorization is the family's real cost.
+/// On-resistance of one output FET, and the off-state / leakage pair.
+///
+/// 50 Ω is chosen against real failure modes rather than a datasheet
+/// typical: an output shorted to a rail passes 100 mA at 5 V and burns
+/// 500 mW, which is over the DIP tier and kills the part in a couple of
+/// seconds (a real 74HC sources 25-50 mA into a short and a sustained short
+/// does destroy it). A 1 kΩ load sags the output to 0.971·vcc; a 100 Ω load
+/// sags it to 0.667·vcc, below the receiver's own threshold — a genuine
+/// design lesson delivered entirely by the solver.
+const LOGIC_R_ON: f64 = 50.0;
+const LOGIC_G_ON: f64 = 1.0 / LOGIC_R_ON;
+const LOGIC_G_OFF: f64 = 1e-9;
+/// Input leak to EACH rail. Two structural jobs: a floating input node can
+/// never be singular, and a floating input parks at exactly vcc/2 — dead in
+/// the middle of the hysteresis band, so the Schmitt latch HOLDS and the
+/// gate deterministically ignores it.
+///
+/// Symmetric on purpose. A pull-down would make a floating input read LOW,
+/// which is convenient and is a lie: real CMOS floats, and "floating inputs
+/// are the #1 CMOS beginner bug" is exactly the lesson this family should
+/// teach. The honest version needs a DIAGNOSTIC, not a fudge — the client
+/// can see from the solver's own node voltage that a pin is sitting in the
+/// indeterminate band and say so.
+const LOGIC_G_IN: f64 = 1e-9;
+/// Static supply current: 1 µA at 5 V. Honest quiescent CMOS, and the same
+/// role `T555_G_QUIESCENT` plays — the rails carry current with every output
+/// unloaded, so KCL stays sane.
+///
+/// NOT modelled, and stated rather than hidden: dynamic `C·V·f` supply
+/// current, which dominates a real CMOS part above a few kHz. These chips
+/// run cooler than real ones at high clock rates. Charging for it would mean
+/// inventing a number no solver produced; doing it honestly needs real
+/// internal node capacitance.
+const LOGIC_G_QUIESCENT: f64 = 2e-7;
+/// Schmitt thresholds as fractions of the LIVE supply, so a 3 V rail is 3 V
+/// logic and a rail sagging under load drags the logic levels down with it.
+///
+/// Hysteresis on EVERY input is a deliberate deviation from a plain 74HC00,
+/// which has a single ~0.5·VCC threshold. Without it a gate inside any real
+/// feedback loop degenerates into substep-rate chatter that neither diverges
+/// nor quarantines — it silently produces a plausible-looking wrong
+/// waveform, which is the worst failure mode available. The 555's 1/3-2/3
+/// divider is the same trick.
+///
+/// What the deviation costs: the model is optimistic about noise. A slow,
+/// noisy ramp into a real HC gate produces a burst of edges; here it
+/// produces one clean edge, so this family will never teach "add a Schmitt
+/// trigger to clean up a slow edge" — every input already is one.
+const LOGIC_TH_HI: f64 = 0.65;
+const LOGIC_TH_LO: f64 = 0.35;
+/// CMOS latch-up. A parasitic SCR fires when a pin is driven far outside the
+/// chip's own rails, or the supply exceeds absolute maximum, and the part
+/// becomes a short across its supply until power is removed.
+///
+/// Modelling it is what makes overvoltage PHYSICALLY DISSIPATIVE instead of
+/// judged by a second damage metric, and that matters because a `Tier`
+/// carries one metric per rung: without latch-up the family would have to
+/// choose between catching a shorted output and catching a 9 V rail. With
+/// it, `Metric::Power` catches both. A 74HC on the hoist's 9 V rail latches,
+/// burns 8.1 W against a 0.35 W package, and dies — a good game moment, and
+/// the correct one.
+///
+/// 7.0 V is the 74HC/74HCT absolute maximum supply. It is a property of the
+/// DIE, so it is a constant of the modelled family and not a `tier` lookup:
+/// `ElementSpec::tier` must never reach a stamp (it would make `state_hash`
+/// depend on a render/damage field), and `dstate` is hashed. A CD4000B-class
+/// 18 V part is a different die and would be a new field on the kind, not a
+/// rung of this ladder.
+const LOGIC_V_ABSMAX: f64 = 7.0;
+/// How far outside its own rails a pin may be driven before the SCR fires.
+const LOGIC_V_LATCH_MARGIN: f64 = 1.0;
+/// The latched short: 10 Ω across VCC-GND.
+const LOGIC_G_LATCHUP: f64 = 0.1;
+/// Supply below this clears the latch — i.e. a power cycle, which is what
+/// actually clears latch-up in the world.
+const LOGIC_V_UNLATCH: f64 = 1.0;
 
 const NR_MAX_ITERS: usize = 100;
 const NR_ABSTOL: f64 = 1e-6;
@@ -156,6 +252,58 @@ struct ElemState {
     /// integer restores the generator exactly — `Default` (0) is a valid
     /// start and there is no "uninitialized" sentinel to get wrong.
     noise_n: u64,
+    /// Discrete state for the CMOS logic family. `region` is an `i8` and a
+    /// 4-bit shift register needs four data bits plus up to four input
+    /// hysteresis latches plus a clock-history bit plus latch-up, so the
+    /// family gets a word of its own rather than overloading `region` a
+    /// third time.
+    ///
+    /// ```text
+    ///   0..8    data      Q0..Q3 / gate output / decoded mux select
+    ///   8..16   schmitt   per-input hysteresis latch, in pin order
+    ///   16      clk_prev  the clock's Schmitt level at the last accepted step
+    ///   17      latched   CMOS latch-up: sticky until the supply is removed
+    ///   18..32  reserved
+    /// ```
+    ///
+    /// All-zeros is the DEFINED power-up state — every bit low, nothing
+    /// latched — which is what makes a shift register read a real 0 V on
+    /// every output from the first substep instead of sitting at an
+    /// indeterminate half-rail until something writes it.
+    dstate: u32,
+}
+
+// `dstate` bit positions. See `ElemState::dstate`.
+const D_DATA: usize = 0;
+const D_SCHMITT: usize = 8;
+const D_CLK_PREV: usize = 16;
+const D_LATCHED: usize = 17;
+
+#[inline]
+fn dbit(d: u32, i: usize) -> bool {
+    (d >> i) & 1 != 0
+}
+
+#[inline]
+fn dset(d: &mut u32, i: usize, v: bool) {
+    if v {
+        *d |= 1 << i;
+    } else {
+        *d &= !(1 << i);
+    }
+}
+
+/// Read an `n`-bit field starting at `lo`.
+#[inline]
+fn dfield(d: u32, lo: usize, n: usize) -> u32 {
+    (d >> lo) & ((1u32 << n) - 1)
+}
+
+/// Write an `n`-bit field starting at `lo`.
+#[inline]
+fn dset_field(d: &mut u32, lo: usize, n: usize, v: u32) {
+    let mask = ((1u32 << n) - 1) << lo;
+    *d = (*d & !mask) | ((v << lo) & mask);
 }
 
 struct CompiledElem {
@@ -1294,6 +1442,75 @@ impl Engine {
                         }
                     }
                 }
+                ElementKind::Gate { .. }
+                | ElementKind::FlipFlop { .. }
+                | ElementKind::ShiftReg { .. }
+                | ElementKind::Counter { .. }
+                | ElementKind::Mux { .. } => {
+                    // The whole family, one arm, and NOTHING is written into
+                    // `b`: a CMOS chip is a switch network, not a source. It
+                    // owns no branch unknown either, so every write below is
+                    // a symmetric conductance and every one of them is
+                    // guarded by `need_factor` — the matrix survives a reuse
+                    // hit, so an unguarded `+=` would accumulate on every
+                    // reuse.
+                    //
+                    // THE PROPERTY THE WHOLE DESIGN TURNS ON: the incidence
+                    // pattern is identical in every discrete state. Both
+                    // output conductances are always stamped and only their
+                    // VALUES move, so a positive-conductance network is all
+                    // this contributes in any state — it cannot induce a
+                    // singularity, which is what makes `probe_solvable`'s
+                    // single cold factorization sound for this family.
+                    if need_factor {
+                        let (vcc, gnd) = (node[0], node[1]);
+                        let lp = kind.logic_pins().ok_or(())?;
+                        let d = state.dstate;
+
+                        self.stamp_g(vcc, gnd, LOGIC_G_QUIESCENT);
+                        // Latch-up is a hard short across the supply. Set in
+                        // `accept`, never here.
+                        if dbit(d, D_LATCHED) {
+                            self.stamp_g(vcc, gnd, LOGIC_G_LATCHUP);
+                        }
+                        // Inputs: symmetric leak to both rails.
+                        for k in 0..lp.n_in {
+                            let p = node[lp.in0 + k];
+                            self.stamp_g(p, vcc, LOGIC_G_IN);
+                            self.stamp_g(p, gnd, LOGIC_G_IN);
+                        }
+                        // Outputs: the totem pole, referred to the supply
+                        // PINS. This is what makes the current a gate
+                        // delivers actually come out of the player's battery
+                        // instead of appearing from nowhere — the 555's
+                        // lesson, reached without a branch row.
+                        for k in 0..lp.n_out {
+                            let p = node[lp.out0 + k];
+                            let (g_pu, g_pd) = if dbit(d, D_DATA + k) {
+                                (LOGIC_G_ON, LOGIC_G_OFF)
+                            } else {
+                                (LOGIC_G_OFF, LOGIC_G_ON)
+                            };
+                            self.stamp_g(p, vcc, g_pu);
+                            self.stamp_g(p, gnd, g_pd);
+                        }
+                        // The mux is the one part whose signal path is a PASS
+                        // GATE rather than a driver: the selected channel is
+                        // connected to Y through 50 Ω and the rest through
+                        // 1 GΩ, in both directions. That is a 4051, not a
+                        // '153 — and because it is a conductance it passes
+                        // analog, which costs nothing extra here.
+                        if let ElementKind::Mux { .. } = kind {
+                            let chans = 1usize << lp.n_in;
+                            let y = node[lp.in0 + lp.n_in];
+                            let on = dfield(d, D_DATA, lp.n_in) as usize;
+                            for j in 0..chans {
+                                let g = if j == on { LOGIC_G_ON } else { LOGIC_G_OFF };
+                                self.stamp_g(node[2 + j], y, g);
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -1566,6 +1783,36 @@ impl Engine {
                         }
                     }
                 }
+                ElementKind::Gate { .. }
+                | ElementKind::FlipFlop { .. }
+                | ElementKind::ShiftReg { .. }
+                | ElementKind::Counter { .. }
+                | ElementKind::Mux { .. } => {
+                    // DELIBERATELY NOTHING, and this arm exists rather than
+                    // falling into `_ => {}` below so that the emptiness is
+                    // visibly intentional and survives someone "fixing" it.
+                    //
+                    // The logic family advances its discrete state once per
+                    // ACCEPTED substep, in `accept`. That is what gives it a
+                    // real one-substep propagation delay — a ring of
+                    // inverters oscillates instead of sitting on its DC fixed
+                    // point, and a cross-coupled pair settles instead of
+                    // chattering. Doing it here would instead:
+                    //   (a) let a chip see its own clock move under Newton's
+                    //       feet within one substep, and self-trigger;
+                    //   (b) be silently rolled back by the rescue path, which
+                    //       snapshots `ElemState` before every solve;
+                    //   (c) collapse a D-deep ripple into D factorizations
+                    //       inside ONE substep instead of one factorization
+                    //       in each of D substeps — same total work, piled
+                    //       into a single 20 µs budget instead of spread.
+                    //
+                    // For the same reason these kinds are deliberately NOT
+                    // added to the `lastv[0]` flip-budget reset in
+                    // `solve_step`: they never flip during NR, so they need
+                    // no budget. Adding them there would be harmless but
+                    // misleading; omitting them is the statement.
+                }
                 _ => {}
             }
         }
@@ -1577,6 +1824,14 @@ impl Engine {
 
     /// Commit device history and pin currents from the solved unknowns.
     fn accept(&mut self, h: f64, be: bool) {
+        // The logic family's discrete state moves HERE rather than in
+        // `update_guesses`, so it needs the `accept`-time analogue of
+        // `discrete_flip`: a chip that changed state has changed the matrix,
+        // and the next substep must not run against the retained LU. This
+        // flag is the ONLY thing standing between the family and a stale-LU
+        // correctness bug, because these parts are `is_nonlinear()` but
+        // never flip during Newton.
+        let mut logic_changed = false;
         for ei in 0..self.elems.len() {
             let (kind, node, branch, broken, share_n, share_sign) = {
                 let e = &self.elems[ei];
@@ -1759,7 +2014,138 @@ impl Engine {
                     st.vg1 = vs[0] - vs[1];
                     st.vg2 = vs[3];
                 }
+                ElementKind::Gate { .. }
+                | ElementKind::FlipFlop { .. }
+                | ElementKind::ShiftReg { .. }
+                | ElementKind::Counter { .. }
+                | ElementKind::Mux { .. } => {
+                    let Some(lp) = kind.logic_pins() else { continue };
+                    let npins = kind.pin_count();
+                    let (vv, vg) = (vs[0], vs[1]);
+                    let vcc_v = vv - vg;
+                    let d0 = st.dstate;
+                    let mut d = d0;
+
+                    // 1. Latch-up, before anything else: a latched chip is a
+                    //    short, not a gate, and it stops functioning.
+                    if dbit(d, D_LATCHED) {
+                        // Sticky until the supply goes away — a power cycle,
+                        // which is exactly what clears real latch-up.
+                        if vcc_v < LOGIC_V_UNLATCH {
+                            dset(&mut d, D_LATCHED, false);
+                        }
+                    } else {
+                        let mut trip = vcc_v > LOGIC_V_ABSMAX;
+                        for p in 0..npins {
+                            if vs[p] > vv + LOGIC_V_LATCH_MARGIN
+                                || vs[p] < vg - LOGIC_V_LATCH_MARGIN
+                            {
+                                trip = true;
+                            }
+                        }
+                        if trip {
+                            dset(&mut d, D_LATCHED, true);
+                        }
+                    }
+
+                    // 2. Input Schmitt latches, thresholds on the LIVE
+                    //    supply. A pin between the two thresholds HOLDS,
+                    //    which is what makes a floating input (parked at
+                    //    vcc/2 by the symmetric leak) deterministic rather
+                    //    than chattering.
+                    let th_hi = vg + vcc_v * LOGIC_TH_HI;
+                    let th_lo = vg + vcc_v * LOGIC_TH_LO;
+                    for k in 0..lp.n_in {
+                        let v = vs[lp.in0 + k];
+                        let cur = dbit(d, D_SCHMITT + k);
+                        let new = if v > th_hi {
+                            true
+                        } else if v < th_lo {
+                            false
+                        } else {
+                            cur
+                        };
+                        dset(&mut d, D_SCHMITT + k, new);
+                    }
+
+                    // 3. The state machine, from the NEW Schmitt bits.
+                    if !dbit(d, D_LATCHED) {
+                        logic_eval(&kind, &lp, &mut d);
+                    }
+
+                    // 4. Clock history LAST, so an edge is exactly one
+                    //    substep wide and the state machine above saw the
+                    //    PREVIOUS accepted level to compare against.
+                    if let Some(c) = lp.clk {
+                        let level = dbit(d, D_SCHMITT + c);
+                        dset(&mut d, D_CLK_PREV, level);
+                    }
+
+                    // 5. Pin currents, from the same conductances `build`
+                    //    stamped. Every internal branch contributes ±, so
+                    //    Σ i = 0 exactly and Σ v·i = Σ g·(Δv)² ≥ 0: honest
+                    //    dissipation by construction, with no `elem_power`
+                    //    exception needed.
+                    let mut pi = [0.0f64; MAX_PINS];
+                    {
+                        let mut add = |a: usize, b: usize, g: f64| {
+                            let i = (vs[a] - vs[b]) * g;
+                            pi[a] += i;
+                            pi[b] -= i;
+                        };
+                        add(0, 1, LOGIC_G_QUIESCENT);
+                        if dbit(d, D_LATCHED) {
+                            add(0, 1, LOGIC_G_LATCHUP);
+                        }
+                        for k in 0..lp.n_in {
+                            add(lp.in0 + k, 0, LOGIC_G_IN);
+                            add(lp.in0 + k, 1, LOGIC_G_IN);
+                        }
+                        for k in 0..lp.n_out {
+                            let hi = dbit(d, D_DATA + k);
+                            add(lp.out0 + k, 0, if hi { LOGIC_G_ON } else { LOGIC_G_OFF });
+                            add(lp.out0 + k, 1, if hi { LOGIC_G_OFF } else { LOGIC_G_ON });
+                        }
+                        if let ElementKind::Mux { .. } = kind {
+                            let chans = 1usize << lp.n_in;
+                            let y = lp.in0 + lp.n_in;
+                            let on = dfield(d, D_DATA, lp.n_in) as usize;
+                            for j in 0..chans {
+                                add(2 + j, y, if j == on { LOGIC_G_ON } else { LOGIC_G_OFF });
+                            }
+                        }
+                    }
+                    st.pin_i = pi;
+                    if d != d0 {
+                        st.dstate = d;
+                        logic_changed = true;
+                    }
+                }
             }
+        }
+        if logic_changed {
+            self.factor_valid = false;
+            // A logic edge is a DISCONTINUITY, in exactly the sense a switch
+            // flip is, and it gets the same treatment: a couple of backward-
+            // Euler substeps to kill trapezoidal ringing.
+            //
+            // This is not decoration. A gate output is a hard step between
+            // the rails behind 50 Ω, and a player WILL hang a capacitor on
+            // it — the sequencer's glide cap is exactly that. Measured on the
+            // shift-register ring at a sequencer clock rate with 100 nF on
+            // Q0, trapezoid rings the output to +5.53 V and -0.55 V on a 5 V
+            // rail: over half a volt outside the chip's own supply, on the
+            // target circuit. That is wrong on its face, and here it is also
+            // dangerous, because a pin driven a volt outside the rails is
+            // what fires the latch-up model — the integrator would have been
+            // destroying chips that nothing was wrong with. With BE armed
+            // the same node stays inside 0..5 V.
+            //
+            // The cost is bounded by construction: at a sequencer clock the
+            // edges are tens of substeps apart, so this is 2 substeps in 50.
+            // A circuit switching every substep runs entirely in BE, which
+            // is the correct integrator for it anyway.
+            self.be_steps = self.be_steps.max(BE_STEPS_AFTER_EVENT);
         }
     }
 
@@ -1967,6 +2353,17 @@ impl Engine {
                 put((e.state.noise_n >> 32) as u32 as f64);
                 put((e.state.noise_n & 0xffff_ffff) as u32 as f64);
             }
+            // A logic chip's whole memory — its stored bits, its input
+            // hysteresis latches, its clock history and whether it has
+            // latched up — is `dstate`, and two engines agreeing on every
+            // voltage can still disagree about the next edge if they
+            // disagree about it. Conditional for the same reason `broken`
+            // and `noise_n` are: a world with no logic part hashes exactly
+            // as it did before this family existed, so no golden digest
+            // moved when it landed. Every u32 is exact in f64.
+            if e.spec.kind.is_logic() {
+                put(f64::from(e.state.dstate));
+            }
         }
         h.digest()
     }
@@ -2005,6 +2402,100 @@ fn elem_power(kind: &ElementKind, npins: usize, v: &[f64; MAX_PINS], i: &[f64; M
         return i_out.abs() * drop.max(0.0);
     }
     (0..npins).map(|p| v[p] * i[p]).sum()
+}
+
+/// Advance one logic chip's data bits from its (already updated) input
+/// Schmitt bits and its previous clock level.
+///
+/// Called once per ACCEPTED substep and nowhere else, which is the whole of
+/// the family's timing model: every logic element is a one-substep delay, so
+/// a signal driven by logic is piecewise-constant across a whole substep and
+/// setup/hold between two logic signals is structurally satisfied. It also
+/// means an edge is quantized to the 20 µs substep grid, capping the honest
+/// clock rate at 1/(2·dt) = 25 kHz — a sequencer clock in the low kHz has
+/// 20x margin, and past the cap the edge count silently aliases, which is
+/// why the client should count solver edges rather than trust the clock.
+///
+/// Reads and writes only `d`. No solved voltages, no time, no history.
+fn logic_eval(kind: &ElementKind, lp: &LogicPins, d: &mut u32) {
+    match *kind {
+        ElementKind::Gate { op, .. } => {
+            let ins = lp.n_in;
+            let n_hi = (0..ins).filter(|k| dbit(*d, D_SCHMITT + k)).count();
+            dset(d, D_DATA, op.eval(ins, n_hi));
+        }
+        // [CLK, D, RST] -> [Q, /Q]. RST is asynchronous and active low.
+        ElementKind::FlipFlop { edge } => {
+            let clk = dbit(*d, D_SCHMITT);
+            let din = dbit(*d, D_SCHMITT + 1);
+            let rst = dbit(*d, D_SCHMITT + 2);
+            let held = dbit(*d, D_DATA);
+            let q = if !rst {
+                false
+            } else if edge {
+                // Rising edge = high now, low at the last accepted substep.
+                // Comparing against the PREVIOUS ACCEPTED level (rather than
+                // anything Newton saw) is what makes this a real edge
+                // detector that also rewinds correctly on a rescue.
+                if clk && !dbit(*d, D_CLK_PREV) {
+                    din
+                } else {
+                    held
+                }
+            } else if clk {
+                din // transparent while the clock is high
+            } else {
+                held
+            };
+            dset(d, D_DATA, q);
+            dset(d, D_DATA + 1, !q);
+        }
+        // [CLK, SER, RST] -> Q0..Q(bits-1). Every stage moves from ONE edge,
+        // here, in one pass: no internal ripple, and therefore one
+        // factorization per clock edge instead of `bits` of them.
+        ElementKind::ShiftReg { .. } => {
+            let bits = lp.n_out;
+            let clk = dbit(*d, D_SCHMITT);
+            let ser = dbit(*d, D_SCHMITT + 1);
+            let rst = dbit(*d, D_SCHMITT + 2);
+            if !rst {
+                dset_field(d, D_DATA, bits, 0);
+            } else if clk && !dbit(*d, D_CLK_PREV) {
+                let cur = dfield(*d, D_DATA, bits);
+                dset_field(d, D_DATA, bits, (cur << 1) | u32::from(ser));
+            }
+        }
+        // [CLK, RST] -> Q0..Q(bits-1), synchronous: all bits from one edge.
+        ElementKind::Counter { modulus, .. } => {
+            let bits = lp.n_out;
+            let clk = dbit(*d, D_SCHMITT);
+            let rst = dbit(*d, D_SCHMITT + 1);
+            // Clamped rather than trusted: `check_kind` refuses a bad
+            // modulus, but this must stay total for a document written by a
+            // build that allowed one.
+            let m = u32::from(modulus).clamp(2, 1 << bits);
+            if !rst {
+                dset_field(d, D_DATA, bits, 0);
+            } else if clk && !dbit(*d, D_CLK_PREV) {
+                let cur = dfield(*d, D_DATA, bits);
+                let next = if cur + 1 >= m { 0 } else { cur + 1 };
+                dset_field(d, D_DATA, bits, next);
+            }
+        }
+        // The select lines decode straight into the data field, which is
+        // what `build` reads to pick the conducting channel.
+        ElementKind::Mux { .. } => {
+            let sel = lp.n_in;
+            let mut v = 0u32;
+            for k in 0..sel {
+                if dbit(*d, D_SCHMITT + k) {
+                    v |= 1 << k;
+                }
+            }
+            dset_field(d, D_DATA, sel, v);
+        }
+        _ => {}
+    }
 }
 
 /// (saturation current, n·Vt, reverse-breakdown offset).
