@@ -5,5 +5,8 @@
     "dev": "pnpm --filter @ee/app dev",
     "build": "pnpm -r build",
     "wasm": "wasm-pack build crates/sim-wasm --target web --out-dir ../../packages/app/src/wasm"
+  },
+  "dependencies": {
+    "ee-game": "link:"
   }
 }
