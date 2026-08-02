@@ -825,6 +825,17 @@ fn refining_the_room_dt_never_makes_the_answer_worse() {
 /// Bit-identity is also why `state_hash` still reproduces: it walks the
 /// islands' solution vectors in island order and the elements in DOCUMENT
 /// order, and for a single-island circuit both are what they always were.
+///
+/// KNOW WHAT THIS DOES NOT COVER. `every_golden_circuit_is_a_single_island`
+/// is a guard, but it is also this test's ceiling: passing here says nothing
+/// about a world that actually partitions. Measured separately on generated
+/// multi-island rooms, levers off: linear ones stay bit-identical, but ones
+/// containing a smooth nonlinearity land within 1.75e-8 V (57x inside
+/// `NR_ABSTOL`) with an identical discrete trajectory — because `main` ran
+/// ONE global Newton loop, where a still-moving diode dragged its converged
+/// neighbours through extra iterations, and each island now converges alone.
+/// Do not "fix" that by re-coupling the loops. See the exactness-scope table
+/// in `docs/scale-baseline.md` before quoting "bit for bit" anywhere.
 #[test]
 fn with_both_levers_off_the_engine_is_the_pre_lever_engine_bit_for_bit() {
     let want: &[(&str, u64)] = &[

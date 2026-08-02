@@ -987,6 +987,41 @@ number their own nodes the same way, so with one island `local == global`.
 `every_golden_circuit_is_a_single_island` guards that premise rather than
 assuming it.
 
+#### The exact scope of "bit for bit" — read this before quoting it
+
+That premise is also the claim's limit, and the limit matters: **every golden
+circuit is a single island**, so the 18 pinned digests do not exercise the
+thing this change actually does. Extending the comparison to generated
+multi-island rooms (`crates/sim-golden/src/bin/scale.rs`, byte-identical in
+both trees), keyed by element id rather than by state hash — a hash
+concatenates per-island `x`, so a permutation would move the digest for free
+— gives three different answers, and only two of them are "bit for bit":
+
+| room class | levers off, vs `main` 0475bbf |
+|---|---|
+| single island, to 504 el / n=149 / 100% nonlinear | **bit-identical** (25/25 configs) |
+| multi-island, **linear**, 71 → 2062 el, to 20 islands | **bit-identical** |
+| multi-island, **with smooth nonlinearities**, 71 → 1027 el | **not** bit-identical |
+
+Quantified over 15 nonlinear multi-island rooms × 20,000 substeps at 20 µs:
+max |Δv| = **1.75e-8 V**, max |Δi| = **4.4e-10 A**, max |Δ lastv| = 6.2e-12 V,
+and **zero region differences** — the discrete trajectory is identical
+substep-for-substep, levers off and on, across up to 13,391 distinct region
+states in one 577-element room.
+
+The mechanism is Newton, not arithmetic. `main` runs **one global NR loop**, so
+an island whose diode is still moving forces another whole-world re-solve and
+nudges its already-converged neighbours. Partitioned, each island stops when it
+alone converges. On a 2053-element room `main` spends 1,420 extra global
+iterations where the islands spend 3,374 tiny local ones, and the two fixed
+points differ by **57× less than the solver's own `NR_ABSTOL` (1e-6 V)**.
+
+This is arguably *more* correct — an island's answer should not depend on how
+hard its neighbours are to converge — and it is below the resolution of every
+player-facing number. But it is not bit-for-bit, so the honest form of the
+claim is: **bit-identical on single-island and on linear multi-island worlds;
+discrete-identical and within 2e-8 V on nonlinear multi-island worlds.**
+
 With the levers ON, 4 of the 18 golden hashes move (`rc_step`, `rl_step`,
 `npn_switch`, `opamp_relaxation`) — those are the circuits that legitimately
 sleep or dilate, and the trajectory change is the documented,
