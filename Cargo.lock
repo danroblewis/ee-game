@@ -1291,6 +1291,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sim-layout"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sim-core",
+]
+
+[[package]]
 name = "sim-math"
 version = "0.1.0"
 dependencies = [

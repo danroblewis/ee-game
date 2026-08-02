@@ -4,6 +4,7 @@ members = [
     "crates/sim-math",
     "crates/sim-core",
     "crates/sim-golden",
+    "crates/sim-layout",
     "crates/sim-wasm",
     "crates/machine",
     "crates/damage",

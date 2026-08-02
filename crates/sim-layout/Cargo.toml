@@ -1,0 +1,10 @@
+[package]
+name = "sim-layout"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+sim-core = { path = "../sim-core", features = ["serde"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
