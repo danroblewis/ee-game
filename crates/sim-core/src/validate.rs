@@ -639,14 +639,14 @@ fn diagnose(eng: &Engine) -> Result<(), Reject> {
 /// so the path is unique and the traversal order is the document order the
 /// edges were accepted in.
 fn trace_loop(accepted: &[(usize, usize, u32)], from: usize, to: usize) -> Vec<u32> {
-    // (previous node, edge id) per visited node.
-    let mut came: Vec<Option<(usize, u32)>> = Vec::new();
+    // `seen` doubles as the BFS queue: nodes are appended in visit order and
+    // read back with a head index, so one vector serves both. `came[i]` is
+    // the (previous node, edge id) that reached `seen[i]`.
     let mut seen: Vec<usize> = vec![from];
-    let mut queue: Vec<usize> = vec![from];
-    came.push(None);
+    let mut came: Vec<Option<(usize, u32)>> = vec![None];
     let mut head = 0;
-    while head < queue.len() {
-        let cur = queue[head];
+    while head < seen.len() {
+        let cur = seen[head];
         head += 1;
         if cur == to {
             break;
@@ -664,9 +664,12 @@ fn trace_loop(accepted: &[(usize, usize, u32)], from: usize, to: usize) -> Vec<u
             }
             seen.push(next);
             came.push(Some((cur, *id)));
-            queue.push(next);
         }
     }
+    // Walk back from `to`. Each hop lands on a node discovered strictly
+    // earlier, so this terminates; a `to` that was never reached (impossible
+    // once union-find says the endpoints are connected) simply yields the
+    // closing edge alone.
     let mut path = Vec::new();
     let mut cur = to;
     while cur != from {
