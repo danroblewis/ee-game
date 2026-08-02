@@ -215,6 +215,28 @@ export function describeDrift(drift: WireDrift[]): string {
   return drift.map((d) => `${d.field}: want ${d.want}, got ${d.got}`).join('; ');
 }
 
+/** Why the server refused an op. Mirrors `sim_core::Reject` through
+ * `server/main.rs`'s `reject_msg`, and is byte-identical in shape to what the
+ * client's own `checkDocument` returns — one implementation, two callers, so
+ * the two sides can never disagree about what is placeable. */
+export interface RejectMsg {
+  /** The player whose op was refused. Only that client should react. */
+  who: number;
+  /** Which path refused it: "edit" | "interact" | "repair" | "machinemove". */
+  ctx: string;
+  /** Machine-readable reason: "bad_value", "collapsed_pins", "shorted_source",
+   * "conflicting_sources", "source_loop", "will_not_converge", "unsolvable",
+   * "unsolvable_switched". */
+  code: string;
+  /** The primary offending element, when the refusal is pinned to one. */
+  id: number | null;
+  /** EVERY implicated element — both halves of a conflict, the whole of a
+   * source loop — so the callout can point at all of them. */
+  ids: number[];
+  /** A sentence for the player, written as a DRC callout. */
+  hint: string;
+}
+
 export interface NetHandlers {
   /** The late-join payload. `room` is null only against a server from before
    * rooms existed — everything else about that server still works. */
@@ -257,6 +279,10 @@ export interface NetHandlers {
   onAudio(t0: number, dts: number, s: Record<string, number[]>, rt: number | null): void;
   onPresence(n: number): void;
   onCursor(who: number, x: number, y: number): void;
+  /** An op was refused by the placement gate. Broadcast to everyone (every
+   * client already ignores messages it does not care about), because the
+   * SENDER needs it to roll back its optimistic local apply. */
+  onReject(r: RejectMsg): void;
   onClose(): void;
   /** The server's `hello` disagreed with the shape this client parses. Always
    * a bug in one half or the other, and always worth being noisy about: the
@@ -403,6 +429,18 @@ export function connect(h: NetHandlers, room: string | null = null): Net {
         break;
       case 'cursor':
         h.onCursor(m.who, m.x, m.y);
+        break;
+      case 'reject':
+        h.onReject({
+          who: m.who,
+          ctx: m.ctx ?? '',
+          code: m.code ?? 'unsolvable',
+          id: typeof m.id === 'number' ? m.id : null,
+          // `ids` is newer than `id`; fall back so an older server still
+          // produces a usable callout.
+          ids: Array.isArray(m.ids) ? m.ids : typeof m.id === 'number' ? [m.id] : [],
+          hint: m.hint ?? '',
+        });
         break;
     }
   };

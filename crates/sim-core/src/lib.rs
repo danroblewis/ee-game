@@ -2,10 +2,12 @@
 //! I/O, no threads, no clocks — so it compiles bit-identically for the
 //! native server and the wasm32 client preview.
 
+pub mod constraint;
 mod engine;
 mod netlist;
 pub mod validate;
 
+pub use constraint::{constraint_of, Constraint, ConstraintKey};
 pub use engine::{AdvanceReport, ElemFrame, ElemTap, Engine, GMIN};
 pub use netlist::{
     DocOp, ElementKind, ElementSpec, InteractOp, ParamWrite, Point, DEFAULT_OPAMP_ISC, MAX_PINS,

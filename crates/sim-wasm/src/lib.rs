@@ -89,17 +89,20 @@ impl Sim {
 /// ElementSpec; `dt` is the sim timestep.
 ///
 /// Returns `null` when the document is placeable, else
-/// `{code, id, hint}` — `code` machine-readable ("bad_value",
-/// "collapsed_pins", "unsolvable", "unsolvable_switched"), `id` the
-/// offending element when it is one element's fault, `hint` a sentence for
-/// the DRC callout.
+/// `{code, id, ids, hint}` — `code` machine-readable ("bad_value",
+/// "collapsed_pins", "shorted_source", "conflicting_sources", "source_loop",
+/// "will_not_converge", "unsolvable", "unsolvable_switched"), `id` the
+/// primary offending element, `ids` EVERY implicated element (so the client
+/// can flash both halves of a conflict, or the whole loop), `hint` a
+/// sentence for the DRC callout.
 #[wasm_bindgen(js_name = checkDocument)]
 pub fn check_document(specs: JsValue, dt: f64) -> Result<JsValue, JsValue> {
     #[derive(serde::Serialize)]
     struct RejectOut {
         code: &'static str,
         id: Option<u32>,
-        hint: &'static str,
+        ids: Vec<u32>,
+        hint: String,
     }
     let specs: Vec<ElementSpec> =
         serde_wasm_bindgen::from_value(specs).map_err(|e| JsValue::from_str(&e.to_string()))?;
@@ -108,6 +111,7 @@ pub fn check_document(specs: JsValue, dt: f64) -> Result<JsValue, JsValue> {
         Err(r) => serde_wasm_bindgen::to_value(&RejectOut {
             code: r.code(),
             id: r.id(),
+            ids: r.ids().iter().collect(),
             hint: r.hint(),
         })
         .map_err(|e| JsValue::from_str(&e.to_string())),

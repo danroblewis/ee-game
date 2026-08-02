@@ -2022,10 +2022,15 @@ fn check_room_doc(elems: &[ElementSpec]) -> Result<(), sim_core::Reject> {
 /// human `hint` for the DRC-style callout. Broadcast, not unicast: every
 /// client already ignores unknown message types, and the sender needs it to
 /// roll back its optimistic local apply.
+///
+/// `ids` is additive alongside the existing `id`: a conflict implicates two
+/// parts and a source loop implicates the whole cycle, and the client wants
+/// to flash all of them. Old clients that only read `id` keep working.
 fn reject_msg(who: u32, ctx: &str, r: &sim_core::Reject) -> String {
+    let ids: Vec<u32> = r.ids().iter().collect();
     json!({
         "t": "reject", "who": who, "ctx": ctx,
-        "code": r.code(), "id": r.id(), "hint": r.hint(),
+        "code": r.code(), "id": r.id(), "ids": ids, "hint": r.hint(),
     })
     .to_string()
 }
@@ -5105,17 +5110,17 @@ mod tests {
             (
                 "wire shorting the vignette-A battery",
                 add(5001, K::Wire, (2, 2), (2, 8)),
-                |r| *r == Reject::Unsolvable,
+                |r| *r == Reject::ShortedSource { id: 1 },
             ),
-            (
-                "second battery stacked on the first (agreeing)",
-                add(5002, dc(9.0), (2, 2), (2, 8)),
-                |r| *r == Reject::Unsolvable,
-            ),
+            // NOTE: "second battery stacked on the first, AGREEING" is no
+            // longer here. It is now ACCEPTED — see
+            // `gate_accepts_a_matching_supply_in_parallel` below. All 9 V
+            // supplies are assumed to come from the same supply, so two of
+            // them on one node are one net, not a singular matrix.
             (
                 "second battery stacked on the first (disagreeing)",
                 add(5003, dc(5.0), (2, 2), (2, 8)),
-                |r| *r == Reject::Unsolvable,
+                |r| matches!(r, Reject::ConflictingSources { a: 1, b: 5003, .. }),
             ),
             (
                 "battery across the hoist's LIM-BOT pair (closed at rest)",
@@ -5125,7 +5130,7 @@ mod tests {
                     fixture_pin(LIM_BOT_ID, 0),
                     fixture_pin(LIM_BOT_ID, 1),
                 ),
-                |r| *r == Reject::Unsolvable,
+                |r| matches!(r, Reject::ConflictingSources { b: 5004, .. }),
             ),
             (
                 "battery across LIM-TOP: fine until the MACHINE closes it",
@@ -5223,7 +5228,7 @@ mod tests {
                 assert_eq!(check_room_doc(&with_rail), Ok(()), "lone rail is legal");
                 assert_eq!(
                     gate(&with_rail, &op),
-                    Err(sim_core::Reject::Unsolvable),
+                    Err(sim_core::Reject::ShortedSource { id: 5100 }),
                     "{why}"
                 );
                 continue;
@@ -5233,6 +5238,49 @@ mod tests {
         }
         // And the room itself is untouched by all that refusing.
         assert_eq!(check_room_doc(&room), Ok(()));
+    }
+
+    /// The other half of the source rule, on the LIVE room: an identical
+    /// supply in parallel is one net, not a refusal.
+    ///
+    /// "It's possible to connect two 5 V sources together not because they
+    /// are the same voltage but because we make the assumption that all 5 V
+    /// sources are from the same source."
+    #[test]
+    fn gate_accepts_a_matching_supply_in_parallel() {
+        let room = full_room();
+        // A second 9 V battery straight across the vignette-A battery.
+        let op = DocOp::Add {
+            spec: spec(5002, dc(9.0), (2, 2), (2, 8)),
+        };
+        assert_eq!(gate(&room, &op), Ok(()), "a matching supply is one net");
+        // A third one, and the same supply drawn the other way round.
+        let mut two = room.clone();
+        assert!(apply_doc_op_to(&mut two, &op));
+        assert_eq!(
+            gate(
+                &two,
+                &DocOp::Add {
+                    spec: spec(5003, dc(-9.0), (2, 8), (2, 2)),
+                }
+            ),
+            Ok(()),
+            "the same constraint drawn backwards is still one net"
+        );
+        // Two closed switches in parallel across the hoist's LIM-BOT pair —
+        // two-way lighting / an OR contact / a manual override. A closed
+        // switch is a 0 V source, so this is the identical singularity as
+        // parallel batteries and used to be refused.
+        assert_eq!(
+            gate(
+                &room,
+                &DocOp::Add {
+                    spec: spec(5004, K::Switch { closed: true }, (57, 22), (61, 22)),
+                }
+            ),
+            Ok(()),
+            "a second closed switch in parallel is one net"
+        );
     }
 
     /// The gate must NOT refuse ordinary building: every legal op class on
@@ -5313,11 +5361,15 @@ mod tests {
         let mut rect = HOIST_RECT;
         let moved = move_machine(&mut next, &mut rect, D.0, D.1);
         assert!(moved.is_some(), "the move itself is well-formed");
-        assert_eq!(
-            check_room_doc(&next),
-            Err(sim_core::Reject::Unsolvable),
-            "landing a closed limit switch on a source must be refused"
+        // Refused, and NAMED: the limit switch is a 0 V constraint and the
+        // battery a 9 V one, on the same node pair.
+        let got = check_room_doc(&next).expect_err("landing LIM-BOT on a source must be refused");
+        assert!(
+            matches!(got, sim_core::Reject::ConflictingSources { .. }),
+            "{got:?}"
         );
+        let ids: Vec<u32> = got.ids().iter().collect();
+        assert!(ids.contains(&903) && ids.contains(&7001), "{ids:?}");
         // A harmless drag of the same distance elsewhere stays legal.
         let mut next = room.clone();
         let mut rect = HOIST_RECT;
@@ -5336,10 +5388,13 @@ mod tests {
         // (The gate would have refused this Add; simulate a legacy doc.)
         let mut closed = room.clone();
         apply_interact_to(&mut closed, 8001, InteractOp::SetSwitch { closed: true });
-        assert_eq!(
-            check_room_doc(&closed),
-            Err(sim_core::Reject::Unsolvable),
-            "closing the shorting switch must be refused"
+        let got = check_room_doc(&closed).expect_err("closing the shorting switch must be refused");
+        assert!(
+            matches!(
+                got,
+                sim_core::Reject::ConflictingSources { a: 1, b: 8001, .. }
+            ),
+            "{got:?}"
         );
 
         // Knob write pushing a source to an absurd value: SetValue on dc
@@ -5370,6 +5425,22 @@ mod tests {
         assert_eq!(v["ctx"], "edit");
         assert_eq!(v["code"], "unsolvable_switched");
         assert!(v["id"].is_null());
+        assert_eq!(v["ids"].as_array().unwrap().len(), 0);
         assert!(v["hint"].as_str().is_some_and(|h| !h.is_empty()));
+
+        // A named refusal carries EVERY implicated part, so the client can
+        // flash both halves of a conflict rather than guessing.
+        let r = sim_core::Reject::ConflictingSources {
+            a: 1,
+            b: 5003,
+            va: 9.0,
+            vb: 5.0,
+        };
+        let v: serde_json::Value = serde_json::from_str(&reject_msg(3, "edit", &r)).unwrap();
+        assert_eq!(v["code"], "conflicting_sources");
+        assert_eq!(v["id"], 1);
+        assert_eq!(v["ids"], serde_json::json!([1, 5003]));
+        let hint = v["hint"].as_str().unwrap();
+        assert!(hint.contains("9 V") && hint.contains("5 V"), "{hint}");
     }
 }

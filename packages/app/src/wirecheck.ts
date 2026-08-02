@@ -323,6 +323,7 @@ function dial(code: string | null = null) {
     onPresence: nop,
     onCursor: nop,
     onClose: nop,
+    onReject: nop,
     onWireDrift: (d) => drifts.push(d),
   };
   const net = connect(handlers, code);

@@ -67,7 +67,7 @@
 // pointer hit-tests go through the grid-space spatial index in spatial.ts,
 // and the zoom band 0.4..200 px/unit drops symbol detail below ~6 px/unit.
 
-import init, { Sim } from './wasm/sim_wasm';
+import init, { Sim, checkDocument } from './wasm/sim_wasm';
 import {
   demoCircuit,
   MAX_PINS,
@@ -669,6 +669,18 @@ const net = connect({
     // instead of only in a console nobody has open.
     toast(`this client and this server disagree about ${drift.map((d) => d.field).join(', ')}`);
   },
+    onReject(r) {
+    // Only the sender acts on it; everyone else's document never changed.
+    //
+    // This should be RARE now: `gateOrExplain` runs the identical Rust gate
+    // before we send, so a refusal here means either a race (someone else's
+    // edit landed first) or a path the client cannot pre-check — a machine
+    // move, or an op from a client that predates the pre-send gate. Say what
+    // happened either way: a silently-refused op used to leave a ghost part
+    // on this canvas forever with no explanation.
+    if (r.who !== myId) return;
+    showReject(r.hint, r.ids, r.ctx);
+  },
   onClose() {
     if (online) {
       online = false;
@@ -703,6 +715,81 @@ function toast(text: string) {
   toastBox.appendChild(el);
   while (toastBox.childElementCount > 4) toastBox.firstElementChild?.remove();
   setTimeout(() => el.remove(), 7000);
+}
+
+// ------------------------------------------------- the placement gate (DRC)
+//
+// The SAME Rust implementation the server enforces, reached through
+// `checkDocument` in sim-wasm. Running it here before we send means the two
+// sides cannot disagree about what is placeable: a move that breaks the
+// simulation is refused at the moment it is made, with a sentence saying
+// why, instead of being applied optimistically and then silently dropped —
+// which used to leave a ghost part on this canvas forever, burning an id the
+// server had never heard of.
+//
+// It is also the ONLY gate offline. `localSim.setElements` was called raw,
+// so every refusal class — a wire across a source, 1 V against 5 V, a 9 V
+// battery straight across an LED — froze the local sim with no explanation.
+
+/** Above this the pre-send check is skipped and the server's refusal (plus
+ * its `reject` callout) is relied on instead.
+ *
+ * The gate is a compile plus one or two dense factorizations, and it would
+ * run on the UI thread once per knob tick during a value drag. "The sim never
+ * stalls the UI" is the invariant that decides the trade: a few hundred
+ * microseconds is fine, tens of milliseconds per frame is not. The honest
+ * residual is that a big room loses pre-send prevention (and, offline, loses
+ * the gate entirely) — the real fix is the two quadratics in the Rust compile
+ * path, not a bigger constant here. */
+const GATE_MAX_ELEMENTS = 600;
+
+/** The document `op` would produce, WITHOUT touching the live one. Mirrors
+ * the server's `apply_doc_op_to`: same verbs, same order, applied to a copy.
+ * Only the changed element is cloned; `checkDocument` serializes and never
+ * mutates. */
+function candidateDoc(op: DocOp): ElementSpec[] {
+  if (op.t === 'Add') return space.get(op.spec.id) ? elements : [...elements, op.spec];
+  if (op.t === 'Remove') return elements.filter((e) => e.id !== op.id);
+  return elements.map((e) =>
+    e.id !== op.id
+      ? e
+      : op.t === 'Move'
+        ? { ...e, pins: op.pins }
+        : { ...e, kind: op.kind },
+  );
+}
+
+/** Point the player at the parts a refusal named, and say what is wrong.
+ * Selecting them is the pointing: these are exactly the parts that have to
+ * change, and the selection is already how this client says "these ones". */
+function showReject(hint: string, ids: number[], ctx: string) {
+  const live = ids.filter((id) => !!space.get(id));
+  if (live.length) {
+    selectedIds = new Set(live);
+    selectedMachine = false;
+  }
+  toast(hint || `that ${ctx || 'change'} was refused`);
+}
+
+/** Run the gate on a candidate document. Returns true when it was REFUSED
+ * (and the callout has already been shown), so callers read as
+ * `if (refused(...)) return;`. */
+function refused(candidate: ElementSpec[], ctx: string): boolean {
+  if (candidate.length > GATE_MAX_ELEMENTS) return false;
+  // The client sim runs at its own dt. Structural refusals do not depend on
+  // it at all; the convergence trial does, marginally — and the server has
+  // the final say either way.
+  type GateReject = { hint?: string; ids?: number[]; id?: number | null };
+  let r: GateReject | null;
+  try {
+    r = checkDocument(candidate, DT) as GateReject | null;
+  } catch {
+    return false; // a gate that cannot run must never block a legal edit
+  }
+  if (!r) return false;
+  const ids = Array.isArray(r.ids) ? r.ids : typeof r.id === 'number' ? [r.id] : [];
+  showReject(r.hint ?? '', ids, ctx);
+  return true;
 }
 
 /** The oldest joke in electronics, and the clearest possible failure notice. */
@@ -747,6 +834,17 @@ function armRepair() {
 }
 
 function interact(e: ElementSpec, op: InteractOp) {
+  // Gate BEFORE the optimistic apply, so a refused switch flip or knob write
+  // never has to be rolled back — it simply does not happen. (The server
+  // gates interacts too; this is the same code, so the two agree.)
+  const cand = elements.map((x) =>
+    x.id === e.id ? (JSON.parse(JSON.stringify(x)) as ElementSpec) : x,
+  );
+  const target = cand.find((x) => x.id === e.id);
+  if (target) {
+    applyOp(target, op);
+    if (refused(cand, 'interact')) return;
+  }
   applyOp(e, op); // optimistic; server echo confirms
   if (online) net.sendInteract(e.id, op);
   else localSim.interact(e.id, op);
@@ -757,6 +855,10 @@ const history = new History(editDoc);
 
 function editDoc(op: DocOp) {
   if (isFixtureId(op.t === 'Add' ? op.spec.id : op.id)) return; // locked fixture
+  // Prevent, don't revert: judge the document the op WOULD produce and drop
+  // the op before anything is applied, recorded or sent. Nothing to roll
+  // back, no undo entry for an edit that never happened, no ghost part.
+  if (refused(candidateDoc(op), 'edit')) return;
   history.record(op, elements); // before applyDoc: captures the prior state
   applyDoc(op); // optimistic
   if (online) net.sendEdit(op);

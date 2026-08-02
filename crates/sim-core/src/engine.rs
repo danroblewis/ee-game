@@ -12,6 +12,7 @@
 //! - A constant current I into pin p stamps `b[p] -= I`.
 //! - A dependence dI_p/dV_n stamps `a[p][n] += g`.
 
+use crate::constraint::{constraint_of, Constraint, ConstraintKey};
 use crate::netlist::{ElementKind, ElementSpec, InteractOp, ParamWrite, Point, MAX_PINS};
 use sim_math::DenseLu;
 
@@ -160,8 +161,20 @@ struct CompiledElem {
     spec: ElementSpec,
     /// Electrical node index per pin (0 = ground; unused pins 0).
     node: [usize; MAX_PINS],
-    /// Index into the branch-current unknowns for branch devices.
+    /// Index into the branch-current unknowns for branch devices. Members of
+    /// a merged ideal-constraint group all point at the SAME index.
     branch: Option<usize>,
+    /// How many elements share this branch unknown (1 = sole owner). A merged
+    /// member reports `i / share_n` — see `accept`.
+    share_n: u32,
+    /// ±1: the sign this element reads its share of the branch current with.
+    /// −1 only for a merged member drawn with its pins in the opposite order
+    /// to the group's leader.
+    share_sign: f64,
+    /// This element writes the branch row. False only for a non-leader member
+    /// of a merged group: the leader already wrote it, and stamping again
+    /// would accumulate the ±1 incidence to ±N.
+    stamps: bool,
     state: ElemState,
     /// The part has failed OPEN: it stamps nothing, owns no branch unknown
     /// and carries no current. Its pins remain junction points, so anything
@@ -311,6 +324,21 @@ impl Engine {
         self.elems.iter().map(|e| (e.spec.id, e.node)).collect()
     }
 
+    /// Every ideal zero-impedance constraint the compiled document imposes,
+    /// in document order: `(element id, canonical constraint)`.
+    ///
+    /// This is the compiled truth — real node numbers after wire closure and
+    /// ground merging — so `crate::validate` can say WHICH parts conflict and
+    /// WHICH ones close a loop, instead of watching the LU return one
+    /// anonymous "singular". Broken parts are skipped: they impose nothing.
+    pub fn ideal_constraints(&self) -> Vec<(u32, Constraint)> {
+        self.elems
+            .iter()
+            .filter(|e| !e.broken)
+            .filter_map(|e| constraint_of(&e.spec.kind, &e.node).map(|c| (e.spec.id, c)))
+            .collect()
+    }
+
     pub fn dt(&self) -> f64 {
         self.dt
     }
@@ -346,6 +374,9 @@ impl Engine {
                 spec: s.clone(),
                 node: [0; MAX_PINS],
                 branch: None,
+                share_n: 1,
+                share_sign: 1.0,
+                stamps: true,
                 state,
                 broken,
             });
@@ -494,6 +525,14 @@ impl Engine {
             i
         }
         for (e, je) in self.elems.iter().zip(ends.iter()) {
+            // A broken part is an OPEN circuit — it must not merge nodes any
+            // more than it stamps. `damage::rating` returns None for Wire and
+            // Ground today so nothing here can break yet; the guard goes in
+            // now, while it is still free, rather than the day wires become
+            // breakable and a "broken" wire silently keeps shorting.
+            if e.broken {
+                continue;
+            }
             match e.spec.kind {
                 ElementKind::Wire => {
                     let (ra, rb) = (find(&mut parent, je[0]), find(&mut parent, je[1]));
@@ -526,18 +565,88 @@ impl Engine {
             .collect();
 
         // 4. Branch unknowns for voltage-source-likes.
+        //
+        //    Ideal, zero-impedance constraints (sources, rails, closed
+        //    switches — see `crate::constraint`) that reduce to the SAME
+        //    canonical constraint share ONE branch unknown. Two 5 V supplies
+        //    on one node are one net, not two duplicate rows; so are a 5 V
+        //    supply and a 5 V rail, and so are two closed switches in
+        //    parallel. Without this they are a singular matrix and the whole
+        //    document is unplaceable — which is why two-way lighting used to
+        //    be refused.
+        //
+        //    Grouping is by exact equality of an integer key, found with a
+        //    linear scan in DOCUMENT ORDER. No hashing and no float
+        //    comparison anywhere: the group a member joins, the member that
+        //    leads it, and the branch index every group gets depend only on
+        //    the document, never on iteration order. Same on native and on
+        //    wasm32, byte for byte.
+        //
+        //    Motors, op-amps and 555s never participate (they are not ideal
+        //    constraints), so this cannot merge anything that was well-posed
+        //    before: every document it changes is one the placement gate
+        //    rejected as `Unsolvable`.
         let mut num_branches = 0usize;
+        // (canonical key, branch index, leader's drawn orientation)
+        let mut groups: Vec<(ConstraintKey, usize, bool)> = Vec::new();
+        // Per element: which group slot it joined, if any.
+        let mut group_of: Vec<Option<usize>> = Vec::with_capacity(self.elems.len());
         for (e, je) in self.elems.iter_mut().zip(ends.iter()) {
             e.node = [0; MAX_PINS];
             for (i, j) in je.iter().enumerate() {
                 e.node[i] = node_of_junction[*j];
             }
+            e.share_n = 1;
+            e.share_sign = 1.0;
+            e.stamps = true;
             // A broken part owns no unknown: it is an open circuit that
             // happens to still be drawn on the schematic.
-            e.branch = (!e.broken && e.spec.kind.is_branch()).then(|| {
+            if e.broken || !e.spec.kind.is_branch() {
+                e.branch = None;
+                group_of.push(None);
+                continue;
+            }
+            let Some(c) = constraint_of(&e.spec.kind, &e.node) else {
+                // A branch device that is not an ideal constraint (motor,
+                // op-amp, 555): always its own unknown.
+                e.branch = Some(num_branches);
                 num_branches += 1;
-                num_branches - 1
-            });
+                group_of.push(None);
+                continue;
+            };
+            let key = c.key();
+            match groups.iter().position(|(k, _, _)| *k == key) {
+                Some(g) => {
+                    // Same net as an earlier element: alias onto its row and
+                    // stay silent. Reading the shared current needs the sign
+                    // of this member's drawn orientation relative to the
+                    // leader's, because the leader's row defines which way
+                    // the branch current is positive.
+                    let (_, bi, leader_flipped) = groups[g];
+                    e.branch = Some(bi);
+                    e.stamps = false;
+                    e.share_sign = if c.flipped == leader_flipped { 1.0 } else { -1.0 };
+                    group_of.push(Some(g));
+                }
+                None => {
+                    e.branch = Some(num_branches);
+                    groups.push((key, num_branches, c.flipped));
+                    group_of.push(Some(groups.len() - 1));
+                    num_branches += 1;
+                }
+            }
+        }
+        // How many members each group ended up with, for the current split.
+        if !groups.is_empty() {
+            let mut counts = vec![0u32; groups.len()];
+            for g in group_of.iter().flatten() {
+                counts[*g] += 1;
+            }
+            for (e, g) in self.elems.iter_mut().zip(group_of.iter()) {
+                if let Some(g) = g {
+                    e.share_n = counts[*g];
+                }
+            }
         }
 
         self.junctions = points
@@ -752,12 +861,20 @@ impl Engine {
         }
 
         for ei in 0..self.elems.len() {
-            let (kind, node, branch, state, broken) = {
+            let (kind, node, branch, state, broken, stamps) = {
                 let e = &self.elems[ei];
-                (e.spec.kind, e.node, e.branch, e.state, e.broken)
+                (e.spec.kind, e.node, e.branch, e.state, e.broken, e.stamps)
             };
             if broken {
                 continue; // failed open: stamps nothing at all
+            }
+            if !stamps {
+                // A merged member of an ideal-constraint group. The leader
+                // already wrote the row and the RHS; writing again would
+                // accumulate the ±1 incidence to ±N. The group's voltage is
+                // the leader's — deterministic, and by construction the two
+                // agree to within the merge tolerance.
+                continue;
             }
             let n = self.n;
             match kind {
@@ -1339,9 +1456,16 @@ impl Engine {
     /// Commit device history and pin currents from the solved unknowns.
     fn accept(&mut self, h: f64, be: bool) {
         for ei in 0..self.elems.len() {
-            let (kind, node, branch, broken) = {
+            let (kind, node, branch, broken, share_n, share_sign) = {
                 let e = &self.elems[ei];
-                (e.spec.kind, e.node, e.branch, e.broken)
+                (
+                    e.spec.kind,
+                    e.node,
+                    e.branch,
+                    e.broken,
+                    e.share_n,
+                    e.share_sign,
+                )
             };
             if broken {
                 // Carries nothing, stores nothing. Reported as exactly zero so
@@ -1353,7 +1477,22 @@ impl Engine {
                 continue;
             }
             let v01 = self.xv(node[0]) - self.xv(node[1]);
-            let bi_val = branch.map(|b| self.x[self.num_nodes + b]);
+            // The branch unknown, oriented and split for THIS member.
+            //
+            // Merged ideal sources share one row, so the solver produces one
+            // total current and — this is the honest part — it CANNOT pick
+            // the split: every division of the total satisfies the same
+            // physics, because the merged constraint has a one-dimensional
+            // null space in branch coordinates. The symmetric point is the
+            // unique choice invariant under permuting the members, and
+            // permutation is the only symmetry the situation has (it is also
+            // what real supplies with matched internal impedance do). The
+            // TOTAL — the number the energy meter and `source_watts` care
+            // about — is exactly the solver's.
+            //
+            // For an unmerged element this is `× 1.0 / 1.0`: bit-exact
+            // identity, so no existing document's state hash can move.
+            let bi_val = branch.map(|b| self.x[self.num_nodes + b] * share_sign / f64::from(share_n));
             let mut vs = [0.0; MAX_PINS];
             for (k, v) in vs.iter_mut().enumerate() {
                 *v = self.xv(node[k]);
