@@ -18,9 +18,20 @@
 // member elements): the schematic keeps only a draggable placeholder while the
 // live instrument becomes a canvas widget row in the window.
 //
-// Screen-anchored, per-player chrome (window position, slider-vs-knob
-// choice, widget row order) lives in localStorage keyed by plid; the region
-// itself is shared, so everyone sees the same panel with their own layout.
+// A window can float over the world or be dropped into one of the two
+// collapsible HUD RAILS, where it sticks. The rails overlay the canvas (the
+// camera stays window-sized) but swallow their own pointer events, so a
+// click in a sidebar never reaches the schematic. Which rail a panel is in,
+// and where in it, is per-player like everything else below.
+//
+// Pointing at a row highlights that part out on the canvas in the schematic's
+// own "this one" blue, and pointing at a part on the canvas makes its row
+// read hot in the region-cyan — the two ends of the same wire.
+//
+// Screen-anchored, per-player chrome (window position or rail slot,
+// slider-vs-knob choice, widget row order) lives in localStorage keyed by
+// plid; the region itself is shared, so everyone sees the same panel with
+// their own layout.
 
 import type { ElemLive, ElementSpec, InteractOp, Point } from './circuit';
 import { LED_COLORS, type Camera } from './render';
@@ -172,8 +183,18 @@ export const PANEL_HANDLE_CURSOR: Record<PanelHandle, string> = {
   w: 'ew-resize',
 };
 
+/** What the region's tab reads. A docked panel keeps its region on the
+ * canvas and grows an arrow saying which sidebar its window went into —
+ * the same courtesy a panel-owned scope's placeholder pays. */
+function tabLabel(p: Panel): string {
+  const side = dockSideOf(p.plid);
+  return side ? `${p.name} ${side === 'left' ? '⇤' : '⇥'}` : p.name;
+}
+
 function tabRect(cam: Camera, p: Panel): [number, number, number, number] {
-  const w = Math.max(72, p.name.length * CHAR_W + 18 + CLOSE_W);
+  // Drawing and hit-testing share tabLabel, so the tab the player clicks is
+  // exactly the tab that was drawn, docked or not.
+  const w = Math.max(72, tabLabel(p).length * CHAR_W + 18 + CLOSE_W);
   return [cam.ox + p.x0 * cam.scale, cam.oy + p.y0 * cam.scale - TAB_H - 3, w, TAB_H];
 }
 
@@ -287,7 +308,7 @@ export function drawPanelRegions(
     ctx.strokeStyle = hot ? '#8ee7ff' : '#3b5c6b';
     ctx.stroke();
     ctx.fillStyle = '#c6e8f4';
-    ctx.fillText(p.name, tx + 8, ty + th / 2 + 0.5);
+    ctx.fillText(tabLabel(p), tx + 8, ty + th / 2 + 0.5);
     ctx.fillStyle = hot ? '#ff9a9a' : '#7f97a2';
     ctx.fillText('×', tx + tw - CLOSE_W + 5, ty + th / 2 + 0.5);
   }
@@ -406,6 +427,209 @@ function readOrder(plid: number): string[] {
   }
 }
 
+// -------------------------------------------------------------- HUD rails
+//
+// Two collapsible sidebars a panel window can be dropped into, where it
+// sticks. They OVERLAY the canvas (the camera stays window-sized — insetting
+// it would mean threading a viewport rect through every hit-test), but they
+// swallow their own pointer events, so a click in a rail never reaches the
+// schematic underneath.
+//
+// Which rail a panel lives in, and where in it, is per-player chrome exactly
+// like its floating position: the region is shared, the furniture is not.
+// The two `order` arrays ARE the placement — a plid in neither of them
+// floats. There is deliberately no per-panel "dock" key: two sources of
+// truth for where a window lives is a bug factory.
+
+export type RailSide = 'left' | 'right';
+const RAIL_SIDES: readonly RailSide[] = ['left', 'right'];
+
+/** Where this player's copy of a panel window sits on screen. */
+export type Placement =
+  | { at: 'float'; x: number; y: number }
+  | { at: 'rail'; side: RailSide; index: number };
+
+/** What the player is pointing at inside a panel window, so the canvas can
+ * light the matching part up. Set on pointerenter / focusin and cleared on
+ * leave — never recomputed per frame. */
+export interface PanelHover {
+  /** Element ids to emphasise. */
+  ids: number[];
+  /** The owning region — its canvas rect goes hot too. */
+  plid: number;
+  /** 'row' = one part, strong; 'panel' = every member, weak. */
+  kind: 'row' | 'panel';
+}
+
+/** Expanded rail width. 300 == `.pwin` width, so docking reflows nothing. */
+const RAIL_W_DEFAULT = 300;
+const RAIL_W_MIN = 240;
+const RAIL_W_MAX = 460;
+/** Collapsed width: the same 24 px strip the scope dock leaves behind. */
+const RAIL_BAR_PX = 24;
+/** Dead zone before a header press becomes a drag (dock.ts uses the same). */
+const DRAG_DEAD_PX = 4;
+/** Slack outside a rail that still counts as aiming at it. */
+const DROP_PAD_PX = 28;
+/** Hold a window over a shut rail this long and it springs open. */
+const DWELL_MS = 350;
+
+interface RailState {
+  readonly side: RailSide;
+  /** Docked plids, top to bottom. Authoritative for order; pruned against
+   * the shared panel list, so a deleted panel cannot leave a hole. */
+  order: number[];
+  open: boolean;
+  /** Expanded width in px; the collapsed width is always RAIL_BAR_PX. */
+  width: number;
+  readonly el: HTMLDivElement;
+  readonly bar: HTMLElement;
+  readonly list: HTMLDivElement;
+  readonly caret: HTMLElement;
+  readonly count: HTMLElement;
+  /** Insertion marker, one per rail, reused (no per-drag allocation). */
+  readonly caretLine: HTMLDivElement;
+}
+
+let rails: Record<RailSide, RailState> | null = null;
+/** True only between a window being lifted and dropped: both rails show
+ * themselves while a panel is in the air, so you can aim at one. */
+let dragActive = false;
+/** Set by PanelHost so the rails' own chrome can ask for a re-layout. */
+let onRailsChanged: () => void = () => {};
+
+function readRailPrefs(side: RailSide): { open: boolean; w: number; order: number[] } {
+  const raw = lsGet(`rail:${side}`);
+  if (raw) {
+    try {
+      const o = JSON.parse(raw) as { open?: unknown; w?: unknown; order?: unknown };
+      return {
+        open: o.open !== false,
+        w:
+          typeof o.w === 'number' && Number.isFinite(o.w)
+            ? clamp(o.w, RAIL_W_MIN, RAIL_W_MAX)
+            : RAIL_W_DEFAULT,
+        order: Array.isArray(o.order)
+          ? o.order.filter((v): v is number => typeof v === 'number' && Number.isFinite(v))
+          : [],
+      };
+    } catch {
+      /* fall through */
+    }
+  }
+  return { open: true, w: RAIL_W_DEFAULT, order: [] };
+}
+
+const writeRailPrefs = (r: RailState) =>
+  lsSet(`rail:${r.side}`, JSON.stringify({ open: r.open, w: Math.round(r.width), order: r.order }));
+
+/** The rail's on-screen width right now. */
+const railPx = (r: RailState) => (r.open ? r.width : RAIL_BAR_PX);
+
+/** Adopt the static markup from index.html; build it if it is missing, so
+ * panel.ts still works against a bare document. */
+function buildRail(side: RailSide): RailState {
+  let el = document.getElementById(`rail-${side}`) as HTMLDivElement | null;
+  if (!el) {
+    el = document.createElement('div');
+    el.id = `rail-${side}`;
+    document.body.appendChild(el);
+  }
+  el.className = 'rail';
+  let bar = el.querySelector<HTMLElement>('.rail-bar');
+  let list = el.querySelector<HTMLDivElement>('.rail-list');
+  let caret = el.querySelector<HTMLElement>('.rail-caret');
+  let count = el.querySelector<HTMLElement>('.rail-count');
+  let caretLine = el.querySelector<HTMLDivElement>('.rail-caretline');
+  let grip = el.querySelector<HTMLElement>('.rail-grip');
+  if (!bar || !list || !caret || !count || !caretLine || !grip) {
+    el.replaceChildren();
+    bar = document.createElement('button');
+    bar.className = 'rail-bar';
+    caret = document.createElement('span');
+    caret.className = 'rail-caret';
+    count = document.createElement('span');
+    count.className = 'rail-count';
+    bar.append(caret, count);
+    list = document.createElement('div');
+    list.className = 'rail-list';
+    caretLine = document.createElement('div');
+    caretLine.className = 'rail-caretline';
+    list.appendChild(caretLine);
+    grip = document.createElement('div');
+    grip.className = 'rail-grip';
+    el.append(bar, list, grip);
+  }
+  const prefs = readRailPrefs(side);
+  const r: RailState = {
+    side,
+    order: prefs.order,
+    open: prefs.open,
+    width: prefs.w,
+    el,
+    bar,
+    list,
+    caret,
+    count,
+    caretLine,
+  };
+
+  bar.addEventListener('click', (ev) => {
+    ev.preventDefault();
+    r.open = !r.open;
+    onRailsChanged();
+    bar!.blur(); // the canvas hotkeys listen on window; do not hold focus
+  });
+
+  // Drag the inner edge to resize. Same 4 px dead zone as the scope dock, so
+  // a stray click on the grip never nudges the width.
+  grip.addEventListener('pointerdown', (ev) => {
+    if (ev.button !== 0) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    const sx = ev.clientX;
+    const w0 = r.width;
+    let moved = false;
+    try {
+      grip!.setPointerCapture(ev.pointerId);
+    } catch {
+      /* synthetic pointers */
+    }
+    const move = (m: PointerEvent) => {
+      const d = side === 'left' ? m.clientX - sx : sx - m.clientX;
+      if (!moved && Math.abs(d) <= DRAG_DEAD_PX) return;
+      moved = true;
+      r.width = clamp(w0 + d, RAIL_W_MIN, RAIL_W_MAX);
+      onRailsChanged();
+    };
+    const up = () => {
+      grip!.removeEventListener('pointermove', move);
+      grip!.removeEventListener('pointerup', up);
+      grip!.removeEventListener('pointercancel', up);
+      if (moved) writeRailPrefs(r);
+    };
+    grip.addEventListener('pointermove', move);
+    grip.addEventListener('pointerup', up);
+    grip.addEventListener('pointercancel', up);
+  });
+
+  return r;
+}
+
+function ensureRails(): Record<RailSide, RailState> {
+  if (!rails) rails = { left: buildRail('left'), right: buildRail('right') };
+  return rails;
+}
+
+/** Which rail holds this panel's window, or null when it floats. Read by the
+ * canvas region chrome so a docked panel's tab says where its window went. */
+function dockSideOf(plid: number): RailSide | null {
+  if (!rails) return null;
+  if (rails.left.order.includes(plid)) return 'left';
+  if (rails.right.order.includes(plid)) return 'right';
+  return null;
+}
+
 // ---------------------------------------------------------------- widgets
 
 const fmtSI = (v: number, unit: string) => {
@@ -436,6 +660,25 @@ export interface PanelHostDeps {
   interact(e: ElementSpec, op: InteractOp): void;
   /** Panel ops (rename / delete from the window chrome). */
   op(op: PanelOp): void;
+  /** The player is pointing at a control (or at a whole window); main.ts
+   * draws the canvas emphasis. Fired on enter/leave only, so it costs
+   * nothing per frame. */
+  hover(h: PanelHover | null): void;
+}
+
+/** What a PanelWindow needs from the host it lives in. */
+interface WinHost {
+  /** The floating layer (#panels) — where an undocked window lives. */
+  readonly root: HTMLElement;
+  setHover(h: PanelHover | null): void;
+  /** A header drag started: pull the window out of its rail and arm both. */
+  beginDrag(plid: number): void;
+  /** Pointer moved mid-drag: resolve and show the drop target. */
+  aimDrop(x: number, y: number): void;
+  dropTarget(): { side: RailSide; index: number } | null;
+  endDrag(plid: number, drop: { side: RailSide; index: number } | null): void;
+  /** The header's dock button: a side docks, null undocks. */
+  dockTo(plid: number, side: RailSide | null): void;
 }
 
 interface TickCtx {
@@ -929,11 +1172,26 @@ class PanelWindow {
   private widgets = new Map<string, Widget>();
   private sig = '';
   private name = '';
+  /** Header buttons: fold the body away, dock/undock. */
+  private shut: HTMLButtonElement;
+  private dockBtn: HTMLButtonElement;
+  /** Last placement applied, as a key. Diffed so re-running applyRails is
+   * free; cleared when the DOM parent is changed behind its back. */
+  private placeKey = '';
+  /** false inside a collapsed rail: the window does no work at all. */
+  private shown = true;
+  /** Folded (header only). Per-player, like every other window preference. */
+  private folded: boolean;
+  /** Latest probe list — hover resolution for `pr:` rows, on demand. */
+  private lastProbes: Probe[] = [];
+  /** The elements this region currently contains. Borrowed from the array
+   * `update` already builds, so hovering allocates nothing new. */
+  private lastMembers: ElementSpec[] = [];
 
   constructor(
     private plid: number,
     private deps: PanelHostDeps,
-    root: HTMLElement,
+    private host: WinHost,
   ) {
     this.el = document.createElement('div');
     this.el.className = 'pwin';
@@ -951,13 +1209,39 @@ class PanelWindow {
     this.mez = document.createElement('span');
     this.mez.className = 'pwin-mez';
     this.mez.setAttribute('aria-hidden', 'true');
+    this.folded = lsGet(`${plid}:shut`) === '1';
+    const shut = document.createElement('button');
+    shut.className = 'pwin-shut';
+    shut.onclick = () => {
+      this.folded = !this.folded;
+      lsSet(`${plid}:shut`, this.folded ? '1' : '0');
+      this.applyFold();
+      shut.blur();
+    };
+    this.shut = shut;
+    const dockBtn = document.createElement('button');
+    dockBtn.className = 'pwin-dock';
+    dockBtn.onclick = () => {
+      const side = dockSideOf(plid);
+      // Floating: dock to whichever rail this window is already nearer.
+      host.dockTo(
+        plid,
+        side ? null : this.el.offsetLeft + this.el.offsetWidth / 2 > window.innerWidth / 2
+          ? 'right'
+          : 'left',
+      );
+      dockBtn.blur();
+    };
+    this.dockBtn = dockBtn;
     const close = document.createElement('button');
     close.className = 'pwin-x';
     close.textContent = '×';
     close.title = 'delete this panel';
     close.onclick = () => deps.op({ t: 'remove', plid });
     this.close = close;
-    hd.append(grab, this.title, this.mez, close);
+    hd.append(grab, this.title, this.mez, shut, dockBtn, close);
+    this.applyFold();
+    this.setDockGlyph(null);
 
     this.body = document.createElement('div');
     this.body.className = 'pwin-body';
@@ -967,21 +1251,32 @@ class PanelWindow {
       'no controls in this region — enclose a pot, switch, lamp, LED, DC source, ' +
       'probe or oscilloscope';
     this.el.append(hd, this.body, this.hint);
-    root.appendChild(this.el);
+    host.root.appendChild(this.el);
 
     const pos = readPos(plid);
     this.el.style.left = `${pos.x}px`;
     this.el.style.top = `${pos.y}px`;
+    this.placeKey = 'float';
+
+    // Pointing anywhere in this window says "the parts on it": weak canvas
+    // emphasis over every member, plus its region goes hot. A row's own
+    // enter fires afterwards and overwrites it with the strong single-part
+    // highlight, so the more specific gesture always wins.
+    this.el.addEventListener('pointerenter', () => this.hoverPanel());
+    this.el.addEventListener('pointerleave', () => host.setHover(null));
 
     // Title-bar drag. The name field is content-sized, so the header space
     // to its right is a real drag strip; ⌘/ctrl held drags from ANYWHERE in
-    // the header, the name included, instead of editing it.
+    // the header, the name included, instead of editing it. Dragging past
+    // the dead zone LIFTS the window: docked, that is how it leaves a rail;
+    // released over one, that is how it joins.
     let lastPress = -1e9;
     hd.addEventListener('pointerdown', (ev) => {
       if (ev.button !== 0) return;
       const force = ev.ctrlKey || ev.metaKey;
-      if (!force && (ev.target === close || ev.target === this.title)) return;
-      if (force && ev.target === close) return; // ⌘+× still deletes
+      const btn = ev.target === close || ev.target === shut || ev.target === dockBtn;
+      if (!force && (btn || ev.target === this.title)) return;
+      if (force && btn) return; // ⌘+× still deletes
       ev.preventDefault();
       // Double-press on the bar itself renames. Counted here rather than via
       // dblclick because the drag's preventDefault can swallow that event.
@@ -996,26 +1291,80 @@ class PanelWindow {
       // the browser will not blur it for us, and a focused field would keep
       // swallowing canvas hotkeys (panelHost.owns).
       if (document.activeElement === this.title) this.title.blur();
+      host.setHover(null);
       const [sx, sy] = [ev.clientX, ev.clientY];
-      const [ox, oy] = [this.el.offsetLeft, this.el.offsetTop];
+      const from: Placement = this.currentPlacement();
+      let lifted = false;
+      let gx = 0;
+      let gy = 0;
       try {
         hd.setPointerCapture(ev.pointerId);
       } catch {
         /* synthetic pointers */
       }
-      const move = (m: PointerEvent) => {
-        this.el.style.left = `${clamp(ox + m.clientX - sx, 0, window.innerWidth - 90)}px`;
-        this.el.style.top = `${clamp(oy + m.clientY - sy, 0, window.innerHeight - 30)}px`;
+
+      // A docked window is a static flex child: the ONE layout read in this
+      // gesture takes its on-screen box, then beginDrag hands it back to the
+      // floating layer at exactly that spot, so it does not jump on grab.
+      const lift = () => {
+        const r = this.el.getBoundingClientRect();
+        gx = sx - r.left;
+        gy = sy - r.top;
+        host.beginDrag(plid); // undocks + arms both rails (may reposition)
+        this.el.classList.add('dragging');
+        this.el.style.left = `${r.left}px`;
+        this.el.style.top = `${r.top}px`;
+        lifted = true;
       };
-      const up = () => {
+
+      const move = (m: PointerEvent) => {
+        if (!lifted) {
+          if (
+            Math.abs(m.clientX - sx) <= DRAG_DEAD_PX &&
+            Math.abs(m.clientY - sy) <= DRAG_DEAD_PX
+          ) {
+            return;
+          }
+          lift();
+        }
+        this.el.style.left = `${clamp(m.clientX - gx, 0, window.innerWidth - 90)}px`;
+        this.el.style.top = `${clamp(m.clientY - gy, 0, window.innerHeight - 30)}px`;
+        host.aimDrop(m.clientX, m.clientY);
+      };
+
+      const finish = (cancel: boolean) => {
         hd.removeEventListener('pointermove', move);
         hd.removeEventListener('pointerup', up);
-        hd.removeEventListener('pointercancel', up);
-        lsSet(`${plid}:pos`, JSON.stringify({ x: this.el.offsetLeft, y: this.el.offsetTop }));
+        hd.removeEventListener('pointercancel', cancelled);
+        window.removeEventListener('keydown', esc, true);
+        if (!lifted) return; // a click, not a drag: nothing moved
+        this.el.classList.remove('dragging');
+        let drop = host.dropTarget();
+        if (cancel) {
+          // Escape restores exactly where it was — rail slot or float spot.
+          drop = from.at === 'rail' ? { side: from.side, index: from.index } : null;
+          if (from.at === 'float') {
+            this.el.style.left = `${from.x}px`;
+            this.el.style.top = `${from.y}px`;
+          }
+        } else if (!drop) {
+          lsSet(`${plid}:pos`, JSON.stringify({ x: this.el.offsetLeft, y: this.el.offsetTop }));
+        }
+        host.endDrag(plid, drop);
+      };
+      const up = () => finish(false);
+      const cancelled = () => finish(true);
+      const esc = (k: KeyboardEvent) => {
+        if (k.key !== 'Escape') return;
+        // Cancelling a drag is a layer AHEAD of the canvas Escape ladder.
+        k.preventDefault();
+        k.stopPropagation();
+        finish(true);
       };
       hd.addEventListener('pointermove', move);
       hd.addEventListener('pointerup', up);
-      hd.addEventListener('pointercancel', up);
+      hd.addEventListener('pointercancel', cancelled);
+      window.addEventListener('keydown', esc, true);
     });
 
     // A modified press on the name must not steal focus — mousedown is where
@@ -1050,6 +1399,146 @@ class PanelWindow {
     this.el.remove();
   }
 
+  // ------------------------------------------------------------ placement
+
+  /** Where this window is right now. Float carries its pixel spot so an
+   * Escape mid-drag can put it back exactly. */
+  currentPlacement(): Placement {
+    const side = dockSideOf(this.plid);
+    if (side) {
+      const i = ensureRails()[side].order.indexOf(this.plid);
+      return { at: 'rail', side, index: Math.max(0, i) };
+    }
+    return { at: 'float', x: this.el.offsetLeft, y: this.el.offsetTop };
+  }
+
+  /** Move the window to where the rail state says it belongs. Diffed against
+   * the last applied placement, so calling this every time anything changes
+   * costs one string compare per window. */
+  setPlacement(p: Placement, rail: RailState | null) {
+    const key = p.at === 'float' ? 'float' : `${p.side}:${p.index}`;
+    if (key === this.placeKey) return;
+    this.placeKey = key;
+    if (p.at === 'rail' && rail) {
+      this.el.classList.add('docked');
+      this.el.style.left = '';
+      this.el.style.top = '';
+      let seen = 0;
+      let before: Element | null = null;
+      for (const c of rail.list.children) {
+        if (c === rail.caretLine || c === this.el) continue;
+        if (seen++ === p.index) {
+          before = c;
+          break;
+        }
+      }
+      rail.list.insertBefore(this.el, before);
+      this.setDockGlyph(p.side);
+    } else {
+      this.el.classList.remove('docked');
+      if (this.el.parentElement !== this.host.root) this.host.root.appendChild(this.el);
+      const pos = readPos(this.plid);
+      this.el.style.left = `${pos.x}px`;
+      this.el.style.top = `${pos.y}px`;
+      this.setDockGlyph(null);
+    }
+  }
+
+  /** A window in a collapsed rail is display:none. It stops updating
+   * entirely — no DOM writes, no scope re-render, and fitTitle never hits
+   * its unlaid-out fallback. Clearing `sig` forces one rebuild on re-show,
+   * so a membership change that happened while hidden still lands. */
+  setShown(v: boolean) {
+    if (v === this.shown) return;
+    this.shown = v;
+    if (!v) this.sig = '';
+  }
+
+  get visible() {
+    return this.shown;
+  }
+
+  private setDockGlyph(side: RailSide | null) {
+    this.dockBtn.textContent = side ? '⇱' : '⇥';
+    const label = side
+      ? `pop this panel out of the ${side} sidebar`
+      : 'dock this panel into a sidebar (or drag its header there)';
+    this.dockBtn.title = label;
+    this.dockBtn.setAttribute('aria-label', label);
+  }
+
+  private applyFold() {
+    this.el.classList.toggle('shut', this.folded);
+    this.shut.textContent = this.folded ? '▸' : '▾';
+    const label = this.folded ? 'show this panel’s controls' : 'fold this panel to its title bar';
+    this.shut.title = label;
+    this.shut.setAttribute('aria-label', label);
+  }
+
+  // ---------------------------------------------------------- highlighting
+
+  /** Element ids a row points at. Resolved on hover, never per frame. */
+  private rowIds(key: string): number[] {
+    const c = key.indexOf(':');
+    if (c < 0) return [];
+    const t = key.slice(0, c);
+    const n = Number(key.slice(c + 1));
+    if (!Number.isFinite(n)) return [];
+    if (t === 'pot' || t === 'sw' || t === 'ind' || t === 'src') return [n];
+    if (t === 'pr') {
+      const p = this.lastProbes.find((q) => q.pid === n);
+      if (!p) return [];
+      // A differential probe measures BETWEEN two parts: light both.
+      return p.r ? [p.elem, p.r[0]] : [p.elem];
+    }
+    return []; // 'sc' — a scope owns no element of its own
+  }
+
+  private probeElem(key: string): number | null {
+    const n = Number(key.slice(3));
+    return this.lastProbes.find((q) => q.pid === n)?.elem ?? null;
+  }
+
+  private hoverPanel() {
+    const ids: number[] = [];
+    for (const e of this.lastMembers) ids.push(e.id);
+    this.host.setHover({ ids, plid: this.plid, kind: 'panel' });
+  }
+
+  /** Rows are hover targets: pointing at one (or tabbing into its control)
+   * says "that part, out there". focusin/focusout is the keyboard path and
+   * adds no tab stops — the sliders and toggles are already focusable. */
+  private wireRowHover(row: HTMLDivElement) {
+    if (row.dataset.hoverWired) return;
+    row.dataset.hoverWired = '1';
+    const on = () => {
+      const key = row.dataset.key ?? '';
+      this.host.setHover({ ids: this.rowIds(key), plid: this.plid, kind: 'row' });
+    };
+    // Leaving a row still leaves the pointer inside the window, so fall back
+    // to the whole-panel highlight rather than clearing it.
+    row.addEventListener('pointerenter', on);
+    row.addEventListener('pointerleave', () => this.hoverPanel());
+    row.addEventListener('focusin', on);
+    row.addEventListener('focusout', () => this.host.setHover(null));
+  }
+
+  /** The other direction: the CANVAS pointer landed on element `id`, so the
+   * row that controls it reads hot. Cyan here on purpose — this says "that
+   * part belongs to this panel", which is region vocabulary. */
+  setHotRow(id: number | null) {
+    const suffix = `:${id}`;
+    let any = false;
+    for (const [key, w] of this.widgets) {
+      const hot =
+        id !== null &&
+        (key.startsWith('pr:') ? this.probeElem(key) === id : !key.startsWith('sc:') && key.endsWith(suffix));
+      w.el.classList.toggle('hot', hot);
+      any = any || hot;
+    }
+    this.el.classList.toggle('hot', any);
+  }
+
   /** Size the name field to its own text (clamped), leaving the rest of the
    * header as drag surface. Measured with the hidden twin so the CSS font,
    * letter-spacing and uppercase transform are all accounted for. */
@@ -1061,11 +1550,11 @@ class PanelWindow {
     // A focused field shows the raw text; unfocused it is uppercased by CSS.
     this.mez.classList.toggle('raw', focused);
     this.mez.textContent = this.title.value || ' ';
-    // × carries margin-left:auto, so its left edge marks the end of the
-    // usable strip whatever the field's current width is.
+    // The fold button carries margin-left:auto, so its left edge marks the
+    // end of the usable strip whatever the field's current width is.
     const laid = this.hd.getBoundingClientRect().width > 0;
     const room = laid
-      ? this.close.getBoundingClientRect().left - this.grab.getBoundingClientRect().right - DRAG_MIN_W
+      ? this.shut.getBoundingClientRect().left - this.grab.getBoundingClientRect().right - DRAG_MIN_W
       : 140;
     const want = Math.ceil(this.mez.getBoundingClientRect().width) + 6;
     const cap = Math.max(TITLE_MIN_W, room);
@@ -1073,12 +1562,17 @@ class PanelWindow {
   }
 
   update(panel: Panel, ctx: TickCtx) {
+    // Hidden inside a collapsed rail: do nothing at all this frame.
+    if (!this.shown) return;
     this.name = panel.name;
     if (document.activeElement !== this.title) this.title.value = panel.name;
     this.fitTitle();
+    // Borrowed, not copied: hover resolution reads this array on demand.
+    this.lastProbes = ctx.probes;
+    this.lastMembers = panelMembers(panel, ctx.elems);
     const specs = widgetSpecs(
       this.plid,
-      panelMembers(panel, ctx.elems),
+      this.lastMembers,
       ctx.probes,
       panelScopes(panel, ctx.scopes, ctx.panels),
       this.deps,
@@ -1109,6 +1603,7 @@ class PanelWindow {
       const w = old.get(s.key) ?? s.make();
       this.widgets.set(s.key, w);
       this.wireRowDrag(w.el);
+      this.wireRowHover(w.el);
       this.body.appendChild(w.el); // appending an existing child re-orders it
     }
     for (const [key, w] of old) if (!this.widgets.has(key)) w.el.remove();
@@ -1167,10 +1662,29 @@ class PanelWindow {
   }
 }
 
-/** Owns every panel control window: one per shared panel region. */
-export class PanelHost {
-  private root: HTMLElement;
+/** Owns every panel control window: one per shared panel region, plus the
+ * two HUD rails they can be docked into. */
+export class PanelHost implements WinHost {
+  readonly root: HTMLElement;
   private wins = new Map<number, PanelWindow>();
+  /** Plids in the shared list right now, or null before the first tick. */
+  private alive: Set<number> | null = null;
+  /** A NON-EMPTY shared list has arrived at least once. Until it has, the
+   * empty list is "not loaded yet", not "every panel was deleted": pruning
+   * the saved rail order against it would wipe the layout on every reload,
+   * in the frames between boot and the server's hello. */
+  private seenPanels = false;
+  /** Last published rail insets, so --rail-l/r are written only on change. */
+  private insL = 0;
+  private insR = 0;
+  private drag: {
+    plid: number;
+    drop: { side: RailSide; index: number } | null;
+    dwellSide: RailSide | null;
+    dwellTimer: number;
+  } | null = null;
+  private canvasHover: number | null = null;
+  private hovering = false;
 
   constructor(private deps: PanelHostDeps) {
     const found = document.getElementById('panels');
@@ -1182,25 +1696,253 @@ export class PanelHost {
       document.body.appendChild(d);
       this.root = d;
     }
+    ensureRails();
+    onRailsChanged = () => this.applyRails();
+    this.applyRails();
+
+    // [ and ] toggle the rails. Registered here rather than in main.ts's
+    // keydown block so this feature adds nothing to the most contested
+    // region of that file; `owns` keeps it out of the rename field.
+    window.addEventListener('keydown', (ev) => {
+      if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+      if (ev.key !== '[' && ev.key !== ']') return;
+      if (this.owns(ev.target) || ev.target instanceof HTMLInputElement) return;
+      ev.preventDefault();
+      this.toggleRail(ev.key === '[' ? 'left' : 'right');
+    });
+    // Starting anything on the canvas must not leave a highlight behind.
+    window.addEventListener(
+      'pointerdown',
+      (ev) => {
+        if (!this.owns(ev.target)) this.setHover(null);
+      },
+      true,
+    );
+    window.addEventListener('blur', () => this.setHover(null));
   }
 
-  /** True for events originating inside a panel window — main.ts uses this
-   * to keep canvas hotkeys out of panel text inputs. */
+  /** True for events originating inside a panel window OR a rail — main.ts
+   * uses this to keep canvas hotkeys out of panel text inputs, and the rails
+   * live outside #panels. */
   owns(target: EventTarget | null): boolean {
-    return target instanceof Node && this.root.contains(target);
+    if (!(target instanceof Node)) return false;
+    if (this.root.contains(target)) return true;
+    const R = rails;
+    return !!R && (R.left.el.contains(target) || R.right.el.contains(target));
+  }
+
+  // ---------------------------------------------------------------- rails
+
+  /** Viewport each rail is eating, px. `fitRect` frames the canvas the
+   * player can actually see rather than the part behind a sidebar. */
+  railInsets(): { left: number; right: number } {
+    return { left: this.insL, right: this.insR };
+  }
+
+  toggleRail(side: RailSide) {
+    const r = ensureRails()[side];
+    r.open = !r.open;
+    this.applyRails();
+  }
+
+  private setRailOpen(side: RailSide, v: boolean) {
+    const r = ensureRails()[side];
+    if (r.open === v) return;
+    r.open = v;
+    this.applyRails();
+  }
+
+  /** The only writer of rail DOM. Called on hydrate, dock, undock, reorder,
+   * toggle, resize and the tick prune — never from the render loop. */
+  private applyRails() {
+    const R = ensureRails();
+    let insL = 0;
+    let insR = 0;
+    for (const side of RAIL_SIDES) {
+      const r = R[side];
+      // A slot whose panel is not in the shared list shows nothing and holds
+      // no space — but it is only FORGOTTEN once we know the list is real,
+      // so a saved layout survives the boot frames before hello lands.
+      const live = this.alive ? r.order.filter((plid) => this.alive!.has(plid)) : r.order;
+      if (this.seenPanels && live.length !== r.order.length) r.order = live;
+      const px = railPx(r);
+      const n = live.length;
+      r.el.classList.toggle('on', n > 0 || dragActive);
+      r.el.classList.toggle('collapsed', !r.open);
+      r.el.style.width = `${px}px`;
+      r.bar.setAttribute('aria-expanded', r.open ? 'true' : 'false');
+      // The caret points the way the strip would move.
+      r.caret.textContent = r.open === (side === 'left') ? '◂' : '▸';
+      r.count.textContent = n === 0 ? 'drop a panel here' : `${n} panel${n === 1 ? '' : 's'}`;
+      r.bar.title = `${r.open ? 'collapse' : 'expand'} the ${side} sidebar (${
+        side === 'left' ? '[' : ']'
+      })`;
+      for (let k = 0; k < n; k++) {
+        const w = this.wins.get(live[k]!);
+        if (!w) continue;
+        w.setPlacement({ at: 'rail', side, index: k }, r);
+        w.setShown(r.open);
+      }
+      // An empty rail eats nothing, however armed it looks mid-drag.
+      if (side === 'left') insL = n > 0 ? px : 0;
+      else insR = n > 0 ? px : 0;
+      writeRailPrefs(r);
+    }
+    for (const [plid, w] of this.wins) {
+      if (dockSideOf(plid)) continue;
+      w.setPlacement({ at: 'float', x: 0, y: 0 }, null);
+      w.setShown(true);
+    }
+    const css = document.documentElement.style;
+    if (insL !== this.insL) {
+      this.insL = insL;
+      css.setProperty('--rail-l', `${insL}px`);
+    }
+    if (insR !== this.insR) {
+      this.insR = insR;
+      css.setProperty('--rail-r', `${insR}px`);
+    }
+  }
+
+  // ------------------------------------------------------- docking gesture
+
+  beginDrag(plid: number) {
+    const R = ensureRails();
+    for (const s of RAIL_SIDES) R[s].order = R[s].order.filter((p) => p !== plid);
+    dragActive = true;
+    this.drag = { plid, drop: null, dwellSide: null, dwellTimer: 0 };
+    this.applyRails();
+  }
+
+  aimDrop(x: number, y: number) {
+    const d = this.drag;
+    if (!d) return;
+    const R = ensureRails();
+    const side: RailSide | null =
+      x <= railPx(R.left) + DROP_PAD_PX
+        ? 'left'
+        : x >= window.innerWidth - railPx(R.right) - DROP_PAD_PX
+          ? 'right'
+          : null;
+
+    // Spring-loading: hold a window over a shut rail and it opens, folder
+    // style, so you can aim at a slot inside it.
+    if (d.dwellSide !== side) {
+      d.dwellSide = side;
+      clearTimeout(d.dwellTimer);
+      if (side && !R[side].open) {
+        d.dwellTimer = window.setTimeout(() => {
+          if (this.drag && this.drag.dwellSide === side) this.setRailOpen(side, true);
+        }, DWELL_MS);
+      }
+    }
+
+    for (const s of RAIL_SIDES) {
+      R[s].el.classList.toggle('armed', s === side);
+      if (s !== side) R[s].caretLine.classList.remove('on');
+    }
+    if (!side) {
+      d.drop = null;
+      return;
+    }
+    const rail = R[side];
+    if (!rail.open) {
+      // Dropping onto a shut rail still docks: it lands at the end and the
+      // count badge says where it went. A panel is never lost.
+      rail.caretLine.classList.remove('on');
+      d.drop = { side, index: rail.order.length };
+      return;
+    }
+    let index = 0;
+    let before: Element | null = null;
+    for (const c of rail.list.children) {
+      if (!(c instanceof HTMLElement) || c === rail.caretLine) continue;
+      const b = c.getBoundingClientRect();
+      if (y < b.top + b.height / 2) {
+        before = c;
+        break;
+      }
+      index++;
+    }
+    rail.list.insertBefore(rail.caretLine, before);
+    rail.caretLine.classList.add('on');
+    d.drop = { side, index };
+  }
+
+  dropTarget() {
+    return this.drag?.drop ?? null;
+  }
+
+  endDrag(plid: number, drop: { side: RailSide; index: number } | null) {
+    const R = ensureRails();
+    if (this.drag) clearTimeout(this.drag.dwellTimer);
+    this.drag = null;
+    dragActive = false;
+    for (const s of RAIL_SIDES) {
+      R[s].el.classList.remove('armed');
+      R[s].caretLine.classList.remove('on');
+      R[s].order = R[s].order.filter((p) => p !== plid);
+    }
+    if (drop) {
+      const o = R[drop.side].order;
+      o.splice(clamp(drop.index, 0, o.length), 0, plid);
+      if (!R[drop.side].open) this.flashRail(drop.side);
+    }
+    this.applyRails();
+  }
+
+  /** It went into a collapsed rail: say so, or it looks like it vanished. */
+  private flashRail(side: RailSide) {
+    const el = ensureRails()[side].el;
+    el.classList.add('armed');
+    window.setTimeout(() => el.classList.remove('armed'), 400);
+  }
+
+  dockTo(plid: number, side: RailSide | null) {
+    const R = ensureRails();
+    for (const s of RAIL_SIDES) R[s].order = R[s].order.filter((p) => p !== plid);
+    if (side) {
+      R[side].order.push(plid);
+      if (!R[side].open) R[side].open = true;
+    }
+    this.applyRails();
+  }
+
+  // ------------------------------------------------------------- highlight
+
+  setHover(h: PanelHover | null) {
+    if (h === null && !this.hovering) return;
+    this.hovering = h !== null;
+    this.deps.hover(h);
+  }
+
+  /** Reverse direction: the id the CANVAS hover resolved to, or null. Guards
+   * on an unchanged value, so main.ts may call it every frame. */
+  setCanvasHover(id: number | null) {
+    if (id === this.canvasHover) return;
+    this.canvasHover = id;
+    for (const w of this.wins.values()) w.setHotRow(id);
   }
 
   /** Called once per frame: sync windows to the shared list, then refresh
    * every widget from the latest solver frame. */
   tick(panels: Panel[]) {
     const alive = new Set(panels.map((p) => p.plid));
+    let churn = this.alive === null;
     for (const [plid, w] of [...this.wins]) {
       if (!alive.has(plid)) {
         w.destroy();
         this.wins.delete(plid);
+        churn = true;
+        if (this.hovering) this.setHover(null);
       }
     }
-    if (panels.length === 0) return;
+    this.alive = alive;
+    if (panels.length > 0) this.seenPanels = true;
+    if (panels.length === 0) {
+      if (churn) this.applyRails();
+      return;
+    }
     const elems = this.deps.elements();
     const ctx: TickCtx = {
       elems,
@@ -1214,10 +1956,17 @@ export class PanelHost {
     for (const p of panels) {
       let w = this.wins.get(p.plid);
       if (!w) {
-        w = new PanelWindow(p.plid, this.deps, this.root);
+        w = new PanelWindow(p.plid, this.deps, this);
         this.wins.set(p.plid, w);
+        churn = true;
       }
-      w.update(p, ctx);
+    }
+    // New or removed windows: re-seat everything against the rail order
+    // before any of them draws, so a restored dock is never a visible flash.
+    if (churn) this.applyRails();
+    for (const p of panels) {
+      const w = this.wins.get(p.plid);
+      if (w && w.visible) w.update(p, ctx);
     }
   }
 }

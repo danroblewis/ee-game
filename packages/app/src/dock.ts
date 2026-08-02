@@ -221,10 +221,17 @@ export function createDock(root: HTMLElement, cv: HTMLCanvasElement, audio: Audi
    * audio-only: it stays a strip however the open flag is stored. */
   let hasProbes = false;
 
+  /** The dock's height is also the bottom of the HUD rails, so publish it as
+   * a CSS variable rather than making panel.ts reach in here. */
+  function publishHeight(px: number) {
+    root.style.height = `${px}px`;
+    document.documentElement.style.setProperty('--dock-h', `${px}px`);
+  }
+
   function apply() {
     const showTraces = open && hasProbes;
     root.classList.toggle('collapsed', !showTraces);
-    root.style.height = `${showTraces ? height : BAR_PX}px`;
+    publishHeight(showTraces ? height : BAR_PX);
     caret.style.display = hasProbes ? '' : 'none';
     caret.textContent = showTraces ? 'scope ▾' : 'scope ▴';
   }
@@ -252,7 +259,7 @@ export function createDock(root: HTMLElement, cv: HTMLCanvasElement, audio: Audi
     drag.moved = true;
     if (!open) setOpen(true);
     height = clampH(drag.h + dy);
-    root.style.height = `${height}px`;
+    publishHeight(height);
   });
   bar.addEventListener('pointerup', () => {
     if (!drag) return;

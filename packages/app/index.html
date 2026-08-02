@@ -7,16 +7,21 @@
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23101014'/%3E%3Cpath d='M4 20h6l3-9 4 14 3-9h8' fill='none' stroke='%234bff6a' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
     <style>
       html, body { margin: 0; height: 100%; background: #101014; overflow: hidden; }
+      /* How much viewport the HUD chrome is eating. panel.ts writes the two
+         rail values, dock.ts the scope dock's height; every screen-anchored
+         overlay below is positioned off them, so nothing has to know about
+         anything else's geometry. */
+      :root { --rail-l: 0px; --rail-r: 0px; --dock-h: 24px; }
       #canvas { display: block; width: 100vw; height: 100vh; cursor: default; }
       /* The hint block used to be bare text over the world, so it smeared
          across anything it happened to sit in front of. Give it its own
          backdrop: chrome should read as chrome. */
       #hud {
-        position: fixed; top: 8px; left: 8px; color: #9a9aa5;
+        position: fixed; top: 8px; left: calc(8px + var(--rail-l)); color: #9a9aa5;
         font: 12px/1.5 ui-monospace, monospace; pointer-events: none;
         white-space: pre; padding: 4px 9px; border-radius: 6px;
         background: #0d0d12d9; border: 1px solid #23232c;
-        max-width: calc(100vw - 320px); overflow: hidden;
+        max-width: calc(100vw - 320px - var(--rail-l) - var(--rail-r)); overflow: hidden;
       }
       #scope {
         position: fixed; left: 0; right: 0; bottom: 0; height: 24px;
@@ -61,7 +66,7 @@
         background: #16161de6; border: 1px solid #33333f; border-radius: 6px;
         padding: 10px; font: 13px/1.7 ui-monospace, monospace; color: #c9c9d4;
       }
-      #props { top: 54px; right: 12px; }
+      #props { top: 54px; right: calc(12px + var(--rail-r)); }
       /* Floating editor: same box, parked next to the part by double-click. */
       #propsdlg {
         left: 0; top: 0; z-index: 30; background: #17171ef7;
@@ -112,8 +117,91 @@
       #ctxmenu .hd { color: #6e6e7e; padding: 2px 8px 4px; font-size: 11px; }
       #ctxmenu .sep { height: 1px; background: #2c2c38; margin: 4px 2px; }
 
+      /* ---- HUD rails: the home a control panel can be dropped into ----
+         Two collapsible sidebars (panel.ts owns all state). They OVERLAY the
+         canvas — the camera stays window-sized — but they swallow their own
+         pointer events, so a click in a rail never reaches the schematic.
+         Hidden entirely while a side holds nothing: a player who has never
+         pressed J must see no new chrome. */
+      .rail {
+        position: fixed; top: 0; bottom: var(--dock-h); z-index: 15;
+        display: none; flex-direction: column; box-sizing: border-box;
+        pointer-events: auto; background: #14181deb;
+        border-right: 1px solid #2c343d;
+      }
+      #rail-right { right: 0; border-right: none; border-left: 1px solid #2c343d; }
+      #rail-left { left: 0; }
+      .rail.on { display: flex; }
+      /* The strip: click toggles, and it is the only thing left when closed. */
+      .rail-bar {
+        flex: none; height: 24px; box-sizing: border-box; padding: 0 6px;
+        display: flex; align-items: center; gap: 8px; cursor: pointer;
+        color: #8a8a98; font: 11px/24px ui-monospace, monospace; overflow: hidden;
+        white-space: nowrap; user-select: none; -webkit-user-select: none;
+        background: none; border: none; border-bottom: 1px solid #2c343d; width: 100%;
+        text-align: left;
+      }
+      .rail-bar:hover { color: #c9c9d4; }
+      .rail-caret { color: #c9c9d4; flex: none; }
+      .rail-count { flex: 1 1 auto; overflow: hidden; }
+      /* Collapsed, the strip IS the rail: the whole 24 px column stays
+         clickable and says how many panels are folded away in it. */
+      .rail.collapsed .rail-bar {
+        flex: 1 1 auto; height: auto; flex-direction: column;
+        justify-content: flex-start; gap: 10px; padding: 5px 2px;
+        border-bottom: none;
+      }
+      .rail.collapsed .rail-count {
+        flex: none; writing-mode: vertical-rl; letter-spacing: 0.06em;
+      }
+      .rail-list {
+        flex: 1 1 auto; overflow-y: auto; overflow-x: hidden; padding: 6px;
+        display: flex; flex-direction: column;
+      }
+      .rail.collapsed .rail-list, .rail.collapsed .rail-grip { display: none; }
+      .rail-grip { position: absolute; top: 24px; bottom: 0; width: 6px; cursor: ew-resize; }
+      #rail-left .rail-grip { right: -3px; }
+      #rail-right .rail-grip { left: -3px; }
+      /* Armed = a window is in the air and this side would take it. */
+      .rail.armed { border-color: #4ad4ff; box-shadow: inset 0 0 0 1px #4ad4ff33; }
+      .rail.armed .rail-bar { color: #8ee7ff; }
+      .rail-caretline {
+        flex: none; height: 2px; background: #8ee7ff; border-radius: 1px;
+        margin: 3px 1px; box-shadow: 0 0 6px #8ee7ff99; display: none;
+      }
+      .rail-caretline.on { display: block; }
+
       /* ---- control panels: floating instrument windows (panel.ts) ---- */
-      #panels { position: fixed; inset: 0; pointer-events: none; }
+      #panels { position: fixed; inset: 0; pointer-events: none; z-index: 16; }
+      /* A docked window gives up absolute positioning and its drop shadow —
+         it is furniture in the rail, not a thing floating over the world. */
+      .pwin.docked {
+        position: static; width: auto; flex: none; margin: 0 0 8px;
+        box-shadow: none; border-radius: 6px;
+      }
+      .pwin.dragging { z-index: 46; opacity: 0.94; }
+      /* A window in the air rides above the goal card and the toasts, or you
+         cannot see what you are aiming at. */
+      #panels:has(.pwin.dragging) { z-index: 45; }
+      /* Reverse highlight: the canvas pointer is on something this panel owns. */
+      .pwin.hot { border-color: #4ad4ff; }
+      .prow.hot { background: #16262e; box-shadow: inset 2px 0 0 #8ee7ff; }
+      /* Header tail: fold · dock · delete. The FOLD button carries the auto
+         margin now, so it (not ×) marks the end of the drag strip — panel.ts
+         measures against it in fitTitle. */
+      .pwin-shut {
+        background: none; border: none; color: #6f8290; margin-left: auto;
+        font: 11px/1 ui-monospace, monospace; cursor: pointer; padding: 0 2px;
+      }
+      .pwin-shut:hover { color: #cfe3ee; }
+      .pwin-dock {
+        background: none; border: none; color: #6f8290;
+        font: 13px/1 ui-monospace, monospace; cursor: pointer; padding: 0 2px;
+      }
+      .pwin-dock:hover { color: #8ee7ff; }
+      .pwin-shut ~ .pwin-x { margin-left: 0; }
+      .pwin.shut .pwin-body, .pwin.shut .pwin-hint { display: none; }
+      .pwin.shut .pwin-hd { border-bottom: none; border-radius: 7px; }
       .pwin {
         position: absolute; pointer-events: auto; width: 300px; color: #c9d6de;
         font: 12px/1.5 ui-monospace, monospace;
@@ -227,7 +315,7 @@
          Same instrument-window language as .pwin, screen-anchored bottom
          right, above the scope dock. Hidden until a machine message lands. */
       .goalcard {
-        position: fixed; right: 12px; bottom: 36px; width: 300px; z-index: 20;
+        position: fixed; right: calc(12px + var(--rail-r)); bottom: 36px; width: 300px; z-index: 20;
         color: #c9d6de; font: 12px/1.5 ui-monospace, monospace;
         background: linear-gradient(#232830, #171b21);
         border: 1px solid #3c4653; border-radius: 8px;
@@ -300,7 +388,7 @@
          the elements; this is only their look). Bottom-left, above the
          scope dock, never in the way of the goal card. */
       #toasts {
-        position: fixed; left: 12px; bottom: 36px; z-index: 25;
+        position: fixed; left: calc(12px + var(--rail-l)); bottom: 36px; z-index: 25;
         display: flex; flex-direction: column; gap: 6px;
         pointer-events: none; max-width: 430px;
       }
@@ -347,6 +435,20 @@
     <div id="props"></div>
     <div id="propsdlg"></div>
     <div id="ctxmenu"></div>
+    <div id="rail-left" class="rail">
+      <button class="rail-bar" type="button" aria-expanded="true" aria-controls="rail-left-list"><span
+          class="rail-caret"
+        >◂</span><span class="rail-count"></span></button>
+      <div class="rail-list" id="rail-left-list"><div class="rail-caretline"></div></div>
+      <div class="rail-grip" title="drag to resize this sidebar"></div>
+    </div>
+    <div id="rail-right" class="rail">
+      <button class="rail-bar" type="button" aria-expanded="true" aria-controls="rail-right-list"><span
+          class="rail-caret"
+        >▸</span><span class="rail-count"></span></button>
+      <div class="rail-list" id="rail-right-list"><div class="rail-caretline"></div></div>
+      <div class="rail-grip" title="drag to resize this sidebar"></div>
+    </div>
     <div id="panels"></div>
     <script type="module" src="/src/main.ts"></script>
   </body>
