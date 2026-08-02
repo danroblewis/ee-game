@@ -63,3 +63,8 @@ jobs:
       - run: wasm-pack build crates/sim-wasm --target web --out-dir ../../packages/app/src/wasm
       - run: pnpm install
       - run: pnpm --filter @ee/app exec tsc -p tsconfig.json --noEmit
+      # The wire contract between client and server. tsc cannot see this:
+      # JSON.parse returns `any`, so a field the client declares but never
+      # receives typechecks clean and simply does not happen. A guard that
+      # CI never runs is not a guard.
+      - run: pnpm --filter @ee/app wirecheck

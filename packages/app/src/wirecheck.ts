@@ -424,5 +424,42 @@ console.log('connect — the code in the URL is the room you get');
   check('the old socket was closed', sockets[0]?.closed === true);
 }
 
+// Walking next door is the case one hello can never test. A client that
+// caches the first room it ever saw passes every single-hello assertion above
+// and still hands the player the previous room's chip, goal card and camera
+// forever. So: two different hellos down one `connect()`, and the second wins.
+console.log('connect — the SECOND room replaces the first');
+{
+  const d = dial();
+  d.deliver(sample);
+  const next = JSON.parse(JSON.stringify(sample)) as Record<string, unknown>;
+  const room = next.room as Record<string, unknown>;
+  room.id = 'BBBBBB';
+  room.name = 'Second room';
+  room.players = 4;
+  next.machine = false;
+  (next.view as Record<string, unknown>).home = [100, 100, 140, 130];
+  d.net.join('BBBBBB');
+  d.deliver(next);
+
+  check('onHello fired twice', d.hellos.length === 2, String(d.hellos.length));
+  const got = d.hellos[d.hellos.length - 1]?.room ?? null;
+  check('room.id is the new room', got?.id === 'BBBBBB', String(got?.id));
+  check('room.name is the new room', got?.name === 'Second room', String(got?.name));
+  check('room.players followed', got?.players === 4, String(got?.players));
+  // These three are the ones a cached room silently keeps from next door.
+  check('room.machine followed', got?.machine === false, String(got?.machine));
+  check(
+    'room.view.home followed',
+    eq(got?.view?.home, [100, 100, 140, 130]),
+    JSON.stringify(got?.view?.home),
+  );
+  check(
+    'the first room was not retained',
+    got?.id !== '7AWF4N' && got?.name !== 'Hoist practice',
+    `${got?.id}/${got?.name}`,
+  );
+}
+
 console.log(failures === 0 ? '\nwirecheck: all ok' : `\nwirecheck: ${failures} FAILED`);
 if (failures > 0) process.exitCode = 1;
