@@ -26,12 +26,20 @@
 //     TARGET_BUF_S of buffer, which costs that much latency and reports its
 //     own depth/underruns back here as `status().buf` so the dock can show
 //     it. `status().ratio` is the server's own dilation figure, so "the sim
-//     is at 0.6x" and "my network hiccuped" are distinguishable.
+//     is at 0.6x" and "my network hiccuped" are distinguishable. When that
+//     ratio sits beyond the rate matcher's ±3 % authority, the worklet
+//     follows it outright: a sim at 0.6x is HEARD at 0.6x — lower pitch,
+//     continuous sound — instead of the old burst/gap cycle of draining,
+//     going silent and re-priming forever. Lost chunks (a best-effort
+//     stream) are bridged in place, not answered with a 200 ms re-prime.
 
 import {
   DEPTH_TAU_S,
   FADE_S,
+  GAP_MAX_S,
   HP_HZ,
+  RATE_MIN,
+  RATE_TAU_S,
   REF_VOLTS,
   RING,
   STALL_S,
@@ -112,12 +120,20 @@ export interface AudioBufferHealth {
   /** Ring overflows: the producer ran so far ahead that oldest audio had to
    * be discarded. Normal over-fill is drained by the rate matcher instead. */
   drops: number;
+  /** Total ms of LOST stream time bridged over instead of re-primed: lost
+   * chunks are concealed with an interpolated ramp between the real samples
+   * on either side, and this is the honest count of that. */
+  concealedMs: number;
   /** True while a source has been starved past STALL_S: the producer stopped
    * rather than fell behind. */
   stalled: boolean;
   /** Applied playback-rate trim, e.g. -0.012 = playing 1.2 % slow to refill.
    * |trim| <= TRIM_MAX always. */
   trim: number;
+  /** Applied BASE playback rate: 1 nominal, <1 when the worklet is slaved to
+   * a dilated sim (the sound is at the sim's own pitch; the dock's "sim
+   * 0.6x" readout is the explanation). */
+  rate: number;
   /** True when an underrun happened within the last few seconds. */
   recent: boolean;
   /** Sources included in this summary. */
@@ -156,10 +172,12 @@ interface SrcStats {
   underrunMs: number;
   drops: number;
   droppedMs: number;
+  concealedMs: number;
   stalled: boolean;
   armed: boolean;
   priming: boolean;
   trim: number;
+  rate: number;
 }
 
 interface MixStats {
@@ -171,8 +189,10 @@ interface MixStats {
   underruns: number;
   underrunMs: number;
   drops: number;
+  concealedMs: number;
   stalled: boolean;
   trim: number;
+  rate: number;
   target: number;
 }
 
@@ -523,8 +543,10 @@ export class AudioPlayer implements AudioControls {
       underruns: isMix ? this.totUnder : s.underruns,
       underrunMs: isMix ? this.totUnderMs : s.underrunMs,
       drops: isMix ? this.totDrops : s.drops,
+      concealedMs: s.concealedMs ?? 0,
       stalled: s.stalled,
       trim: s.trim,
+      rate: s.rate ?? 1,
       recent,
       sources: isMix ? (s as MixStats).sources : 1,
       priming: isMix ? (s as MixStats).priming : (s as SrcStats).priming ? 1 : 0,
@@ -546,19 +568,31 @@ export class AudioPlayer implements AudioControls {
   ) {
     const s = this.srcs.get(key);
     if (!s || samples.length === 0 || !(dts > 0)) return;
-    // A jump in the sample clock means continuity is gone (lagged socket,
-    // dropped chunk, room restart): re-prime that ONE source instead of
-    // splicing a discontinuity in. The other sources keep playing.
-    if (s.nextT !== null && Math.abs(t0 - s.nextT) > dts * 4) {
-      this.node?.port.postMessage({ t: 'reset', id: key });
+    // A jump in the sample clock is classified, not punished uniformly. A
+    // small FORWARD jump is a lost message or two on a best-effort stream
+    // (a lagged socket skips whole 33 ms chunks): the worklet bridges the
+    // hole and keeps everything it already buffered — a blip, as net.ts
+    // promises. Resetting here (the old behavior) threw away up to 200 ms
+    // of real audio and then sat silent through a full re-prime, turning
+    // each 33 ms loss into ~7x its length of silence. Only a BACKWARD jump
+    // or a gap too big to bridge (room restart, long stall, a quarantined
+    // solver's frozen clock) still re-primes that ONE source; the other
+    // sources keep playing either way.
+    let gapN = 0;
+    if (s.nextT !== null) {
+      const gap = t0 - s.nextT;
+      if (Math.abs(gap) > dts * 4) {
+        if (gap > 0 && gap <= GAP_MAX_S) gapN = Math.round(gap / dts);
+        else this.node?.port.postMessage({ t: 'reset', id: key });
+      }
     }
     s.nextT = t0 + samples.length * dts;
     const buf = new Float32Array(samples.length);
     for (let k = 0; k < samples.length; k++) buf[k] = samples[k] ?? 0;
-    this.send(key, dts, buf, gain);
+    this.send(key, dts, buf, gain, gapN);
   }
 
-  private send(key: string, dts: number, buf: Float32Array, gain: number) {
+  private send(key: string, dts: number, buf: Float32Array, gain: number, gapN = 0) {
     const s = this.srcs.get(key);
     if (!s) return;
     let peak = 0;
@@ -575,7 +609,16 @@ export class AudioPlayer implements AudioControls {
       void this.boot();
       return;
     }
-    this.node.port.postMessage({ t: 'chunk', id: key, dts, gain, s: buf }, [buf.buffer]);
+    // The server's realtime ratio rides along while fresh: the worklet
+    // slaves its base playback rate to a sim dilated beyond the trim's
+    // reach (see the worklet header). Offline feeds carry none and play at
+    // nominal rate, exactly as before.
+    const rt =
+      performance.now() - this.rtAt <= RATIO_TTL_MS ? this.rt : undefined;
+    this.node.port.postMessage(
+      { t: 'chunk', id: key, dts, gain, rt, gap: gapN, s: buf },
+      [buf.buffer],
+    );
   }
 
   private boot(): Promise<void> {
@@ -613,6 +656,8 @@ export class AudioPlayer implements AudioControls {
           depthTauSec: DEPTH_TAU_S,
           statsHz: STATS_HZ,
           stallSec: STALL_S,
+          rateTauSec: RATE_TAU_S,
+          rateMin: RATE_MIN,
         },
       });
       node.port.onmessage = (ev: MessageEvent) => {

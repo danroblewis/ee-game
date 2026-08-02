@@ -27,6 +27,8 @@ import {
   DEPTH_TAU_S,
   FADE_S,
   HP_HZ,
+  RATE_MIN,
+  RATE_TAU_S,
   REF_VOLTS,
   RING,
   STALL_S,
@@ -101,10 +103,12 @@ interface SrcTel {
   underrunMs: number;
   drops: number;
   droppedMs: number;
+  concealedMs: number;
   stalled: boolean;
   armed: boolean;
   priming: boolean;
   trim: number;
+  rate: number;
 }
 interface MixTel {
   sources: number;
@@ -115,8 +119,10 @@ interface MixTel {
   underruns: number;
   underrunMs: number;
   drops: number;
+  concealedMs: number;
   stalled: boolean;
   trim: number;
+  rate: number;
   target: number;
 }
 interface Tel {
@@ -148,6 +154,8 @@ function mixer() {
       depthTauSec: DEPTH_TAU_S,
       statsHz: STATS_HZ,
       stallSec: STALL_S,
+      rateTauSec: RATE_TAU_S,
+      rateMin: RATE_MIN,
     },
   });
   const tel: Tel[] = [];
@@ -235,6 +243,20 @@ const pinned = (a: Float32Array) => {
   for (const v of a) if (Math.abs(v) >= 0.999) n++;
   return n / Math.max(1, a.length);
 };
+/** Longest run of EXACT zeros starting at `from`, in samples. Exact zero is
+ * the mixer's own definition of silence (the hush path forces it), so this
+ * measures audible gaps: continuous playback keeps it near zero. */
+const zeroRun = (a: Float32Array, from = 0) => {
+  let max = 0;
+  let run = 0;
+  for (let k = from; k < a.length; k++) {
+    if (a[k] === 0) {
+      run++;
+      if (run > max) max = run;
+    } else run = 0;
+  }
+  return max;
+};
 
 /** Goertzel magnitude at `hz`, normalized by length: "how much of THIS tone
  * is in the output". The right question for a mixer — the limiter deliberately
@@ -314,6 +336,10 @@ interface Feed {
  * delivers them late (network jitter). The samples themselves are always a
  * continuous tone in SOURCE time — the tone the solver computed — so any
  * frequency error in the output is the resampler's, not the generator's.
+ *
+ * `rt` is the server's self-reported realtime ratio riding each chunk, as
+ * the real client forwards it. Omitted = an old server / offline feed: the
+ * rate slave must then stay OUT of the loop entirely.
  */
 function drive(
   m: ReturnType<typeof mixer>,
@@ -321,6 +347,7 @@ function drive(
   seconds: number,
   rate = 1,
   hold = 0,
+  rt?: number,
 ): Float32Array {
   const ticks = Math.max(1, Math.round(seconds * 30));
   const chunks: Float32Array[] = [];
@@ -341,6 +368,7 @@ function drive(
             id: f.id,
             dts: AUDIO_DTS,
             gain: f.gain ?? 1,
+            rt,
             s: sine(f.hz, f.amp, AUDIO_DTS, n, have * AUDIO_DTS),
           });
           sent.set(f.id, want);
@@ -816,15 +844,18 @@ console.log('\nthe producer stops entirely, then comes back');
   check('it re-primes and plays again', peak(back.subarray(-8 * QUANTUM)) > 0.05);
   check('re-priming produces no NaN', finite(back));
   check('the stall flag clears', !st.mix.stalled);
+  // A source that was ALREADY playing re-arms at HALF the target — sound
+  // returns ~100 ms sooner than a full prime — and the trim then refills the
+  // rest in the background. Only a fresh/reset source pays the full prime.
   check(
-    'it re-primes to the TARGET depth, not to a sliver',
-    Math.abs(st.mix.ms - TARGET_MS) <= 45,
-    `${st.mix.ms.toFixed(1)} ms`,
+    'it re-arms at half target and refills toward it, not a sliver',
+    st.mix.ms >= TARGET_MS * 0.45 && st.mix.ms <= TARGET_MS + 45,
+    `${st.mix.ms.toFixed(1)} ms (target ${TARGET_MS} ms)`,
   );
   check(
-    'the re-primed tone is on pitch',
-    Math.abs(cents(freq(afterPrime(back)), 440)) < 6,
-    `${freq(afterPrime(back)).toFixed(3)} Hz`,
+    'the re-primed tone stays inside the trim clamp while refilling',
+    Math.abs(cents(freq(afterPrime(back)), 440)) < 1200 * Math.log2(1 + TRIM_MAX) + 2,
+    `${freq(afterPrime(back)).toFixed(3)} Hz (${cents(freq(afterPrime(back)), 440).toFixed(1)} cents)`,
   );
   check('no clipping across the whole stop/restart', peak(gap) <= 1 && peak(back) <= 1);
 }
@@ -921,6 +952,179 @@ console.log('\ncatastrophe: a producer at half speed, and one that floods');
     'the burst neither underran nor clipped nor went NaN',
     bst.mix.underruns === 0 && finite(yb) && peak(yb) <= 1 && peak(yb.subarray(-8 * QUANTUM)) > 0.05,
     `${bst.mix.underruns} underruns, peak ${peak(yb).toFixed(3)}`,
+  );
+}
+
+console.log('\na LOST chunk is bridged in place, not answered with a re-prime');
+{
+  // The speaker stream is best-effort: a lagged socket skips whole 33 ms
+  // messages, and the client detects the t0 jump and forwards the next chunk
+  // with `gap: N` (audio.ts). The old behavior — reset + full 200 ms
+  // re-prime — turned each loss into ~7x its length of silence. Now the
+  // buffered real audio on both sides must keep playing, with the hole
+  // bridged and COUNTED.
+  const m = mixer();
+  const chunks: Float32Array[] = [];
+  let blocksDone = 0;
+  let srcT = 0; // source samples produced so far (the sim's clock)
+  let lostN = 0;
+  const ticks = 60; // 2 s
+  const lostAt = 31; // one tick lost mid-stream, well past the prime
+  for (let k = 1; k <= ticks; k++) {
+    const n = Math.round(k * TICK_SRC) - Math.round((k - 1) * TICK_SRC);
+    if (k === lostAt) {
+      lostN = n; // produced by the server, never delivered
+    } else {
+      m.send({
+        t: 'chunk',
+        id: 's1',
+        dts: AUDIO_DTS,
+        gain: 1,
+        gap: k === lostAt + 1 ? lostN : 0,
+        s: sine(440, 5, AUDIO_DTS, n, srcT * AUDIO_DTS),
+      });
+    }
+    srcT += n;
+    const wantBlocks = Math.floor((k * TICK_FRAMES) / QUANTUM);
+    chunks.push(m.run(wantBlocks - blocksDone));
+    blocksDone = wantBlocks;
+  }
+  const total = chunks.reduce((s, c) => s + c.length, 0);
+  const y = new Float32Array(total);
+  let at = 0;
+  for (const c of chunks) {
+    y.set(c, at);
+    at += c.length;
+  }
+  const st = m.last();
+  const startAt = firstSound(y);
+  check('a lost chunk produces no NaN', finite(y));
+  check(
+    'ZERO underruns: the loss never reached the read cursor',
+    st.mix.underruns === 0,
+    `${st.mix.underruns} underruns`,
+  );
+  check(
+    'the bridged time is counted honestly',
+    Math.abs(st.mix.concealedMs - lostN * AUDIO_DTS * 1000) < 5,
+    `${st.mix.concealedMs.toFixed(1)} ms concealed for a ${(lostN * AUDIO_DTS * 1000).toFixed(1)} ms loss`,
+  );
+  check(
+    'playback is CONTINUOUS through the loss — a blip, not 200+ ms of silence',
+    startAt >= 0 && zeroRun(y, startAt) < 0.05 * SAMPLE_RATE,
+    `longest silence after start: ${((zeroRun(y, Math.max(0, startAt)) / SAMPLE_RATE) * 1000).toFixed(1)} ms`,
+  );
+  check(
+    'it never went back to priming',
+    st.mix.priming === 0 && st.s['s1']?.armed === true,
+  );
+  const f = freq(y.subarray(-Math.round(0.5 * SAMPLE_RATE)));
+  check(
+    'the tone is back on pitch afterwards',
+    Math.abs(cents(f, 440)) < 8,
+    `${f.toFixed(3)} Hz (${cents(f, 440).toFixed(2)} cents)`,
+  );
+  check('no clipping through the bridge', peak(y) <= 1);
+}
+
+console.log('\nsustained dilation: a sim at 0.6x, with the server saying so');
+{
+  // The design invariant — heavy circuits slow SIM TIME, never the tick —
+  // means production can sit far beyond the ±3 % trim forever, and the server
+  // reports exactly that ratio on every audio message. The old escape hatch
+  // (drain, fade, full re-prime, repeat) was a permanent burst/gap limit
+  // cycle: ~430 ms bursts and ~400 ms silences at 0.5x. Now the base rate is
+  // SLAVED to the reported ratio: continuous sound on the sim's own timeline,
+  // pitched at 0.6x — which is what the circuit is genuinely doing — with the
+  // dock's "sim 0.6x" readout as the explanation.
+  const m = mixer();
+  const y = drive(m, [{ id: 's1', hz: 440, amp: 5 }], 4, 0.6, 0, 0.6);
+  const st = m.last();
+  check('a slaved stream produces no NaN', finite(y));
+  check(
+    'ZERO underruns at 0.6x: no burst/gap limit cycle',
+    st.mix.underruns === 0,
+    `${st.mix.underruns} underruns over 4 s at 0.6x`,
+  );
+  const startAt = firstSound(y);
+  check(
+    'playback is continuous once primed',
+    startAt >= 0 && zeroRun(y, startAt) < 0.05 * SAMPLE_RATE,
+    `longest silence ${((zeroRun(y, Math.max(0, startAt)) / SAMPLE_RATE) * 1000).toFixed(1)} ms`,
+  );
+  check(
+    'the base rate is slaved to the reported ratio',
+    Math.abs((st.s['s1']?.rate ?? 1) - 0.6) < 0.05,
+    `rate ${(st.s['s1']?.rate ?? 1).toFixed(3)} against rt 0.6`,
+  );
+  check(
+    'the trim still respects its clamp on top of the slave',
+    m.peakTrim() <= TRIM_MAX + 1e-9,
+    `peak |trim| ${(m.peakTrim() * 100).toFixed(3)} %`,
+  );
+  const f = freq(afterPrime(y, 1));
+  check(
+    "the tone lands at 0.6x pitch — the sim's own timeline, not a fabrication",
+    Math.abs(cents(f, 440 * 0.6)) < 30,
+    `${f.toFixed(2)} Hz vs ${440 * 0.6} Hz (${cents(f, 440 * 0.6).toFixed(1)} cents)`,
+  );
+  check(
+    'the buffer is held near the target, not drained',
+    st.mix.ms > TARGET_MS - 90 && st.mix.ms < TARGET_MS + 90,
+    `${st.mix.ms.toFixed(1)} ms (target ${TARGET_MS} ms)`,
+  );
+  check('no clipping while slaved', peak(y) <= 1);
+}
+
+console.log('\ndilation arriving MID-STREAM: one blip at most, then locked');
+{
+  // A healthy room that suddenly gets heavy: rt drops from 1.0 to 0.6 while
+  // audio is playing. The EMA takes a few hundred ms to cross the engage
+  // threshold, so the buffer may pay one underrun at the transition — but it
+  // must then lock to the new rate and play continuously, not limit-cycle.
+  const m = mixer();
+  drive(m, [{ id: 's1', hz: 440, amp: 5 }], 1, 1, 0, 1);
+  const y = drive(m, [{ id: 's1', hz: 440, amp: 5 }], 4, 0.6, 0, 0.6);
+  const st = m.last();
+  check('the transition produces no NaN', finite(y));
+  check(
+    'at most one blip at the transition (was a permanent gap cycle)',
+    st.mix.underruns <= 1,
+    `${st.mix.underruns} underruns over 4 s of 0.6x after a healthy second`,
+  );
+  check(
+    'it ends up slaved to the new ratio',
+    Math.abs((st.s['s1']?.rate ?? 1) - 0.6) < 0.05,
+    `rate ${(st.s['s1']?.rate ?? 1).toFixed(3)}`,
+  );
+  const tail = y.subarray(-Math.round(1.5 * SAMPLE_RATE));
+  check(
+    'the last 1.5 s are gap-free',
+    zeroRun(tail) < 0.05 * SAMPLE_RATE,
+    `longest silence ${((zeroRun(tail) / SAMPLE_RATE) * 1000).toFixed(1)} ms`,
+  );
+  const f = freq(tail);
+  check(
+    "and play at the sim's honest pitch",
+    Math.abs(cents(f, 440 * 0.6)) < 60,
+    `${f.toFixed(2)} Hz vs ${440 * 0.6} Hz (${cents(f, 440 * 0.6).toFixed(1)} cents)`,
+  );
+  check('recovery clears the underrun state', st.s['s1']?.armed === true && !st.mix.stalled);
+}
+
+console.log('\nno server ratio, no slave: the clamp story is unchanged');
+{
+  // Offline feeds and old servers send chunks with no rt. The slave must
+  // stay completely out of the loop: base rate exactly 1, and a dilated
+  // producer degrades exactly as it always did (clamped trim, counted
+  // underruns) rather than guessing a rate from buffer depth.
+  const m = mixer();
+  drive(m, [{ id: 's1', hz: 440, amp: 5 }], 2, 0.9);
+  const st = m.last();
+  check(
+    'without rt the base rate stays exactly nominal',
+    (st.s['s1']?.rate ?? 0) === 1,
+    `rate ${st.s['s1']?.rate ?? 0}`,
   );
 }
 

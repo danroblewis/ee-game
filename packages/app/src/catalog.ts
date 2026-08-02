@@ -181,7 +181,7 @@ export function searchParts(q: string): PartDef[] {
   );
 }
 
-function pinCount(kind: ElementKind): number {
+export function pinCount(kind: ElementKind): number {
   switch (kind.t) {
     case 'Ground':
     case 'Rail':
@@ -223,17 +223,21 @@ export function makePins(kind: ElementKind, a: Point, b: Point): Point[] {
     return [at(0, 0), at(0, 4), at(0, 1), at(0, 3), at(4, 3), at(4, 1)];
   }
   if (kind.t === 'Ota') {
-    // [in+, in-, out, bias]: inputs split at A, out at B, bias below.
+    // [in+, in-, out, bias]: inputs split at A, out at B. The bias pin sits
+    // square to the body one step back from the output — that is where the
+    // transconductance balls are drawn, so its lead is a straight run out of
+    // them (up for a left-to-right part) instead of a diagonal.
     const dx = b[0] - a[0];
     const dy = b[1] - a[1];
     const horiz = Math.abs(dx) >= Math.abs(dy);
     const p: Point = horiz ? [0, 1] : [Math.sign(dy) >= 0 ? -1 : 1, 0];
-    const mid: Point = [Math.round((a[0] + b[0]) / 2), Math.round((a[1] + b[1]) / 2)];
+    const ux: Point = horiz ? [Math.sign(dx) || 1, 0] : [0, Math.sign(dy) || 1];
+    const tip: Point = [b[0] - ux[0], b[1] - ux[1]];
     return [
       [a[0] - p[0], a[1] - p[1]],
       [a[0] + p[0], a[1] + p[1]],
       b,
-      [mid[0] + p[0] * 2, mid[1] + p[1] * 2],
+      [tip[0] - p[0] * 2, tip[1] - p[1] * 2],
     ];
   }
   // 3-pin: split the far end (or inputs) perpendicular to the drag axis.

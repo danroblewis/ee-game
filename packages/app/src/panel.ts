@@ -23,7 +23,7 @@
 // itself is shared, so everyone sees the same panel with their own layout.
 
 import type { ElemLive, ElementSpec, InteractOp, Point } from './circuit';
-import { LED_COLORS, type Camera } from './render';
+import { LED_COLORS, LOD_FULL, type Camera } from './render';
 import {
   applyScopeControl,
   probeColor,
@@ -148,6 +148,9 @@ export function panelScopes(
 
 const TAB_H = 19;
 const TAB_FONT = '11px ui-monospace, monospace';
+/** The zoomed-out caption: small, dim, and clipped inside the region. */
+const CAPTION_PX = 10;
+const CAPTION_FONT = `${CAPTION_PX}px ui-monospace, monospace`;
 /** ui-monospace advance at 11px. Drawing and hit-testing share it so the
  * tab the player clicks is exactly the tab that was drawn. */
 const CHAR_W = 6.7;
@@ -160,6 +163,8 @@ const HANDLES: PanelHandle[] = ['nw', 'ne', 'se', 'sw', 'n', 'e', 's', 'w'];
 /** Half the drawn grip square, and the (slightly larger) click radius. */
 const GRIP_R = 4.5;
 const GRIP_HIT = 7;
+/** How wide the region's border reads as "the region" for hovering. */
+const EDGE_HIT = 6;
 
 export const PANEL_HANDLE_CURSOR: Record<PanelHandle, string> = {
   nw: 'nwse-resize',
@@ -175,6 +180,16 @@ export const PANEL_HANDLE_CURSOR: Record<PanelHandle, string> = {
 function tabRect(cam: Camera, p: Panel): [number, number, number, number] {
   const w = Math.max(72, p.name.length * CHAR_W + 18 + CLOSE_W);
   return [cam.ox + p.x0 * cam.scale, cam.oy + p.y0 * cam.scale - TAB_H - 3, w, TAB_H];
+}
+
+/** The tab is fixed screen-space chrome, so zooming out eventually makes it
+ *  bigger than the region it labels. It therefore switches to a quiet caption
+ *  at exactly the zoom where the schematic itself stops being drawn — the same
+ *  moment the current dots go — so the whole view calms down at once instead
+ *  of in stages. Applies to drawing AND hit-testing, so the vanished tab never
+ *  leaves an invisible click zone behind. */
+function tabFits(cam: Camera): boolean {
+  return cam.scale >= LOD_FULL;
 }
 
 /** The region in screen pixels: [x, y, w, h]. */
@@ -257,9 +272,9 @@ export function drawPanelRegions(
   for (const p of panels) {
     const hot = p.plid === hoverPlid;
     const [X, Y, W, H] = regionPx(cam, p);
+    // No interior wash: the region is a boundary, not a pane of glass over
+    // the parts inside it.
     roundRectPath(ctx, X, Y, W, H, Math.min(16, cam.scale * 0.5));
-    ctx.fillStyle = hot ? '#4ad4ff12' : '#4ad4ff08';
-    ctx.fill();
     ctx.setLineDash([5, 6]);
     ctx.lineWidth = hot ? 2 : 1.4;
     ctx.strokeStyle = hot ? '#8ee7ff' : '#4a8ea8';
@@ -279,6 +294,24 @@ export function drawPanelRegions(
       }
     }
 
+    if (!tabFits(cam)) {
+      // Zoomed out: the name sits quietly in the bottom-left corner, clipped
+      // to the region so it can never spill outside the box it names. Below a
+      // couple of text heights even that is noise, so the box speaks for itself.
+      if (H >= CAPTION_PX * 2 && W >= CAPTION_PX * 2) {
+        ctx.save();
+        roundRectPath(ctx, X, Y, W, H, Math.min(16, cam.scale * 0.5));
+        ctx.clip();
+        ctx.font = CAPTION_FONT;
+        ctx.textBaseline = 'alphabetic';
+        ctx.fillStyle = hot ? '#8ee7ff' : '#6f8b98';
+        ctx.fillText(p.name, X + 4, Y + H - 4);
+        ctx.restore();
+        ctx.font = TAB_FONT;
+        ctx.textBaseline = 'middle';
+      }
+      continue;
+    }
     const [tx, ty, tw, th] = tabRect(cam, p);
     roundRectPath(ctx, tx, ty, tw, th, 5);
     ctx.fillStyle = hot ? '#22333d' : '#18242d';
@@ -325,9 +358,13 @@ export function panelZoneAt(
 ): PanelZone | null {
   for (let k = panels.length - 1; k >= 0; k--) {
     const p = panels[k]!;
-    const [tx, ty, tw, th] = tabRect(cam, p);
-    if (x >= tx && x <= tx + tw && y >= ty && y <= ty + th) {
-      return { panel: p, zone: x >= tx + tw - CLOSE_W ? 'close' : 'tab' };
+    // Only when the tab is actually drawn — otherwise the strip above a
+    // zoomed-out region would still swallow clicks meant for the schematic.
+    if (tabFits(cam)) {
+      const [tx, ty, tw, th] = tabRect(cam, p);
+      if (x >= tx && x <= tx + tw && y >= ty && y <= ty + th) {
+        return { panel: p, zone: x >= tx + tw - CLOSE_W ? 'close' : 'tab' };
+      }
     }
     for (const h of HANDLES) {
       const [hx, hy] = gripPx(cam, p, h);
@@ -346,10 +383,17 @@ export function panelHotAt(cam: Camera, panels: Panel[], x: number, y: number): 
   // Whatever a click would act on wins, so the grips drawn are the grips hit.
   const z = panelZoneAt(cam, panels, x, y);
   if (z) return z.panel;
+  // Only the EDGE counts as the region, never its interior. The parts inside a
+  // panel are ordinary parts and must stay ordinary to hover and click — a
+  // region that lit up whenever the pointer crossed it would put a permanent
+  // highlight over everything it contains.
   for (let k = panels.length - 1; k >= 0; k--) {
     const p = panels[k]!;
     const [X, Y, W, H] = regionPx(cam, p);
-    if (x >= X && x <= X + W && y >= Y && y <= Y + H) return p;
+    const inOuter = x >= X - EDGE_HIT && x <= X + W + EDGE_HIT && y >= Y - EDGE_HIT && y <= Y + H + EDGE_HIT;
+    if (!inOuter) continue;
+    const inInner = x > X + EDGE_HIT && x < X + W - EDGE_HIT && y > Y + EDGE_HIT && y < Y + H - EDGE_HIT;
+    if (!inInner) return p;
   }
   return null;
 }

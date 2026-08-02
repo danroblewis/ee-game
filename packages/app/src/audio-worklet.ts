@@ -39,11 +39,18 @@
 // to the main thread so the player can SEE the state instead of guessing.
 //
 // What rate matching cannot do: manufacture samples. A producer that is
-// permanently 10 % slow (a sim running at 0.9x) cannot be tracked by a 3 %
-// trim, and pitching the whole mix down 10 % to follow it would be a lie
-// about the circuit. Those cases drain the buffer, fade to silence and
-// re-prime, and the client shows the server's own realtime ratio so the
-// player knows the circuit is too heavy rather than the audio being broken.
+// permanently 10 % slow (a sim dilated to 0.9x by a heavy circuit) cannot
+// be tracked by a 3 % trim. Draining, fading and re-priming — the original
+// answer — turns sustained dilation into a burst/gap limit cycle: play
+// 0.2/(0.97-rt) seconds, go silent for a full re-prime, repeat forever,
+// which a player hears as "audio never keeps up". So when the SERVER'S OWN
+// realtime ratio (it rides every audio chunk) sits beyond the trim's
+// authority, the base playback rate is SLAVED to it. That is not
+// fabrication: the samples are still exactly the solver's waveform, heard
+// on the sim's own timeline — a sim at 0.6x genuinely oscillates at 0.6x
+// the wall-clock frequency — and the dock shows "sim 0.6x" so the player
+// knows why the pitch fell. The slave engages with hysteresis and glides,
+// so a healthy stream is still pitch-perfect and never wobbles.
 
 /** Peak volts that maps to `TARGET_FS` of full scale. */
 export const REF_VOLTS = 5;
@@ -143,6 +150,39 @@ export const STATS_HZ = 10;
  * the player nothing they cannot already hear (silence).
  */
 export const STALL_S = 0.25;
+/**
+ * Largest FORWARD jump in a source's sample clock that is concealed by
+ * bridging instead of resetting, in seconds.
+ *
+ * The speaker stream is best-effort: a lagged socket silently skips whole
+ * 33 ms messages. Resetting on every skip (the original behavior, threshold
+ * 4 samples) discards up to TARGET_BUF_S of already-buffered REAL solver
+ * audio and then sits silent through a full re-prime — one lost 33 ms
+ * message cost ~7x its length in silence, and periodic losses turned
+ * playback into mostly-priming. Instead, a gap of up to this many seconds
+ * is written into the ring as a linear bridge between the last received
+ * sample and the next chunk's first sample (the same interpolation the
+ * resampler already does between adjacent samples, over a longer span), so
+ * a lost message is what net.ts always claimed it was: a blip, not a reset.
+ * Beyond this, continuity is genuinely gone (room restart, long stall) and
+ * the source re-primes from scratch. Concealed time is counted and reported
+ * as `concealedMs` — the player can always see how much was bridged.
+ */
+export const GAP_MAX_S = 0.25;
+/**
+ * Time constant of the smoothed server realtime ratio the rate slave acts
+ * on, in seconds. The server already smooths rt (EMA, ~150 ms); this adds
+ * enough on top that a one-tick spike cannot yank the base rate, while a
+ * real dilation engages the slave before the buffer is fully drained.
+ */
+export const RATE_TAU_S = 0.3;
+/**
+ * Floor on the slaved base rate. A ratio below this (a quarantined or
+ * near-stopped sim) is a producer that has effectively STOPPED — playing at
+ * a twentieth of nominal would be an unrecognizable drone, not a dilated
+ * version of the circuit's sound. Let it starve and report stalled instead.
+ */
+export const RATE_MIN = 0.25;
 
 export const WORKLET_SRC = `
 const r2 = (v) => Math.round(v * 100) / 100;
@@ -171,6 +211,12 @@ class Src {
     // ---- rate matching
     this.trim = 0;         // applied rate trim, -cfg.trimMax..+cfg.trimMax
     this.dAvg = 0;         // smoothed buffer depth in seconds (the loop's input)
+    // ---- rate slaving (a sim dilated beyond the trim's authority)
+    this.base = 1;         // applied base rate multiplier (1 = nominal)
+    this.rtLast = 1;       // most recent server realtime ratio received
+    this.rtAvg = 1;        // ...and its smoothed value (cfg.rateTau)
+    this.rtSeen = false;   // first ratio initializes rtAvg directly
+    this.slaved = false;   // hysteresis state: following rtAvg, not nominal
     // ---- telemetry
     this.avail = 0;        // buffered source samples, sampled per block
     this.underruns = 0;    // starvation events since this source appeared
@@ -179,6 +225,7 @@ class Src {
     this.stalled = false;  // starved past cfg.stallFrames: producer is gone
     this.drops = 0;        // ring overflows: oldest audio discarded
     this.dropped = 0;      // source samples discarded by those overflows
+    this.concealed = 0;    // source samples bridged over lost chunks
     this.bkMin = Infinity; // depth min/max since the last report, in ms
     this.bkMax = 0;
     this.hMin = new Float64Array(BUCKETS);
@@ -194,8 +241,16 @@ class Src {
     this.dts = dts;
     this.step = step;
     // Prime to the TARGET depth, not to some smaller "enough to start"
-    // figure: starting thin just means underrunning a moment later.
-    this.prime = Math.max(4, Math.min(this.size >> 1, Math.round(this.cfg.target / dts)));
+    // figure: starting thin just means underrunning a moment later. The 1 %
+    // shave matters: delivery is quantized in whole chunks, and the server's
+    // real chunks are 416 samples (integer division of the tick budget), so
+    // 6 of them buffer 2496 samples — 4 SHORT of an exact round(0.2/80 µs) =
+    // 2500. Without the shave every prime waited a whole 7th chunk (+33 ms)
+    // for those 4 samples.
+    this.prime = Math.max(
+      4,
+      Math.min(this.size >> 1, Math.round((0.99 * this.cfg.target) / dts)),
+    );
   }
 
   reset() {
@@ -210,7 +265,10 @@ class Src {
     this.last = 0;
     // A re-prime is a stream discontinuity, not a buffer failure: keep the
     // cumulative counters (they are session totals) but drop the in-flight
-    // starvation state and the trim, so playback restarts at nominal rate.
+    // starvation state and the trim. The rate-slave state (rtAvg, slaved,
+    // base) survives on purpose — dilation is a property of the PRODUCER,
+    // not of this buffer, and restarting a dilated stream at nominal rate
+    // would just walk it straight back into the drain that caused the reset.
     this.trim = 0;
     this.dAvg = 0;
     this.starving = 0;
@@ -223,16 +281,56 @@ class Src {
       this.ring[this.w % this.size] = s[k];
       this.w++;
     }
-    // Over-full is the rate matcher's job (it runs slightly fast and drains
-    // the surplus inaudibly). The ONLY thing handled here is a genuine ring
-    // overflow — the writer lapping the reader — which loses audio whatever
-    // we do, so it is counted instead of being silently absorbed.
+    this.overflow();
+  }
+
+  /**
+   * Conceal a LOST stretch of the stream: n source samples never arrived
+   * (a lagged socket skipped whole messages), and the next chunk starts at
+   * \`to\`. Write a linear bridge from the last received sample to \`to\` —
+   * the same interpolation the read cursor already does between adjacent
+   * samples, spanning the hole — so the buffered REAL audio on either side
+   * keeps playing instead of being thrown away for a full re-prime. The
+   * bridged time is counted: it is the one thing in this file that is not
+   * a solver sample, and telemetry must say so.
+   */
+  bridge(n, to) {
+    if (this.w === 0) return; // nothing to bridge from: prime normally
+    let cap = this.size >> 1; // the main thread caps harder; belt and braces
+    if (n > cap) n = cap;
+    const from = this.ring[(this.w - 1) % this.size];
+    for (let k = 1; k <= n; k++) {
+      this.ring[this.w % this.size] = from + ((to - from) * k) / (n + 1);
+      this.w++;
+    }
+    this.concealed += n;
+    this.overflow();
+  }
+
+  /** Over-full is the rate matcher's job (it runs slightly fast and drains
+   * the surplus inaudibly). The ONLY thing handled here is a genuine ring
+   * overflow — the writer lapping the reader — which loses audio whatever
+   * we do, so it is counted instead of being silently absorbed. */
+  overflow() {
     const cap = this.size - 2;
     if (this.w - this.r > cap) {
       const keep = Math.min(cap, Math.max(this.prime, 4));
       this.dropped += this.w - this.r - keep;
       this.r = this.w - keep;
       this.drops++;
+    }
+  }
+
+  /** Latest server realtime ratio (sim seconds per wall second), straight
+   * off the audio message this source's chunks ride. Smoothed in control(). */
+  ratio(rt) {
+    if (!(rt >= 0) || !isFinite(rt)) return;
+    this.rtLast = rt;
+    if (!this.rtSeen) {
+      // First report: adopt it outright, so a stream that STARTS dilated
+      // slaves immediately instead of draining while the EMA crawls down.
+      this.rtAvg = rt;
+      this.rtSeen = true;
     }
   }
 
@@ -267,6 +365,24 @@ class Src {
     // The clamp is a guarantee, not a consequence of the maths above.
     if (this.trim > cfg.trimMax) this.trim = cfg.trimMax;
     else if (this.trim < -cfg.trimMax) this.trim = -cfg.trimMax;
+    // ---- rate slave (see the header): the trim above can bend consumption
+    // by ±trimMax around the BASE rate; this loop moves the base itself when
+    // the server says its sim is dilated further than the trim can follow.
+    // Wall-clock EMA of the reported ratio, then hysteresis: engage only
+    // once the deficit is beyond the trim's authority, disengage only once
+    // the trim could comfortably take over again — a ratio hovering at the
+    // threshold must not gate the slave on and off audibly.
+    if (this.rtSeen) {
+      this.rtAvg += (this.rtLast - this.rtAvg) * Math.min(1, frames / (cfg.rateTau * sampleRate));
+      if (this.slaved) {
+        if (this.rtAvg > cfg.rateOff) this.slaved = false;
+      } else if (this.rtAvg < cfg.rateOn) {
+        this.slaved = true;
+      }
+    }
+    const wantBase = this.slaved ? Math.max(cfg.rateMin, Math.min(1, this.rtAvg)) : 1;
+    this.base += (wantBase - this.base) * a;
+    if (Math.abs(wantBase - this.base) < 1e-7) this.base = wantBase;
   }
 
   /** Next sample, faded and gain-glided. Underrun coasts to silence instead
@@ -282,7 +398,7 @@ class Src {
         const a = this.ring[i % this.size];
         const b = this.ring[(i + 1) % this.size];
         s = a + (b - a) * f;
-        this.r += this.step * (1 + this.trim);
+        this.r += this.step * this.base * (1 + this.trim);
         this.last = s;
         this.starving = 0;
         if (!this.doomed) this.fade = Math.min(1, this.fade + this.fadeInc);
@@ -309,17 +425,22 @@ class Src {
           this.stalled = true;
         }
       }
-      // Re-prime: wait for a full target buffer, then start again at exactly
-      // nominal rate. This is the same path a fresh source starts on, so a
-      // resumed producer sounds like a new one, not like a splice.
-      if (!this.doomed && this.fade <= 0 && this.step > 0 && this.w - this.r >= this.prime) {
-        this.r = this.w - this.prime;
+      // Re-prime. A FRESH source (or one reset by a real discontinuity)
+      // waits for the full target: starting thin just underruns a moment
+      // later. But a source that was already playing and got starved by a
+      // producer hiccup re-arms at HALF the target: the full-prime rule made
+      // every glitch cost >=200 ms of silence on top of the glitch itself,
+      // and half the target still rides out one whole late tick while the
+      // trim (running slow) refills the rest in the background.
+      const need = this.ever ? Math.max(4, this.prime >> 1) : this.prime;
+      if (!this.doomed && this.fade <= 0 && this.step > 0 && this.w - this.r >= need) {
+        this.r = this.w - need;
         this.armed = true;
         this.ever = true;
         this.trim = 0;
         // Start the loop centred on the depth we just primed to, or it would
         // read the pre-arm ramp as a huge deficit and pull the clamp.
-        this.dAvg = this.prime * this.dts;
+        this.dAvg = need * this.dts;
         this.starving = 0;
         this.stalled = false;
       }
@@ -355,8 +476,12 @@ class Src {
       underrunMs: r2((this.starved / sampleRate) * 1000),
       drops: this.drops,
       droppedMs: r2(this.dropped * this.dts * 1000),
+      concealedMs: r2(this.concealed * this.dts * 1000),
       stalled: this.stalled,
       armed: this.armed,
+      // The rate actually applied to the read cursor, trim aside: 1 nominal,
+      // <1 slaved to a dilated sim (the honest pitch the player is hearing).
+      rate: Math.round(this.base * 1000) / 1000,
       // Filling up for the first time: the depth is LOW BY DESIGN, so the
       // readout says "priming" instead of warning about a thin buffer.
       priming: !this.ever,
@@ -380,16 +505,24 @@ class SimAudioProcessor extends AudioWorkletProcessor {
     this.fsTarget = o.target || 0.2;
     this.refV = o.refV || 5;
     const fadeSec = o.fadeSec || 0.006;
+    const trimMax = o.trimMax === undefined ? 0.03 : o.trimMax;
     // Shared, immutable tuning handed to every source.
     this.cfg = {
       target: o.targetSec || 0.2,
       deadband: o.deadbandSec === undefined ? 0.045 : o.deadbandSec,
       kp: o.kp === undefined ? 0.3 : o.kp,
-      trimMax: o.trimMax === undefined ? 0.03 : o.trimMax,
+      trimMax: trimMax,
       trimTau: o.trimTauSec || 0.05,
       depthTau: o.depthTauSec || 0.3,
       fadeInc: 1 / Math.max(1, fadeSec * sampleRate),
       stallFrames: Math.max(1, Math.round((o.stallSec || 0.25) * sampleRate)),
+      rateTau: o.rateTauSec || 0.3,
+      rateMin: o.rateMin === undefined ? 0.25 : o.rateMin,
+      // Slave hysteresis, derived from the trim clamp: engage once the
+      // dilation is beyond what the trim could track, disengage only when
+      // the trim could hold the residual with room to spare.
+      rateOn: 1 - trimMax,
+      rateOff: 1 - trimMax / 4,
     };
     this.hpCoef = 1 - (2 * Math.PI * (o.hpHz || 20)) / sampleRate;
     // Consecutive all-zero-sum samples before the output stage is hard-reset.
@@ -418,6 +551,11 @@ class SimAudioProcessor extends AudioWorkletProcessor {
         s.doomed = false;
         if (m.gain !== undefined) s.gain = m.gain;
         s.setRate(m.dts);
+        if (m.rt !== undefined) s.ratio(m.rt);
+        // The main thread saw a small forward jump in this source's sample
+        // clock: m.gap samples were LOST in transit. Bridge them so the
+        // audio buffered on both sides survives, instead of resetting.
+        if (m.gap > 0) s.bridge(m.gap, m.s.length ? m.s[0] : 0);
         s.write(m.s);
       } else if (m.t === 'gain') {
         // Immediate response to a mute/solo click; chunks carry gain too, so
@@ -470,6 +608,8 @@ class SimAudioProcessor extends AudioWorkletProcessor {
     let trim = 0;
     let n = 0;
     let priming = 0;
+    let rate = 1;
+    let concealedMs = 0;
     for (const [id, src] of this.srcs) {
       const st = src.stats();
       s[id] = st;
@@ -482,8 +622,10 @@ class SimAudioProcessor extends AudioWorkletProcessor {
       underruns += st.underruns;
       underrunMs += st.underrunMs;
       drops += st.drops;
+      concealedMs += st.concealedMs;
       if (st.stalled) stalled = true;
       if (Math.abs(st.trim) > Math.abs(trim)) trim = st.trim;
+      if (st.rate < rate) rate = st.rate; // most-slaved source: the mix's pitch story
     }
     this.port.postMessage({
       t: 'stats',
@@ -499,8 +641,10 @@ class SimAudioProcessor extends AudioWorkletProcessor {
         underruns: underruns,
         underrunMs: r2(underrunMs),
         drops: drops,
+        concealedMs: r2(concealedMs),
         stalled: stalled,
         trim: trim,
+        rate: rate,
         target: this.cfg.target * 1000,
       },
       s: s,

@@ -875,22 +875,40 @@ export function drawElement(d: DrawCtx, e: ElementSpec) {
       const axVec = sub(Op, back);
       const axDist = mag(axVec);
       const uo = axDist > 1e-6 ? norm(axVec) : perp(pmDir);
-      // Height from the input spacing, but never so tall that the 1.3:1
-      // body would overshoot the output pin.
-      const half = Math.max(s * 0.45, Math.min(inSpan * 0.575, axDist / 2.6));
-      const triLen = Math.max(s * 0.5, Math.min(axDist, half * 2.6));
-      const apex = add(back, uo, triLen);
-      const v1 = add(back, pmDir, half);
-      const v2 = add(back, pmDir, -half);
-      // Input leads, for placements whose pins sit outside the back edge.
+      // The body stays proportional to its own height (1.1:1), and the axial
+      // slack left over is SPLIT between input legs and the output lead —
+      // giving the inputs visible legs instead of handing every spare unit
+      // to the output pin.
+      const half = Math.max(s * 0.45, Math.min(inSpan * 0.72, axDist / 2.2));
+      // An OTA ends its body exactly under the bias pin: the transconductance
+      // balls straddle the apex and the bias lead leaves them square to the
+      // axis, so anchoring the tip to that pin is what keeps the lead straight.
+      const biasAxial = e.kind.t === 'Ota' && P[3] ? dot(sub(P[3], back), uo) : 0;
+      let triLen: number;
+      let inLeg: number;
+      if (biasAxial > s * 0.3) {
+        const tip = Math.min(biasAxial, axDist - s * 0.05);
+        inLeg = Math.min(s * 0.5, tip * 0.22);
+        triLen = Math.max(s * 0.3, tip - inLeg);
+      } else {
+        triLen = Math.max(s * 0.45, Math.min(axDist * 0.85, half * 1.75));
+        inLeg = Math.max(0, axDist - triLen) * 0.55;
+      }
+      const bodyStart = add(back, uo, inLeg);
+      const apex = add(bodyStart, uo, triLen);
+      const v1 = add(bodyStart, pmDir, half);
+      const v2 = add(bodyStart, pmDir, -half);
+      // Input legs, from each pin back to the body's edge.
       for (const [k, Q] of [[0, Pp], [1, Mp]] as const) {
-        const dp = dot(sub(Q, back), pmDir);
-        const edge = add(back, pmDir, Math.max(-half * 0.8, Math.min(half * 0.8, dp)));
+        const dp = dot(sub(Q, bodyStart), pmDir);
+        // Attach at the pin's own offset when it fits inside the back edge, so
+        // the leg runs straight along the axis instead of sloping to a corner.
+        const edge = add(bodyStart, pmDir, Math.max(-half, Math.min(half, dp)));
         if (mag(sub(edge, Q)) > s * 0.05) stroke(ctx, voltageColor(v(k)), [Q, edge]);
       }
-      // Output lead for the axial slack the triangle does not use.
+      // Output lead: the short stub between the apex and the pin.
       const io = -iPin(2); // current leaving the output pin
-      if (axDist - triLen > s * 0.02) {
+      if (mag(sub(Op, apex)) > s * 0.02) {
         stroke(ctx, voltageColor(v(2)), [apex, Op]);
         drawDots(ctx, cam, apex, Op, d.dots.advance(e.id, io, d.dtSec), io);
       } else {
@@ -911,23 +929,33 @@ export function drawElement(d: DrawCtx, e: ElementSpec) {
       ctx.font = `${Math.round(Math.min(s * 0.3, half * 0.42))}px ui-monospace`;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
-      const inset = add(back, uo, Math.min(s * 0.34, triLen * 0.2));
+      const inset = add(bodyStart, uo, Math.min(s * 0.34, triLen * 0.2));
       const lab = Math.min(half * 0.55, s * 0.62);
       ctx.fillText('+', ...add(inset, pmDir, lab));
       ctx.fillText('−', ...add(inset, pmDir, -lab));
       ctx.restore();
       if (e.kind.t === 'Ota' && P[3]) {
-        // Bias lead into the triangle's belly; a double bar marks the
-        // current-output nature.
-        stroke(ctx, voltageColor(v(3)), [P[3]!, lerp(back, apex, 0.45)]);
+        // The OTA is a plain op-amp triangle with two small overlapping balls
+        // IN LINE with the body axis at the output apex — the balls are the
+        // transconductance. The bias pin leaves the middle of the pair square
+        // to the axis (straight up or down for a horizontal part), so it is
+        // drawn as an elbow: a perpendicular stub, then an axial run to the
+        // pin. The output lead starts at the far edge of the LAST ball.
+        // Keep the pair inside the output lead so it never runs past the pin.
+        const span = mag(sub(Op, apex));
+        const r = Math.max(s * 0.05, Math.min(half * 0.34, s * 0.2, span / 2.2));
         const no = perp(uo);
+        // The pair straddles the apex, which sits under the bias pin, so the
+        // lead is one straight segment square to the body — never an elbow.
+        const c1 = add(apex, uo, -r * 0.55);
+        const c2 = add(apex, uo, r * 0.55);
+        stroke(ctx, voltageColor(v(3)), [apex, P[3]!]);
+        ctx.fillStyle = '#181820';
         ctx.strokeStyle = '#c9c9d4';
-        for (const k of [0.62, 0.74]) {
-          const c = lerp(back, apex, k);
-          const h = half * (1 - k) * 0.8;
+        for (const c of [c1, c2]) {
           ctx.beginPath();
-          ctx.moveTo(...add(c, no, h));
-          ctx.lineTo(...add(c, no, -h));
+          ctx.arc(c[0], c[1], r, 0, Math.PI * 2);
+          ctx.fill();
           ctx.stroke();
         }
       }
@@ -1045,7 +1073,15 @@ export function drawGrid(ctx: CanvasRenderingContext2D, cam: Camera, W: number, 
 // calls — the value still comes from the frame, never from the UI).
 
 /** Voltage buckets in the LOD ramp (odd, so 0 V lands exactly in the middle). */
+/** The zoom (px per grid unit) at which the schematic stops being a schematic:
+ *  above it you get full symbols, current dots, probe flags and panel tabs;
+ *  below it the calm voltage-only view. One constant so all of those switch
+ *  together instead of drifting apart. */
+export const LOD_FULL = 6;
+
 const LOD_STEPS = 17;
+/** Part bodies carry no single potential, so they are drawn off the ramp. */
+const LOD_BODY = '#70727f';
 
 const LOD_RAMP: string[] = Array.from({ length: LOD_STEPS }, (_, k) =>
   voltageColor(((k / (LOD_STEPS - 1)) * 2 - 1) * V_FULL),
@@ -1087,60 +1123,83 @@ export function drawElementsLod(
       ]);
     }
   }
-  for (const e of elems) {
-    const P = e.pins;
-    if (P.length === 0) continue;
-    const l = live.get(e.id);
-    const k = lodBucket(l?.v[0] ?? 0);
+  // A part is NOT at one potential. Colouring a whole glyph from pin 0 states
+  // something false — a 555 flooded with its VCC green while TRIG swings, an
+  // op-amp whose body claims to be at its + input. So each pin colours only
+  // its own short lead, and the body, which has no single voltage, is neutral.
+  const body = new Path2D();
+  let hasBody = false;
+  const bucketFor = (volts: number) => {
+    const k = lodBucket(volts);
     let path = paths[k];
     if (!path) {
       path = new Path2D();
       paths[k] = path;
     }
-    const ax = cam.ox + P[0]![0] * cam.scale;
-    const ay = cam.oy + P[0]![1] * cam.scale;
+    return path;
+  };
+  for (const e of elems) {
+    const P = e.pins;
+    if (P.length === 0) continue;
+    const l = live.get(e.id);
+    const volts = (i: number) => l?.v[i] ?? 0;
+    const sx = (i: number) => cam.ox + P[i]![0] * cam.scale;
+    const sy = (i: number) => cam.oy + P[i]![1] * cam.scale;
+    const ax = sx(0);
+    const ay = sy(0);
     if (P.length === 1) {
       // Single-pin parts (ground) get a stub so they are not invisible.
-      path.moveTo(ax - tick, ay);
-      path.lineTo(ax + tick, ay);
+      const p0 = bucketFor(volts(0));
+      p0.moveTo(ax - tick, ay);
+      p0.lineTo(ax + tick, ay);
       continue;
     }
-    path.moveTo(ax, ay);
-    if (single) {
-      const last = P[P.length - 1]!;
-      path.lineTo(cam.ox + last[0] * cam.scale, cam.oy + last[1] * cam.scale);
+    if (P.length === 2 || single) {
+      // Split at the midpoint so each end carries its OWN pin's colour: that
+      // is what makes a resistor read as a drop rather than a flat value.
+      const j = P.length - 1;
+      const bx = sx(j);
+      const by = sy(j);
+      const mx = (ax + bx) / 2;
+      const my = (ay + by) / 2;
+      const pa = bucketFor(volts(0));
+      pa.moveTo(ax, ay);
+      pa.lineTo(mx, my);
+      const pb = bucketFor(volts(j));
+      pb.moveTo(mx, my);
+      pb.lineTo(bx, by);
       continue;
     }
-    if (P.length > 4) {
-      // Packages (the 555) are boxes, not chains: a polyline through DIP
-      // pins would read as a scribble. Outline the pin bbox instead.
-      let x0 = Infinity;
-      let y0 = Infinity;
-      let x1 = -Infinity;
-      let y1 = -Infinity;
-      for (const p of P) {
-        if (p[0] < x0) x0 = p[0];
-        if (p[0] > x1) x1 = p[0];
-        if (p[1] < y0) y0 = p[1];
-        if (p[1] > y1) y1 = p[1];
-      }
-      const px0 = cam.ox + x0 * cam.scale;
-      const py0 = cam.oy + y0 * cam.scale;
-      path.moveTo(px0, py0);
-      path.lineTo(cam.ox + x1 * cam.scale, py0);
-      path.lineTo(cam.ox + x1 * cam.scale, cam.oy + y1 * cam.scale);
-      path.lineTo(px0, cam.oy + y1 * cam.scale);
-      path.lineTo(px0, py0);
-      continue;
+    // Three pins and up read as a package with one coloured leg per pin, so a
+    // transistor, an op-amp and a 555 all look like parts rather than a
+    // scribble, and their pins are visibly at different potentials.
+    let cx = 0;
+    let cy = 0;
+    let x0 = Infinity;
+    let y0 = Infinity;
+    let x1 = -Infinity;
+    let y1 = -Infinity;
+    for (let i = 0; i < P.length; i++) {
+      const x = sx(i);
+      const y = sy(i);
+      cx += x;
+      cy += y;
+      if (x < x0) x0 = x;
+      if (x > x1) x1 = x;
+      if (y < y0) y0 = y;
+      if (y > y1) y1 = y;
     }
-    for (let i = 1; i < P.length; i++) {
-      path.lineTo(cam.ox + P[i]![0] * cam.scale, cam.oy + P[i]![1] * cam.scale);
+    cx /= P.length;
+    cy /= P.length;
+    for (let i = 0; i < P.length; i++) {
+      const p = bucketFor(volts(i));
+      p.moveTo(sx(i), sy(i));
+      p.lineTo(sx(i) + (cx - sx(i)) * 0.55, sy(i) + (cy - sy(i)) * 0.55);
     }
-    // Three-pin parts close the triangle so a transistor still reads as one.
-    if (P.length === 3) {
-      path.moveTo(ax, ay);
-      path.lineTo(cam.ox + P[2]![0] * cam.scale, cam.oy + P[2]![1] * cam.scale);
-    }
+    const hw = Math.max(tick * 0.45, (x1 - x0) * 0.22);
+    const hh = Math.max(tick * 0.45, (y1 - y0) * 0.22);
+    body.rect(cx - hw, cy - hh, hw * 2, hh * 2);
+    hasBody = true;
   }
   ctx.lineWidth = Math.max(1, cam.scale * 0.12);
   ctx.lineCap = 'butt';
@@ -1149,6 +1208,13 @@ export function drawElementsLod(
     if (!path) continue;
     ctx.strokeStyle = LOD_RAMP[k]!;
     ctx.stroke(path);
+  }
+  if (hasBody) {
+    // One extra stroke for every package on screen, drawn last so the bodies
+    // sit above their own legs.
+    ctx.lineWidth = Math.max(1, cam.scale * 0.09);
+    ctx.strokeStyle = LOD_BODY;
+    ctx.stroke(body);
   }
   ctx.lineCap = 'round';
   if (dead.length > 0) {

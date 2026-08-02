@@ -10,7 +10,9 @@
 //                         B lamp, T pot) — click places (Q rotates first),
 //                         drag places with drag orientation, Esc exits
 //   click                 select part / probe flag;  drag on empty = marquee
-//   probe flag            X deletes it; right-click = delete/reference/listen
+//   shift+click/drag      ADD to the selection (never removes)
+//   alt+click/drag        REMOVE from the selection (ctrl is map panning)
+//   probe flag            Del removes it; right-click = delete/reference/listen
 //   drag a part body      move it (whole selection if it is in one)
 //   drag a machine        the freight hoist moves as one assembly — grab the
 //                         bar across the top of its cabinet (or any cabinet
@@ -30,6 +32,8 @@
 //   ⌘/Ctrl+C, ⌘/Ctrl+V    copy selection / paste bound to cursor
 //   ⌘/Ctrl+Z, +Shift, ^Y  undo / redo — this player's own edits only
 //   Q                     rotate placement ghost, paste ghost, or selection
+//   X / Y                 mirror the paste ghost or selection left-right (X)
+//                         or top-bottom (Y), about its own centroid
 //   1 / 2                 voltage probe / current clamp at hover
 //   3                     listen: play that node's waveform (WebAudio)
 //                         — Speakers need no probe: every Speaker element in
@@ -37,7 +41,7 @@
 //                         12.5 kHz tap, muted/soloed from its right-click
 //                         menu, with global mute + volume in the scope bar
 //   0                     set selected V-probe's reference (differential)
-//   O                     drop an in-place oscilloscope;  X delete
+//   O                     drop an in-place oscilloscope;  Del/Backspace delete
 //   ` (backquote)         collapse/expand the bottom scope dock (starts collapsed)
 //   K                     repair tool: the wrench cursor; click a charred
 //                         part to put it back into service (parts break when
@@ -67,7 +71,7 @@ import {
   type Point,
 } from './circuit';
 import { AudioPlayer } from './audio';
-import { CATALOG, CATEGORIES, makePins, partsInCategory, type PartDef } from './catalog';
+import { CATALOG, CATEGORIES, makePins, partsInCategory, pinCount, type PartDef } from './catalog';
 import { History, isTypingTarget } from './history';
 import { createHoist, type MachineRect } from './hoist';
 import { connect } from './net';
@@ -94,6 +98,7 @@ import {
   drawElementsLod,
   drawGrid,
   hitTest,
+  LOD_FULL,
   type Camera,
   type DamageState,
 } from './render';
@@ -764,6 +769,33 @@ function placeEnd(a: Point): Point {
   return [a[0] + d[0] * 4, a[1] + d[1] * 4];
 }
 
+// Armed mirrors, so an orientation can be chosen BEFORE the part lands.
+// Sticky across placements, like placeRot.
+let placeFlipX = false;
+let placeFlipY = false;
+
+/** Mirror pins about their own bounding box — the same exact involution the
+ *  selection flip uses, so armed and after-the-fact flips agree. */
+function mirrorPins(pins: Point[], axis: 'x' | 'y'): Point[] {
+  const i = axis === 'x' ? 0 : 1;
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (const p of pins) {
+    if (p[i] < lo) lo = p[i];
+    if (p[i] > hi) hi = p[i];
+  }
+  const sum = lo + hi;
+  return pins.map(([x, y]) => (i === 0 ? [sum - x, y] : [x, sum - y]) as Point);
+}
+
+/** Pin layout for a placement, with the armed mirrors applied. */
+function placePins(kind: ElementKind, a: Point, b: Point): Point[] {
+  let pins = makePins(kind, a, b);
+  if (placeFlipX) pins = mirrorPins(pins, 'x');
+  if (placeFlipY) pins = mirrorPins(pins, 'y');
+  return pins;
+}
+
 function choosePart(p: PartDef) {
   placing = p;
   pasting = null;
@@ -984,6 +1016,47 @@ function rotateElements(sel: ElementSpec[]) {
 }
 
 const rotateSelection = () => rotateElements(elements.filter((e) => selectedIds.has(e.id)));
+
+/** Mirror parts about their bounding box: 'x' flips left-right (about the
+ *  vertical axis), 'y' flips top-bottom — the KiCad convention. Pin ORDER is
+ *  untouched, so terminal identity survives: a mirrored op-amp keeps in+ as
+ *  pin 0, it just sits on the other side.
+ *
+ *  The mirror is about the bounding box rather than the centroid because
+ *  `min + max - v` is an exact involution on the integer grid: the box maps
+ *  onto itself, so flipping twice lands exactly where you started. A rounded
+ *  centroid does not — a selection whose mean falls on a half unit would
+ *  walk sideways every time you flipped it. */
+function flipElements(sel: ElementSpec[], axis: 'x' | 'y') {
+  if (sel.length === 0) return;
+  const i = axis === 'x' ? 0 : 1;
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (const e of sel) {
+    for (const p of e.pins) {
+      if (p[i] < lo) lo = p[i];
+      if (p[i] > hi) hi = p[i];
+    }
+  }
+  const sum = lo + hi;
+  const many = sel.length > 1 ? ` ${sel.length} parts` : ' part';
+  history.begin(sel, `flip${many} ${axis === 'x' ? 'horizontally' : 'vertically'}`);
+  for (const e of sel) {
+    // Mirror about the SELECTION's box, not each part's own, so a group
+    // keeps its arrangement instead of every part flipping in place.
+    const pins = e.pins.map(
+      ([x, y]) => (axis === 'x' ? [sum - x, y] : [x, sum - y]) as Point,
+    );
+    editDoc({ t: 'Move', id: e.id, pins });
+  }
+  history.end();
+}
+
+const flipSelection = (axis: 'x' | 'y') =>
+  flipElements(
+    elements.filter((e) => selectedIds.has(e.id)),
+    axis,
+  );
 
 /** Bulk-delete threshold: above this, rebuild the array (and the local
  * netlist) once instead of once per element — a marquee over a district can
@@ -1382,7 +1455,7 @@ function partMenu(e: ElementSpec, x: number, y: number): MenuItem[] {
   items.push(
     { label: 'Edit…', run: () => openPropsDialog(e) },
     { label: `Rotate${many}`, hint: 'Q', run: () => rotateElements(groupOf(e)) },
-    { label: `Delete${many}`, hint: 'X', run: () => deleteElements(groupOf(e)) },
+    { label: `Delete${many}`, hint: 'Del', run: () => deleteElements(groupOf(e)) },
   );
   if (e.kind.t !== 'Ground') {
     items.push(
@@ -1423,7 +1496,7 @@ function partMenu(e: ElementSpec, x: number, y: number): MenuItem[] {
 function probeMenu(p: Probe): MenuItem[] {
   const items: MenuItem[] = [
     { head: `${p.kind === 'v' ? 'Voltage probe' : 'Current clamp'} ${p.pid}` },
-    { label: 'Delete probe', hint: 'X', run: () => deleteProbe(p) },
+    { label: 'Delete probe', hint: 'Del', run: () => deleteProbe(p) },
   ];
   if (p.kind === 'v') {
     const r = p.r;
@@ -1473,7 +1546,17 @@ let panDrag: { x: number; y: number; ox: number; oy: number } | null = null;
 /** Dragging one pin of one part: `k` is the pin index being carried. */
 let pinDrag: { id: number; k: number; moved: boolean; lastSent: number } | null = null;
 let placeDrag: { a: Point; b: Point } | null = null;
-let marquee: { x0: number; y0: number; x1: number; y1: number; add: boolean } | null = null;
+/** How a click or sweep combines with what is already selected. Ctrl is taken
+ *  by map panning, so SUBTRACT is Alt — the CAD convention (shift adds, alt
+ *  removes) and the only free modifier. Shift is strictly ADDITIVE: a careful
+ *  multi-select must never evaporate because one shift-click landed wrong. */
+type SelectMode = 'replace' | 'add' | 'remove';
+const selectModeOf = (ev: { shiftKey: boolean; altKey: boolean }): SelectMode =>
+  ev.altKey ? 'remove' : ev.shiftKey ? 'add' : 'replace';
+const modifiedSelect = (ev: { shiftKey: boolean; altKey: boolean }) =>
+  ev.shiftKey || ev.altKey;
+
+let marquee: { x0: number; y0: number; x1: number; y1: number; mode: SelectMode } | null = null;
 let moveDrag: {
   items: { id: number; startPins: Point[] }[];
   start: Point;
@@ -1769,7 +1852,7 @@ canvas.addEventListener('pointerdown', (ev) => {
   // Pins take priority: dragging a terminal reshapes ITS part — stretch,
   // shrink, reorient. Wires are placed with W (or the right-click menu),
   // never by pin-dragging.
-  if (!ev.shiftKey) {
+  if (!modifiedSelect(ev)) {
     const own = pinOwnerAt(ev.clientX, ev.clientY);
     if (own) {
       history.begin([own.e], 'reshape part'); // pins mutate in place mid-drag
@@ -1787,7 +1870,7 @@ canvas.addEventListener('pointerdown', (ev) => {
   // grab bar, the frame, empty faceplate away from the children — picks up the
   // whole machine. Shift+drag stays a marquee, so a selection can still be
   // swept across the cabinet.
-  if (!e && !ev.shiftKey && hoist.zoneAt(cam, ev.clientX, ev.clientY)) {
+  if (!e && !modifiedSelect(ev) && hoist.zoneAt(cam, ev.clientX, ev.clientY)) {
     startMachineDrag(ev.clientX, ev.clientY);
     return;
   }
@@ -1797,14 +1880,18 @@ canvas.addEventListener('pointerdown', (ev) => {
       y0: ev.clientY,
       x1: ev.clientX,
       y1: ev.clientY,
-      add: ev.shiftKey,
+      mode: selectModeOf(ev),
     };
     return;
   }
-  if (ev.shiftKey) {
-    // Shift+click toggles membership in the selection.
-    if (selectedIds.has(e.id)) selectedIds.delete(e.id);
-    else selectedIds.add(e.id);
+  const mode = selectModeOf(ev);
+  if (mode !== 'replace') {
+    // Deliberately NOT a toggle: shift only ever adds, alt only ever removes.
+    // A toggle means a mis-aimed shift-click silently drops the part you meant
+    // to keep, which is the failure this system is built to avoid.
+    if (mode === 'add') selectedIds.add(e.id);
+    else selectedIds.delete(e.id);
+    selectedProbe = null;
     return;
   }
   const startMove = (all: number[]) => {
@@ -1844,12 +1931,6 @@ canvas.addEventListener('pointerdown', (ev) => {
 });
 
 // Double-click a part: floating property editor, parked next to it.
-canvas.addEventListener('dblclick', (ev) => {
-  if (placing || pasting) return;
-  if (scopeZoneAt(ev.clientX, ev.clientY)) return;
-  const e = elementAt(ev.clientX, ev.clientY);
-  if (e) openPropsDialog(e);
-});
 
 canvas.addEventListener('pointermove', (ev) => {
   mouse = { x: ev.clientX, y: ev.clientY };
@@ -2064,7 +2145,9 @@ canvas.addEventListener('pointerup', (ev) => {
     const [gx0, gy0] = toGrid(Math.min(marquee.x0, marquee.x1), Math.min(marquee.y0, marquee.y1));
     const [gx1, gy1] = toGrid(Math.max(marquee.x0, marquee.x1), Math.max(marquee.y0, marquee.y1));
     const dragged = Math.abs(marquee.x1 - marquee.x0) + Math.abs(marquee.y1 - marquee.y0) > 6;
-    if (!marquee.add) {
+    // Only an UNMODIFIED click clears. A stray shift- or alt-click on empty
+    // space leaves a hard-won selection exactly as it was.
+    if (marquee.mode === 'replace') {
       selectedIds.clear();
       selectedProbe = null;
       selectedMachine = false;
@@ -2072,7 +2155,8 @@ canvas.addEventListener('pointerup', (ev) => {
     if (dragged) {
       for (const e of space.query(gx0, gy0, gx1, gy1)) {
         if (e.pins.some(([x, y]) => x >= gx0 && x <= gx1 && y >= gy0 && y <= gy1)) {
-          selectedIds.add(e.id);
+          if (marquee.mode === 'remove') selectedIds.delete(e.id);
+          else selectedIds.add(e.id);
         }
       }
     }
@@ -2085,7 +2169,7 @@ canvas.addEventListener('pointerup', (ev) => {
     const clicked = placeDrag.b[0] === a[0] && placeDrag.b[1] === a[1];
     const b = clicked ? placeEnd(a) : placeDrag.b;
     const id = newId();
-    editDoc({ t: 'Add', spec: { id, kind, pins: makePins(kind, a, b) } });
+    editDoc({ t: 'Add', spec: { id, kind, pins: placePins(kind, a, b) } });
     selectedIds = new Set([id]);
     selectedProbe = null;
     selectedMachine = false;
@@ -2240,9 +2324,9 @@ window.addEventListener('keydown', (ev) => {
     canvas.style.cursor = 'crosshair';
     return;
   }
-  if (ev.key === 'Delete' || ev.key === 'Backspace' || ev.key === 'x') {
-    // Probes win over the part selection: pointing at a flag and pressing X
-    // must never delete the parts you happen to have selected elsewhere.
+  if (ev.key === 'Delete' || ev.key === 'Backspace') {
+    // Probes win over the part selection: pointing at a flag and pressing
+    // Delete must never remove the parts you have selected elsewhere.
     const pr =
       (mouse ? probeAt(mouse.x, mouse.y) : undefined) ??
       (selectedProbe !== null ? probes.find((p) => p.pid === selectedProbe) : undefined);
@@ -2266,6 +2350,23 @@ window.addEventListener('keydown', (ev) => {
       }));
     } else {
       rotateSelection();
+    }
+    return;
+  }
+  if (ev.key === 'x' || ev.key === 'X' || ev.key === 'y' || ev.key === 'Y') {
+    const axis: 'x' | 'y' = ev.key === 'x' || ev.key === 'X' ? 'x' : 'y';
+    if (pasting) {
+      // Ghost pins are relative to the cursor, so the centroid is the origin.
+      pasting = pasting.map((c) => ({
+        kind: c.kind,
+        pins: c.pins.map(([x, y]) => (axis === 'x' ? [-x, y] : [x, -y]) as Point),
+      }));
+    } else if (placing) {
+      // Arm the mirror so the orientation is chosen BEFORE the part lands.
+      if (axis === 'x') placeFlipX = !placeFlipX;
+      else placeFlipY = !placeFlipY;
+    } else {
+      flipSelection(axis);
     }
     return;
   }
@@ -2564,7 +2665,9 @@ function drawFloatScopes() {
   for (const s of floatScopes) {
     const owner = scopeOwnerOf(s);
     if (owner) {
-      drawScopePlaceholder(s, owner);
+      // The placeholder is a handle, not content: it belongs with the other
+      // schematic furniture that stands down for the calm zoomed-out view.
+      if (cam.scale >= LOD_FULL) drawScopePlaceholder(s, owner);
       continue;
     }
     const [X, Y, W, H] = scopeRectPx(s);
@@ -2647,10 +2750,10 @@ function inView(v: ViewRect, id: number): boolean {
 }
 
 /** Level of detail, px per grid unit:
- *   >= 6  full symbols (dots, glow, text)
- *   2..6  conductor chains only, still solver-colored
- *   < 2   one segment per element */
-const LOD_FULL = 6;
+ *   >= LOD_FULL  full symbols (dots, glow, text, probe flags, panel tabs)
+ *   2..LOD_FULL  conductor chains only, still solver-colored
+ *   < 2          one segment per element
+ * LOD_FULL lives in render.ts so every switch tied to it happens at once. */
 const LOD_CHAIN = 2;
 
 /** Reused draw list so a steady frame allocates nothing. */
@@ -2665,7 +2768,11 @@ let simDebt = 0;
 let lastT = performance.now();
 
 function frame(now: number) {
-  const wallDt = Math.min(0.1, (now - lastT) / 1000);
+  // Clamp below at 0: on a cold load Chrome can deliver a first rAF
+  // timestamp *earlier* than the module-eval-time lastT. A negative delta
+  // would drive `want` negative, which reinterprets as ~2^32 u32 steps at
+  // the wasm ABI (Sim.advance(max_steps: u32)) — a multi-minute spin.
+  const wallDt = Math.min(0.1, Math.max(0, (now - lastT) / 1000));
   lastT = now;
 
   // Speakers are sources of sound the moment they exist in the document.
@@ -2766,15 +2873,21 @@ function frame(now: number) {
 
   // Ghost previews for in-progress edits.
   ctx.globalAlpha = 0.45;
+  // While you are DRAWING it, you always see it — that is the whole point of
+  // dragging a part out. It is only the ghost that idles under the cursor
+  // before the drag that is suppressed for few-pinned parts, since those are
+  // drawn rather than stamped down as an object.
   if (placeDrag && placing) {
     const kind = placing.make();
     const clicked = placeDrag.b[0] === placeDrag.a[0] && placeDrag.b[1] === placeDrag.a[1];
     const b = clicked ? placeEnd(placeDrag.a) : placeDrag.b;
-    drawElement({ ctx, cam, dots, dtSec: 0 }, { id: 0, kind, pins: makePins(kind, placeDrag.a, b) });
+    drawElement({ ctx, cam, dots, dtSec: 0 }, { id: 0, kind, pins: placePins(kind, placeDrag.a, b) });
   } else if (placing && mouse) {
     const kind = placing.make();
-    const a = snap(mouse.x, mouse.y);
-    drawElement({ ctx, cam, dots, dtSec: 0 }, { id: 0, kind, pins: makePins(kind, a, placeEnd(a)) });
+    if (pinCount(kind) > 3) {
+      const a = snap(mouse.x, mouse.y);
+      drawElement({ ctx, cam, dots, dtSec: 0 }, { id: 0, kind, pins: placePins(kind, a, placeEnd(a)) });
+    }
   }
   if (pasting && mouse) {
     const at = snap(mouse.x, mouse.y);
@@ -2818,7 +2931,9 @@ function frame(now: number) {
 
   drawSelectionBoxes(view);
   drawMachineSelection();
-  drawProbeMarkers();
+  // Probe flags are schematic furniture: in the calm zoomed-out view they
+  // are clutter over a picture that is about voltage, not instrumentation.
+  if (cam.scale >= LOD_FULL) drawProbeMarkers();
   drawFloatScopes();
   drawCursors(now);
   syncPropsPanel();
@@ -2839,15 +2954,15 @@ function frame(now: number) {
     : panelTool
     ? 'control panel: drag a region around the parts you want on it (Esc cancels)'
     : pasting
-      ? `pasting ${pasting.length} parts (Q rotates, click places, Esc cancels)`
+      ? `pasting ${pasting.length} parts (Q rotates, X/Y flips, click places, Esc cancels)`
       : placing
-        ? `placing: ${placing.name} (click or drag, Q rotates, Esc exits)`
+        ? `placing: ${placing.name} (click or drag, Q rotates, X/Y flips, Esc exits)`
         : machineDrag
           ? 'moving the FREIGHT HOIST — release to place it (⌘Z undoes the whole move)'
           : selectedMachine
             ? 'FREIGHT HOIST selected — drag its top bar (or its cabinet) to move the whole machine; its terminals come with it'
             : selectedIds.size > 1
-              ? `${selectedIds.size} selected (drag moves, Q rotates, ⌘C copies, X deletes)`
+              ? `${selectedIds.size} selected (drag moves, Q rotates, X/Y flips, shift+ adds, alt+ removes, Del deletes)`
               : '';
   const note = history.note();
   // A standing count of the damage, so somebody working at the other end of
@@ -2874,7 +2989,7 @@ function frame(now: number) {
       : '';
   const hints = hintsOpen
     ? `\nparts: R C L W G V D N P M A U 5 S B T Z E F I · ⇧V rail · drag part = move · drag the hoist cabinet = move the machine · dbl-click = edit values · right-click = menu` +
-      `\ndrag pin = reshape part · W then drag = wire · drag empty = select · Q rotate · ⌘Z undo · ⌘C/⌘V copy/paste · 1/2 probe · 3 listen · 0 ref · O scope · \` dock · J panel · K repair · X delete` +
+      `\ndrag pin = reshape part · W then drag = wire · drag empty = select · Q rotate · X/Y flip · ⌘Z undo · ⌘C/⌘V copy/paste · 1/2 probe · 3 listen · 0 ref · O scope · \` dock · J panel · K repair · Del delete` +
       `\nH home district · shift+H fit everything · wheel = zoom (0.4–200 px/unit) · pan: middle / ctrl+drag / space+drag · ? hides this`
     : `\n? controls`;
   hud.textContent =
