@@ -1905,7 +1905,16 @@ impl Engine {
             put(e.state.vg1);
             put(e.state.vg2);
             put(e.state.region as f64);
-            for p in 0..MAX_PINS {
+            // Only the pins the part HAS. The slots past `pin_count()` are
+            // structurally dead — nothing ever writes them, every device
+            // clears the whole array before filling its own prefix — so
+            // hashing them fed a run of guaranteed zeros into the digest and
+            // made every golden hash a function of MAX_PINS. Scoping the
+            // loop moves every hash exactly ONCE and then decouples the
+            // digest from the ceiling permanently, which is what lets the
+            // logic family raise MAX_PINS without touching provenance again.
+            let np = e.spec.kind.pin_count();
+            for p in 0..np {
                 put(e.state.lastv[p]);
                 put(e.state.pin_i[p]);
             }
