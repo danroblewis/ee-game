@@ -17,7 +17,11 @@ export interface RoomView {
 }
 
 /** Which room this socket landed in. Null against a pre-rooms server, which
- * is the one case where the client genuinely cannot say where it is. */
+ * is the one case where the client genuinely cannot say where it is.
+ *
+ * This is the CLIENT's shape, not the wire's: `machine` and `view` ride the
+ * hello beside `room`, not inside it, and `parseHello` is the one place they
+ * are joined up. Build one anywhere else and you are guessing. */
 export interface RoomHello {
   /** The 6-char code: immutable, the filename, and the `?room=` value. */
   id: string;
@@ -41,6 +45,174 @@ export interface ServerFrame {
   /** Sim seconds per wall second, smoothed server-side (absent on servers
    * from before it rode the frame). */
   rt?: number;
+}
+
+// ------------------------------------------------------------- hello parse
+//
+// The boundary. `JSON.parse` hands back `any`, so every field read off a
+// socket message is a claim the compiler cannot check — and a declared-but-
+// never-delivered field is invisible: it reads as `undefined` at runtime and
+// typechecks clean forever. That is not hypothetical. `hello` used to be
+// forwarded as `m.room`, which carries {id, name, template, players} and
+// NOTHING ELSE, while the server writes `view` and `machine` at the TOP LEVEL
+// beside it. `RoomHello` declared all six fields, tsc was happy, and two of
+// the four things a template promises — the camera it frames and the scopes
+// it ships — silently never arrived.
+//
+// So the wire is parsed into the declared shape here, once, and anything that
+// does not match is REPORTED rather than absorbed. See
+// `src/wire/hello.contract.json`, which pins this shape from both ends: the
+// server asserts it against a real `hello_msg` (crates/server, `the_hello_a_
+// room_sends_is_the_shape_the_client_parses`), the client asserts it against
+// `parseHello` (`pnpm --filter @ee/app wirecheck`).
+
+/** One field of `hello` that did not arrive in the shape the client expects.
+ * Never fatal — a client that renders four fifths of a room beats a blank
+ * page — but never silent either: it means the two halves have drifted. */
+export interface WireDrift {
+  /** Dotted path as the CLIENT expects it, e.g. `hello.view.home`. */
+  field: string;
+  /** What that path has to be for the field to reach the player. */
+  want: string;
+  /** What turned up instead: a type name, `missing`, or where it was found. */
+  got: string;
+}
+
+/** `hello`, parsed. Exactly the arguments `onHello` takes, plus the list of
+ * places the payload disagreed with this client. */
+export interface ParsedHello {
+  you: number;
+  elements: ElementSpec[];
+  probes: Probe[];
+  panels: Panel[];
+  room: RoomHello | null;
+  drift: WireDrift[];
+}
+
+const typeName = (v: unknown): string =>
+  v === undefined ? 'missing' : v === null ? 'null' : Array.isArray(v) ? 'array' : typeof v;
+
+const isRecord = (v: unknown): v is Record<string, unknown> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v);
+
+/**
+ * Turn a raw `hello` message into the shape the rest of the client is written
+ * against. Never throws: a malformed payload yields defaults plus a `drift`
+ * entry naming the field, so the failure is a loud line in the console and a
+ * failing check, not a feature that quietly stops existing.
+ */
+export function parseHello(raw: unknown): ParsedHello {
+  const drift: WireDrift[] = [];
+  const note = (field: string, want: string, got: unknown) =>
+    drift.push({ field, want, got: typeof got === 'string' ? got : typeName(got) });
+
+  if (!isRecord(raw)) {
+    note('hello', 'object', raw);
+    return { you: 0, elements: [], probes: [], panels: [], room: null, drift };
+  }
+  const m = raw;
+
+  let you = 0;
+  if (typeof m.you === 'number' && Number.isFinite(m.you)) you = m.you;
+  else note('hello.you', 'number', m.you);
+
+  /** Optional-on-the-wire list: absent is fine (old servers), wrong is not. */
+  const list = <T>(v: unknown, field: string): T[] => {
+    if (v === undefined) return [];
+    if (Array.isArray(v)) return v as T[];
+    note(field, 'array', v);
+    return [];
+  };
+  const elements = list<ElementSpec>(m.elements, 'hello.elements');
+  const probes = list<Probe>(m.probes, 'hello.probes');
+  const panels = list<Panel>(m.panels, 'hello.panels');
+
+  // No `room` key at all = a server from before rooms existed. That is a
+  // supported server, not drift: the chip says "this server has no room list"
+  // and everything else works.
+  let room: RoomHello | null = null;
+  if (m.room !== undefined && m.room !== null) {
+    if (!isRecord(m.room)) {
+      note('hello.room', 'object', m.room);
+    } else {
+      const r = m.room;
+      const str = (v: unknown, field: string): string => {
+        if (typeof v === 'string') return v;
+        note(field, 'string', v);
+        return '';
+      };
+      const id = str(r.id, 'hello.room.id');
+      const name = str(r.name, 'hello.room.name');
+      const template = str(r.template, 'hello.room.template');
+      let players = 0;
+      if (typeof r.players === 'number' && Number.isFinite(r.players)) players = r.players;
+      else note('hello.room.players', 'number', r.players);
+
+      // THE JOIN. `machine` and `view` are top-level: they are this client's
+      // half of a room (a goal card to show, a camera to fly, instruments to
+      // materialize), not registry metadata about it. A server that nests
+      // them instead is still understood — losing a template's whole camera
+      // over a moved brace would be absurd — but it is reported, because one
+      // of the two halves is then wrong.
+      let machineRaw = m.machine;
+      if (machineRaw === undefined && r.machine !== undefined) {
+        machineRaw = r.machine;
+        note('hello.machine', 'boolean beside `room`', 'nested inside hello.room');
+      }
+      let machine = false;
+      if (typeof machineRaw === 'boolean') machine = machineRaw;
+      else note('hello.machine', 'boolean', machineRaw);
+
+      let viewRaw = m.view;
+      if (viewRaw === undefined && r.view !== undefined) {
+        viewRaw = r.view;
+        note('hello.view', 'object beside `room`', 'nested inside hello.room');
+      }
+      let view: RoomView | null = null;
+      if (viewRaw === undefined) {
+        // Every rooms-era server sends a view object, even an empty one.
+        note('hello.view', 'object', viewRaw);
+      } else if (viewRaw === null) {
+        view = null; // an explicit "no opinion": the client's own district
+      } else if (!isRecord(viewRaw)) {
+        note('hello.view', 'object', viewRaw);
+      } else {
+        view = {};
+        const h = viewRaw.home;
+        if (h !== undefined && h !== null) {
+          if (
+            Array.isArray(h) &&
+            h.length === 4 &&
+            h.every((n) => typeof n === 'number' && Number.isFinite(n))
+          ) {
+            view.home = [h[0] as number, h[1] as number, h[2] as number, h[3] as number];
+          } else {
+            note('hello.view.home', 'four finite numbers', h);
+          }
+        }
+        const s = viewRaw.scopes;
+        if (s !== undefined) {
+          if (Array.isArray(s)) {
+            // Seeds are hand-editable (a template is a file): keep the
+            // objects, drop anything that is not one. `seedToScope` clamps
+            // every field inside them.
+            view.scopes = s.filter(isRecord) as unknown as SeedScope[];
+          } else {
+            note('hello.view.scopes', 'array', s);
+          }
+        }
+      }
+
+      room = { id, name, template, players, machine, view };
+    }
+  }
+
+  return { you, elements, probes, panels, room, drift };
+}
+
+/** One line per drifted field, for a console or a toast. */
+export function describeDrift(drift: WireDrift[]): string {
+  return drift.map((d) => `${d.field}: want ${d.want}, got ${d.got}`).join('; ');
 }
 
 export interface NetHandlers {
@@ -86,6 +258,11 @@ export interface NetHandlers {
   onPresence(n: number): void;
   onCursor(who: number, x: number, y: number): void;
   onClose(): void;
+  /** The server's `hello` disagreed with the shape this client parses. Always
+   * a bug in one half or the other, and always worth being noisy about: the
+   * fields that go missing this way (a room's camera, its scopes, whether it
+   * has a goal) fail by simply not happening. */
+  onWireDrift?(drift: WireDrift[]): void;
 }
 
 export interface Net {
@@ -167,13 +344,20 @@ export function connect(h: NetHandlers, room: string | null = null): Net {
   const onMessage = (ev: MessageEvent) => {
     const m = JSON.parse(ev.data as string);
     switch (m.t) {
-      case 'hello':
-        // A server that predates rooms sends no `room` key: null, not a
-        // fabricated one — "I don't know which room" is honest, and the chip
-        // says so rather than showing a made-up code.
-        h.onHello(m.you, m.elements, m.probes ?? [], m.panels ?? [], m.room ?? null);
-        if (m.room && typeof m.room.id === 'string') want = m.room.id;
+      case 'hello': {
+        // Parsed, not trusted — see `parseHello`. A server that predates
+        // rooms sends no `room` key: null, not a fabricated one, because "I
+        // don't know which room" is honest and the chip says so rather than
+        // showing a made-up code.
+        const p = parseHello(m);
+        if (p.drift.length > 0) {
+          console.error(`hello: wire drift — ${describeDrift(p.drift)}`);
+          h.onWireDrift?.(p.drift);
+        }
+        h.onHello(p.you, p.elements, p.probes, p.panels, p.room);
+        if (p.room && p.room.id) want = p.room.id;
         break;
+      }
       case 'roommeta':
         h.onRoomMeta(m.id, m.name);
         break;

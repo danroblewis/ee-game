@@ -142,6 +142,117 @@ fn the_hello_frame_names_the_room_and_carries_its_whole_setup() {
     assert_eq!(m2["room"]["template"], "sandbox");
 }
 
+/// The JSON type of a dotted path, in the names the client's `typeof` uses.
+fn json_type_at(root: &serde_json::Value, path: &str) -> &'static str {
+    let mut v = root;
+    for key in path.split('.') {
+        match v.get(key) {
+            Some(next) => v = next,
+            None => return "missing",
+        }
+    }
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// THE OTHER HALF of `hello`: not "does the server send it" — the test above
+/// already asked that, passed, and the feature was still broken — but "is it
+/// the shape the client PARSES".
+///
+/// `view` and `machine` reached the socket in perfect health and stopped at
+/// the client boundary, which forwarded `hello.room` alone as its RoomHello.
+/// The TypeScript interface declared all six fields; `JSON.parse` returns
+/// `any`; nothing on either side could notice. A template's camera, its
+/// seeded scopes and its goal card simply never happened.
+///
+/// So the shape now lives in one file that neither half owns —
+/// `packages/app/src/wire/hello.contract.json` — and both halves assert
+/// against it: this test against a real `hello_msg`, and
+/// `pnpm --filter @ee/app wirecheck` against `parseHello`. Move a field on
+/// either side and one of the two fails, naming the path.
+#[test]
+fn the_hello_a_room_sends_is_the_shape_the_client_parses() {
+    let contract: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../packages/app/src/wire/hello.contract.json"
+    ))
+    .expect("the hello contract is not valid JSON");
+    let types = contract["types"]
+        .as_object()
+        .expect("the contract lists the paths a hello must carry");
+    let sample = &contract["sample"];
+
+    let (rd, td) = dirs("hellocontract");
+    let reg = Registry::open(&rd, &td);
+    // The hoist template is the one that exercises every path by PRESENCE:
+    // parts, panels, probes, a framed camera, a seeded scope and a goal.
+    let h = reg.create("Hoist practice", "hoist").unwrap();
+    let hello: serde_json::Value = serde_json::from_str(&crate::hello_msg(&h, 1)).unwrap();
+
+    for (path, want) in types {
+        let want = want.as_str().expect("contract types are type names");
+        assert_eq!(
+            json_type_at(&hello, path),
+            want,
+            "hello.{path}: the client parses this as {want}. If the server \
+             moved or renamed it, move it in hello.contract.json too — and \
+             fix packages/app/src/net.ts, which is where it lands."
+        );
+        // The sample in the file is what the client's own check parses, so it
+        // must not rot away from the contract it illustrates.
+        assert_eq!(
+            json_type_at(sample, path),
+            want,
+            "hello.contract.json: `sample` disagrees with `types` at {path}"
+        );
+    }
+
+    // Where the two client-side fields live is the whole point: BESIDE
+    // `room`, not inside it. They are this client's half of a room — a camera
+    // to fly, instruments to materialize, a goal card to show — not registry
+    // metadata about it, and `room` is the object the lobby also serves.
+    assert!(
+        hello["room"].get("view").is_none() && hello["room"].get("machine").is_none(),
+        "view/machine are top-level in `hello`; a second copy inside `room` \
+         is a fork waiting to disagree with itself"
+    );
+
+    // And the values, not just the shapes: a template that frames a district
+    // and ships an instrument has to say so in the payload the client reads.
+    assert_eq!(hello["machine"], true);
+    let home = hello["view"]["home"].as_array().unwrap();
+    assert_eq!(home.len(), 4, "a camera rect is [x0, y0, x1, y1]");
+    assert!(home[2].as_f64().unwrap() > home[0].as_f64().unwrap());
+    assert_eq!(hello["view"]["scopes"].as_array().unwrap().len(), 1);
+
+    // A hand-written template's home reaches the same path — this is the
+    // field that decides whether a player lands on their own level or 500
+    // units away from it.
+    std::fs::write(
+        td.join("district.json"),
+        serde_json::json!({
+            "name": "District", "blurb": "far from the origin",
+            "elements": [], "probes": [], "panels": [],
+            "machine": {"kind": "none"},
+            "view": {"home": [500.0, 500.0, 540.0, 530.0], "scopes": []}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let d = reg.create("Far away", "district").unwrap();
+    let dh: serde_json::Value = serde_json::from_str(&crate::hello_msg(&d, 2)).unwrap();
+    assert_eq!(
+        dh["view"]["home"],
+        serde_json::json!([500.0, 500.0, 540.0, 530.0])
+    );
+    assert_eq!(dh["machine"], false);
+}
+
 #[test]
 fn a_machineless_template_keeps_the_reserved_ids_free() {
     let (rd, td) = dirs("sandbox");

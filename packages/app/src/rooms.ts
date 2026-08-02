@@ -247,9 +247,37 @@ export function createRooms(deps: RoomsDeps): RoomsUI {
   const foot = el('div', 'rdlg-ft', box);
   const msg = el('div', 'rmsg', foot);
 
-  function say(text: string, kind: '' | 'good' | 'bad' = '') {
+  type MsgKind = '' | 'good' | 'bad';
+
+  /** A message that has to outlive the fetch already in flight behind it.
+   * The browser opens ITSELF when a room disappears under the player, and
+   * opening it starts an async refresh whose routine "N rooms on this
+   * server" lands a moment later — directly on top of the one sentence that
+   * explains why a dialog just appeared. Pinned text holds the footer until
+   * the PLAYER does something that deserves a new line. */
+  let pinned: { text: string; kind: MsgKind } | null = null;
+
+  function setMsg(text: string, kind: MsgKind) {
     msg.className = `rmsg${kind ? ` ${kind}` : ''}`;
     msg.textContent = text;
+  }
+
+  /** Say something because of what the player just did: it replaces a pin. */
+  function say(text: string, kind: MsgKind = '') {
+    pinned = null;
+    setMsg(text, kind);
+  }
+
+  /** Say something because of what just HAPPENED TO the player. */
+  function pin(text: string, kind: MsgKind) {
+    pinned = { text, kind };
+    setMsg(text, kind);
+  }
+
+  /** Routine status — a count, a hint. Never displaces an explanation. */
+  function status(text: string) {
+    if (pinned) setMsg(pinned.text, pinned.kind);
+    else setMsg(text, '');
   }
 
   function fail(e: unknown) {
@@ -347,7 +375,7 @@ export function createRooms(deps: RoomsDeps): RoomsUI {
       rooms = r.rooms ?? [];
       unreachable = false;
       if (tab === 'rooms') paintRooms();
-      say(`${plural(rooms.length, 'room')} on this server`);
+      status(`${plural(rooms.length, 'room')} on this server`);
     } catch (e) {
       rooms = [];
       unreachable = true;
@@ -468,7 +496,7 @@ export function createRooms(deps: RoomsDeps): RoomsUI {
     nameInput = input;
     const go = button('rbtn go', 'create room', bar, () => void create(input.value));
     go.disabled = picked === null;
-    say(picked ? `new room from "${picked.name}"` : 'pick a template');
+    status(picked ? `new room from "${picked.name}"` : 'pick a template');
   }
 
   async function refreshTemplates() {
@@ -576,7 +604,7 @@ export function createRooms(deps: RoomsDeps): RoomsUI {
       };
     }
     button('rbtn go rft', 'save template', foot, run);
-    say('the template is written on the server, and appears in "new room" at once');
+    status('the template is written on the server, and appears in "new room" at once');
   }
 
   /** A room name → a legal template id (`^[a-z0-9][a-z0-9-]{0,31}$`). */
@@ -753,16 +781,37 @@ export function createRooms(deps: RoomsDeps): RoomsUI {
       paintChip();
       document.title = 'EE Game';
       goneStreak++;
-      if (reason === 'deleted') deps.toast(`room "${was}" was deleted — moving you out`);
-      else deps.toast(`room ${id || '?'} is not on this server`);
-      if (goneStreak === 1) {
-        // Fall back to whatever the server calls default. If THAT is gone
-        // too the next roomgone opens the browser instead of ping-ponging.
-        deps.join(null);
-      } else {
-        open('rooms');
-        say('that room is gone — join another, or start a new one', 'bad');
+      // A server with NO rooms at all answers every reconnect with another
+      // roomgone — one per RECONNECT_MS, for as long as the player sits
+      // there. So this runs on a repeat, and everything it does has to be
+      // something it is willing to do forever:
+      //
+      //   1st  news. Say it, and fall back to whatever the server calls
+      //        default — which is nearly always where the player wants to be.
+      //   2nd  the answer: there is nowhere to fall back to. Show the browser
+      //        and explain, once.
+      //   3rd+ the player is ALREADY looking at the browser, quite possibly
+      //        half-way through naming their new room. Say nothing, touch
+      //        nothing. Re-opening the browser here is what put the tab back
+      //        to "browse" and binned a half-typed name every 2.5 s.
+      if (goneStreak <= 2) {
+        if (reason === 'deleted') deps.toast(`room "${was}" was deleted — moving you out`);
+        else deps.toast(`room ${id || '?'} is not on this server`);
       }
+      if (goneStreak === 1) {
+        deps.join(null);
+        return;
+      }
+      if (goneStreak > 2) return;
+      // Open the browser — unless it is already open, in which case it is the
+      // player's: refresh the list under them rather than resetting the pane
+      // they are working in.
+      if (!isOpen()) open('rooms');
+      else if (tab === 'rooms') void refreshRooms();
+      // Pinned, not said: `open()` has just started a room fetch whose
+      // "0 rooms on this server" would otherwise land on top of the only
+      // sentence that explains why this dialog is here.
+      pin('that room is gone — join another, or start a new one', 'bad');
     },
     onOffline() {
       online = false;

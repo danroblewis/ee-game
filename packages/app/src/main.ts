@@ -576,13 +576,28 @@ const net = connect({
     // belonged to it BEFORE rooms.ts moves us, so nothing survives the
     // handover; `roomKey` is cleared so the landing hello counts as a
     // change and re-fits the camera.
-    roomKey = null;
-    resetForRoom(null);
-    hoist.clear(); // whatever machine that room had, it is not ours any more
+    //
+    // ONCE, though. A server with no rooms sends one of these every reconnect
+    // for as long as the player sits there, and the teardown ends in
+    // fitHome(): repeating it would snatch the camera back to the default
+    // district every 2.5 s while they are panning around the local sim. If
+    // `roomKey` is already null there is nothing left to drop.
+    if (roomKey !== null) {
+      roomKey = null;
+      resetForRoom(null);
+      hoist.clear(); // whatever machine that room had, it is not ours any more
+    }
     roomsUI.onGone(id, reason);
   },
   onCursor(who, x, y) {
     if (who !== myId) cursors.set(who, { x, y, seen: performance.now() });
+  },
+  onWireDrift(drift) {
+    // The server said something this client does not understand. Fields that
+    // arrive this way fail by NOT HAPPENING — a camera that never flies, a
+    // scope that never appears — so it gets said out loud in the world
+    // instead of only in a console nobody has open.
+    toast(`this client and this server disagree about ${drift.map((d) => d.field).join(', ')}`);
   },
   onClose() {
     if (online) {

@@ -38,7 +38,15 @@
 //! that ignores unknown `t` values keeps working):
 //!   hello{..., room:{id, name, template, players}, view:{home, scopes},
 //!         machine: bool}   — which room this is, where the camera lands,
-//!                            and whether the room has a goal at all
+//!                            and whether the room has a goal at all.
+//!                            `view` and `machine` sit BESIDE `room`, not
+//!                            inside it: they are the client's half of a
+//!                            room, not registry metadata about it. That
+//!                            exact split is pinned by
+//!                            packages/app/src/wire/hello.contract.json and
+//!                            asserted from both ends — see
+//!                            `the_hello_a_room_sends_is_the_shape_the_
+//!                            client_parses` and the client's `wirecheck`.
 //!   roommeta{id, name}     — a rename, broadcast to everyone inside
 //!   roomgone{id, reason}   — "deleted" | "unknown", then the socket closes
 //!
