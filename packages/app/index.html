@@ -385,6 +385,39 @@
          why the motor is about to die. */
       .goal-cell span.over { color: #ff8f6a; font-weight: 600; }
 
+      /* ---- the chip's datasheet: GOAL / PINOUT, opened by the package's
+         own ⓘ badge. A machine has no editable values, so double-clicking it
+         opens this instead of a property editor. */
+      .goal-tabs {
+        display: flex; gap: 4px; padding: 6px 8px 0;
+        border-bottom: 1px solid #2c343d;
+      }
+      .goalcard.collapsed .goal-tabs { display: none; }
+      .goal-tab {
+        background: #1c222a; color: #8ea3b1; border: 1px solid #2c343d;
+        border-bottom: none; border-radius: 4px 4px 0 0; padding: 3px 9px;
+        font: 600 10px ui-monospace, monospace; letter-spacing: 0.1em;
+        cursor: pointer;
+      }
+      .goal-tab:hover { color: #cfe3ee; }
+      .goal-tab.on { background: #2b323c; color: #dff0f8; border-color: #3c4653; }
+      .goal-pins { padding: 8px; }
+      .goalcard.collapsed .goal-pins { display: none; }
+      .goal-pin {
+        display: grid; grid-template-columns: 46px 1fr; gap: 2px 8px;
+        padding: 3px 0; border-bottom: 1px solid #232a32;
+      }
+      .goal-pin:last-child { border-bottom: none; }
+      .goal-pin b {
+        font: 700 11px ui-monospace, monospace; color: #dff0f8;
+        letter-spacing: 0.04em;
+      }
+      .goal-pin i { font-style: normal; color: #8ea3b1; font-size: 11px; }
+      .goal-pin u {
+        grid-column: 2; text-decoration: none; color: #7fb4d0; font-size: 11px;
+        font-variant-numeric: tabular-nums;
+      }
+
       /* ---- damage toasts: "R7 released its magic smoke" (main.ts owns
          the elements; this is only their look). Bottom-left, above the
          scope dock, never in the way of the goal card. */

@@ -379,24 +379,53 @@ fn demo_room_circuit() -> Vec<ElementSpec> {
 //
 // A crate hangs on a platform in a vertical shaft, driven by a DC motor
 // whose two leads are real wire-able terminals. A green band is painted
-// across the shaft; the faceplate reads "CRATE IN BAND — HOLD 5.0 s".
+// across the shaft; the package's title band reads "CRATE IN BAND".
 // Wiring a constant voltage lifts the crate but cannot hold it — voltage
 // buys speed, not position — so holding it needs feedback from the
 // position sensor. There is no quest log and nothing to accept: the goal
 // is measured from solver quantities and nothing else.
 
 /// The hoist's footprint SIZE in grid units. Fixed: the assembly MOVES (a
-/// player drags the cabinet, see `move_machine`), it does not resize.
-const HOIST_W: i32 = 18;
-const HOIST_H: i32 = 22;
+/// player drags the chip, see `move_machine`), it does not resize.
+///
+/// The footprint is the machine's CELL on the grid, not its package body: the
+/// client insets a chip body inside it and leaves a one-unit margin outside
+/// the pin columns for the legs to stand in. That is the whole reason the
+/// "every pin is inside the rect" invariant (and its test) survived the move
+/// to a chip presentation unchanged.
+const HOIST_W: i32 = 16;
+const HOIST_H: i32 = 15;
 
 /// The footprint of a hoist whose top-left corner is at (x0, y0), in GRID
-/// units — broadcast to clients as `rect`. All hoist chrome is drawn inside
+/// units — broadcast to clients as `rect`. The whole package is drawn inside
 /// it and every fixture pin is derived from it, so the box and its terminals
 /// can never drift apart.
 const fn hoist_rect(x0: i32, y0: i32) -> [i32; 4] {
     [x0, y0, x0 + HOIST_W, y0 + HOIST_H]
 }
+
+/// SEAM, server side. Everything the room needs to stand a machine up and let
+/// a player drag it around, in one value. `sane_rect_for`, `ensure_fixture_for`
+/// and `move_machine_for` are written against only this — a second machine is
+/// a second `MachineDef` plus its own mechanism, not a second copy of the
+/// footprint/persistence/validation machinery.
+struct MachineDef {
+    /// Which chip presentation the client should look up (`machine.kind`).
+    kind: &'static str,
+    /// Footprint size in grid units.
+    w: i32,
+    h: i32,
+    /// The terminal map: rect -> the locked child elements, pins and all.
+    fixtures: fn([i32; 4]) -> Vec<ElementSpec>,
+}
+
+/// The one machine this room stands up today.
+const HOIST: MachineDef = MachineDef {
+    kind: "hoist",
+    w: HOIST_W,
+    h: HOIST_H,
+    fixtures: hoist_fixture_at,
+};
 
 /// Where a fresh room stands the hoist: its own district east of the showcase
 /// vignettes (which occupy x <= 40). The live footprint is room STATE from
@@ -424,10 +453,15 @@ const MAX_MACHINE_STEP: i32 = 100_000;
 /// Force a footprint back onto its invariants: normalized corners, the fixed
 /// size, origin inside the world range. Used on load (a save may predate the
 /// field, or be hand-edited) and on every move.
+fn sane_rect_for(def: &MachineDef, r: [i32; 4]) -> [i32; 4] {
+    let x0 = r[0].min(r[2]).clamp(-WORLD_LIMIT, WORLD_LIMIT - def.w);
+    let y0 = r[1].min(r[3]).clamp(-WORLD_LIMIT, WORLD_LIMIT - def.h);
+    [x0, y0, x0 + def.w, y0 + def.h]
+}
+
+/// The room's single machine, for the call sites that predate the seam.
 fn sane_rect(r: [i32; 4]) -> [i32; 4] {
-    let x0 = r[0].min(r[2]).clamp(-WORLD_LIMIT, WORLD_LIMIT - HOIST_W);
-    let y0 = r[1].min(r[3]).clamp(-WORLD_LIMIT, WORLD_LIMIT - HOIST_H);
-    hoist_rect(x0, y0)
+    sane_rect_for(&HOIST, r)
 }
 
 /// The four locked fixture elements. Players wire to their terminals but
@@ -447,20 +481,49 @@ fn reserved_id(id: u32) -> bool {
     (900..=999).contains(&id)
 }
 
-/// The fixture, laid out on the faceplate inside the footprint:
-///   900 Motor         [M+, M-]
-///   901 Potentiometer [SENSE-A, SENSE-W, SENSE-B]  (the position sensor)
-///   902 Switch        [LIM-TOP-a, LIM-TOP-b]
-///   903 Switch        [LIM-BOT-a, LIM-BOT-b]
-/// The shaft itself takes the left of the rect; the terminal column sits on
-/// the right so wires can reach it without crossing the crate.
+/// The fixture: NINE pins on two columns, laid out like a DIP package. Rows
+/// are grid units down from the footprint's top edge; the columns are one
+/// unit inside its left and right edges.
+///
+///   row   u=1  ┌───────────────┐  u=15
+///     2        │               ├──  TOP A
+///     3    M+ ─┤    FREIGHT    ├──  TOP B
+///     5    M− ─┤     HOIST     ├──  SNS A   (= top of travel)
+///     8        │               ├──  SNS W   (= mid travel)
+///    11        │               ├──  SNS B   (= the floor)
+///    12        │               ├──  BOT A
+///    13        └───────────────┤──  BOT B
+///
+///   900 Motor         [M+, M−]              left  column, rows 3 and 5
+///   902 Switch        [TOP A, TOP B]        right column, rows 2 and 3
+///   901 Potentiometer [SNS A, SNS W, SNS B] right column, rows 5 / 8 / 11
+///   903 Switch        [BOT A, BOT B]        right column, rows 12 and 13
+///
+/// Left is drive, right is information — and the right column is a vertical
+/// MAP OF THE SHAFT: the top stop at the top, the floor stop at the bottom,
+/// the sensor spanning between them with its wiper tap at mid-travel. So
+/// SNS A sits at the row the client draws the top of travel on and SNS B at
+/// the row it draws the floor on, and the picture inside the package is the
+/// wiring rather than a metaphor for it.
+///
+/// The pot's polarity follows from that and is the one thing here that is
+/// electrical rather than cosmetic: `wiper` runs 0 at the head to 1 at the
+/// floor (machine::Hoist::sensors), so A must be the TOP end. Excite A from
+/// the supply and B to ground and SNS W rises with the crate, which is what
+/// the nameplate's "12.5 mV/mm" promises.
+///
+/// Each device also keeps ALL of its pins in ONE column, which is what stops
+/// a child from stealing clicks meant for the package: `hitTest` for a 2- or
+/// 3-pin part is the distance to its pin chain, and none of those chains
+/// crosses the body.
 ///
 /// EVERY pin is derived from the rect's origin — this function is the whole
 /// "terminal map" of the assembly, and the reason a move cannot separate a
-/// terminal from its machine.
+/// terminal from its machine. The one-unit margin between the columns and the
+/// footprint edge is where the client stands the legs up.
 fn hoist_fixture_at(rect: [i32; 4]) -> Vec<ElementSpec> {
     let [x0, y0, ..] = rect;
-    let (a, b) = (x0 + 11, x0 + 15); // terminal column
+    let (l, r) = (x0 + 1, x0 + HOIST_W - 1); // the two pin columns
     vec![
         ElementSpec::two(
             MOTOR_ID,
@@ -469,8 +532,8 @@ fn hoist_fixture_at(rect: [i32; 4]) -> Vec<ElementSpec> {
                 henries: machine::L_ARM,
                 bemf: 0.0,
             },
-            (a, y0 + 3),
-            (a, y0 + 7),
+            (l, y0 + 3),
+            (l, y0 + 5),
         ),
         ElementSpec::three(
             SENSOR_ID,
@@ -479,22 +542,22 @@ fn hoist_fixture_at(rect: [i32; 4]) -> Vec<ElementSpec> {
                 // Crate on the floor: wiper = 1 - y/H, clamped off the end.
                 wiper: machine::WIPER_MAX,
             },
-            (a, y0 + 10),
-            (b, y0 + 12),
-            (a, y0 + 14),
+            (r, y0 + 5),
+            (r, y0 + 8),
+            (r, y0 + 11),
         ),
         ElementSpec::two(
             LIM_TOP_ID,
             ElementKind::Switch { closed: false },
-            (a, y0 + 17),
-            (b, y0 + 17),
+            (r, y0 + 2),
+            (r, y0 + 3),
         ),
         ElementSpec::two(
             LIM_BOT_ID,
             // Closed: the crate starts on the floor.
             ElementKind::Switch { closed: true },
-            (a, y0 + 20),
-            (b, y0 + 20),
+            (r, y0 + 12),
+            (r, y0 + 13),
         ),
     ]
 }
@@ -507,8 +570,21 @@ fn hoist_fixture() -> Vec<ElementSpec> {
     hoist_fixture_at(HOIST_RECT)
 }
 
+/// One fixture terminal in world coordinates, on the default footprint.
+/// Tests that need to wire something to a specific terminal ask for it by
+/// NAME rather than spelling the coordinate out, so re-laying the package
+/// out moves them with it instead of silently aiming at empty grid.
+#[cfg(test)]
+fn fixture_pin(id: u32, k: usize) -> (i32, i32) {
+    hoist_fixture()
+        .into_iter()
+        .find(|e| e.id == id)
+        .unwrap_or_else(|| panic!("no fixture {id}"))
+        .pins[k]
+}
+
 /// The hoist motor's nameplate current (A), read from the damage table so
-/// the faceplate can never disagree with the model that enforces it.
+/// the package's plate can never disagree with the model that enforces it.
 ///
 /// Design note, and the reason the goal card no longer says "wire 12 V to
 /// M+/M−": at 12 V the armature draws V/R = 6 A whenever the rotor is not
@@ -535,12 +611,13 @@ fn motor_i_max() -> f64 {
 /// a reload.
 ///
 /// Returns (id, pins) for each child, ready to broadcast as `DocOp::Move`.
-fn ensure_fixture(
+fn ensure_fixture_for(
+    def: &MachineDef,
     elems: &mut Vec<ElementSpec>,
     rect: [i32; 4],
 ) -> Vec<(u32, Vec<sim_core::Point>)> {
     let mut moved = Vec::with_capacity(4);
-    for spec in hoist_fixture_at(rect) {
+    for spec in (def.fixtures)(rect) {
         let (id, pins) = (spec.id, spec.pins.clone());
         match elems.iter_mut().find(|e| e.id == id) {
             // A save written before ids 900-999 were reserved could hold a
@@ -557,6 +634,14 @@ fn ensure_fixture(
     moved
 }
 
+/// The room's single machine, for the call sites that predate the seam.
+fn ensure_fixture(
+    elems: &mut Vec<ElementSpec>,
+    rect: [i32; 4],
+) -> Vec<(u32, Vec<sim_core::Point>)> {
+    ensure_fixture_for(&HOIST, elems, rect)
+}
+
 /// Move the whole hoist assembly by an integer grid delta: the footprint AND
 /// all four child fixtures, together, in one shot. This is the ONLY way any
 /// of them moves — `apply_doc_op` refuses a client `DocOp::Move` on a
@@ -564,17 +649,18 @@ fn ensure_fixture(
 /// Returns the children's new pins for the broadcast, or None when the move is
 /// refused (no-op, absurd step, or a destination outside the world range).
 ///
-/// SEAM — this is the whole assembly abstraction, deliberately hard-wired to
-/// THIS machine. A future generic `Container` part would need, per instance:
-///   * a CHILD LIST (here: the four reserved ids, implied by `hoist_fixture_at`);
-///   * a FOOTPRINT (here: the room's single `hoist_rect`);
-///   * a TERMINAL MAP from child pins to footprint-relative offsets (here:
-///     `hoist_fixture_at`, which derives every pin from the rect's origin);
+/// SEAM — this is the whole assembly abstraction. It reads nothing about the
+/// hoist beyond its `MachineDef`, which carries per instance:
+///   * a CHILD LIST (implied by `def.fixtures`, whose ids are reserved);
+///   * a FOOTPRINT SIZE (`def.w` / `def.h`);
+///   * a TERMINAL MAP from child pins to footprint-relative offsets
+///     (`def.fixtures`, which derives every pin from the rect's origin);
 ///   * PER-INSTANCE WORLD STATE carried along untouched (here: the one
 ///     `Hoist`) — a translation is not a reset.
 ///
-/// Everything else in this function is generic already.
-fn move_machine(
+/// A second machine is a second `MachineDef`; nothing in here changes.
+fn move_machine_for(
+    def: &MachineDef,
     elems: &mut Vec<ElementSpec>,
     rect: &mut [i32; 4],
     dx: i32,
@@ -594,13 +680,23 @@ fn move_machine(
     let (x0, y0) = (rect[0].checked_add(dx)?, rect[1].checked_add(dy)?);
     // Every corner of the box (and therefore every derived pin) has to land
     // somewhere a player could plausibly follow it to.
-    if !(-WORLD_LIMIT..=WORLD_LIMIT - HOIST_W).contains(&x0)
-        || !(-WORLD_LIMIT..=WORLD_LIMIT - HOIST_H).contains(&y0)
+    if !(-WORLD_LIMIT..=WORLD_LIMIT - def.w).contains(&x0)
+        || !(-WORLD_LIMIT..=WORLD_LIMIT - def.h).contains(&y0)
     {
         return None;
     }
-    *rect = hoist_rect(x0, y0);
-    Some(ensure_fixture(elems, *rect))
+    *rect = [x0, y0, x0 + def.w, y0 + def.h];
+    Some(ensure_fixture_for(def, elems, *rect))
+}
+
+/// The room's single machine, for the call sites that predate the seam.
+fn move_machine(
+    elems: &mut Vec<ElementSpec>,
+    rect: &mut [i32; 4],
+    dx: i32,
+    dy: i32,
+) -> Option<Vec<(u32, Vec<sim_core::Point>)>> {
+    move_machine_for(&HOIST, elems, rect, dx, dy)
 }
 
 /// Ids of the document's sources, cached for the energy meter.
@@ -865,7 +961,7 @@ enum Cmd {
     /// Lower the crate to the floor and re-arm the hoist's goal.
     MachineReset,
     /// Drag the whole hoist assembly by an integer grid delta (the player has
-    /// the cabinet in hand). Applied at a tick boundary like every other op.
+    /// the package in hand). Applied at a tick boundary like every other op.
     MachineMove {
         who: u32,
         dx: i32,
@@ -1306,7 +1402,7 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
         }
 
         // Assembly moves arriving this tick, summed and applied once below.
-        // `pending_mover` is the last client to touch the cabinet this tick —
+        // `pending_mover` is the last client to touch the machine this tick —
         // the one a refused move is reported to.
         let mut pending_move = (0i32, 0i32);
         let mut pending_mover = 0u32;
@@ -1542,7 +1638,7 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
             // CANDIDATE copy and gate it. This path never goes through
             // `apply_doc_op`, and a drag can park the closed LIM-BOT switch
             // exactly on a player's source terminals — a move that would
-            // freeze the whole room is refused instead (the cabinet simply
+            // freeze the whole room is refused instead (the package simply
             // does not follow the pointer, and the dragger is told why).
             let moved = {
                 let elems = room.elements.lock().unwrap();
@@ -1787,12 +1883,21 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
 /// motor's branch unknown, `y`/`vel` are integrals of `i`, `hold` is measured
 /// from `y`, and `joules` integrates source power. Nothing here is asserted.
 /// `rect` is the LIVE footprint in GRID units — room state now, since the
-/// assembly is draggable — so the client can draw all hoist chrome (and
-/// hit-test the cabinet) without hardcoding geometry; `impact` is non-zero
+/// assembly is draggable — so the client can draw the whole package (and
+/// hit-test it) without hardcoding geometry; `impact` is non-zero
 /// only on the tick a landing happened. `imax` is the motor's nameplate
-/// current from the damage table — the client engraves it on the faceplate
+/// current from the damage table — the client engraves it on the package
 /// rather than hardcoding a number that could drift from the model that
 /// enforces it.
+///
+/// `kind` names the chip presentation the client should look this machine up
+/// under, and `wiper`/`limt`/`limb` are the SENSOR outputs — exactly what the
+/// mechanism hands the solver. The client needs them because the stored
+/// document's copy of the pot wiper and the two switch positions is written
+/// once per tick but never re-broadcast, so a package that drew its sensors
+/// from `ElementKind` would be showing state frozen at `hello`. `lim` is the
+/// pair of trip heights (m) so the limit blocks can be drawn where they
+/// actually trip instead of at the ends of travel.
 fn machine_msg(
     hoist: &Hoist,
     rect: [i32; 4],
@@ -1800,11 +1905,17 @@ fn machine_msg(
     impact: f64,
     i_max: f64,
 ) -> serde_json::Value {
+    let s = hoist.sensors();
     json!({
         "imax": i_max,
         "t": "machine",
         "id": MOTOR_ID,
+        "kind": HOIST.kind,
         "rect": rect,
+        "wiper": s.wiper,
+        "limt": s.lim_top,
+        "limb": s.lim_bot,
+        "lim": [machine::LIM_BOT_Y, machine::LIM_TOP_Y],
         "h": machine::SHAFT_H,
         "band": [machine::BAND_LO, machine::BAND_HI],
         "y": hoist.y,
@@ -2773,7 +2884,7 @@ mod tests {
         hoist.joules = 12.5;
         let v = machine_msg(&hoist, HOIST_RECT, 0.94, 1.75, motor_i_max());
         assert_eq!(v["t"], "machine");
-        // The nameplate current the faceplate engraves comes from the damage
+        // The nameplate current the package engraves comes from the damage
         // table, and it has to bracket the motor's two operating points: the
         // ~0.94 A it runs at must be safe, the 6 A it stalls at on a bare
         // 12 V lead must not be.
@@ -2786,7 +2897,8 @@ mod tests {
             machine::HOLD_CURRENT
         );
         assert_eq!(v["id"], MOTOR_ID);
-        assert_eq!(v["rect"], json!([46, 2, 64, 24]));
+        assert_eq!(v["rect"], json!([46, 2, 62, 17]));
+        assert_eq!(v["kind"], "hoist");
         assert_eq!(v["h"], 0.40);
         assert_eq!(v["band"], json!([0.30, 0.34]));
         assert_eq!(v["y"], 0.321);
@@ -2798,8 +2910,25 @@ mod tests {
         assert_eq!(v["landings"], 3);
         assert_eq!(v["win"], false);
         assert_eq!(v["joules"], 12.5);
+        // The sensor outputs: exactly the numbers the mechanism hands the
+        // solver, so the package's picture of its own sensors can never
+        // disagree with what the circuit sees.
+        let s = hoist.sensors();
+        assert_eq!(v["wiper"], s.wiper);
+        assert_eq!(v["wiper"], (1.0 - 0.321 / machine::SHAFT_H).clamp(0.02, 0.98));
+        // The limit switches are LATCHED (hysteresis), so the broadcast
+        // reports what the mechanism last latched, not what `y` implies —
+        // this fixture was posed at 321 mm without ticking, so it still
+        // carries the floor latch it was built with. Reporting anything else
+        // would be the client drawing a switch the solver does not have.
+        assert_eq!(v["limt"], false);
+        assert_eq!(v["limb"], true);
+        assert_eq!(v["lim"], json!([machine::LIM_BOT_Y, machine::LIM_TOP_Y]));
         // rect must actually contain every fixture pin, or the client draws
-        // terminals outside the box it was told about.
+        // terminals outside the box it was told about. This is the invariant
+        // that makes the chip presentation cheap: the rect is the machine's
+        // CELL, the package body is inset inside it, and the legs point
+        // inward — so pins on legs never leave the box.
         let [x0, y0, x1, y1] = HOIST_RECT;
         for e in hoist_fixture() {
             for (px, py) in e.pins {
@@ -2944,7 +3073,7 @@ mod tests {
         }
     }
 
-    /// Dragging the cabinet is a TRANSLATION: the crate does not teleport to
+    /// Dragging the package is a TRANSLATION: the crate does not teleport to
     /// the floor, the hold timer does not restart, the landing count does not
     /// clear. The whole point of putting the footprint in state rather than
     /// rebuilding the machine.
@@ -3004,7 +3133,7 @@ mod tests {
 
     /// A client can only move the machine through the assembly op. Direct
     /// document ops on a fixture stay refused, which is what stops a player
-    /// dragging the motor out of its own cabinet.
+    /// dragging the motor out of its own package.
     #[test]
     fn a_direct_move_of_a_fixture_is_still_refused() {
         let mut elements = demo_room_circuit();
@@ -3077,7 +3206,8 @@ mod tests {
         }
         // A hand-edited or corrupt rect is forced back onto the invariants:
         // normalized corners, fixed size, inside the world.
-        assert_eq!(sane_rect([64, 24, 46, 2]), HOIST_RECT);
+        let [rx0, ry0, rx1, ry1] = HOIST_RECT;
+        assert_eq!(sane_rect([rx1, ry1, rx0, ry0]), HOIST_RECT);
         let far = sane_rect([i32::MAX, i32::MIN, 0, 0]);
         assert_eq!((far[2] - far[0], far[3] - far[1]), (HOIST_W, HOIST_H));
         assert!(far[2] <= WORLD_LIMIT && far[1] >= -WORLD_LIMIT, "{far:?}");
@@ -4586,17 +4716,32 @@ mod tests {
             ),
             (
                 "battery across the hoist's LIM-BOT pair (closed at rest)",
-                add(5004, dc(9.0), (57, 22), (61, 22)),
+                add(
+                    5004,
+                    dc(9.0),
+                    fixture_pin(LIM_BOT_ID, 0),
+                    fixture_pin(LIM_BOT_ID, 1),
+                ),
                 |r| *r == Reject::Unsolvable,
             ),
             (
                 "battery across LIM-TOP: fine until the MACHINE closes it",
-                add(5005, dc(9.0), (57, 19), (61, 19)),
+                add(
+                    5005,
+                    dc(9.0),
+                    fixture_pin(LIM_TOP_ID, 0),
+                    fixture_pin(LIM_TOP_ID, 1),
+                ),
                 |r| *r == Reject::UnsolvableWhenSwitched,
             ),
             (
                 "wire across LIM-TOP (the measured self-locking deadlock)",
-                add(5006, K::Wire, (57, 19), (61, 19)),
+                add(
+                    5006,
+                    K::Wire,
+                    fixture_pin(LIM_TOP_ID, 0),
+                    fixture_pin(LIM_TOP_ID, 1),
+                ),
                 |r| *r == Reject::UnsolvableWhenSwitched,
             ),
             (
@@ -4712,11 +4857,11 @@ mod tests {
                         hz: 0.0,
                         phase: 0.0,
                     },
-                    pins: vec![(57, 5)],
+                    pins: vec![fixture_pin(MOTOR_ID, 0)],
                 },
             },
             DocOp::Add {
-                spec: gnd(6004, (57, 9)),
+                spec: gnd(6004, fixture_pin(MOTOR_ID, 1)),
             },
             // Ordinary properties edit and pin drag.
             DocOp::SetKind {
@@ -4737,23 +4882,29 @@ mod tests {
         }
     }
 
-    /// The machine-move path: dragging the cabinet so its closed LIM-BOT
+    /// The machine-move path: dragging the package so its closed LIM-BOT
     /// switch lands exactly on a player's battery terminals must be refused
     /// by the same gate (this path never passes through `apply_doc_op`).
     #[test]
     fn gate_refuses_machine_move_landing_on_a_source() {
         let mut room = full_room();
-        // The measured repro: battery + load at (80,30)-(84,30), far from
-        // the hoist's default footprint.
-        room.push(spec(7001, dc(9.0), (80, 30), (84, 30)));
-        room.push(spec(7002, r(100.0), (80, 30), (84, 30)));
-        room.push(gnd(7003, (84, 30)));
+        // The measured repro, aimed at where LIM-BOT WOULD land after a
+        // (23, 8) drag rather than at a hardcoded coordinate — so the repro
+        // follows the package instead of quietly aiming at empty grid.
+        const D: (i32, i32) = (23, 8);
+        let a = fixture_pin(LIM_BOT_ID, 0);
+        let b = fixture_pin(LIM_BOT_ID, 1);
+        let a = (a.0 + D.0, a.1 + D.1);
+        let b = (b.0 + D.0, b.1 + D.1);
+        room.push(spec(7001, dc(9.0), a, b));
+        room.push(spec(7002, r(100.0), a, b));
+        room.push(gnd(7003, b));
         assert_eq!(check_room_doc(&room), Ok(()));
 
-        // machinemove dx=23, dy=8 lands LIM-BOT (closed) on those pins.
+        // The drag parks the closed LIM-BOT switch straight across them.
         let mut next = room.clone();
         let mut rect = HOIST_RECT;
-        let moved = move_machine(&mut next, &mut rect, 23, 8);
+        let moved = move_machine(&mut next, &mut rect, D.0, D.1);
         assert!(moved.is_some(), "the move itself is well-formed");
         assert_eq!(
             check_room_doc(&next),

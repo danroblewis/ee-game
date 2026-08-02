@@ -17,7 +17,8 @@
 //     an edit issued from inside a thunk is not recorded as a fresh entry.
 //
 // What it CANNOT prove: that dragging the hoist FEELS like moving a part, or
-// that the grab bar is discoverable. That needs a browser and a human.
+// that its package reads as one grabbable object. That needs a browser and a
+// human.
 
 import { History } from './history';
 import type { DocOp, ElementSpec, Point } from './circuit';

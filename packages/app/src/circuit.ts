@@ -28,7 +28,11 @@ export type ElementKind =
   | { t: 'Potentiometer'; ohms: number; wiper: number }
   // `seed` picks WHICH noise, `volts` how loud. Two sources with the same
   // seed are the same signal, so each placement gets its own (catalog.ts).
-  | { t: 'Noise'; volts: number; ohms: number; seed: number };
+  | { t: 'Noise'; volts: number; ohms: number; seed: number }
+  // Machine fixtures. Not in the parts catalogue — a player cannot place one —
+  // but they are ordinary elements in the document, so the client's model of
+  // the document has to know them or their pins are untyped and unnamed.
+  | { t: 'Motor'; ohms: number; henries: number; bemf: number };
 
 export interface ElementSpec {
   id: number;
@@ -63,6 +67,8 @@ export function pinLabels(kind: ElementKind): string[] {
       return ['VCC', 'GND', 'TRG', 'THR', 'OUT', 'DIS'];
     case 'Potentiometer':
       return ['A', 'W', 'B'];
+    case 'Motor':
+      return ['M+', 'M−'];
     case 'Ground':
       return ['⏚'];
     case 'Rail':

@@ -14,12 +14,13 @@
 //   alt+click/drag        REMOVE from the selection (ctrl is map panning)
 //   probe flag            Del removes it; right-click = delete/reference/listen
 //   drag a part body      move it (whole selection if it is in one)
-//   drag a machine        the freight hoist moves as one assembly — grab the
-//                         bar across the top of its cabinet (or any cabinet
-//                         chrome clear of its terminals); its four fixtures
-//                         travel with it and ⌘Z undoes the whole gesture.
-//                         Its pins still draw wires and its children still
-//                         select individually; shift+drag still marquees.
+//   drag a machine        the freight hoist is a CHIP: nine pins on legs
+//                         outside a package whose face is the whole handle.
+//                         Drag anywhere on the body to move the assembly; its
+//                         four fixtures travel with it and ⌘Z undoes the whole
+//                         gesture. Its pins still draw wires and its children
+//                         still select individually; shift+drag still marquees.
+//                         The ⓘ badge on its title band opens its datasheet.
 //   double-click a part   floating property editor next to it
 //   right-click           cascading context menu — on a part:
 //                         edit/rotate/delete/probe/listen/copy; on empty
@@ -298,9 +299,13 @@ function applyDoc(op: DocOp) {
 let idCounter = 1;
 const newId = () => (myId > 0 ? myId : 999) * 1_000_000 + idCounter++;
 
-/** THE HOIST: machine chrome on the canvas plus the goal card. hoist.ts owns
- * every pixel and every DOM node of it; the four fixture parts it stands on
- * (ids 900..903) are ordinary elements the normal renderer draws on top. */
+/** THE HOIST: the machine's package on the canvas plus the goal card.
+ * hoist.ts + chip.ts own every pixel and every DOM node of it, INCLUDING the
+ * glyphs of the four fixture parts it stands on — inside a package a device
+ * symbol is internal schematic, not a free-standing part, exactly as the 555
+ * draws its own divider and comparators. Rendering is not existence: those
+ * four stay real elements for the solver, for wiring, for probes, for
+ * tooltips, for damage and for `elementAt`. Only their glyph moved. */
 const hoist = createHoist(document.body, { reset: () => net.sendMachineReset() });
 
 /** Ids 900..999 are the server's machine fixtures: players wire to them but
@@ -311,9 +316,12 @@ const isFixtureId = (id: number) => id >= 900 && id <= 999;
 
 // ------------------------------------------------------ the machine assembly
 //
-// The freight hoist behaves like a part: click its cabinet to select it, drag
-// the cabinet (or the grab bar across its top) to move it. It is NOT an
-// element — the four fixtures bolted inside it are, and the server owns them —
+// The freight hoist behaves like a part because it IS presented as one: a
+// chip. Click its package face to select it, drag the face to move it — the
+// same rule render.ts already applies to any part with more than four pins
+// (`hitTest`: "packages are boxes, so the whole chip is grabbable"), which is
+// also why it needs no title bar. It is NOT an element, though — the four
+// fixtures bolted inside it are, and the server owns them —
 // so the move travels as its own op and translates the footprint and all four
 // children atomically, without touching the mechanism (height, velocity, hold
 // timer and landing count all survive a move; it is a translation, not a
@@ -355,7 +363,7 @@ function clampMachineDelta(r: MachineRect, dx: number, dy: number): [number, num
   ];
 }
 
-/** Translate the assembly by an integer grid delta: footprint, chrome and
+/** Translate the assembly by an integer grid delta: footprint, package and
  * children together, optimistically here and authoritatively on the server.
  * Used by undo/redo (with the gesture's delta negated); the drag itself places
  * from its own snapshot so a long gesture cannot accumulate rounding. */
@@ -562,7 +570,7 @@ const net = connect({
   onDoc(op) {
     // While THIS client drags the machine it owns the children's geometry: the
     // server's echo of a throttled increment lags the pointer by up to 60 ms,
-    // and applying it would rubber-band the terminals against the chrome.
+    // and applying it would rubber-band the terminals against the package.
     // The final op on release reconciles everything.
     if (machineDrag && op.t === 'Move' && isFixtureId(op.id)) return;
     applyDoc(op); // idempotent for our own echoes
@@ -1848,7 +1856,7 @@ let scopeResize: { s: FloatScope } | null = null;
  * machine is not an element, and its children are locked against the document
  * Move op that moveDrag issues. */
 interface MachineDrag {
-  /** Grid point where the cabinet was grabbed. */
+  /** Grid point where the package was grabbed. */
   start: Point;
   /** Footprint and children as they were at that moment: the drag places from
    * this snapshot, so 300 pointer moves cannot drift from 1 move of 300. */
@@ -1951,7 +1959,7 @@ function startMachineDrag(x: number, y: number) {
 }
 
 /** Put the whole assembly at the drag's current delta, THIS frame: footprint
- * and all four children from the same snapshot, so the chrome and the terminals
+ * and all four children from the same snapshot, so the package and the terminals
  * can never rubber-band against each other. */
 function placeMachineDrag(d: MachineDrag) {
   hoist.setLocalRect([
@@ -2141,14 +2149,26 @@ canvas.addEventListener('pointerdown', (ev) => {
       return;
     }
   }
+  // The machine's ⓘ badge, after pins and before parts. Two rules meet here:
+  // a terminal always wins over a glyph (wiring is the primary action), and
+  // panel.ts's tab discipline — only ever hit-test a glyph at the zoom where
+  // it is actually painted, or an invisible button eats clicks when zoomed
+  // out. `zoneAt` reports 'info' under exactly that condition.
+  if (!modifiedSelect(ev) && hoist.zoneAt(cam, ev.clientX, ev.clientY) === 'info') {
+    hoist.openPinout();
+    selectedMachine = true;
+    selectedIds.clear();
+    selectedProbe = null;
+    return;
+  }
   const e = elementAt(ev.clientX, ev.clientY);
   // The machine assembly comes LAST, after pins and after parts: a pointer on
   // a fixture terminal or child part still selects that part (fixture pins
-  // are bolted down, so they never reshape-drag). Only the cabinet's own chrome — the
-  // grab bar, the frame, empty faceplate away from the children — picks up the
-  // whole machine. Shift+drag stays a marquee, so a selection can still be
-  // swept across the cabinet.
-  if (!e && !modifiedSelect(ev) && hoist.zoneAt(cam, ev.clientX, ev.clientY)) {
+  // are bolted down, so they never reshape-drag). The package's FACE picks up
+  // the whole machine — its legs are outside the body box, so a terminal can
+  // never be swallowed by the chip. Shift+drag stays a marquee, so a
+  // selection can still be swept across the package.
+  if (!e && !modifiedSelect(ev) && hoist.zoneAt(cam, ev.clientX, ev.clientY) === 'body') {
     startMachineDrag(ev.clientX, ev.clientY);
     return;
   }
@@ -2304,7 +2324,7 @@ canvas.addEventListener('pointermove', (ev) => {
     if (dx !== machineDrag.dx || dy !== machineDrag.dy) {
       machineDrag.dx = dx;
       machineDrag.dy = dy;
-      placeMachineDrag(machineDrag); // live, snapped, chrome + children as one
+      placeMachineDrag(machineDrag); // live, snapped, package + children as one
     }
     // Same ~60 ms cadence as a part drag: the pointer never waits on the wire.
     if (now - machineDrag.lastSent > 60) {
@@ -2346,7 +2366,7 @@ canvas.addEventListener('pointermove', (ev) => {
   // what pointerdown will do.
   const mz =
     z || pz || over || onPin ? null : hoist.zoneAt(cam, ev.clientX, ev.clientY);
-  hoist.setHot(mz === 'grab');
+  hoist.setHot(mz === 'body' || !!machineDrag);
   canvas.style.cursor = repairing
     ? REPAIR_CURSOR
     : placing || pasting || panelTool
@@ -2373,10 +2393,10 @@ canvas.addEventListener('pointermove', (ev) => {
               ? 'pointer'
               : over
                 ? 'move' // plain drag moves any part
-                : mz === 'grab'
-                  ? 'grab' // the machine's title strip: pick the whole thing up
+                : mz === 'info'
+                  ? 'pointer' // the package's ⓘ badge: open the datasheet
                   : mz
-                    ? 'move' // its cabinet drags the assembly too
+                    ? 'move' // the package's face drags the whole assembly
                     : 'default';
 });
 
@@ -3111,8 +3131,11 @@ function inView(v: ViewRect, id: number): boolean {
  * LOD_FULL lives in render.ts so every switch tied to it happens at once. */
 const LOD_CHAIN = 2;
 
-/** Reused draw list so a steady frame allocates nothing. */
+/** Reused draw lists so a steady frame allocates nothing. `visible` is
+ * everything on screen; `schematic` is that minus the machine fixtures, whose
+ * glyphs belong to their package. */
 const visible: ElementSpec[] = [];
+const schematic: ElementSpec[] = [];
 /** Above this many on-screen elements, skip the document-order sort: at that
  * density the z-order of overlapping symbols is not visible anyway. */
 const SORT_LIMIT = 3000;
@@ -3162,20 +3185,6 @@ function frame(now: number) {
   ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
   drawGrid(ctx, cam, window.innerWidth, window.innerHeight);
 
-  // Machine chrome (the hoist) is scenery: it goes down before the panel
-  // regions and the schematic so its fixture parts stay visible and wire-able.
-  // The same call refreshes the goal card overlay.
-  // The locked fixture parts, so the hoist can name its own terminals.
-  hoist.draw(
-    ctx,
-    cam,
-    now,
-    wallDt,
-    elements
-      .filter((e) => e.id >= 900 && e.id <= 903)
-      .map((e) => ({ id: e.id, pins: e.pins as [number, number][] })),
-  );
-
   // Panel regions sit under the schematic: they frame parts, never hide them.
   // The one under the pointer (or being dragged) shows its resize grips.
   const hotPanel = mouse ? panelHotAt(cam, panels, mouse.x, mouse.y) : null;
@@ -3197,8 +3206,15 @@ function frame(now: number) {
   perf.drawn = visible.length;
   perf.total = space.count;
 
+  // Machine fixtures are drawn by their package, not by the schematic pass:
+  // inside a chip, a device symbol is internal schematic. They stay in
+  // `visible` (and in the spatial index, and in `elementAt`) — only their
+  // glyph belongs to the machine.
+  schematic.length = 0;
+  for (const e of visible) if (!isFixtureId(e.id)) schematic.push(e);
+
   if (cam.scale >= LOD_FULL) {
-    for (const e of visible) {
+    for (const e of schematic) {
       // Speakers get their audio state alongside the solver frame: a
       // sounding one glows, a muted or unstreamed one looks plainly idle.
       const sound =
@@ -3213,9 +3229,22 @@ function frame(now: number) {
   } else {
     // Too small for symbols: conductors only, colored by the solver frame —
     // plus heat, a blast ping and a marker on every dead part, because
-    // finding them IS the repair.
-    drawElementsLod(ctx, cam, visible, live, cam.scale < LOD_CHAIN, damage, now);
+    // finding them IS the repair. `schematic` excludes the machine's own
+    // fixtures — the chip draws those itself, inside its package.
+    drawElementsLod(ctx, cam, schematic, live, cam.scale < LOD_CHAIN, damage, now);
   }
+
+  // The machine's package, on top of the wires (a player's wire routed across
+  // a chip passes BEHIND its body, which is what a package does) and under
+  // the selection halos and probe flags. It draws its own LOD form, so this
+  // is one call on both sides of LOD_FULL. The same call refreshes the goal
+  // card overlay.
+  hoist.draw(ctx, cam, now, wallDt, {
+    children: machineChildren(),
+    live,
+    damage,
+    dots,
+  });
 
   // Hover highlight (blue element + pin dots), Falstad-style.
   const zHover = mouse ? scopeZoneAt(mouse.x, mouse.y) : null;
@@ -3326,7 +3355,7 @@ function frame(now: number) {
         : machineDrag
           ? 'moving the FREIGHT HOIST — release to place it (⌘Z undoes the whole move)'
           : selectedMachine
-            ? 'FREIGHT HOIST selected — drag its top bar (or its cabinet) to move the whole machine; its terminals come with it'
+            ? 'FREIGHT HOIST selected — drag the chip to move the whole machine; its nine terminals come with it (ⓘ opens its pinout)'
             : selectedIds.size > 1
               ? `${selectedIds.size} selected (drag moves, Q rotates, X/Y flips, shift+ adds, alt+ removes, Del deletes)`
               : '';
@@ -3354,7 +3383,7 @@ function frame(now: number) {
       ? `  ${speakerIds.length} speaker${speakerIds.length === 1 ? '' : 's'} silent offline (no substep sampler in the local sim)`
       : '';
   const hints = hintsOpen
-    ? `\nparts: R C L W G V D N P M A U 5 S B T Z E F I · ⇧V rail · drag part = move · drag the hoist cabinet = move the machine · dbl-click = edit values · right-click = menu` +
+    ? `\nparts: R C L W G V D N P M A U 5 S B T Z E F I · ⇧V rail · drag part = move · drag the hoist chip = move the machine · dbl-click = edit values · right-click = menu` +
       `\ndrag pin = reshape part · W then drag = wire · drag empty = select · Q rotate · X/Y flip · ⌘Z undo · ⌘C/⌘V copy/paste · 1/2 probe · 3 listen · 0 ref · O scope · \` dock · J panel · [ ] sidebars · K repair · Del delete` +
       `\nH home district · shift+H fit everything · ⇧R rooms · wheel = zoom (0.4–200 px/unit) · pan: middle / ctrl+drag / space+drag · ? hides this`
     : `\n? controls`;

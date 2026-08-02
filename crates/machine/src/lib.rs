@@ -226,6 +226,24 @@ impl Hoist {
         self.impact = 0.0;
     }
 
+    /// The mechanism's electrical outputs as they stand RIGHT NOW, without
+    /// touching the hysteresis latches — `tick` is the only thing allowed to
+    /// move those. The broadcast reads this so the picture a client draws of
+    /// the sensors is the same number the solver was handed, on every tick,
+    /// including the ticks where the solver is quarantined and there is no
+    /// fresh write.
+    pub fn sensors(&self) -> Writes {
+        Writes {
+            bemf: K * self.omega,
+            // Wiper runs from 1 at the floor to 0 at the head: wire SENSE-A
+            // to the supply and SENSE-B to ground and the wiper voltage
+            // rises with height.
+            wiper: (1.0 - self.y / SHAFT_H).clamp(WIPER_MIN, WIPER_MAX),
+            lim_top: self.lim_top,
+            lim_bot: self.lim_bot,
+        }
+    }
+
     /// Recompute the writes, latching the hysteretic limit switches.
     fn writes(&mut self) -> Writes {
         self.lim_top = if self.lim_top {
@@ -238,14 +256,6 @@ impl Hoist {
         } else {
             self.y <= LIM_BOT_Y
         };
-        Writes {
-            bemf: K * self.omega,
-            // Wiper runs from 1 at the floor to 0 at the head: wire SENSE-A
-            // to the supply and SENSE-B to ground and the wiper voltage
-            // rises with height.
-            wiper: (1.0 - self.y / SHAFT_H).clamp(WIPER_MIN, WIPER_MAX),
-            lim_top: self.lim_top,
-            lim_bot: self.lim_bot,
-        }
+        self.sensors()
     }
 }
