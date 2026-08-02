@@ -734,13 +734,21 @@ function toast(text: string) {
 /** Above this the pre-send check is skipped and the server's refusal (plus
  * its `reject` callout) is relied on instead.
  *
- * The gate is a compile plus one or two dense factorizations, and it would
- * run on the UI thread once per knob tick during a value drag. "The sim never
- * stalls the UI" is the invariant that decides the trade: a few hundred
- * microseconds is fine, tens of milliseconds per frame is not. The honest
- * residual is that a big room loses pre-send prevention (and, offline, loses
- * the gate entirely) — the real fix is the two quadratics in the Rust compile
- * path, not a bigger constant here. */
+ * The gate is a compile plus one or two dense factorizations plus up to four
+ * short convergence trials, and it would run on the UI thread once per knob
+ * tick during a value drag. "The sim never stalls the UI" is the invariant
+ * that decides the trade: a few hundred microseconds is fine, tens of
+ * milliseconds per frame is not.
+ *
+ * Measured (release, native, same code path as the wasm build): 0.07 ms on a
+ * beginner's handful of parts, 1.3 ms on the shipped room (147 elements),
+ * 2.2 ms at the worst size, and back to ~1.2 ms above 400 elements where
+ * sim-core skips the trials outright. Worst case is ~13% of a 60 fps frame,
+ * and only on the frames a drag actually changes a value.
+ *
+ * The honest residual is that a big room loses pre-send prevention (and,
+ * offline, loses the gate entirely) — the real fix is the two quadratics in
+ * the Rust compile path, not a bigger constant here. */
 const GATE_MAX_ELEMENTS = 600;
 
 /** The document `op` would produce, WITHOUT touching the live one. Mirrors

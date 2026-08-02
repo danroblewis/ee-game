@@ -791,6 +791,20 @@ fn apply_repair(damage: &mut DamageModel, eng: &mut Engine, id: u32) -> bool {
 /// unknown already sitting in the solved vector, while `frame()` is
 /// O(elements) and runs KCL propagation for wire currents — 1.5 kHz of that
 /// would be the most expensive thing in the room.
+/// These four writes are the only mutations of the live netlist that do NOT
+/// pass the placement gate, and they are ungated on purpose — the mechanism
+/// is not a player action and there is no honest way to refuse one. Refusing
+/// a limit-switch write would leave the crate at the top with LIM-TOP saying
+/// otherwise, which is a lie about the world; and the gate costs ~1 ms while
+/// this runs at 1.5 kHz.
+///
+/// The guarantee is therefore made at PLACEMENT time instead, which is where
+/// the owner wants it: `check_document`'s layer 3 factors the document with
+/// every switch closed, and layer 4 now runs its convergence trial on that
+/// same clone. Anything the mechanism can do to the topology, the gate has
+/// already tried. What is left ungated is bounded by construction: `bemf` is
+/// RHS-only and cannot make a matrix singular, and `wiper` is clamped into
+/// (0, 1) by `write_param` so the pot stays two finite resistances.
 fn machine_step(eng: &mut Engine, hoist: &mut Hoist, sources: &[u32]) -> machine::Writes {
     let i = eng.pin_current(MOTOR_ID, 0).unwrap_or(0.0);
     let w = hoist.tick(i, MACHINE_H);
@@ -2601,6 +2615,12 @@ mod tests {
         fn new(player_circuit: Vec<ElementSpec>) -> Self {
             let mut elems = hoist_fixture();
             elems.extend(player_circuit);
+            // Every hoist run is a document a player could have placed, so
+            // it has to pass the same gate a placement does. This is what
+            // keeps the placement gate honest about the ONE circuit the game
+            // is built to teach: tighten the gate and break the intended
+            // solution, and this fails before the win test even runs.
+            assert_eq!(check_room_doc(&elems), Ok(()), "the run must be placeable");
             let sources = source_ids(&elems);
             let mut eng = Engine::new(DT);
             eng.set_elements(&elems);
@@ -5335,6 +5355,58 @@ mod tests {
             assert_eq!(check_room_doc(&next), Ok(()), "gate must accept {op:?}");
             doc = next; // ops build on each other, like a real session
         }
+    }
+
+    /// The one class of breakage the GAME inflicts on a document the gate
+    /// blessed: `machine_step` writes LIM-TOP/LIM-BOT into the live engine
+    /// every 640 us with nothing in front of it, and `write_param` never
+    /// clears quarantine. A player wiring an LED in series with LIM-TOP used
+    /// to be told the placement was fine, and then the crate froze the room
+    /// on its way up — with no player action able to undo it.
+    ///
+    /// The fix is at placement time, which is where the owner wants it: the
+    /// gate now runs its convergence trial on the all-switches-closed clone
+    /// it was already factoring, so a circuit that only diverges once a
+    /// limit switch closes is refused before it can be placed.
+    #[test]
+    fn gate_refuses_a_circuit_the_machine_would_break_by_closing_a_limit() {
+        let room = full_room();
+        // LIM-TOP's terminals, derived from the fixture rather than written
+        // down: the chip re-laid the package out, and a hardcoded pair here
+        // would silently test two empty grid points.
+        let (top_a, top_b) = (fixture_pin(LIM_TOP_ID, 0), fixture_pin(LIM_TOP_ID, 1));
+        // 9 V onto one side of LIM-TOP, an LED from the other side back to
+        // ground: two dangling half-circuits while the crate is down, and an
+        // ideal source straight across the LED the moment it reaches the top.
+        for source in [
+            dc(9.0),
+            K::VoltageSource {
+                dc: 0.0,
+                amp: 9.0,
+                hz: 50.0,
+                phase: 0.0,
+            },
+        ] {
+            let mut next = room.clone();
+            next.push(spec(7101, source, top_a, (70, 46)));
+            next.push(spec(7102, K::Led { color: 0 }, top_b, (70, 46)));
+            next.push(gnd(7103, (70, 46)));
+            // Nothing structural to say about it: it factors as placed AND
+            // with every switch closed. Only the trial catches it.
+            let got = check_room_doc(&next).expect_err("must be refused");
+            assert!(
+                matches!(got, sim_core::Reject::WillNotConverge { id: Some(7102) }),
+                "{got:?}"
+            );
+        }
+        // The same shape with the series resistor the hint asks for stays
+        // placeable — this must refuse landmines, not LEDs.
+        let mut next = room.clone();
+        next.push(spec(7101, dc(9.0), top_a, (70, 46)));
+        next.push(spec(7102, r(330.0), top_b, (70, 43)));
+        next.push(spec(7104, K::Led { color: 0 }, (70, 43), (70, 46)));
+        next.push(gnd(7103, (70, 46)));
+        assert_eq!(check_room_doc(&next), Ok(()));
     }
 
     /// The machine-move path: dragging the package so its closed LIM-BOT

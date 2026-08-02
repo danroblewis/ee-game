@@ -36,6 +36,7 @@ fn rail_at(id: u32, v: f64, at: (i32, i32)) -> ElementSpec {
         id,
         kind: rail(v),
         pins: vec![at],
+        ..Default::default()
     }
 }
 
@@ -262,8 +263,8 @@ fn the_measured_table() {
         (
             "two OpAmps sharing all three pins",
             vec![
-                ElementSpec::three(1, ElementKind::OpAmp { rail: 9.0 }, (0, 0), (4, 0), (8, 0)),
-                ElementSpec::three(2, ElementKind::OpAmp { rail: 9.0 }, (0, 0), (4, 0), (8, 0)),
+                ElementSpec::three(1, ElementKind::OpAmp { rail: 9.0, isc: sim_core::DEFAULT_OPAMP_ISC }, (0, 0), (4, 0), (8, 0)),
+                ElementSpec::three(2, ElementKind::OpAmp { rail: 9.0, isc: sim_core::DEFAULT_OPAMP_ISC }, (0, 0), (4, 0), (8, 0)),
                 ElementSpec::two(3, r(1000.0), (8, 0), (0, 6)),
                 gnd(4),
             ],

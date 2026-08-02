@@ -58,16 +58,43 @@
 //!    what catches any residual dependency the structural pass does not
 //!    model.
 //!
-//! 4. **Convergence** — one trial step on the scratch engine. Factorability
-//!    is not solvability: the shipped 9 V battery wired straight across the
-//!    shipped LED factors perfectly and then freezes the room at t = 0,
-//!    because an ideal source pins the junction voltage somewhere its
-//!    exponential can never meet. Newton burns all 100 iterations, the
-//!    rescue ladder halves dt four times, and the engine quarantines with
-//!    ZERO steps completed — self-concealing, because the damage model is
-//!    skipped while quarantined so the LED never even burns out. This is
-//!    reachable with two catalog parts in the first minute of play, and it
-//!    is far more likely than every structural failure combined.
+//! 4. **Convergence** — trial RUNS on the scratch engine. Factorability is
+//!    not solvability: the shipped 9 V battery wired straight across the
+//!    shipped LED factors perfectly and then freezes the room, because an
+//!    ideal source pins the junction voltage somewhere its exponential can
+//!    never meet. Newton burns all 100 iterations, the rescue ladder halves
+//!    dt four times, and the engine quarantines — self-concealing, because
+//!    the damage model is skipped while quarantined so the LED never even
+//!    burns out. This is reachable with two catalog parts in the first
+//!    minute of play, and it is far more likely than every structural
+//!    failure combined.
+//!
+//!    A trial is run in each of up to four STATES of the document, because
+//!    the freeze is not in general a t = 0 property (see
+//!    [`trial_depth`] for the depths and the measured cost):
+//!
+//!    * **as placed**, for `trial_depth` steps — the state the room is in;
+//!    * **every switch closed**, for `trial_depth` steps — the same clone
+//!      layer 3 factors, because a switch closed by a player OR BY THE
+//!      MACHINE must not be able to reach a state nothing validated;
+//!    * **every source at the top of its swing**, one step;
+//!    * **every source at the bottom of its swing**, one step.
+//!
+//!    The last two are the cheap answer to time-varying drive. A sine across
+//!    an LED does not fail at t = 0 — it fails when the waveform climbs past
+//!    what the junction can hold, 107 steps later for a 9 V 50 Hz sine, and
+//!    2 500 000 steps later for the 0.3 Hz sine the showcase ships. Chasing
+//!    that in the time domain is hopeless at any affordable depth; pinning
+//!    each source at `dc ± |amp|` reaches the same operating point in ONE
+//!    step, at a cost independent of frequency. Measured over accepted-
+//!    then-frozen fuzz documents, the two extreme states alone account for
+//!    79% of the class — more than a 400-step trial (60%) and 400× cheaper.
+//!
+//!    Measured end to end over 12 000 fuzzed documents (this tree, release):
+//!    of the documents this gate ACCEPTS, the share that then quarantines
+//!    inside 5 000 steps falls from **0.67% to 0.07%**. The survivors are
+//!    deep transients — median step 1474 — which no affordable trial reaches
+//!    and which the quarantine machinery still handles honestly.
 //!
 //! Broken parts are validated as if healthy: a broken part stamps nothing,
 //! but `Repair` can put any of them back at any time, so a document is only
@@ -118,6 +145,15 @@ pub const MIN_OPAMP_ISC: f64 = 1e-6;
 /// It is a first-minute-of-play, small-circuit failure, so the cap buys
 /// nearly all of the value.
 ///
+/// What the cap costs at the sizes the game actually reaches: the room a
+/// fresh server stands up is 147 elements (143 showcase + 4 hoist fixture),
+/// so every room a player joins is trialled in full, and a room would have
+/// to grow 2.7x before the trial switched itself off. Above the cap a
+/// document keeps all three structural layers — value sanity, named
+/// degeneracy, LU as placed and with every switch closed — and loses only
+/// the convergence prediction. Nothing becomes MORE placeable there; the
+/// gate just stops seeing one class.
+///
 /// The real fix is not a bigger cap, it is the two quadratics in the compile
 /// path (`Engine::compile` interns junctions with a linear scan;
 /// `set_elements` restores per-element state with another). Measured
@@ -134,6 +170,49 @@ pub const MIN_OPAMP_ISC: f64 = 1e-6;
 /// The two columns converge because the COMPILES dominate, not the solve.
 /// Replace the quadratics and the cap rises or disappears.
 pub const TRIAL_MAX_ELEMENTS: usize = 400;
+
+/// How many steps one layer-4 trial state runs for a document of `elements`
+/// elements. Zero means the trial is skipped entirely (see
+/// [`TRIAL_MAX_ELEMENTS`]).
+///
+/// Depth is bought, not assumed. The old gate ran exactly ONE step and
+/// justified it by calling the freeze "a DC operating-point failure, visible
+/// on the very first step". That premise is measurably false: over fuzzed
+/// documents this gate ACCEPTED and the engine then quarantined, **0.00%
+/// died at step 0** — median step 161, p90 step 2601. A single step catches
+/// essentially none of the class on its own.
+///
+/// Depth is also not free, and it is the opposite of free where it would be
+/// most convenient. One trial step is one real step, and a real step on a
+/// nonlinear document refactors per Newton iteration, so the per-step cost
+/// grows like n^2.3 (measured, release, this tree):
+///
+/// ```text
+///   elements   per step   -> depth chosen   one trial state
+///          4     0.25 us          256            ~130 us
+///         18     1.3  us          256            ~320 us
+///         52     8.6  us           32            ~270 us
+///        102    31    us            8            ~255 us
+///        202   123    us            2            ~290 us
+///        402   470    us            1            ~600 us
+/// ```
+///
+/// So the depth ladder holds ONE trial state to roughly 300 µs at every
+/// size, and the gate runs at most four states (see [`check_document`]).
+/// Deep trials are therefore a SMALL-document instrument — which is exactly
+/// where the class lives: three catalogue parts in the first minute of play.
+/// At room scale the frequency-independent extreme-state trials do the work,
+/// and they cost one step each at any size.
+pub fn trial_depth(elements: usize) -> u32 {
+    match elements {
+        0..=16 => 256,
+        17..=64 => 32,
+        65..=128 => 8,
+        129..=256 => 2,
+        257..=TRIAL_MAX_ELEMENTS => 1,
+        _ => 0,
+    }
+}
 
 /// Up to four element ids carried by a [`Reject`], so the client can flash
 /// every implicated part rather than just one. Fixed-size to keep `Reject`
@@ -685,12 +764,28 @@ fn trace_loop(accepted: &[(usize, usize, u32)], from: usize, to: usize) -> Vec<u
 }
 
 /// The nonlinear junction device most likely to be the reason Newton could
-/// not converge: a diode/LED/zener sitting directly across an ideal
-/// constraint. That is not a guess about the numerics — an ideal source pins
-/// the junction voltage to a value its exponential can never satisfy, which
-/// is precisely the shipped-battery-across-the-shipped-LED case.
+/// not converge: a diode/LED/zener whose two nodes are joined by a PATH of
+/// ideal constraints. That is not a guess about the numerics — a chain of
+/// zero-impedance sources pins the junction voltage to the sum along the
+/// path, a value its exponential can never satisfy, which is precisely the
+/// shipped-battery-across-the-shipped-LED case.
+///
+/// A path rather than a single constraint, because the interesting version
+/// is not the one drawn as a single part: 9 V into a closed switch into an
+/// LED is a source, a 0 V constraint and a junction, and naming the LED
+/// there is the difference between a part the client can flash and an
+/// anonymous refusal. Union-find in document order, integer comparisons
+/// only, first offender wins — deterministic on every target.
 fn blame_for_divergence(eng: &Engine, specs: &[ElementSpec]) -> Option<u32> {
     let cs = eng.ideal_constraints();
+    if cs.is_empty() {
+        return None;
+    }
+    let mut parent: Vec<usize> = (0..eng.node_count() + 1).collect();
+    for (_, c) in &cs {
+        let (ra, rb) = (find(&mut parent, c.a), find(&mut parent, c.b));
+        parent[ra] = rb;
+    }
     let nodes = eng.element_nodes();
     for s in specs {
         if !matches!(
@@ -704,16 +799,79 @@ fn blame_for_divergence(eng: &Engine, specs: &[ElementSpec]) -> Option<u32> {
         let Some((_, n)) = nodes.iter().find(|(id, _)| *id == s.id) else {
             continue;
         };
-        let pair = if n[0] <= n[1] {
-            (n[0], n[1])
-        } else {
-            (n[1], n[0])
-        };
-        if cs.iter().any(|(_, c)| (c.a, c.b) == pair) {
+        if n[0] != n[1] && find(&mut parent, n[0]) == find(&mut parent, n[1]) {
             return Some(s.id);
         }
     }
     None
+}
+
+/// One trial run: compile `specs` on a scratch engine and step it. `Some`
+/// when the engine gave up — that is the room freezing, in advance.
+///
+/// A linear document takes the solver's single-pass path and cannot fail to
+/// converge, so the common big-document case (resistor ladders, wire nets)
+/// pays only the compile. `advance` stops at the first failed step, so the
+/// depth is paid by documents that are FINE, never by the ones being caught.
+fn trial(specs: &[ElementSpec], dt: f64, steps: u32) -> Option<Reject> {
+    let mut eng = Engine::new(dt);
+    eng.set_elements(specs);
+    if eng.is_linear() {
+        return None;
+    }
+    if eng.advance(steps).quarantined {
+        return Some(Reject::WillNotConverge {
+            id: blame_for_divergence(&eng, specs),
+        });
+    }
+    None
+}
+
+/// The document with every source frozen at one end of its swing:
+/// `dc + sign·|amp|`, no frequency, no phase. `None` when nothing in the
+/// document actually swings, so the caller can skip a duplicate trial.
+///
+/// This is the whole answer to time-varying drive, and it is worth being
+/// precise about why it is legitimate rather than a heuristic. The freeze
+/// this layer exists to catch is an ideal constraint pinning a junction
+/// somewhere its exponential cannot reach. Whether that happens depends on
+/// the constraint's VALUE, not on how it got there — and the set of values a
+/// `dc + amp·sin(...)` source takes is exactly `[dc − |amp|, dc + |amp|]`,
+/// both ends of which it really does visit, every cycle. Testing the two
+/// ends is testing the operating points the circuit will actually be in.
+///
+/// One-sided conservatism, named rather than hidden: sources with different
+/// phases are pinned at their extremes SIMULTANEOUSLY here, and two sources
+/// in one loop that never peak together would be judged on a sum they never
+/// really see. Every shipped and fixtured circuit is checked against that in
+/// the tests; a room that hit it would be refused a placement that was in
+/// fact safe, which is the safe direction to be wrong in.
+///
+/// `dc + |amp|` can exceed the [`MAX_SOURCE_VOLTS`] the value layer enforces
+/// (1 MV + 1 MV). That is fine and deliberate: this document is a scratch
+/// operating point, it is never stored, broadcast or shown, and 2e6 is nine
+/// orders of magnitude inside f64.
+fn peak_clone(specs: &[ElementSpec], sign: f64) -> Option<Vec<ElementSpec>> {
+    let mut swings = false;
+    let out: Vec<ElementSpec> = specs
+        .iter()
+        .map(|s| {
+            let mut s = s.clone();
+            if let ElementKind::VoltageSource { dc, amp, hz, phase }
+            | ElementKind::Rail { dc, amp, hz, phase } = &mut s.kind
+            {
+                if *amp != 0.0 {
+                    swings = true;
+                    *dc += sign * amp.abs();
+                    *amp = 0.0;
+                    *hz = 0.0;
+                    *phase = 0.0;
+                }
+            }
+            s
+        })
+        .collect();
+    swings.then_some(out)
 }
 
 // ---------------------------------------------------------------- the gate
@@ -721,9 +879,23 @@ fn blame_for_divergence(eng: &Engine, specs: &[ElementSpec]) -> Option<u32> {
 /// Would the engine accept this document? `Ok(())` = every parameter is in
 /// range, no ideal constraint is shorted, conflicting or looped, the MNA
 /// matrix factors both as placed and with every switch closed, and Newton
-/// finds an operating point. Pure and deterministic. `dt` should be the
+/// finds an operating point as placed, with every switch closed, and at both
+/// ends of every source's swing. Pure and deterministic. `dt` should be the
 /// timestep the live engine runs at (companion conductances depend on it;
 /// structural singularity does not).
+///
+/// Two properties worth stating because they are what make the answer mean
+/// anything:
+///
+/// * the trial engine compiles the SAME `specs` slice the live engine will,
+///   so it interns the same junctions, numbers the same nodes and factors
+///   the same permutation of the same matrix. The numeric layers are
+///   therefore a prediction of what this document does in the room, not of
+///   what some equivalent document would do;
+/// * the trial starts COLD (t = 0, every device at rest) while a live edit
+///   keeps continuous state by id. A document that only fails from an
+///   initial transient it has already lived through is refused — the safe
+///   direction, and the only one available to a pure function.
 pub fn check_document(specs: &[ElementSpec], dt: f64) -> Result<(), Reject> {
     for s in specs {
         if s.pins.len() != s.kind.pin_count() {
@@ -799,25 +971,46 @@ pub fn check_document(specs: &[ElementSpec], dt: f64) -> Result<(), Reject> {
         }
     }
 
-    // Convergence. A linear document takes the single-pass path and cannot
-    // fail to converge, so the common big-document case (resistor ladders,
-    // wire nets) pays nothing at all.
-    //
-    // ONE step is enough and is not a compromise: this class is a DC
-    // operating-point failure, visible on the very first step with zero
-    // steps completed. Deeper trials cost linearly and catch nothing more.
-    //
-    // As-placed only, not the all-switches-closed clone: convergence is a
-    // property of the operating point the player is actually in, and the
-    // structural pass already covers the closed states. Deliberate one-sided
-    // conservatism gap, recorded rather than hidden.
-    if specs.len() <= TRIAL_MAX_ELEMENTS {
-        let mut trial = Engine::new(dt);
-        trial.set_elements(specs);
-        if !trial.is_linear() && trial.advance(1).quarantined {
-            return Err(Reject::WillNotConverge {
-                id: blame_for_divergence(&trial, specs),
-            });
+    // Convergence, in up to four states of the document.
+    let depth = trial_depth(specs.len());
+    if depth > 0 {
+        // 1. As placed: the operating point the room is in right now.
+        if let Some(r) = trial(specs, dt, depth) {
+            return Err(r);
+        }
+        // 2. Every switch closed — the SAME clone layer 3 factors, held to
+        //    the same policy. This is not symmetry for its own sake: the
+        //    hoist's limit switches are closed by the MACHINE through
+        //    `write_param`, on its own schedule, with no gate anywhere in
+        //    front of them, and `write_param` deliberately never clears
+        //    quarantine. Without this trial a player could wire an LED in
+        //    series with LIM-TOP, be told the placement was fine, and have
+        //    the crate itself freeze the room on the way up — the one
+        //    failure the game inflicts on a document it blessed.
+        //
+        //    Singularity is monotone in the closed set (layer 3's argument);
+        //    convergence is not, so this is a two-point sample of a space
+        //    with 2^n corners, not a proof. It covers the direction that
+        //    matters: closing switches only ever ADDS ideal constraints and
+        //    merges nodes, which is what puts a source across a junction.
+        if any_open {
+            if let Some(r) = trial(&closed, dt, depth) {
+                return Err(r);
+            }
+        }
+        // 3-4. Both ends of every source's swing, one step each. A DC
+        //      document's operating-point failure IS visible on the first
+        //      step — that claim was only ever true here, of a document with
+        //      nothing left moving in it. Built from the all-closed clone so
+        //      the two conservatisms compose instead of needing four more
+        //      trials.
+        for sign in [1.0, -1.0] {
+            let Some(peaked) = peak_clone(&closed, sign) else {
+                break; // nothing swings; both signs would repeat state 2
+            };
+            if let Some(r) = trial(&peaked, dt, 1) {
+                return Err(r);
+            }
         }
     }
     Ok(())
@@ -1369,6 +1562,218 @@ mod tests {
         }
     }
 
+    /// REPRO A: three catalogue parts, a beginner's first minute — a 9 V
+    /// 50 Hz sine straight across the shipped LED. The gate used to ACCEPT
+    /// this and the engine quarantined 107 steps (2.14 ms) later, before the
+    /// damage model ever ran, so the LED did not even burn out: the room
+    /// simply stopped, self-concealing, until somebody deleted the part.
+    ///
+    /// The DC twin was always refused. The gate was blind SPECIFICALLY to
+    /// time-varying drive, because it ran one step and called the class a
+    /// t = 0 property.
+    #[test]
+    fn an_ac_source_straight_across_a_junction_is_refused() {
+        let repro = |kind: ElementKind| {
+            vec![
+                ElementSpec::two(1, ac(0.0, 9.0, 50.0, 0.0), (0, 0), (0, 6)),
+                ElementSpec::two(2, kind, (0, 0), (0, 6)),
+                ElementSpec::ground(3, (0, 6)),
+            ]
+        };
+        for (kind, why) in [
+            (ElementKind::Led { color: 0 }, "LED"),
+            (ElementKind::Diode, "diode"),
+            (ElementKind::Zener { vz: 5.1 }, "zener"),
+        ] {
+            let d = repro(kind);
+            let got = reject_of(&d);
+            assert!(
+                matches!(got, Reject::WillNotConverge { id: Some(2) }),
+                "{why}: {got:?}"
+            );
+        }
+
+        // The freeze this prevents is real, and it is NOT at t = 0. Committed
+        // to a live engine, the LED version runs 107 clean steps and then
+        // quarantines for good — which is exactly why one trial step could
+        // never have seen it.
+        let d = repro(ElementKind::Led { color: 0 });
+        let mut e = Engine::new(DT);
+        e.set_elements(&d);
+        let mut good = 0;
+        while good < 5000 && !e.advance(1).quarantined {
+            good += 1;
+        }
+        assert_eq!(good, 107, "the measured failure step");
+        assert!(e.is_quarantined());
+
+        // And the one-step trial the old gate ran does not see it at any
+        // frequency the catalogue offers — the point of the extreme states.
+        for hz in [0.3, 1.0, 50.0, 60.0, 440.0] {
+            let d = vec![
+                ElementSpec::two(1, ac(0.0, 9.0, hz, 0.0), (0, 0), (0, 6)),
+                ElementSpec::two(2, ElementKind::Led { color: 0 }, (0, 0), (0, 6)),
+                ElementSpec::ground(3, (0, 6)),
+            ];
+            let mut one = Engine::new(DT);
+            one.set_elements(&d);
+            assert!(
+                !one.advance(1).quarantined,
+                "{hz} Hz: one step must NOT be what catches this"
+            );
+            assert!(check_document(&d, DT).is_err(), "{hz} Hz must be refused");
+        }
+    }
+
+    /// The extreme-state trials must judge circuits by operating points they
+    /// really reach, and nothing else. Every one of these is a circuit a
+    /// player is supposed to be able to build.
+    #[test]
+    fn time_varying_drive_that_is_actually_fine_stays_placeable() {
+        // The same sine WITH a series resistor: the whole point of the hint.
+        for ohms in [1.0, 330.0] {
+            ok(&[
+                ElementSpec::two(1, ac(0.0, 9.0, 50.0, 0.0), (0, 0), (0, 6)),
+                ElementSpec::two(2, r(ohms), (0, 0), (4, 0)),
+                ElementSpec::two(3, ElementKind::Led { color: 0 }, (4, 0), (0, 6)),
+                ElementSpec::ground(4, (0, 6)),
+            ]);
+        }
+        // A sine offset so it never crosses zero, and one that swings far
+        // negative into a diode's reverse region.
+        for (dc_v, amp) in [(6.0, 1.0), (0.0, 24.0), (-5.0, 12.0)] {
+            ok(&[
+                ElementSpec::two(1, ac(dc_v, amp, 50.0, 0.7), (0, 0), (0, 6)),
+                ElementSpec::two(2, r(1000.0), (0, 0), (4, 0)),
+                ElementSpec::two(3, ElementKind::Diode, (4, 0), (0, 6)),
+                ElementSpec::ground(4, (0, 6)),
+            ]);
+        }
+        // The showcase's shape: a sub-Hz gate driver on an NMOS, where the
+        // period is 166 667 steps and no affordable time trial could ever
+        // reach the peak.
+        ok(&[
+            ElementSpec::two(1, dc(9.0), (0, 0), (0, 12)),
+            ElementSpec::two(
+                2,
+                ElementKind::Lamp {
+                    ohms: 60.0,
+                    rated_watts: 1.2,
+                },
+                (0, 0),
+                (4, 0),
+            ),
+            ElementSpec::three(
+                3,
+                ElementKind::Nmos { vt: 1.5, k: 0.05 },
+                (8, 6),
+                (4, 0),
+                (4, 12),
+            ),
+            ElementSpec::two(4, ac(3.0, 3.0, 0.3, 0.0), (8, 6), (0, 12)),
+            ElementSpec::ground(5, (0, 12)),
+        ]);
+        // Two sines of different phase and frequency in one loop: the case
+        // the simultaneous-peak conservatism could in principle refuse.
+        ok(&[
+            ElementSpec::two(1, ac(0.0, 6.0, 50.0, 0.0), (0, 0), (4, 0)),
+            ElementSpec::two(2, ac(0.0, 6.0, 60.0, 1.5), (4, 0), (8, 0)),
+            ElementSpec::two(3, r(470.0), (8, 0), (8, 6)),
+            ElementSpec::two(4, ElementKind::Led { color: 0 }, (8, 6), (0, 6)),
+            ElementSpec::two(5, ElementKind::Wire, (0, 6), (0, 0)),
+            ElementSpec::ground(6, (0, 6)),
+        ]);
+    }
+
+    /// F2: the one failure the GAME inflicts on a document the gate blessed.
+    ///
+    /// `machine_step` writes LIM-TOP/LIM-BOT straight into the live engine
+    /// every 640 µs with no gate in front of it, and `write_param` — quite
+    /// correctly — never clears quarantine. So a circuit that only diverges
+    /// once a limit switch closes is a room-wide freeze that the crate
+    /// itself triggers, that no player action can undo, and that the gate
+    /// used to sign off on because it only ever trialled the state the
+    /// document was IN.
+    #[test]
+    fn a_switch_closing_into_a_junction_is_refused_before_it_can_close() {
+        // 9 V -> switch -> LED -> ground. Open: the LED dangles. Closed:
+        // an ideal source straight across it.
+        let repro = |source: ElementKind, closed: bool| {
+            vec![
+                ElementSpec::two(1, source, (0, 0), (0, 6)),
+                ElementSpec::two(902, ElementKind::Switch { closed }, (0, 0), (4, 0)),
+                ElementSpec::two(3, ElementKind::Led { color: 0 }, (4, 0), (0, 6)),
+                ElementSpec::ground(4, (0, 6)),
+            ]
+        };
+        for source in [dc(9.0), ac(0.0, 9.0, 50.0, 0.0)] {
+            let d = repro(source, false);
+            // It factors as placed and with the switch closed: layer 3 has
+            // nothing to say about it, which is why layer 4 has to.
+            let mut e = Engine::new(DT);
+            e.set_elements(&d);
+            assert!(e.probe_solvable(), "structurally fine as placed");
+            let got = reject_of(&d);
+            assert!(
+                matches!(got, Reject::WillNotConverge { id: Some(3) }),
+                "the LED must be named: {got:?}"
+            );
+            // Closed as placed, it is refused too — same circuit, no gap.
+            assert!(check_document(&repro(source, true), DT).is_err());
+        }
+
+        // What was actually happening: the machine closes the switch and the
+        // room never comes back, not even when the crate leaves the limit.
+        let d = repro(dc(9.0), false);
+        let mut e = Engine::new(DT);
+        e.set_elements(&d);
+        e.advance(50);
+        assert!(!e.is_quarantined(), "healthy while the switch is open");
+        e.write_param(902, crate::netlist::ParamWrite::Switch { closed: true });
+        e.advance(1);
+        assert!(e.is_quarantined(), "the machine froze the room");
+        e.write_param(902, crate::netlist::ParamWrite::Switch { closed: false });
+        e.advance(100);
+        assert!(e.is_quarantined(), "and it is self-locking: no way back");
+
+        // A switch closing onto something that is FINE closed stays legal —
+        // the fix must not make the hoist's own drive unplaceable.
+        for closed in [false, true] {
+            ok(&[
+                ElementSpec::two(1, dc(9.0), (0, 0), (0, 6)),
+                ElementSpec::two(902, ElementKind::Switch { closed }, (0, 0), (4, 0)),
+                ElementSpec::two(3, r(330.0), (4, 0), (8, 0)),
+                ElementSpec::two(4, ElementKind::Led { color: 0 }, (8, 0), (0, 6)),
+                ElementSpec::ground(5, (0, 6)),
+            ]);
+        }
+    }
+
+    /// F4: the trial's depth ladder, and the cap that switches it off.
+    #[test]
+    fn the_trial_depth_ladder_is_bounded_and_stops_at_the_cap() {
+        // Monotone non-increasing, so a bigger document never buys a deeper
+        // (more expensive) trial.
+        let mut last = u32::MAX;
+        for n in 0..=(TRIAL_MAX_ELEMENTS + 8) {
+            let d = trial_depth(n);
+            assert!(d <= last, "depth must not grow at {n}");
+            last = d;
+        }
+        assert_eq!(
+            trial_depth(3),
+            256,
+            "a beginner's circuit gets the deep run"
+        );
+        assert!(trial_depth(147) >= 1, "the shipped room is trialled");
+        assert_eq!(trial_depth(TRIAL_MAX_ELEMENTS), 1);
+        assert_eq!(
+            trial_depth(TRIAL_MAX_ELEMENTS + 1),
+            0,
+            "above the cap the trial is skipped, as documented"
+        );
+    }
+
     #[test]
     fn the_same_led_with_a_series_resistor_is_fine() {
         for ohms in [1.0, 330.0] {
@@ -1589,6 +1994,128 @@ mod tests {
                 "a conflict is a conflict in any order"
             );
         }
+    }
+
+    /// What element order can and cannot change, stated exactly.
+    ///
+    /// Layers 1-2 are integer work — value ranges, constraint keys,
+    /// union-find over node pairs — and their VERDICT is exactly
+    /// order-invariant. (Which part a multi-fault document names first is
+    /// document order on purpose: "the first offender" is the reading a
+    /// player expects, and every implicated id is in `ids()` anyway.)
+    ///
+    /// Layers 3-4 are floating-point. Element order fixes the order
+    /// junctions are interned in, hence the node numbering, hence which
+    /// permutation of the same matrix gets factored — and a document sitting
+    /// exactly on the singular/convergent boundary can land either side of
+    /// it. Measured over 8 000 fuzzed documents x 6 permutations, 12 flipped
+    /// (0.025%), every one of them in the two numeric layers.
+    ///
+    /// That is not a bug and "fixing" it would make the gate LESS accurate,
+    /// because of the property this test actually pins: the trial engine
+    /// compiles the same slice the live engine will, so whatever ordering
+    /// the room has is the ordering that was judged. An order-invariant
+    /// verdict would have to answer for an ordering the room does not have.
+    #[test]
+    fn element_order_moves_only_the_numeric_layers() {
+        let sw = |closed| ElementKind::Switch { closed };
+        // Structural cases: the verdict and the code must survive any order.
+        let structural: Vec<(&str, Vec<ElementSpec>)> = vec![
+            ("healthy", base()),
+            ("merged supplies", {
+                let mut d = base();
+                d.push(ElementSpec::two(4, dc(9.0), (0, 0), (0, 6)));
+                d
+            }),
+            ("shorted", {
+                let mut d = base();
+                d.push(ElementSpec::two(4, ElementKind::Wire, (0, 0), (0, 6)));
+                d
+            }),
+            ("conflict", {
+                let mut d = base();
+                d.push(ElementSpec::two(4, dc(1.0), (0, 0), (0, 6)));
+                d
+            }),
+            (
+                "loop",
+                vec![
+                    ElementSpec::two(1, dc(9.0), (0, 0), (0, 6)),
+                    ElementSpec::two(2, dc(5.0), (0, 6), (6, 6)),
+                    ElementSpec::two(3, dc(3.0), (6, 6), (0, 0)),
+                ],
+            ),
+            ("latent short", {
+                let mut d = base();
+                d.push(ElementSpec::two(4, sw(false), (0, 0), (0, 6)));
+                d
+            }),
+            ("bad value", {
+                let mut d = base();
+                d[1] = ElementSpec::two(2, r(0.0), (0, 0), (0, 6));
+                d
+            }),
+        ];
+        for (why, d) in &structural {
+            let want = check_document(d, DT).map_err(|r| r.code());
+            for p in permutations(d) {
+                assert_eq!(
+                    check_document(&p, DT).map_err(|r| r.code()),
+                    want,
+                    "{why}: the verdict must not depend on element order"
+                );
+            }
+        }
+
+        // The property that makes the numeric layers' order-sensitivity
+        // harmless: for EVERY ordering, the gate's answer is the truth about
+        // that ordering. Accept => the engine compiled from the very same
+        // slice survives the trial; a convergence refusal => it does not.
+        let numeric: Vec<Vec<ElementSpec>> = structural
+            .iter()
+            .map(|(_, d)| d.clone())
+            .chain([
+                vec![
+                    ElementSpec::two(1, ac(0.0, 9.0, 50.0, 0.0), (0, 0), (0, 6)),
+                    ElementSpec::two(2, r(330.0), (0, 0), (4, 0)),
+                    ElementSpec::two(3, ElementKind::Led { color: 0 }, (4, 0), (0, 6)),
+                    ElementSpec::ground(4, (0, 6)),
+                ],
+                vec![
+                    ElementSpec::two(1, dc(9.0), (0, 0), (0, 6)),
+                    ElementSpec::two(2, ElementKind::Led { color: 0 }, (0, 0), (0, 6)),
+                    ElementSpec::ground(3, (0, 6)),
+                ],
+            ])
+            .collect();
+        for d in &numeric {
+            for p in permutations(d) {
+                if check_document(&p, DT).is_err() {
+                    continue;
+                }
+                let mut live = Engine::new(DT);
+                live.set_elements(&p);
+                assert!(
+                    !live.advance(trial_depth(p.len())).quarantined,
+                    "accepted an ordering that then froze: {p:?}"
+                );
+            }
+        }
+    }
+
+    /// Every rotation of `d`, plus its reverse: enough distinct orders to
+    /// catch an order-dependent verdict, and deterministic.
+    fn permutations(d: &[ElementSpec]) -> Vec<Vec<ElementSpec>> {
+        let mut out = Vec::new();
+        for k in 0..d.len() {
+            let mut p: Vec<ElementSpec> = d[k..].to_vec();
+            p.extend_from_slice(&d[..k]);
+            out.push(p);
+        }
+        let mut rev = d.to_vec();
+        rev.reverse();
+        out.push(rev);
+        out
     }
 
     #[test]
