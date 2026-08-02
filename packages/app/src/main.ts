@@ -89,6 +89,7 @@ import {
   scopeOwner,
   type Panel,
   type PanelHandle,
+  type PanelHover,
   type PanelOp,
   type PanelRect,
 } from './panel';
@@ -177,6 +178,9 @@ let damageSeen = false;
 let probes: Probe[] = [];
 /** Shared control-panel regions (room-scoped, like probes). */
 let panels: Panel[] = [];
+/** What a control panel is pointing at: hovering a row (or a whole window)
+ * highlights the part out on the canvas. Set by panel.ts on enter/leave. */
+let panelHover: PanelHover | null = null;
 let localPlidCounter = 1;
 const traces = new TraceStore();
 let localPidCounter = 1;
@@ -652,6 +656,9 @@ const panelHost = new PanelHost({
   },
   interact: (e, op) => interact(e, op),
   op: panelOp,
+  hover: (h) => {
+    panelHover = h;
+  },
 });
 
 function nearestPin(e: ElementSpec, x: number, y: number): number {
@@ -702,9 +709,13 @@ const HOME_RECT = { x0: -10, y0: -10, x1: 60, y1: 60 };
 function fitRect(x0: number, y0: number, x1: number, y1: number, loScale = 4, hiScale = 60) {
   const w = Math.max(1, x1 - x0 + 4);
   const ht = Math.max(1, y1 - y0 + 4);
-  const fit = Math.min(window.innerWidth / w, window.innerHeight / ht);
+  // The HUD rails overlay the canvas, so "fit" means fit into the part of it
+  // that is not behind a sidebar. Nothing else in the camera is inset.
+  const ins = panelHost.railInsets();
+  const vw = Math.max(160, window.innerWidth - ins.left - ins.right);
+  const fit = Math.min(vw / w, window.innerHeight / ht);
   cam.scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, Math.max(loScale, Math.min(hiScale, fit))));
-  cam.ox = (window.innerWidth - (x0 + x1) * cam.scale) / 2;
+  cam.ox = ins.left + (vw - (x0 + x1) * cam.scale) / 2;
   cam.oy = (window.innerHeight - (y0 + y1) * cam.scale) / 2;
 }
 
@@ -2505,6 +2516,69 @@ function drawHighlight(e: ElementSpec, strong: boolean) {
   ctx.globalAlpha = 1;
 }
 
+/** A control panel is pointing at something: light it up in exactly the
+ * language the canvas already uses for "this one" — a docked panel is just
+ * another way of pointing at a part. A row gets the strong single-part box,
+ * a whole window the weak "these" box over every member. */
+function drawPanelHoverHighlight(h: PanelHover, view: ViewRect) {
+  const strong = h.kind === 'row';
+  for (const id of h.ids) {
+    const e = elemById(id);
+    if (!e) continue; // the part went away mid-hover: draw nothing
+    if (inView(view, id)) drawHighlight(e, strong);
+    else if (strong) drawOffscreenPointer(e);
+  }
+}
+
+/** The part is off-screen — routine once the panel lives in a sidebar, and a
+ * highlight nobody can see is a failed feature. Put a chevron on the
+ * viewport edge, on the ray to the part, inset past the rails so it is not
+ * hidden under the very panel being used. */
+function drawOffscreenPointer(e: ElementSpec) {
+  const ins = panelHost.railInsets();
+  const m = 26;
+  // The HUD block owns the top-left corner; keep the chevron out from under
+  // it, and off the scope dock at the bottom.
+  const top = 62;
+  let cx = 0;
+  let cy = 0;
+  for (const p of e.pins) {
+    cx += p[0];
+    cy += p[1];
+  }
+  const n = e.pins.length || 1;
+  const sx = cam.ox + (cx / n) * cam.scale;
+  const sy = cam.oy + (cy / n) * cam.scale;
+  const px = Math.max(ins.left + m, Math.min(window.innerWidth - ins.right - m, sx));
+  const py = Math.max(top, Math.min(window.innerHeight - 30 - m, sy));
+  const a = Math.atan2(sy - py, sx - px);
+  ctx.save();
+  ctx.globalAlpha = 0.92;
+  ctx.translate(px, py);
+  ctx.rotate(a);
+  ctx.fillStyle = '#5a8cff';
+  ctx.beginPath();
+  ctx.moveTo(12, 0);
+  ctx.lineTo(-6, 7.5);
+  ctx.lineTo(-6, -7.5);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+  // The distance is grid units off the camera, not an invented number.
+  ctx.save();
+  ctx.globalAlpha = 0.95;
+  ctx.fillStyle = '#9dbcff';
+  ctx.font = '11px ui-monospace, monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(
+    `#${e.id} ${(Math.hypot(sx - px, sy - py) / cam.scale).toFixed(0)}u`,
+    px - Math.cos(a) * 22,
+    py - Math.sin(a) * 22,
+  );
+  ctx.restore();
+}
+
 /** Little speaker next to the flag of the probe we are listening to; its
  * arcs ride the stream's own amplitude. */
 function drawListenGlyph(x: number, y: number, color: string) {
@@ -2826,7 +2900,7 @@ function frame(now: number) {
     ctx,
     cam,
     panels,
-    panelResize?.plid ?? panelMove?.plid ?? hotPanel?.plid ?? null,
+    panelResize?.plid ?? panelMove?.plid ?? hotPanel?.plid ?? panelHover?.plid ?? null,
   );
   if (panelDrag) drawPanelGhost(ctx, cam, panelDrag.a, panelDrag.b);
 
@@ -2874,6 +2948,8 @@ function frame(now: number) {
     const e = elemById(id);
     if (e && e !== hover) drawHighlight(e, false);
   }
+  // ...and whatever a control panel is pointing at (row hover / keyboard).
+  if (panelHover) drawPanelHoverHighlight(panelHover, view);
 
   // Ghost previews for in-progress edits.
   ctx.globalAlpha = 0.45;
@@ -2945,6 +3021,9 @@ function frame(now: number) {
   // Panel windows are HTML overlays: re-derive members and refresh every
   // widget from this frame's solver values.
   panelHost.tick(panels);
+  // The other direction: pointing at a part on the canvas makes its row in
+  // whichever panel owns it read hot. Self-guarded on an unchanged id.
+  panelHost.setCanvasHover(hover?.id ?? null);
 
   dock.update(now, probes, traces, dockScope);
 
@@ -2993,7 +3072,7 @@ function frame(now: number) {
       : '';
   const hints = hintsOpen
     ? `\nparts: R C L W G V D N P M A U 5 S B T Z E F I · ⇧V rail · drag part = move · drag the hoist cabinet = move the machine · dbl-click = edit values · right-click = menu` +
-      `\ndrag pin = reshape part · W then drag = wire · drag empty = select · Q rotate · X/Y flip · ⌘Z undo · ⌘C/⌘V copy/paste · 1/2 probe · 3 listen · 0 ref · O scope · \` dock · J panel · K repair · Del delete` +
+      `\ndrag pin = reshape part · W then drag = wire · drag empty = select · Q rotate · X/Y flip · ⌘Z undo · ⌘C/⌘V copy/paste · 1/2 probe · 3 listen · 0 ref · O scope · \` dock · J panel · [ ] sidebars · K repair · Del delete` +
       `\nH home district · shift+H fit everything · wheel = zoom (0.4–200 px/unit) · pan: middle / ctrl+drag / space+drag · ? hides this`
     : `\n? controls`;
   hud.textContent =

@@ -10,7 +10,9 @@ export default defineConfig({
     allowedHosts: ['.trycloudflare.com'],
     proxy: {
       // Dev-mode: the game server owns /ws (run `cargo run -p server`).
-      // Override the server port with EE_SERVER_PORT to run parallel instances.
+      // EE_SERVER_PORT points a dev client at a server other than the default
+      // one, so isolated rooms can run side by side without disturbing it.
+
       '/ws': { target: `ws://localhost:${process.env.EE_SERVER_PORT ?? 8080}`, ws: true },
     },
   },
