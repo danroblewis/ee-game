@@ -52,6 +52,7 @@ import {
   TRIM_TAU_S,
   WORKLET_SRC,
 } from './audio-worklet';
+import { SfxBus, TAIL_MS } from './sfx';
 import { lsFlag, lsNum, lsSet } from './store';
 
 /** Offline: animation-frame samples batched per message. */
@@ -206,6 +207,17 @@ interface MixStats {
 export class AudioPlayer implements AudioControls {
   private ctx: AudioContext | null = null;
   private node: AudioWorkletNode | null = null;
+  /** UI sound effects. A SEPARATE graph that shares only the AudioContext:
+   * it never becomes a worklet source, so a synthesized noise can never be
+   * mistaken for — or sum into the limiter of — the solver's own samples.
+   * See the header of sfx.ts. */
+  private sfx: SfxBus | null = null;
+  /** performance.now() until which an effect is still sounding, so `idle()`
+   * cannot park the context on top of a tail. */
+  private effectUntil = 0;
+  /** An effect was dropped for want of a user gesture: the HUD should ask
+   * for the click even in a room with no speakers to ask on behalf of. */
+  private missedEffect = false;
   private booting: Promise<void> | null = null;
   private dead = false;
   /** pid of the '3'-listen probe, or null. */
@@ -248,11 +260,12 @@ export class AudioPlayer implements AudioControls {
   constructor() {
     const kick = () => {
       this.activated = true;
+      this.missedEffect = false;
       if (this.srcs.size === 0) return;
       // First gesture with audio waiting: create the context here, in the
       // gesture's own task (boot() constructs it synchronously before its
       // first await). Otherwise just un-park an existing one.
-      if (!this.ctx) void this.boot();
+      if (!this.node) void this.boot();
       else this.wake();
     };
     window.addEventListener('pointerdown', kick);
@@ -400,10 +413,47 @@ export class AudioPlayer implements AudioControls {
       listening: this.src !== null,
       sounding: sounding && !this.mute,
       needsGesture:
-        this.srcs.size > 0 && (!this.activated || this.ctx?.state === 'suspended'),
+        (this.srcs.size > 0 || this.missedEffect) &&
+        (!this.activated || this.ctx?.state === 'suspended'),
       buf: fresh ? this.healthOf(this.mix) : null,
       ratio: now - this.rtAt <= RATIO_TTL_MS ? this.rt : null,
     };
+  }
+
+  // ------------------------------------------------------------ UI effects
+
+  /**
+   * A part broke: play its break sound. `kind` is the element's kind tag
+   * (`e.kind.t`) — unknown or missing gets the generic snap. `id` only
+   * detunes the voice so identical parts do not machine-gun.
+   *
+   * This is the ONE synthesized sound in the audio system, and it is
+   * deliberately kept out of the worklet: it goes to a parallel `SfxBus`
+   * that shares the AudioContext and nothing else, so it can never be
+   * pushed into a ring buffer, never sum into the limiter that guards the
+   * speaker taps, and never appear in `status().buf`. See sfx.ts.
+   *
+   * The EVENT is the server's — the damage model broke the part from solver
+   * quantities and said so in a `damage` snapshot. This is a label on a real
+   * event, not an invented one.
+   */
+  playBreak(kind?: string, id = 0) {
+    if (this.dead || this.mute || this.vol <= 0) return;
+    const ctx = this.ensureCtx();
+    if (!ctx) {
+      // Pre-gesture. Dropping the sound is mandatory — building a context to
+      // play it would poison audio for the whole session — so remember that
+      // one was wanted and let the HUD ask for a click.
+      this.missedEffect = true;
+      return;
+    }
+    if (!this.sfx) this.sfx = new SfxBus(ctx, ctx.destination);
+    this.sfx.setGain(this.vol);
+    this.wake();
+    if (!this.sfx.playBreak(kind, id)) return; // voice cap: a bang, not a wall
+    this.effectUntil = performance.now() + TAIL_MS;
+    // No streams to hold the context open: park it again once this rings out.
+    if (this.srcs.size === 0) setTimeout(() => this.idle(), TAIL_MS + 40);
   }
 
   // ------------------------------------------------------------------ feeds
@@ -468,7 +518,24 @@ export class AudioPlayer implements AudioControls {
   /** Nothing left to play: park the context so the tab stops burning an
    * audio thread. `add` and any user gesture wake it again. */
   private idle() {
-    if (this.srcs.size === 0) void this.ctx?.suspend();
+    if (this.srcs.size > 0) return;
+    // A break in a room with no speakers still has to finish ringing.
+    const left = this.effectUntil - performance.now();
+    if (left > 0) {
+      setTimeout(() => this.idle(), left + 20);
+      return;
+    }
+    void this.ctx?.suspend();
+  }
+
+  /** The one AudioContext, built lazily and NEVER before a user gesture: a
+   * context created earlier is permanently blocked by Chrome's autoplay
+   * policy, and no later resume() can rescue it. Both the worklet path and
+   * the effects bus go through here so that rule has exactly one home. */
+  private ensureCtx(): AudioContext | null {
+    if (this.dead || !this.activated) return null;
+    if (!this.ctx) this.ctx = new AudioContext({ latencyHint: 'interactive' });
+    return this.ctx;
   }
 
   /** Wake a parked context. A no-op while the browser is still waiting for a
@@ -496,6 +563,8 @@ export class AudioPlayer implements AudioControls {
 
   private pushMaster() {
     this.node?.port.postMessage({ t: 'master', gain: this.vol, mute: this.mute });
+    // The effect bus rides the same master controls — "sound off" is off.
+    this.sfx?.setGain(this.mute ? 0 : this.vol);
   }
 
   /** Worklet telemetry, ~10 Hz. Cheap: a handful of numbers per source. */
@@ -631,7 +700,10 @@ export class AudioPlayer implements AudioControls {
       return this.booting;
     }
     this.booting = (async () => {
-      const ctx = new AudioContext({ latencyHint: 'interactive' });
+      // Synchronously, before the first await: this call is still inside the
+      // gesture's own task, which is the only place a usable context exists.
+      const ctx = this.ensureCtx();
+      if (!ctx) return;
       const url = URL.createObjectURL(new Blob([WORKLET_SRC], { type: 'text/javascript' }));
       try {
         await ctx.audioWorklet.addModule(url);
@@ -668,8 +740,9 @@ export class AudioPlayer implements AudioControls {
       this.node = node;
       this.pushMaster();
       // Everything stopped while the module was loading: idle instead of
-      // running an audio thread for silence.
-      if (this.srcs.size === 0) await ctx.suspend();
+      // running an audio thread for silence (but not on top of an effect
+      // tail — `idle()` waits that out).
+      if (this.srcs.size === 0) this.idle();
       else await ctx.resume();
     })().catch((err: unknown) => {
       // No AudioWorklet (or the page refuses to make noise): stay silent

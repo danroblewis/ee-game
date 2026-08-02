@@ -507,6 +507,9 @@ function toast(text: string) {
 /** The oldest joke in electronics, and the clearest possible failure notice. */
 function magicSmoke(id: number) {
   const e = elemById(id);
+  // Fired from the false→true edge of the server's `broken` bit, once per
+  // part, never for damage that was already there when we joined.
+  audio.playBreak(e?.kind.t, id);
   toast(`${e ? e.kind.t : 'Part'} #${id} released its magic smoke — press K, then click it to repair`);
 }
 
@@ -2852,8 +2855,9 @@ function frame(now: number) {
     }
   } else {
     // Too small for symbols: conductors only, colored by the solver frame —
-    // plus a marker on every dead part, because finding them IS the repair.
-    drawElementsLod(ctx, cam, visible, live, cam.scale < LOD_CHAIN, damage);
+    // plus heat, a blast ping and a marker on every dead part, because
+    // finding them IS the repair.
+    drawElementsLod(ctx, cam, visible, live, cam.scale < LOD_CHAIN, damage, now);
   }
 
   // Hover highlight (blue element + pin dots), Falstad-style.
