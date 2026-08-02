@@ -191,6 +191,43 @@ pub enum ElementKind {
 }
 
 impl ElementKind {
+    /// The document tag — the `t` field serde writes, and the same string the
+    /// TypeScript client discriminates on.
+    ///
+    /// Exhaustive by design (no wildcard arm): a new variant will not compile
+    /// until someone names it here, which is what lets other tables key off a
+    /// tag instead of repeating the variant list.
+    pub fn tag(&self) -> &'static str {
+        use ElementKind::*;
+        match self {
+            Wire => "Wire",
+            Ground => "Ground",
+            Resistor { .. } => "Resistor",
+            Lamp { .. } => "Lamp",
+            Speaker { .. } => "Speaker",
+            Capacitor { .. } => "Capacitor",
+            Inductor { .. } => "Inductor",
+            VoltageSource { .. } => "VoltageSource",
+            CurrentSource { .. } => "CurrentSource",
+            Rail { .. } => "Rail",
+            Switch { .. } => "Switch",
+            Button { .. } => "Button",
+            Diode => "Diode",
+            Zener { .. } => "Zener",
+            Led { .. } => "Led",
+            Npn { .. } => "Npn",
+            Pnp { .. } => "Pnp",
+            Nmos { .. } => "Nmos",
+            Pmos { .. } => "Pmos",
+            OpAmp { .. } => "OpAmp",
+            Ota => "Ota",
+            Timer555 => "Timer555",
+            Potentiometer { .. } => "Potentiometer",
+            Motor { .. } => "Motor",
+            Noise { .. } => "Noise",
+        }
+    }
+
     pub fn pin_count(&self) -> usize {
         use ElementKind::*;
         match self {

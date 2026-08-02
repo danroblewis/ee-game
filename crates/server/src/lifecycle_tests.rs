@@ -32,6 +32,79 @@ fn small_circuit() -> Vec<sim_core::ElementSpec> {
     ]
 }
 
+/// NO FALSE REJECTIONS. Every shipped template must still pass the gate it
+/// passed before the shape rule existed, and must still accept an ordinary
+/// edit afterwards.
+///
+/// The second half is the one that matters: `check_shapes` is a rule about a
+/// CHANGE, so a template full of parts that predate it has to stay editable.
+/// If this ever fails, a room made from that template cannot be worked on —
+/// which is the exact failure mode a whole-document rule would have caused
+/// in every one of these five.
+#[test]
+fn every_builtin_template_still_loads_and_still_accepts_edits() {
+    for b in templates::BUILTINS {
+        let doc = (b.build)().normalize().unwrap().elements;
+        assert!(
+            crate::check_room_doc(&doc).is_ok(),
+            "template {} no longer validates",
+            b.id
+        );
+        // An unrelated part dropped into the room: the ordinary edit.
+        let mut next = doc.clone();
+        next.push(spec(880, r(1000.0), (-400, -400), (-396, -400)));
+        assert!(
+            crate::check_room_edit(&doc, &next).is_ok(),
+            "template {} refuses a plain edit",
+            b.id
+        );
+        // ...and every multi-pin part in it can still be picked up and moved.
+        for e in doc.iter().filter(|e| e.pins.len() > 2) {
+            let mut moved = doc.clone();
+            let t = moved.iter_mut().find(|x| x.id == e.id).unwrap();
+            t.pins = t.pins.iter().map(|p| (p.0 + 100, p.1 + 100)).collect();
+            assert!(
+                sim_core::check_shapes(&doc, &moved).is_ok(),
+                "template {} cannot move part #{}",
+                b.id,
+                e.id
+            );
+        }
+    }
+}
+
+/// How much of each shipped template is already in formation. Not a
+/// requirement — the grandfather clause means a legacy part costs nothing —
+/// but a number worth keeping honest, because every part outside its family
+/// is a part that will visibly snap the first time someone drags it.
+#[test]
+fn the_shipped_templates_shape_census() {
+    let mut lines = Vec::new();
+    for b in templates::BUILTINS {
+        let doc = (b.build)().normalize().unwrap().elements;
+        let multi: Vec<_> = doc
+            .iter()
+            .filter(|e| e.pins.len() > 2 && !crate::reserved_id(e.id))
+            .collect();
+        let bad = multi
+            .iter()
+            .filter(|e| !sim_core::is_rigid(&e.kind, &e.pins))
+            .count();
+        lines.push(format!(
+            "{}: {}/{} in formation",
+            b.id,
+            multi.len() - bad,
+            multi.len()
+        ));
+    }
+    let census = lines.join("  |  ");
+    // Recorded, not asserted part by part: the synth is rebuilt in formation
+    // by the layout pass that follows this one, and the two showcase rooms
+    // are hand-placed vignettes nobody has revisited since.
+    assert!(census.contains("sandbox: 0/0"), "{census}");
+    println!("shape census — {census}");
+}
+
 #[test]
 fn every_builtin_template_creates_a_room_that_matches_its_advertisement() {
     let (rd, td) = dirs("builtins");

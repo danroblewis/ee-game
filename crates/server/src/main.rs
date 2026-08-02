@@ -1646,13 +1646,17 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
                     let candidate = {
                         let elems = room.elements.lock().unwrap();
                         let mut next = elems.clone();
-                        apply_doc_op_to(&mut next, &op).then_some(next)
+                        // The document being replaced is kept alongside the
+                        // candidate: the shape rule is a rule about the
+                        // CHANGE (a legacy skewed part may move, but nothing
+                        // may become newly skewed), so the gate needs both.
+                        apply_doc_op_to(&mut next, &op).then(|| (elems.clone(), next))
                     };
                     // Syntactic failures (unknown/duplicate/reserved id) stay
                     // silent drops, as before: they are client bugs or races,
                     // not placements a player can act on.
-                    let Some(next) = candidate else { continue };
-                    if let Err(r) = check_room_doc(&next) {
+                    let Some((prev, next)) = candidate else { continue };
+                    if let Err(r) = check_room_edit(&prev, &next) {
                         tracing::info!("edit refused ({}): {:?}", r.code(), op);
                         let _ = room.events.send(reject_msg(who, "edit", &r));
                         continue;
@@ -2132,6 +2136,19 @@ fn sample_probes(eng: &Engine, probes: &[Probe], bufs: &mut [Vec<f32>]) {
 /// placement, only refused.
 fn check_room_doc(elems: &[ElementSpec]) -> Result<(), sim_core::Reject> {
     sim_core::check_document(elems, DT)
+}
+
+/// The gate for a DOCUMENT EDIT: everything `check_room_doc` judges, plus the
+/// shape rule, which needs both halves of the change.
+///
+/// The shape rule is deliberately not inside `check_room_doc`. That function
+/// runs on candidates for interacts, repairs and machine moves too — none of
+/// which can change a part's geometry — and it is the only gate a room being
+/// loaded ever sees. Keeping the rule on the edit path means an old room full
+/// of skewed parts still opens, still runs, and still accepts every op that
+/// does not make the skew worse. See `sim_core::check_shapes`.
+fn check_room_edit(before: &[ElementSpec], after: &[ElementSpec]) -> Result<(), sim_core::Reject> {
+    sim_core::check_edit(before, after, DT)
 }
 
 /// The broadcast telling client `who` why its op was refused, with a
