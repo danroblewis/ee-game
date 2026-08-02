@@ -979,6 +979,104 @@ enum PanelOp {
     },
 }
 
+/// Drop the commands this tick that a later command in the SAME tick makes
+/// irrelevant, so the placement gate runs once per part per tick instead of
+/// once per pointer sample.
+///
+/// This is the same trick `pending_move` already plays for the hoist cabinet,
+/// generalised to the two ops a drag repeats. Both are ABSOLUTE writes — a
+/// `Move` sets pins outright, a `SetValue`/`SetSwitch` sets one parameter
+/// outright — so applying the last one is byte-for-byte applying all of them.
+/// A part drag sends one `Move` per selected element every 60 ms and a knob
+/// drag one `SetValue` per pointer sample; each of those used to be a full
+/// `check_room_doc`, and with a multi-part selection they arrived faster than
+/// the tick could retire them.
+///
+/// Two things it deliberately does NOT do:
+///
+/// * coalesce across DIFFERENT parameters of one part. `SetSwitch` then
+///   `SetValue` on the same id write different fields, and keeping only the
+///   last would silently drop the first;
+/// * coalesce past anything else that touches the id. If any other command in
+///   the tick names the same part — a `Remove`, an `Add`, a repair — every one
+///   of that part's commands is kept, in order, and the tick behaves exactly
+///   as it did before. Superseding is an optimisation, and it only applies
+///   where it is provably invisible.
+///
+/// The one visible change is which refusal a player sees: a mid-drag position
+/// that would have been refused is no longer judged at all, only the position
+/// the drag actually left the part in. That is the better answer — a drag is
+/// one gesture, and refusing a frame of it that no longer exists was never
+/// something the player could act on.
+fn supersede(cmds: &mut Vec<Cmd>) {
+    // Which id each command is about, and whether it is an absolute write
+    // that a later identical-shaped write replaces.
+    fn subject(c: &Cmd) -> Option<(u32, u8)> {
+        match c {
+            Cmd::Edit {
+                op: DocOp::Move { id, .. },
+                ..
+            } => Some((*id, 0)),
+            Cmd::Interact {
+                id,
+                op: InteractOp::SetValue { .. },
+                ..
+            } => Some((*id, 1)),
+            Cmd::Interact {
+                id,
+                op: InteractOp::SetSwitch { .. },
+                ..
+            } => Some((*id, 2)),
+            _ => None,
+        }
+    }
+    /// Every id a command names, superseder or not — the guard against
+    /// coalescing across a `Remove` or an `Add` of the same part.
+    fn touches(c: &Cmd) -> Option<u32> {
+        match c {
+            Cmd::Interact { id, .. } => Some(*id),
+            Cmd::Edit { op, .. } => Some(match op {
+                DocOp::Add { spec } => spec.id,
+                DocOp::Remove { id } | DocOp::Move { id, .. } | DocOp::SetKind { id, .. } => *id,
+            }),
+            Cmd::Repair { id, .. } => Some(*id),
+            _ => None,
+        }
+    }
+    // An id is safe to coalesce only if every command naming it this tick is
+    // one of its own superseders.
+    let mut unsafe_ids: Vec<u32> = Vec::new();
+    for c in cmds.iter() {
+        if let (Some(id), None) = (touches(c), subject(c)) {
+            if !unsafe_ids.contains(&id) {
+                unsafe_ids.push(id);
+            }
+        }
+    }
+    let mut last: Vec<(u32, u8, usize)> = Vec::new();
+    for (i, c) in cmds.iter().enumerate() {
+        if let Some((id, slot)) = subject(c) {
+            if unsafe_ids.contains(&id) {
+                continue;
+            }
+            match last.iter_mut().find(|(d, s, _)| *d == id && *s == slot) {
+                Some(e) => e.2 = i,
+                None => last.push((id, slot, i)),
+            }
+        }
+    }
+    let mut i = 0;
+    cmds.retain(|c| {
+        let survivor = |(d, s, k): &(u32, u8, usize)| subject(c) == Some((*d, *s)) && *k == i;
+        let keep = match subject(c) {
+            Some((id, _)) => unsafe_ids.contains(&id) || last.iter().any(survivor),
+            None => true,
+        };
+        i += 1;
+        keep
+    });
+}
+
 enum Cmd {
     Interact {
         /// Client id of the sender, for the `reject` broadcast: an op that
@@ -1456,7 +1554,12 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
         // Set by Cmd::Stop. Handled AFTER the drain: the receiver cannot be
         // moved out of while it is being borrowed by `try_recv`.
         let mut stop: Option<bool> = None;
+        let mut drained: Vec<Cmd> = Vec::new();
         while let Ok(cmd) = cmds.try_recv() {
+            drained.push(cmd);
+        }
+        supersede(&mut drained);
+        for cmd in drained {
             match cmd {
                 Cmd::Interact { who, id, op } => {
                     // The hoist fixture is server-owned: no knob drags, no
@@ -5117,6 +5220,116 @@ mod tests {
     #[test]
     fn the_shipped_room_passes_the_gate() {
         assert_eq!(check_room_doc(&full_room()), Ok(()));
+    }
+
+    /// A tick's worth of commands, coalesced: the drag frames a later frame
+    /// replaces are dropped, and nothing else is.
+    #[test]
+    fn superseding_drops_only_replaced_drag_frames() {
+        let pins = |x: i32| vec![(x, 0), (x, 6)];
+        let mv = |id: u32, x: i32| Cmd::Edit {
+            who: 1,
+            // `rot` rides Move for 1-pin parts; a drag never turns one.
+            op: DocOp::Move { id, pins: pins(x), rot: None },
+        };
+        let val = |id: u32, v: f64| Cmd::Interact {
+            who: 1,
+            id,
+            op: InteractOp::SetValue { value: v },
+        };
+        let sw = |id: u32, closed: bool| Cmd::Interact {
+            who: 1,
+            id,
+            op: InteractOp::SetSwitch { closed },
+        };
+        let shape = |cmds: &[Cmd]| -> Vec<String> {
+            let mut v: Vec<Cmd> = Vec::new();
+            for c in cmds {
+                v.push(match c {
+                    Cmd::Edit { who, op } => Cmd::Edit {
+                        who: *who,
+                        op: op.clone(),
+                    },
+                    Cmd::Interact { who, id, op } => Cmd::Interact {
+                        who: *who,
+                        id: *id,
+                        op: *op,
+                    },
+                    Cmd::Repair { who, id } => Cmd::Repair { who: *who, id: *id },
+                    _ => unreachable!(),
+                });
+            }
+            supersede(&mut v);
+            v.iter()
+                .map(|c| match c {
+                    Cmd::Edit {
+                        op: DocOp::Move { id, pins, .. },
+                        ..
+                    } => format!("mv{id}@{}", pins[0].0),
+                    Cmd::Edit {
+                        op: DocOp::Remove { id },
+                        ..
+                    } => format!("rm{id}"),
+                    Cmd::Interact {
+                        id,
+                        op: InteractOp::SetValue { value },
+                        ..
+                    } => format!("v{id}={value}"),
+                    Cmd::Interact {
+                        id,
+                        op: InteractOp::SetSwitch { closed },
+                        ..
+                    } => format!("s{id}={closed}"),
+                    Cmd::Repair { id, .. } => format!("fix{id}"),
+                    _ => unreachable!(),
+                })
+                .collect()
+        };
+
+        // A drag of one part: only where it ended up.
+        assert_eq!(shape(&[mv(7, 1), mv(7, 2), mv(7, 3)]), ["mv7@3"]);
+        // Two parts dragged together: one frame each, in document order.
+        assert_eq!(
+            shape(&[mv(7, 1), mv(8, 1), mv(7, 2), mv(8, 2)]),
+            ["mv7@2", "mv8@2"]
+        );
+        // A knob drag, and a switch on the same part: different parameters,
+        // so the switch flip is NOT swallowed by the last value write.
+        assert_eq!(
+            shape(&[val(3, 1.0), sw(3, true), val(3, 2.0)]),
+            ["s3=true", "v3=2"]
+        );
+        // Anything else naming the id turns superseding off for that id
+        // entirely: a move, a delete and a move back all stay, in order.
+        assert_eq!(
+            shape(&[
+                mv(7, 1),
+                Cmd::Edit {
+                    who: 1,
+                    op: DocOp::Remove { id: 7 }
+                },
+                mv(7, 2)
+            ]),
+            ["mv7@1", "rm7", "mv7@2"]
+        );
+        // ... and a repair counts, because it changes what the moves mean.
+        assert_eq!(
+            shape(&[mv(7, 1), Cmd::Repair { who: 1, id: 7 }, mv(7, 2)]),
+            ["mv7@1", "fix7", "mv7@2"]
+        );
+        // Other parts' drags are unaffected by one part being unsafe.
+        assert_eq!(
+            shape(&[
+                mv(7, 1),
+                mv(8, 1),
+                Cmd::Edit {
+                    who: 1,
+                    op: DocOp::Remove { id: 7 }
+                },
+                mv(8, 2)
+            ]),
+            ["mv7@1", "rm7", "mv8@2"]
+        );
     }
 
     #[test]

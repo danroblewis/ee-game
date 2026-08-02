@@ -15,6 +15,7 @@
 use crate::constraint::{constraint_of, Constraint, ConstraintKey};
 use crate::netlist::{ElementKind, ElementSpec, InteractOp, ParamWrite, Point, MAX_PINS};
 use sim_math::DenseLu;
+use std::collections::BTreeMap;
 
 pub const GMIN: f64 = 1e-12;
 
@@ -355,21 +356,24 @@ impl Engine {
     /// inductor current) and the broken flag survive for elements whose id
     /// persists: moving a dead resistor does not repair it.
     pub fn set_elements(&mut self, specs: &[ElementSpec]) {
-        let old_state: Vec<(u32, ElemState, bool)> = self
+        // Keyed by id, not scanned for it: `set_elements` is called on every
+        // edit and on every block the placement gate trials, and the scan this
+        // replaces was O(elements²). First writer wins, which is what
+        // `Vec::find` did, so a document that repeats an id carries the same
+        // state across as before. Ordered map for the same reason `compile`
+        // uses one: no hasher, no platform RNG, identical on wasm32.
+        let old_state: BTreeMap<u32, (ElemState, bool)> = self
             .elems
             .iter()
-            .map(|e| (e.spec.id, e.state, e.broken))
+            .rev()
+            .map(|e| (e.spec.id, (e.state, e.broken)))
             .collect();
         self.elems.clear();
         for s in specs {
             if s.pins.len() != s.kind.pin_count() {
                 continue; // malformed element: drop rather than panic
             }
-            let (state, broken) = old_state
-                .iter()
-                .find(|(id, _, _)| *id == s.id)
-                .map(|(_, st, b)| (*st, *b))
-                .unwrap_or_default();
+            let (state, broken) = old_state.get(&s.id).copied().unwrap_or_default();
             self.elems.push(CompiledElem {
                 spec: s.clone(),
                 node: [0; MAX_PINS],
@@ -497,20 +501,36 @@ impl Engine {
 
     /// Wire closure + node numbering + unknown layout.
     fn compile(&mut self) {
-        // 1. Junctions: unique endpoints.
+        // 1. Junctions: unique endpoints, interned in first-seen order.
+        //
+        //    The index a point gets is exactly the one a linear scan would
+        //    give it — first seen, first numbered — so the compiled netlist is
+        //    byte-for-byte what it was before this was an ordered map. The map
+        //    only decides how fast the lookup finds it. `BTreeMap`, not a hash
+        //    map: no hasher seed, no platform RNG, nothing that could differ
+        //    between native and wasm32.
+        //
+        //    It matters because `compile` is not a rare event. Every edit,
+        //    every switch flip, every knob turn, every machine move and every
+        //    trial the placement gate runs recompiles the document, and the
+        //    scan this replaces was O(points²): 69 us on a 400-element room,
+        //    against 25 us here (measured, release, this tree).
         let mut points: Vec<Point> = Vec::new();
-        let jix = |points: &mut Vec<Point>, p: Point| -> usize {
-            match points.iter().position(|q| *q == p) {
-                Some(i) => i,
-                None => {
-                    points.push(p);
-                    points.len() - 1
-                }
-            }
-        };
+        let mut index_of: BTreeMap<Point, usize> = BTreeMap::new();
         let mut ends: Vec<Vec<usize>> = Vec::with_capacity(self.elems.len());
         for e in &self.elems {
-            ends.push(e.spec.pins.iter().map(|p| jix(&mut points, *p)).collect());
+            ends.push(
+                e.spec
+                    .pins
+                    .iter()
+                    .map(|p| {
+                        *index_of.entry(*p).or_insert_with(|| {
+                            points.push(*p);
+                            points.len() - 1
+                        })
+                    })
+                    .collect(),
+            );
         }
 
         // 2. Union-find: wires merge their endpoints; grounds pin to a
@@ -547,20 +567,22 @@ impl Engine {
         }
 
         // 3. Number electrical nodes: ground set -> 0, others 1..=N.
+        //    Same first-seen numbering as the scan it replaces, so node
+        //    indices — and therefore the matrix, and therefore every hash —
+        //    are unchanged. Roots are junction indices, so a flat vector
+        //    indexed by root does the lookup in O(1) with no map at all.
         let groot = find(&mut parent, ground_root);
-        let mut node_of_root: Vec<(usize, usize)> = vec![(groot, 0)];
+        let mut node_of_root: Vec<usize> = vec![usize::MAX; points.len() + 1];
+        node_of_root[groot] = 0;
         let mut num_nodes = 0usize;
         let node_of_junction: Vec<usize> = (0..points.len())
             .map(|j| {
                 let r = find(&mut parent, j);
-                match node_of_root.iter().find(|(root, _)| *root == r) {
-                    Some((_, n)) => *n,
-                    None => {
-                        num_nodes += 1;
-                        node_of_root.push((r, num_nodes));
-                        num_nodes
-                    }
+                if node_of_root[r] == usize::MAX {
+                    num_nodes += 1;
+                    node_of_root[r] = num_nodes;
                 }
+                node_of_root[r]
             })
             .collect();
 

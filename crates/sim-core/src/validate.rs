@@ -70,8 +70,8 @@
 //!    failure combined.
 //!
 //!    A trial is run in each of up to four STATES of the document, because
-//!    the freeze is not in general a t = 0 property (see
-//!    [`trial_depth`] for the depths and the measured cost):
+//!    the freeze is not in general a t = 0 property (see [`trial_depth`] for
+//!    how deep each one runs and what that costs):
 //!
 //!    * **as placed**, for `trial_depth` steps — the state the room is in;
 //!    * **every switch closed**, for `trial_depth` steps — the same clone
@@ -96,6 +96,19 @@
 //!    deep transients — median step 1474 — which no affordable trial reaches
 //!    and which the quarantine machinery still handles honestly.
 //!
+//!    Every trial is run **one MNA block at a time** (see [`Blocks`]). The
+//!    world's matrix is block diagonal — two circuits that share only a
+//!    ground symbol share no unknown — and a dense LU is O(n³), so judging
+//!    the room whole costs `(Σ nᵢ)³` where judging its circuits costs
+//!    `Σ nᵢ³`. That is not a different answer, it is the same answer at 1/15
+//!    the price on a 400-element room, and it is what pays for the four
+//!    states. It is also what lets depth be BOUGHT per circuit against a
+//!    budget ([`TRIAL_BUDGET`]) instead of read off a table of element
+//!    counts: the old table switched layer 4 off entirely above 400 elements,
+//!    so a 401-element room accepted an AC source across an LED that a
+//!    400-element room refused, and then quarantined at step 107. Nothing
+//!    switches off now.
+//!
 //! Broken parts are validated as if healthy: a broken part stamps nothing,
 //! but `Repair` can put any of them back at any time, so a document is only
 //! accepted if it solves with every part in service.
@@ -109,7 +122,7 @@
 
 use crate::constraint::ConstraintKey;
 use crate::engine::Engine;
-use crate::netlist::{ElementKind, ElementSpec};
+use crate::netlist::{ElementKind, ElementSpec, Point};
 
 // ---- value ranges. Lower bounds match the `InteractOp::SetValue` clamps in
 // `Engine::interact`; upper bounds keep every derived quantity (1/ohms, C/h,
@@ -133,47 +146,137 @@ pub const MAX_MOS_K: f64 = 1e9;
 /// Smallest op-amp output-current limit a document may carry.
 pub const MIN_OPAMP_ISC: f64 = 1e-6;
 
-/// Above this element count the convergence trial (layer 4) is skipped and
-/// the gate falls back to structural checks only.
+/// A single MNA block wider than this is not trialled — the rest of the
+/// document still is.
 ///
-/// This is a STOPGAP and should be named as one. A trial step costs about
-/// what the next real step costs, and the gate runs on the sim thread inside
-/// the command drain, so at a few thousand elements one edit would consume a
-/// whole 33 ms tick — which would violate "the sim never stalls the UI", the
-/// invariant that decides the trade. The residual gap is honest and worth
-/// stating: **above this cap the non-convergence class is still reachable.**
-/// It is a first-minute-of-play, small-circuit failure, so the cap buys
-/// nearly all of the value.
+/// This is the last remaining cap, and it is deliberately shaped as a taper
+/// rather than the cliff it replaces. The old cap keyed on ELEMENT COUNT and
+/// switched the whole of layer 4 off above 400 elements, which had the worst
+/// possible shape: it admitted exactly the band where cost peaked (measured
+/// on this tree, before blocks: 19.2 ms at 300 elements, 42.9 ms at 400) and
+/// then refused nothing at all above it — a 401-element room accepted an AC
+/// source across an LED that a 400-element room correctly refused, and then
+/// quarantined at step 107. Keying on the widest BLOCK instead means a big
+/// room loses the trial only for the one enormous circuit inside it that is
+/// genuinely unaffordable; every other circuit in the same room is still
+/// judged, and adding parts elsewhere can never switch the trial off.
 ///
-/// What the cap costs at the sizes the game actually reaches: the room a
-/// fresh server stands up is 147 elements (143 showcase + 4 hoist fixture),
-/// so every room a player joins is trialled in full, and a room would have
-/// to grow 2.7x before the trial switched itself off. Above the cap a
-/// document keeps all three structural layers — value sanity, named
-/// degeneracy, LU as placed and with every switch closed — and loses only
-/// the convergence prediction. Nothing becomes MORE placeable there; the
-/// gate just stops seeing one class.
+/// The most a document will ever spend on layer 4, in the step units
+/// [`block_step_cost`] counts. One unit is about 0.6 us of a cold block step,
+/// so this is ~2.6 ms — and it is a CEILING, not a budget: [`TRIAL_BUDGET`]
+/// buys depth and can always be spent more thinly, but one step of every block
+/// is the floor that depth cannot shrink, and this is what bounds it.
 ///
-/// The real fix is not a bigger cap, it is the two quadratics in the compile
-/// path (`Engine::compile` interns junctions with a linear scan;
-/// `set_elements` restores per-element state with another). Measured
-/// (release, this tree), the trial is not even the expensive half:
+/// It is spent cheapest-first (see [`affordable_cost`]), so what a document
+/// gives up when it cannot afford everything is its WIDEST circuits — the ones
+/// a trial step costs the most on — while every ordinary circuit beside them
+/// is still judged. That is the whole shape difference from the cap this
+/// replaces, which keyed on the document's element count and switched layer 4
+/// off for all of it at once, cheap circuits included.
+///
+/// Measured (release, this tree) on a diode ladder — one block, one step from
+/// cold, which is what one trial state costs:
 ///
 /// ```text
-///   elements     linear      nonlinear (trial runs)
-///        53      32 us       44 us
-///       203     309 us      478 us
-///       503    2057 us     2091 us
-///      1003    9694 us     9359 us
+///   unknowns   elements   one step   all four states
+///          4          5      1.3 us            5 us
+///         18         26     13.2 us           53 us
+///         50         74     92.4 us          370 us
+///         98        146    378   us         1512 us
+///        130        194    648   us         2592 us
+///        194        290   1222   us         4890 us
+///        386        578   7182   us        28729 us
 /// ```
 ///
-/// The two columns converge because the COMPILES dominate, not the solve.
-/// Replace the quadratics and the cap rises or disappears.
-pub const TRIAL_MAX_ELEMENTS: usize = 400;
+/// So one four-state circuit is affordable up to ~128 unknowns — about 190
+/// parts drawn as a single connected mesh — and a DC one with no switch up to
+/// twice that. Rooms do not reach it by growing: the shipped 147-element room's
+/// widest block is 9 unknowns, and a 405-element room grown from it is still 9.
+pub const TRIAL_CEILING: u64 = 4096;
 
-/// How many steps one layer-4 trial state runs for a document of `elements`
-/// elements. Zero means the trial is skipped entirely (see
-/// [`TRIAL_MAX_ELEMENTS`]).
+/// Deepest any trial state ever runs. Beyond this the marginal catch rate is
+/// not worth the constant: measured over the four documents the gate accepts
+/// and the engine still freezes, going 256 -> 4096 steps catches ONE more and
+/// costs 18x.
+pub const MAX_TRIAL_DEPTH: u32 = 256;
+
+/// The whole of layer 4, for one document, is held to this many step units —
+/// where one unit is about 0.6 us of a cold block step (see
+/// [`block_step_cost`]), so the budget is ~250 us of trial per gate call at
+/// EVERY document size.
+///
+/// Calibrated against the corpus, not taste. Replayed over the same 20 000
+/// fuzzed documents the four-state trial was measured on, 1024 units gives
+/// back one document the trial used to catch (it needed 126 steps and got
+/// 102); 2048 reproduces the four-state gate's verdict on all 20 000, document
+/// for document, code for code. Measured end to end, on the shipped room grown
+/// the way a room really grows — `check_document` in full, all four states,
+/// every block (release, this tree):
+///
+/// ```text
+///   elements     4    147    250    400    600    800   1200
+///   before     1.5   1304   11443  42909   1372   1996   5583   us
+///   after       46    485     625    906   1511   2372   5829   us
+/// ```
+///
+/// Layer 4 is the flat part of that curve — it is this budget, and the budget
+/// does not grow with the room (at 400 elements it is 483 us of the 906).
+/// What grows is layers 1-3: the two whole-document factorizations are O(n³)
+/// in the room's unknowns and nothing here caps them. That is the remaining
+/// wall, it is older than this budget, and it is why the numbers converge
+/// again past 800. The client's `GATE_MAX_ELEMENTS` is the guard in front of
+/// it.
+pub const TRIAL_BUDGET: u64 = 2048;
+
+/// What one step of one block costs, in units of "one step of a small block".
+///
+/// A step of a nonlinear block re-stamps and re-FACTORS once per Newton
+/// iteration, so it is somewhere between quadratic and cubic in the block's
+/// unknowns — the dense LU is O(u³), but the stamping and the iteration count
+/// dominate until the matrix gets wide. `1 + u²/16` tracks the measured curve
+/// in [`TRIAL_CEILING`] to within 1.6x from 4 unknowns to 128, which is
+/// the only range this is ever asked about; wider blocks are not trialled at
+/// all. Getting this shape wrong is what let the old element-count ladder
+/// mis-price documents by 30x in both directions.
+///
+/// Integer arithmetic on an integer input, so the depth a document gets is
+/// bit-identical on every target.
+fn block_step_cost(unknowns: usize) -> u64 {
+    let u = unknowns as u64;
+    1 + u.saturating_mul(u) / 16
+}
+
+/// The largest per-block cost this document can afford one step of, given
+/// [`TRIAL_CEILING`]. Blocks costing more are not trialled; blocks costing
+/// this or less all are. `costs` is every candidate block's cost for one step
+/// of every state it runs, and is left sorted.
+///
+/// Cheapest first, so the circuits a document gives up are its widest ones.
+/// The cut is a VALUE, not a position, so blocks that cost the same are always
+/// treated the same and the answer cannot depend on the order the document
+/// happens to be in — the one property a "spend until the budget runs out"
+/// loop would not have had.
+fn affordable_cost(costs: &mut Vec<u64>) -> u64 {
+    costs.sort_unstable();
+    let (mut spent, mut cut, mut i) = (0u64, 0u64, 0usize);
+    while i < costs.len() {
+        let v = costs[i];
+        let mut group = 0u64;
+        while i < costs.len() && costs[i] == v {
+            group = group.saturating_add(v);
+            i += 1;
+        }
+        match spent.checked_add(group) {
+            Some(t) if t <= TRIAL_CEILING => (spent, cut) = (t, v),
+            _ => break,
+        }
+    }
+    cut
+}
+
+/// How many steps one block's trial states run, given that block's cost for
+/// one step of every state it will run (`states x block_step_cost`) and how
+/// many trialled blocks the document has to share the budget between.
 ///
 /// Depth is bought, not assumed. The old gate ran exactly ONE step and
 /// justified it by calling the freeze "a DC operating-point failure, visible
@@ -182,36 +285,26 @@ pub const TRIAL_MAX_ELEMENTS: usize = 400;
 /// died at step 0** — median step 161, p90 step 2601. A single step catches
 /// essentially none of the class on its own.
 ///
-/// Depth is also not free, and it is the opposite of free where it would be
-/// most convenient. One trial step is one real step, and a real step on a
-/// nonlinear document refactors per Newton iteration, so the per-step cost
-/// grows like n^2.3 (measured, release, this tree):
+/// Depth is not free either, so it is spent against a budget instead of read
+/// off a table of element counts. Each trialled block gets an equal SHARE of
+/// [`TRIAL_BUDGET`] and buys as many steps as its share affords. That has
+/// four properties the element-count table did not:
 ///
-/// ```text
-///   elements   per step   -> depth chosen   one trial state
-///          4     0.25 us          256            ~130 us
-///         18     1.3  us          256            ~320 us
-///         52     8.6  us           32            ~270 us
-///        102    31    us            8            ~255 us
-///        202   123    us            2            ~290 us
-///        402   470    us            1            ~600 us
-/// ```
+/// * it never reaches zero, so there is no size at which the gate stops
+///   seeing the non-convergence class;
+/// * it prices a block by its width, which is what actually costs — a
+///   400-element room of small circuits is cheaper to trial deeply than a
+///   21-element one drawn as a single dense mesh, and the old table had that
+///   exactly backwards;
+/// * it is per BLOCK, so one big circuit already in the room cannot blind the
+///   gate to the three-part one a player just drew next to it;
+/// * it degrades smoothly, so no edit can move a document across a cliff.
 ///
-/// So the depth ladder holds ONE trial state to roughly 300 µs at every
-/// size, and the gate runs at most four states (see [`check_document`]).
-/// Deep trials are therefore a SMALL-document instrument — which is exactly
-/// where the class lives: three catalogue parts in the first minute of play.
-/// At room scale the frequency-independent extreme-state trials do the work,
-/// and they cost one step each at any size.
-pub fn trial_depth(elements: usize) -> u32 {
-    match elements {
-        0..=16 => 256,
-        17..=64 => 32,
-        65..=128 => 8,
-        129..=256 => 2,
-        257..=TRIAL_MAX_ELEMENTS => 1,
-        _ => 0,
-    }
+/// Order-independent by construction: `share` depends on how many blocks the
+/// document has, never on which one is being priced, so shuffling the
+/// document cannot change a single depth.
+fn trial_depth(share: u64, block_cost: u64) -> u32 {
+    (share / block_cost.max(1)).clamp(1, MAX_TRIAL_DEPTH as u64) as u32
 }
 
 /// Up to four element ids carried by a [`Reject`], so the client can flash
@@ -827,9 +920,187 @@ fn trial(specs: &[ElementSpec], dt: f64, steps: u32) -> Option<Reject> {
     None
 }
 
-/// The document with every source frozen at one end of its swing:
-/// `dc + sign·|amp|`, no frequency, no phase. `None` when nothing in the
-/// document actually swings, so the caller can skip a duplicate trial.
+// ------------------------------------------------------------- MNA blocks
+
+/// The document cut into the independent blocks of its MNA matrix, so a
+/// trial solves each one on its own.
+///
+/// **Why this is exact, not an approximation.** There is exactly one matrix
+/// for the whole world, but it is BLOCK DIAGONAL. Every stamp an element
+/// makes lands on rows and columns belonging to its own pins' nodes (and its
+/// own branch row); nothing in `Engine` couples two elements that share no
+/// node. Node 0 is not an unknown — it has no row and no column — so two
+/// circuits whose only common node is ground are two blocks, not one. And
+/// two ideal constraints share a branch row only when their canonical keys
+/// match, which needs the same node pair; the only pair two blocks can share
+/// is `(0, 0)`, and every `(0, 0)` constraint is a `ShortedSource` refused by
+/// layer 2 before layer 4 ever runs.
+///
+/// Newton on a block-diagonal system is Newton on each block: the linear
+/// solve inside every iteration decouples, the guess update is per device, and
+/// the rescue ladder only ever subjects a block to a SMALLER step than it
+/// would have taken alone. So a block that quarantines alone quarantines in
+/// the room, and one that survives alone survives — the verdict is the same,
+/// which is the whole licence for doing this.
+///
+/// **Why it is worth doing.** A dense LU is O(n³) and Newton pays it once per
+/// iteration, so trialling the world whole costs `(Σ nᵢ)³` where trialling the
+/// blocks costs `Σ nᵢ³`. Rooms are not one circuit; they are dozens of small
+/// ones sharing a ground symbol. The shipped 147-element room is 61 unknowns
+/// in 14 blocks whose biggest is 7 nodes, and a 400-element room grown from it
+/// is 214 unknowns in 65 blocks — still 9 unknowns at the widest. Measured on
+/// this tree, that is what takes the whole gate at 400 elements from 42.9 ms
+/// to 0.91 ms, and what lets depth stop being guessed from an element count
+/// (see [`TRIAL_BUDGET`]).
+struct Blocks {
+    /// Indices into the document, per block, in document order.
+    members: Vec<Vec<usize>>,
+    /// Points the FULL document holds at node 0 which this block would
+    /// otherwise float: it is grounded through `Ground` parts and wires that
+    /// live outside the block, and the sub-document has to say so itself.
+    grounds: Vec<Vec<Point>>,
+    /// Unknowns the full matrix devotes to this block — nodes plus branch
+    /// rows. The cost model the depth ladder is written against.
+    unknowns: Vec<usize>,
+    /// Does this block contain an OPEN switch or button? If not, the
+    /// all-closed state is the same sub-document as the as-placed one.
+    opens: Vec<bool>,
+    /// Does this block contain a source with a non-zero amplitude? If not, the
+    /// two peak states are the same sub-document as the all-closed one.
+    swings: Vec<bool>,
+    /// Anything nonlinear? A linear block cannot fail to converge — the solver
+    /// takes its single-pass path — so it is not worth compiling to find out.
+    nonlinear: Vec<bool>,
+}
+
+/// Cut a COMPILED document into blocks. `None` when the compiled element list
+/// does not line up with `specs` one-to-one (a malformed element was dropped),
+/// in which case the caller trials the document whole rather than guessing.
+///
+/// Switch state deliberately does not enter: an element joins its pins'
+/// nodes whether or not it stamps, so an open switch is treated as coupling
+/// its two sides. That is the conservative direction (bigger blocks, same
+/// verdict) and it buys one partition that is valid for all four trial
+/// states, since neither closing a switch nor pinning a source at its peak
+/// moves a pin.
+fn split_blocks(eng: &Engine, specs: &[ElementSpec]) -> Option<Blocks> {
+    let nodes = eng.element_nodes();
+    if nodes.len() != specs.len() {
+        return None;
+    }
+    let mut parent: Vec<usize> = (0..specs.len()).collect();
+    // First element seen at each node; usize::MAX = none yet.
+    let mut first: Vec<usize> = vec![usize::MAX; eng.node_count() + 1];
+    for (i, s) in specs.iter().enumerate() {
+        for &nd in &nodes[i].1[..s.pins.len()] {
+            if nd == 0 {
+                continue; // ground couples nothing: it has no row
+            }
+            if first[nd] == usize::MAX {
+                first[nd] = i;
+            } else {
+                let (a, b) = (find(&mut parent, first[nd]), find(&mut parent, i));
+                parent[a] = b;
+            }
+        }
+    }
+
+    let mut block_of_root: Vec<usize> = vec![usize::MAX; specs.len()];
+    let mut b = Blocks {
+        members: Vec::new(),
+        grounds: Vec::new(),
+        unknowns: Vec::new(),
+        opens: Vec::new(),
+        swings: Vec::new(),
+        nonlinear: Vec::new(),
+    };
+    // Distinct non-ground nodes per block, counted as they are first seen.
+    let mut node_seen: Vec<usize> = vec![usize::MAX; eng.node_count() + 1];
+    for (i, s) in specs.iter().enumerate() {
+        let ns = &nodes[i].1[..s.pins.len()];
+        if ns.iter().all(|n| *n == 0) {
+            // Every pin on ground: no row, no column, nothing to solve. These
+            // are the `Ground` parts and the wires along a ground rail — the
+            // blocks that need them re-ground themselves below.
+            continue;
+        }
+        let r = find(&mut parent, i);
+        let k = if block_of_root[r] == usize::MAX {
+            block_of_root[r] = b.members.len();
+            b.members.push(Vec::new());
+            b.grounds.push(Vec::new());
+            // Every branch-carrying part is one unknown, except the ones that
+            // alias onto an earlier constraint's row — which `share_n` would
+            // tell us, but which only ever SHRINKS the count, and this is a
+            // cost model, not a contract.
+            b.unknowns.push(0);
+            b.opens.push(false);
+            b.swings.push(false);
+            b.nonlinear.push(false);
+            b.members.len() - 1
+        } else {
+            block_of_root[r]
+        };
+        b.members[k].push(i);
+        if s.kind.is_branch() {
+            b.unknowns[k] += 1;
+        }
+        match s.kind {
+            ElementKind::Switch { closed: false } | ElementKind::Button { closed: false } => {
+                b.opens[k] = true
+            }
+            ElementKind::VoltageSource { amp, .. } | ElementKind::Rail { amp, .. }
+                if amp != 0.0 =>
+            {
+                b.swings[k] = true
+            }
+            _ => {}
+        }
+        b.nonlinear[k] |= s.kind.is_nonlinear();
+        for (p, &nd) in s.pins.iter().zip(ns.iter()) {
+            if nd == 0 {
+                if !b.grounds[k].contains(p) {
+                    b.grounds[k].push(*p);
+                }
+            } else if node_seen[nd] == usize::MAX {
+                node_seen[nd] = k;
+                b.unknowns[k] += 1;
+            }
+        }
+    }
+    Some(b)
+}
+
+/// Ids for the `Ground` parts a sub-document has to invent. Counting down
+/// from the top of the range keeps them clear of anything a room hands out
+/// (ids are allocated upward from 1, and the hoist fixture reserves 900-999).
+/// They are never stored, broadcast or blamed: `blame_for_divergence` only
+/// ever names a diode, an LED or a zener.
+const SYNTHETIC_GROUND_ID: u32 = u32::MAX;
+
+/// Block `k` of `specs` as a document in its own right. `specs` must be the
+/// document [`split_blocks`] was run on, or a clone of it with the same
+/// elements in the same order and the same pins — every trial state qualifies.
+fn block_doc(specs: &[ElementSpec], b: &Blocks, k: usize, out: &mut Vec<ElementSpec>) {
+    out.clear();
+    out.extend(b.members[k].iter().map(|i| specs[*i].clone()));
+    for (j, p) in b.grounds[k].iter().enumerate() {
+        out.push(ElementSpec::ground(SYNTHETIC_GROUND_ID - j as u32, *p));
+    }
+}
+
+/// Does this part drive a waveform, rather than a constant? The two peak
+/// states are the same document as the all-closed one without one of these,
+/// which is how a block skips them.
+fn swings(kind: &ElementKind) -> bool {
+    matches!(
+        kind,
+        ElementKind::VoltageSource { amp, .. } | ElementKind::Rail { amp, .. } if *amp != 0.0
+    )
+}
+
+/// Freeze every source in place at one end of its swing: `dc + sign·|amp|`,
+/// no frequency, no phase.
 ///
 /// This is the whole answer to time-varying drive, and it is worth being
 /// precise about why it is legitimate rather than a heuristic. The freeze
@@ -851,27 +1122,19 @@ fn trial(specs: &[ElementSpec], dt: f64, steps: u32) -> Option<Reject> {
 /// (1 MV + 1 MV). That is fine and deliberate: this document is a scratch
 /// operating point, it is never stored, broadcast or shown, and 2e6 is nine
 /// orders of magnitude inside f64.
-fn peak_clone(specs: &[ElementSpec], sign: f64) -> Option<Vec<ElementSpec>> {
-    let mut swings = false;
-    let out: Vec<ElementSpec> = specs
-        .iter()
-        .map(|s| {
-            let mut s = s.clone();
-            if let ElementKind::VoltageSource { dc, amp, hz, phase }
-            | ElementKind::Rail { dc, amp, hz, phase } = &mut s.kind
-            {
-                if *amp != 0.0 {
-                    swings = true;
-                    *dc += sign * amp.abs();
-                    *amp = 0.0;
-                    *hz = 0.0;
-                    *phase = 0.0;
-                }
+fn pin_at_peak(specs: &mut [ElementSpec], sign: f64) {
+    for s in specs.iter_mut() {
+        if let ElementKind::VoltageSource { dc, amp, hz, phase }
+        | ElementKind::Rail { dc, amp, hz, phase } = &mut s.kind
+        {
+            if *amp != 0.0 {
+                *dc += sign * amp.abs();
+                *amp = 0.0;
+                *hz = 0.0;
+                *phase = 0.0;
             }
-            s
-        })
-        .collect();
-    swings.then_some(out)
+        }
+    }
 }
 
 // ---------------------------------------------------------------- the gate
@@ -938,6 +1201,11 @@ pub fn check_document(specs: &[ElementSpec], dt: f64) -> Result<(), Reject> {
     if !eng.probe_solvable() {
         return Err(Reject::Unsolvable);
     }
+    // The matrix layer 4 will solve, cut into its independent blocks. Taken
+    // HERE, off the as-placed compile, because node numbering depends only on
+    // geometry, wires and grounds — not on switch positions or source values —
+    // so this one partition serves every trial state below.
+    let blocks = split_blocks(&eng, specs);
 
     // Worst case: every switch and button closed. Closing only ever adds
     // 0 V branch rows (it merges no nodes), so any singular mixed state is
@@ -971,49 +1239,126 @@ pub fn check_document(specs: &[ElementSpec], dt: f64) -> Result<(), Reject> {
         }
     }
 
-    // Convergence, in up to four states of the document.
-    let depth = trial_depth(specs.len());
-    if depth > 0 {
-        // 1. As placed: the operating point the room is in right now.
-        if let Some(r) = trial(specs, dt, depth) {
-            return Err(r);
+    // Convergence, in up to four states of the document — and in each state,
+    // one MNA block at a time (see [`Blocks`]).
+    //
+    // The four states, in the order a refusal claims them:
+    //
+    // 1. **As placed** — the operating point the room is in right now.
+    // 2. **Every switch closed** — the SAME clone layer 3 factors, held to
+    //    the same policy. This is not symmetry for its own sake: the hoist's
+    //    limit switches are closed by the MACHINE through `write_param`, on
+    //    its own schedule, with no gate anywhere in front of them, and
+    //    `write_param` deliberately never clears quarantine. Without this
+    //    trial a player could wire an LED in series with LIM-TOP, be told the
+    //    placement was fine, and have the crate itself freeze the room on the
+    //    way up — the one failure the game inflicts on a document it blessed.
+    //
+    //    Singularity is monotone in the closed set (layer 3's argument);
+    //    convergence is not, so this is a two-point sample of a space with
+    //    2^n corners, not a proof. It covers the direction that matters:
+    //    closing switches only ever ADDS ideal constraints and merges nodes,
+    //    which is what puts a source across a junction.
+    // 3-4. **Both ends of every source's swing**, one step each. A DC
+    //    document's operating-point failure IS visible on the first step —
+    //    that claim was only ever true here, of a document with nothing left
+    //    moving in it. Built from the all-closed clone so the two
+    //    conservatisms compose instead of needing four more trials.
+    //
+    // A block only runs a state that is a DIFFERENT sub-document for it. A
+    // circuit with no open switch has the same all-closed state it is already
+    // in; one with no swinging source has the same peaks. Trialling those
+    // again is not extra safety, it is the same computation three more times —
+    // and in a room of many small circuits, it is most of the bill.
+    // `None` = no usable partition, which means a malformed element was
+    // dropped by `set_elements` — layer 1 refuses those, so this is a
+    // belt-and-braces path: judge the document whole, as one block.
+    let whole = Blocks {
+        members: vec![(0..specs.len()).collect()],
+        grounds: vec![Vec::new()],
+        unknowns: vec![eng.unknowns()],
+        opens: vec![any_open],
+        swings: vec![specs.iter().any(|s| swings(&s.kind))],
+        nonlinear: vec![!eng.is_linear()],
+    };
+    let b = blocks.as_ref().unwrap_or(&whole);
+
+    // What layer 4 costs has to be PRICED before it is spent, in two parts.
+    // Integer arithmetic on the document alone, so a document gets the same
+    // trial on native and on wasm32.
+    //
+    // First the floor: one step of block k in every state it runs, which no
+    // depth decision can reduce. `TRIAL_CEILING` is what the document may
+    // spend on that, cheapest circuits first.
+    let floor = |k: usize| {
+        let states = 1 + u64::from(b.opens[k]) + 2 * u64::from(b.swings[k]);
+        states.saturating_mul(block_step_cost(b.unknowns[k]))
+    };
+    let mut costs: Vec<u64> = (0..b.members.len())
+        .filter(|k| b.nonlinear[*k])
+        .map(&floor)
+        .collect();
+    let cut = affordable_cost(&mut costs);
+    let trialled = |k: usize| b.nonlinear[k] && floor(k) <= cut;
+    // Then the depth: `TRIAL_BUDGET`, split evenly between the blocks that
+    // survived the ceiling.
+    let share = TRIAL_BUDGET / (0..b.members.len()).filter(|k| trialled(*k)).count().max(1) as u64;
+    let depth = |k: usize| {
+        // Only the as-placed and all-closed states are `depth` steps deep; the
+        // two peak states are one step each however deep the others run, so
+        // they are not what depth is being traded against.
+        let deep_states = 1 + u64::from(b.opens[k]);
+        trial_depth(
+            share,
+            deep_states.saturating_mul(block_step_cost(b.unknowns[k])),
+        )
+    };
+
+    // States 3 and 4 are one step by construction: pinning every source at
+    // `dc ± |amp|` reaches the operating point it will visit immediately, so
+    // depth buys nothing there. States outermost, so a refusal still names the
+    // earliest state that fails — the one the player is closest to.
+    let mut sub: Vec<ElementSpec> = Vec::new();
+    for which in [State::AsPlaced, State::Closed, State::PeakHi, State::PeakLo] {
+        if matches!(which, State::Closed) && !any_open {
+            continue;
         }
-        // 2. Every switch closed — the SAME clone layer 3 factors, held to
-        //    the same policy. This is not symmetry for its own sake: the
-        //    hoist's limit switches are closed by the MACHINE through
-        //    `write_param`, on its own schedule, with no gate anywhere in
-        //    front of them, and `write_param` deliberately never clears
-        //    quarantine. Without this trial a player could wire an LED in
-        //    series with LIM-TOP, be told the placement was fine, and have
-        //    the crate itself freeze the room on the way up — the one
-        //    failure the game inflicts on a document it blessed.
-        //
-        //    Singularity is monotone in the closed set (layer 3's argument);
-        //    convergence is not, so this is a two-point sample of a space
-        //    with 2^n corners, not a proof. It covers the direction that
-        //    matters: closing switches only ever ADDS ideal constraints and
-        //    merges nodes, which is what puts a source across a junction.
-        if any_open {
-            if let Some(r) = trial(&closed, dt, depth) {
-                return Err(r);
-            }
-        }
-        // 3-4. Both ends of every source's swing, one step each. A DC
-        //      document's operating-point failure IS visible on the first
-        //      step — that claim was only ever true here, of a document with
-        //      nothing left moving in it. Built from the all-closed clone so
-        //      the two conservatisms compose instead of needing four more
-        //      trials.
-        for sign in [1.0, -1.0] {
-            let Some(peaked) = peak_clone(&closed, sign) else {
-                break; // nothing swings; both signs would repeat state 2
+        for k in 0..b.members.len() {
+            let runs = match which {
+                State::AsPlaced => true,
+                State::Closed => b.opens[k],
+                State::PeakHi | State::PeakLo => b.swings[k],
             };
-            if let Some(r) = trial(&peaked, dt, 1) {
+            if !runs || !trialled(k) {
+                continue;
+            }
+            let (source, steps) = match which {
+                State::AsPlaced => (specs, depth(k)),
+                State::Closed => (&closed[..], depth(k)),
+                _ => (&closed[..], 1),
+            };
+            block_doc(source, b, k, &mut sub);
+            match which {
+                State::PeakHi => pin_at_peak(&mut sub, 1.0),
+                State::PeakLo => pin_at_peak(&mut sub, -1.0),
+                _ => {}
+            }
+            if let Some(r) = trial(&sub, dt, steps) {
                 return Err(r);
             }
         }
     }
     Ok(())
+}
+
+/// Which of the four trial states a sweep is running, so a block can skip the
+/// ones that are the same sub-document it has already been judged in.
+#[derive(Clone, Copy)]
+enum State {
+    AsPlaced,
+    Closed,
+    PeakHi,
+    PeakLo,
 }
 
 #[cfg(test)]
@@ -1749,29 +2094,196 @@ mod tests {
         }
     }
 
-    /// F4: the trial's depth ladder, and the cap that switches it off.
+    /// F4: the depth budget. Monotone, bounded, and — the whole point of
+    /// replacing the element-count table — never zero.
     #[test]
-    fn the_trial_depth_ladder_is_bounded_and_stops_at_the_cap() {
-        // Monotone non-increasing, so a bigger document never buys a deeper
-        // (more expensive) trial.
+    fn the_trial_depth_budget_is_bounded_and_never_switches_off() {
         let mut last = u32::MAX;
-        for n in 0..=(TRIAL_MAX_ELEMENTS + 8) {
-            let d = trial_depth(n);
-            assert!(d <= last, "depth must not grow at {n}");
+        for cost in 0..=100_000u64 {
+            let d = trial_depth(TRIAL_BUDGET, cost);
+            assert!(d <= last, "depth must not grow at cost {cost}");
+            assert!(
+                (1..=MAX_TRIAL_DEPTH).contains(&d),
+                "depth {d} out of range at cost {cost}"
+            );
             last = d;
         }
         assert_eq!(
-            trial_depth(3),
-            256,
+            trial_depth(TRIAL_BUDGET, 1),
+            MAX_TRIAL_DEPTH,
             "a beginner's circuit gets the deep run"
         );
-        assert!(trial_depth(147) >= 1, "the shipped room is trialled");
-        assert_eq!(trial_depth(TRIAL_MAX_ELEMENTS), 1);
         assert_eq!(
-            trial_depth(TRIAL_MAX_ELEMENTS + 1),
-            0,
-            "above the cap the trial is skipped, as documented"
+            trial_depth(TRIAL_BUDGET, u64::MAX),
+            1,
+            "no block is ever priced out of the trial entirely"
         );
+        assert_eq!(
+            trial_depth(0, 1),
+            1,
+            "not even a room of thousands of circuits: every one still gets a step"
+        );
+        // The cost model has to be monotone too, or a bigger block could buy
+        // a deeper trial than a smaller one.
+        let mut last = 0;
+        for u in 0..=512 {
+            let c = block_step_cost(u);
+            assert!(c >= last, "block cost must not shrink at {u} unknowns");
+            last = c;
+        }
+        assert_eq!(block_step_cost(usize::MAX), u64::MAX / 16 + 1, "saturates");
+    }
+
+    /// Depth follows the width of a circuit, not the size of the room. The
+    /// element-count table this replaced had that backwards, which is how a
+    /// 160-element room of four-part circuits came to get a 2-step trial.
+    #[test]
+    fn depth_follows_the_widest_block_not_the_element_count() {
+        // Same share, different widths: wider buys fewer steps. This is the
+        // whole content of the cost model.
+        let share = TRIAL_BUDGET;
+        let narrow = trial_depth(share, block_step_cost(4));
+        let wide = trial_depth(share, block_step_cost(64));
+        assert!(
+            narrow > wide,
+            "a 4-unknown block ({narrow}) must out-run a 64-unknown one ({wide})"
+        );
+        assert_eq!(narrow, MAX_TRIAL_DEPTH, "small circuits still run deep");
+
+        // 40 independent 4-element circuits: 40 blocks, and every one of them
+        // still gets a real trial. The old table gave this document 2 steps.
+        let mut room: Vec<ElementSpec> = Vec::new();
+        for k in 0..40i32 {
+            let (x, id) = (k * 4, 1 + 10 * k as u32);
+            room.push(ElementSpec::two(id, dc(9.0), (x, 0), (x, 6)));
+            room.push(ElementSpec::two(id + 1, r(330.0), (x, 0), (x + 1, 0)));
+            room.push(ElementSpec::two(
+                id + 2,
+                ElementKind::Led { color: 0 },
+                (x + 1, 0),
+                (x, 6),
+            ));
+            room.push(ElementSpec::ground(id + 3, (x, 6)));
+        }
+        assert_eq!(check_document(&room, DT), Ok(()));
+        let (depth, blocks) = depth_for(&room);
+        assert_eq!(blocks, 40, "one block per circuit");
+        assert!(
+            depth >= 16,
+            "160 elements in small blocks must still run deep, got {depth}"
+        );
+    }
+
+    /// What a document gives up when it cannot afford to judge everything is
+    /// its widest circuits — never its cheap ones, and never because of how
+    /// many parts are on the canvas.
+    #[test]
+    fn the_ceiling_gives_up_the_widest_circuits_first() {
+        // A room the ceiling comfortably covers: nothing is given up.
+        let mut cheap = vec![1u64; 200];
+        assert_eq!(affordable_cost(&mut cheap), 1);
+        // One expensive circuit among cheap ones: the cheap ones survive.
+        let mut mixed = vec![1, 1, 1, 1, TRIAL_CEILING * 4];
+        assert_eq!(affordable_cost(&mut mixed), 1, "the wide one is given up");
+        // Equal-cost circuits are all treated the same, however many there
+        // are — so the answer cannot depend on document order.
+        let big = TRIAL_CEILING / 2 + 1;
+        assert_eq!(affordable_cost(&mut vec![big]), big, "one fits");
+        assert_eq!(
+            affordable_cost(&mut vec![big, big]),
+            0,
+            "two do not, so neither runs"
+        );
+        assert_eq!(
+            affordable_cost(&mut vec![1, big, big]),
+            1,
+            "and the cheap circuit beside them still runs"
+        );
+        // Reordering the same multiset cannot change the cut.
+        let m = [7u64, 3, 900, 3, 4096, 1];
+        let mut a: Vec<u64> = m.to_vec();
+        let mut b: Vec<u64> = m.iter().rev().copied().collect();
+        assert_eq!(affordable_cost(&mut a), affordable_cost(&mut b));
+        // Nothing to trial: no cut, and no panic on the empty case.
+        assert_eq!(affordable_cost(&mut Vec::new()), 0);
+        // Saturating: a block whose cost overflows the accumulator is simply
+        // unaffordable, not a wrapped-around bargain.
+        assert_eq!(affordable_cost(&mut vec![u64::MAX, 1]), 1);
+    }
+
+    /// The measured regression the old element-count cap left behind: an AC
+    /// source straight across an LED was refused in a 400-element room and
+    /// ACCEPTED in a 401-element one, where it then quarantined at step 107.
+    /// Room size must not decide whether the gate can see a three-part fault.
+    #[test]
+    fn a_bad_circuit_stays_refused_however_big_the_room_around_it_is() {
+        // A healthy room, grown one four-part circuit at a time.
+        let cell = |k: i32| {
+            let (x, id) = (k * 4, 1000 + 10 * k as u32);
+            vec![
+                ElementSpec::two(id, dc(9.0), (x, 0), (x, 6)),
+                ElementSpec::two(id + 1, r(330.0), (x, 0), (x + 1, 0)),
+                ElementSpec::two(id + 2, ElementKind::Led { color: 0 }, (x + 1, 0), (x, 6)),
+                ElementSpec::ground(id + 3, (x, 6)),
+            ]
+        };
+        // The fault: 9 V peak straight across a junction, far from everything.
+        let fault = vec![
+            ElementSpec::two(1, ac(0.0, 9.0, 50.0, 0.0), (-100, 0), (-100, 6)),
+            ElementSpec::two(2, ElementKind::Led { color: 0 }, (-100, 0), (-100, 6)),
+            ElementSpec::ground(3, (-100, 6)),
+        ];
+        for cells in [0usize, 25, 50, 100, 200, 400] {
+            let mut room: Vec<ElementSpec> = Vec::new();
+            for k in 0..cells {
+                room.extend(cell(k as i32));
+            }
+            assert_eq!(
+                check_document(&room, DT),
+                Ok(()),
+                "{} healthy elements must stay placeable",
+                room.len()
+            );
+            let mut bad = room.clone();
+            bad.extend(fault.iter().cloned());
+            let got = check_document(&bad, DT);
+            assert!(
+                matches!(got, Err(Reject::WillNotConverge { .. })),
+                "the same three parts must be refused in a {}-element room, got {got:?}",
+                bad.len()
+            );
+        }
+    }
+
+    /// The deepest trial `check_document` would run on `specs`, and how many
+    /// blocks it cut the document into.
+    fn depth_for(specs: &[ElementSpec]) -> (u32, usize) {
+        let mut eng = Engine::new(DT);
+        eng.set_elements(specs);
+        let b = split_blocks(&eng, specs).expect("well-formed document");
+        let floor = |k: usize| {
+            (1 + u64::from(b.opens[k]) + 2 * u64::from(b.swings[k]))
+                .saturating_mul(block_step_cost(b.unknowns[k]))
+        };
+        let mut costs: Vec<u64> = (0..b.members.len())
+            .filter(|k| b.nonlinear[*k])
+            .map(&floor)
+            .collect();
+        let cut = affordable_cost(&mut costs);
+        let trialled = |k: usize| b.nonlinear[k] && floor(k) <= cut;
+        let n = (0..b.members.len()).filter(|k| trialled(*k)).count();
+        let share = TRIAL_BUDGET / n.max(1) as u64;
+        let deepest = (0..b.members.len())
+            .filter(|k| trialled(*k))
+            .map(|k| {
+                trial_depth(
+                    share,
+                    (1 + u64::from(b.opens[k])).saturating_mul(block_step_cost(b.unknowns[k])),
+                )
+            })
+            .max()
+            .unwrap_or(0);
+        (deepest, b.members.len())
     }
 
     #[test]
@@ -2096,7 +2608,7 @@ mod tests {
                 let mut live = Engine::new(DT);
                 live.set_elements(&p);
                 assert!(
-                    !live.advance(trial_depth(p.len())).quarantined,
+                    !live.advance(MAX_TRIAL_DEPTH).quarantined,
                     "accepted an ordering that then froze: {p:?}"
                 );
             }

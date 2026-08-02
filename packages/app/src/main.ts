@@ -734,22 +734,41 @@ function toast(text: string) {
 /** Above this the pre-send check is skipped and the server's refusal (plus
  * its `reject` callout) is relied on instead.
  *
- * The gate is a compile plus one or two dense factorizations plus up to four
- * short convergence trials, and it would run on the UI thread once per knob
- * tick during a value drag. "The sim never stalls the UI" is the invariant
- * that decides the trade: a few hundred microseconds is fine, tens of
- * milliseconds per frame is not.
+ * The gate is two compiles, two dense factorizations of the whole document,
+ * and a short convergence trial of each independent circuit in it. It runs on
+ * the UI thread, so "the sim never stalls the UI" is the invariant that
+ * decides the trade.
  *
- * Measured (release, native, same code path as the wasm build): 0.07 ms on a
- * beginner's handful of parts, 1.3 ms on the shipped room (147 elements),
- * 2.2 ms at the worst size, and back to ~1.2 ms above 400 elements where
- * sim-core skips the trials outright. Worst case is ~13% of a 60 fps frame,
- * and only on the frames a drag actually changes a value.
+ * Every number here was measured on this tree (release, native, the same code
+ * path the wasm build compiles), on the shipped room grown the way a room
+ * really grows — independent sub-circuits on fresh grid cells:
  *
- * The honest residual is that a big room loses pre-send prevention (and,
- * offline, loses the gate entirely) — the real fix is the two quadratics in
- * the Rust compile path, not a bigger constant here. */
-const GATE_MAX_ELEMENTS = 600;
+ *     elements     4    147    250    400    600    800   1200
+ *     check_doc  0.05  0.48   0.63   0.91   1.51   2.37   5.83   ms
+ *
+ * Those are healthy rooms. The worst document anyone can construct inside the
+ * cap — 720 parts drawn as 48 dense diode meshes, each with an open switch
+ * and an AC source, so every one of them runs all four trial states — costs
+ * 4.1 ms, a quarter of a frame, and only on the frame an edit lands.
+ *
+ * 800 is where a healthy room reaches 2.4 ms — 14% of a 60 fps frame — and it
+ * is more than five times the size of the room a fresh server stands up (147).
+ * Past it the curve turns: the two whole-document factorizations are O(n³) in
+ * the MNA unknowns and nothing caps them, which is why the cap keys on the
+ * document and not, like sim-core's `TRIAL_CEILING`, on one circuit.
+ *
+ * The previous constant here was 600 and the numbers beside it were wrong by
+ * 20x: it claimed "2.2 ms at the worst size", when the worst size inside the
+ * old cap actually cost 42.9 ms — 258% of a frame, on this thread. The guard
+ * admitted exactly the band that hurt. It is worth saying plainly, because
+ * the fix was not a different constant: sim-core now trials each MNA block
+ * separately, which is what took 400 elements from 42.9 ms to 0.91 ms.
+ *
+ * The honest residual is unchanged: a room past the cap loses pre-send
+ * prevention, and offline it loses the gate entirely. Nothing becomes more
+ * placeable there — the server still refuses it — the callout just arrives a
+ * round trip later. */
+const GATE_MAX_ELEMENTS = 800;
 
 /** The document `op` would produce, WITHOUT touching the live one. Mirrors
  * the server's `apply_doc_op_to`: same verbs, same order, applied to a copy.
