@@ -226,7 +226,14 @@ pub const MAX_TRIAL_DEPTH: u32 = 256;
 /// wall, it is older than this budget, and it is why the numbers converge
 /// again past 800. The client's `GATE_MAX_ELEMENTS` is the guard in front of
 /// it.
-pub const TRIAL_BUDGET: u64 = 2048;
+/// Calibrated at 2560, not 2048: an adversarial 20,000-document corpus found
+/// one 8-unknown document that 2048 buys 204 trial steps for and which needs
+/// 218. At 2560 the accepted set is IDENTICAL to the whole-document gate this
+/// replaced — 0 newly accepted, 0 newly refused — for 1.02-1.16x the cost.
+/// 4096 also works and buys nothing further. If this constant is ever lowered,
+/// re-run that corpus: the failure mode is silent, a document that validates
+/// and then quarantines a few hundred steps later.
+pub const TRIAL_BUDGET: u64 = 2560;
 
 /// What one step of one block costs, in units of "one step of a small block".
 ///

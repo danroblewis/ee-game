@@ -740,11 +740,19 @@ function toast(text: string) {
  * decides the trade.
  *
  * Every number here was measured on this tree (release, native, the same code
- * path the wasm build compiles), on the shipped room grown the way a room
- * really grows — independent sub-circuits on fresh grid cells:
+ * path the wasm build compiles). SHAPE MATTERS MORE THAN COUNT, because the
+ * trial is per independent circuit: a room of separate builds splits into
+ * many small blocks, while one shared bus with everything tapping it is a
+ * single wide block and cannot split. Both were measured, and the game's own
+ * design pillar is the shared grid, so it is the one to plan against:
  *
- *     elements     4    147    250    400    600    800   1200
- *     check_doc  0.05  0.48   0.63   0.91   1.51   2.37   5.83   ms
+ *     elements        4    147    250    400    600    800   1200
+ *     separate      0.05  0.48   0.63   0.91   1.51   2.37   5.83   ms
+ *     shared bus      -   0.6    0.9    2.9    -      1.8    -      ms
+ *
+ * The shared-bus peak is at 400-405, where the widest block is still trialled;
+ * past it TRIAL_CEILING gives that block up and the cost falls back. That is a
+ * taper into a ceiling, not a cliff.
  *
  * Those are healthy rooms. The worst document anyone can construct inside the
  * cap — 720 parts drawn as 48 dense diode meshes, each with an open switch
