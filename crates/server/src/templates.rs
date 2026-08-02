@@ -252,6 +252,12 @@ pub static BUILTINS: &[Builtin] = &[
         build: showcase_setup,
     },
     Builtin {
+        id: "synth",
+        name: "Analog Synthesizer",
+        blurb: "A patchable synth: 555 clocks, OTA filters, a pot-and-button sequencer and noise drums. It is already playing.",
+        build: synth_setup,
+    },
+    Builtin {
         id: "sandbox",
         name: "Sandbox",
         blurb: "An empty plane. Build anything.",
@@ -286,6 +292,37 @@ fn showcase_setup() -> RoomSetup {
         machine: MachineSpec::None,
         view: View {
             home: Some([-10.0, -10.0, 60.0, 60.0]),
+            scopes: Vec::new(),
+        },
+        ..RoomSetup::default()
+    }
+}
+
+/// The analog synthesizer. It arrived on its own branch with an `EE_WORLD`
+/// switch, which templates supersede — this is the same room, reached the way
+/// every other room is reached.
+fn synth_setup() -> RoomSetup {
+    let panels: Vec<Panel> = crate::synth::synth_panels()
+        .into_iter()
+        .enumerate()
+        .map(|(i, p)| Panel {
+            plid: i as u32 + 1,
+            x0: p.x0,
+            y0: p.y0,
+            x1: p.x1,
+            y1: p.y1,
+            name: p.name.to_string(),
+        })
+        .collect();
+    let next_plid = panels.len() as u32 + 1;
+    RoomSetup {
+        elements: crate::synth::synth_room_circuit(),
+        panels,
+        next_plid,
+        // No machine: the synth's goal is that it makes a noise.
+        machine: MachineSpec::None,
+        view: View {
+            home: Some([-4.0, -4.0, 76.0, 44.0]),
             scopes: Vec::new(),
         },
         ..RoomSetup::default()

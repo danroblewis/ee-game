@@ -340,6 +340,34 @@ pub fn led_loop() -> Vec<ElementSpec> {
     ]
 }
 
+/// White-noise source (1 V peak behind 1 kΩ, seed 12345) into a 4.7 kΩ /
+/// 10 nF lowpass — the front end of a snare voice, and the smallest circuit
+/// that puts the PRNG on the cross-target harness.
+///
+/// The generator is integer-only and counter-based, so this circuit has no
+/// closed-form waveform but it has exact reproducibility: native and wasm32
+/// must produce the same sample sequence, hence the same state hash. The RC
+/// pole (fc = 1/(2π·4.7k·10n) = 3.39 kHz) is the band-limiting every noise
+/// path needs before an audio tap, so the golden exercises the real usage.
+pub fn noise_rc() -> Vec<ElementSpec> {
+    vec![
+        ElementSpec::two(
+            1,
+            ElementKind::Noise {
+                volts: 1.0,
+                ohms: 1000.0,
+                seed: 12345,
+            },
+            (0, 0),
+            (0, 8),
+        ),
+        spec(2, r(4700.0), (0, 0), (6, 0)),
+        spec(3, ElementKind::Capacitor { farads: 10e-9 }, (6, 0), (0, 8)),
+        spec(4, r(100_000.0), (6, 0), (0, 8)),
+        gnd(5, (0, 8)),
+    ]
+}
+
 /// Every golden circuit, for the determinism harness.
 pub fn all_golden() -> Vec<(&'static str, Vec<ElementSpec>)> {
     vec![
@@ -360,5 +388,6 @@ pub fn all_golden() -> Vec<(&'static str, Vec<ElementSpec>)> {
         ("pot_divider", pot_divider()),
         ("led_loop", led_loop()),
         ("motor_step", motor_step()),
+        ("noise_rc", noise_rc()),
     ]
 }

@@ -25,7 +25,10 @@ export type ElementKind =
   | { t: 'OpAmp'; rail: number }
   | { t: 'Ota' }
   | { t: 'Timer555' }
-  | { t: 'Potentiometer'; ohms: number; wiper: number };
+  | { t: 'Potentiometer'; ohms: number; wiper: number }
+  // `seed` picks WHICH noise, `volts` how loud. Two sources with the same
+  // seed are the same signal, so each placement gets its own (catalog.ts).
+  | { t: 'Noise'; volts: number; ohms: number; seed: number };
 
 export interface ElementSpec {
   id: number;
@@ -64,6 +67,8 @@ export function pinLabels(kind: ElementKind): string[] {
       return ['⏚'];
     case 'Rail':
       return ['+'];
+    case 'Noise':
+      return ['out', 'ref'];
     default:
       return ['a', 'b'];
   }

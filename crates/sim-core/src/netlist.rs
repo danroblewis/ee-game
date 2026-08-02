@@ -143,6 +143,28 @@ pub enum ElementKind {
         henries: f64,
         bemf: f64,
     },
+    /// White-noise generator: an EMF of `volts` peak behind `ohms` of
+    /// output resistance, redrawn once per timestep. Pins: [out, ref];
+    /// pin 0 is +.
+    ///
+    /// The stream is a *pure function* of (`seed`, sample index) evaluated
+    /// with integer arithmetic only, so it is bit-identical on native and
+    /// wasm32, survives save/reload, and never touches a clock, an OS
+    /// entropy source or the `rand` crate. Two sources with different
+    /// seeds are independent; two with the SAME seed are the same signal.
+    ///
+    /// Uniform on [-volts, +volts): RMS = volts/sqrt(3) = 0.5774·volts,
+    /// mean 0. One fresh sample per substep is a zero-order hold at the
+    /// substep rate (50 kHz at the standard 20 µs dt), so the spectrum is
+    /// flat to well past audio — the hiss is deliberately unfiltered.
+    /// Band-limit it in the circuit (an RC pole, a gm-C filter), which is
+    /// what a drum voice wants anyway and what keeps content out of the
+    /// fold-back band above the audio tap's Nyquist.
+    Noise {
+        volts: f64,
+        ohms: f64,
+        seed: u32,
+    },
 }
 
 impl ElementKind {

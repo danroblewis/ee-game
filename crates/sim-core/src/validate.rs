@@ -160,6 +160,20 @@ fn check_kind(kind: &ElementKind) -> Result<(), &'static str> {
             }
             Ok(())
         }
+        // Noise is a Norton source: an amplitude and its own internal
+        // impedance. `seed` needs no range — every u32 is a valid stream, and
+        // that is the point of seeding it rather than sampling a clock.
+        K::Noise { volts, ohms, seed: _ } => {
+            // Zero is legal — a silent noise source is a valid part, not a
+            // broken one — so this is a magnitude bound, not a range.
+            if !mag_ok(volts, MAX_SOURCE_VOLTS) {
+                return Err("noise amplitude must be a finite voltage");
+            }
+            if !in_range(ohms, MIN_OHMS, MAX_OHMS) {
+                return Err("source impedance must be a finite value between 1 uOhm and 1 TOhm");
+            }
+            Ok(())
+        }
         K::Capacitor { farads } => {
             if !in_range(farads, MIN_FARADS, MAX_FARADS) {
                 return Err("capacitance must be a finite value between 1 fF and 1 kF");

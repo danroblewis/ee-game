@@ -65,6 +65,17 @@ use axum::{
     routing::get,
     Router,
 };
+mod sequencer;
+mod synth;
+// The measured module library the synth room was assembled from. `synth.rs`
+// uses `sequencer`; these two hold designs that did not fit the real-time
+// budget (the gm-C kick, the VCO's own pitch knob, the 555 LFO) with the
+// measurements that say so. Kept compiled so they cannot silently rot.
+#[allow(dead_code)]
+mod drums;
+#[allow(dead_code)]
+mod synth_vco;
+
 use damage::DamageModel;
 use machine::Hoist;
 use registry::{Life, Parked, Registry, RoomHandle};
@@ -391,6 +402,13 @@ const fn hoist_rect(x0: i32, y0: i32) -> [i32; 4] {
 /// vignettes (which occupy x <= 40). The live footprint is room STATE from
 /// here on (persisted in `SaveFile::hoist_rect`), not a constant.
 const HOIST_RECT: [i32; 4] = hoist_rect(46, 2);
+
+/// Where the SYNTH room stands it. The instrument occupies x <= 52 and the
+/// client's home view frames -10..60, so this parks the machine just east of
+/// the patch and still on screen. `synth_room_pins_clear_the_hoist` asserts
+/// the two never overlap — an overlapping pin would silently wire the
+/// sequencer into the motor terminals.
+const SYNTH_HOIST_RECT: [i32; 4] = hoist_rect(56, 30);
 
 /// Grid coordinates the machine may occupy. The world is meant to be huge, so
 /// this is a guard against a runaway client (or a corrupt save) parking the
@@ -4125,6 +4143,375 @@ mod tests {
             "showcase worst case: part #{} settles at {:.2} of failure",
             worst.0, worst.1
         );
+    }
+
+    // ---------------------------------------------------------- synth room
+    //
+    // The second sample world. It arrived with its own `EE_WORLD` switch,
+    // which the template registry supersedes — it is now the `synth`
+    // built-in, reached the way every other room is reached.
+
+    /// The default template is still the showcase plus a hoist, and the synth
+    /// is a room you choose rather than a mode the binary boots into.
+    #[test]
+    fn the_default_template_is_still_the_showcase_and_synth_is_its_own() {
+        let demo = templates::BUILTINS
+            .iter()
+            .find(|b| b.id == default_template())
+            .expect("the default template exists");
+        let setup = (demo.build)();
+        let want = demo_room_circuit();
+        assert!(
+            setup.elements.len() > want.len(),
+            "the default room is the showcase plus a hoist fixture"
+        );
+        for (a, b) in setup.elements.iter().zip(want.iter()) {
+            assert_eq!(a.id, b.id);
+            assert_eq!(a.pins, b.pins);
+        }
+
+        let synth = templates::BUILTINS
+            .iter()
+            .find(|b| b.id == "synth")
+            .expect("the synth ships as a template");
+        let s = (synth.build)();
+        assert!(!s.elements.is_empty(), "the synth room has parts");
+        assert!(!s.panels.is_empty(), "and its labels");
+        assert!(
+            !s.machine.is_some(),
+            "the synth arms no machine: its goal is that it makes a noise"
+        );
+    }
+
+    /// The room is a musical instrument, and an instrument that cannot hold
+    /// real time plays FLAT: sim-time dilation is a pitch error, not a frame
+    /// drop. Measured on an Apple M4 (release, pinned cargo 1.95.0, machine
+    /// under load from other builds, two runs of three passes): **13.60-13.73
+    /// µs per substep = 1.46-1.47x real time**, and the LIVE server reports
+    /// rt 0.993 against the shipped showcase room's 0.985 on the same
+    /// machine. Cost in this engine goes as
+    /// `newton_iterations x elements^1.64`, so the element count is the
+    /// budget, and this is the guard rail on it.
+    #[test]
+    fn the_synth_room_fits_the_realtime_budget() {
+        let n = synth::synth_room_circuit().len();
+        assert!(
+            n <= 72,
+            "the synth room grew to {n} elements; at 1.45x real time it had \
+             71, and the margin is not there to spend"
+        );
+    }
+
+    /// Nothing in the instrument may sit inside the machine's footprint: an
+    /// overlapping pin would wire the sequencer into the motor terminals.
+    #[test]
+    fn synth_room_pins_clear_the_hoist() {
+        let [x0, y0, x1, y1] = SYNTH_HOIST_RECT;
+        for e in synth::synth_room_circuit() {
+            for (px, py) in &e.pins {
+                assert!(
+                    *px < x0 || *px > x1 || *py < y0 || *py > y1,
+                    "element {} pin ({px},{py}) is inside {SYNTH_HOIST_RECT:?}",
+                    e.id
+                );
+            }
+        }
+        // And the whole patch is inside the client's home view, so a player
+        // who joins is looking at the knobs rather than at empty canvas.
+        for e in synth::synth_room_circuit() {
+            for (px, py) in &e.pins {
+                assert!(
+                    (-10..=60).contains(px) && (-10..=60).contains(py),
+                    "element {} pin ({px},{py}) is outside the home view",
+                    e.id
+                );
+            }
+        }
+    }
+
+    /// The speaker must own the lowest Speaker id in the room, because the
+    /// server only streams the four lowest and a player dropping speakers
+    /// next to the instrument must not be able to mute it.
+    #[test]
+    fn the_synth_speaker_is_always_an_audio_tap() {
+        let mut elems = synth::synth_room_circuit();
+        assert_eq!(audio_tap_ids(&elems), vec![synth::ID_SPEAKER]);
+        for id in 200..206 {
+            elems.push(ElementSpec::two(
+                id,
+                ElementKind::Speaker { ohms: 8.0 },
+                (70, 70),
+                (74, 70),
+            ));
+        }
+        assert!(audio_tap_ids(&elems).contains(&synth::ID_SPEAKER));
+    }
+
+    /// It must be ALIVE the moment the room boots and stay alive: the
+    /// oscillator running, the clock stepping, nothing quarantining.
+    #[test]
+    fn synth_room_never_quarantines() {
+        let elems = synth::synth_room_circuit();
+        let sq = synth::seq_config();
+        let mut eng = Engine::new(DT);
+        eng.set_elements(&elems);
+        let mut osc_flips = 0u32;
+        let mut osc_high = false;
+        let mut bar_flips = 0u32;
+        let mut bar_high = true;
+        let mut rescues = 0u32;
+        // 30 simulated seconds in 10 ms chunks.
+        for chunk in 0..3000 {
+            let rep = eng.advance(500);
+            rescues += rep.rescues;
+            assert!(
+                !eng.is_quarantined(),
+                "quarantined at t={:.3}s (chunk {chunk})",
+                eng.time()
+            );
+            // The VCO's comparator output, +-5 V.
+            let osc = eng.voltage_at((44, -8)).unwrap_or(0.0) > 0.0;
+            if osc != osc_high {
+                osc_flips += 1;
+                osc_high = osc;
+            }
+            // The 555's bar marker: high, pulsing low once per four steps.
+            let bar = eng.voltage_at(sq.bar()).unwrap_or(0.0) > 4.0;
+            if bar != bar_high {
+                bar_flips += 1;
+                bar_high = bar;
+            }
+        }
+        // Sampled every 10 ms, so this undercounts a 250 Hz oscillator
+        // enormously -- it only has to prove the thing never stopped.
+        assert!(osc_flips > 500, "the VCO only flipped {osc_flips} times");
+        // ~1 s per bar, and the marker is low for 5 ms so a 10 ms sampler
+        // catches most but not all of them.
+        assert!(
+            (20..=70).contains(&bar_flips),
+            "the bar marker flipped {bar_flips} times in 30 s (expect ~2 per bar)"
+        );
+        assert_eq!(rescues, 0, "the solver needed {rescues} rescue steps");
+    }
+
+    /// What it actually plays. The four pitch knobs ship trimmed BY
+    /// MEASUREMENT -- the CV row is linear in the wiper only to about 2 %, so
+    /// nominal values would be a semitone out -- and this is what stops them
+    /// drifting silently out of tune when anything upstream changes.
+    #[test]
+    fn synth_room_plays_a_tune() {
+        let elems = synth::synth_room_circuit();
+        let mut eng = Engine::new(DT);
+        eng.set_elements(&elems);
+        eng.advance(150_000); // 3 s: let the bar and the LFO cap settle
+        let sq = synth::seq_config();
+        // Sample the oscillator and the CV bus for three bars.
+        let n = 160_000usize;
+        let mut osc = Vec::with_capacity(n);
+        let mut cv = Vec::with_capacity(n);
+        for _ in 0..n {
+            eng.advance(1);
+            osc.push(eng.voltage_at((44, -8)).unwrap_or(0.0));
+            cv.push(eng.voltage_at(sq.cv()).unwrap_or(0.0));
+        }
+        // Cut the run into CV plateaus: one per step.
+        let mut steps: Vec<(usize, usize)> = Vec::new();
+        let mut i = 0;
+        while i < n {
+            let v0 = cv[i];
+            let mut j = i;
+            while j < n && (cv[j] - v0).abs() < 0.02 {
+                j += 1;
+            }
+            if j - i > 4_000 {
+                steps.push((i, j));
+            }
+            i = j.max(i + 1);
+        }
+        assert!(
+            steps.len() >= 8,
+            "only found {} steps in 3.2 s -- is the clock running?",
+            steps.len()
+        );
+        // A minor: A3 C4 E4, repeating.
+        const RIFF: [f64; 3] = [220.0, 261.626, 329.628];
+        // Which step of the bar the first plateau is depends on where the
+        // settling run stopped, so lock the phase onto the lowest note.
+        let f0 = pitch_of(&osc[steps[0].0..steps[0].1]);
+        let phase = (0..RIFF.len())
+            .min_by(|a, b| {
+                let d = |k: &usize| (f0 / RIFF[*k]).log2().abs();
+                d(a).partial_cmp(&d(b)).unwrap()
+            })
+            .unwrap();
+        for (k, (a, b)) in steps.iter().enumerate().take(8) {
+            let want = RIFF[(phase + k) % RIFF.len()];
+            let got = pitch_of(&osc[*a..*b]);
+            let cents = 1200.0 * (got / want).log2();
+            assert!(
+                cents.abs() < 25.0,
+                "step {k} played {got:.2} Hz, {cents:+.0} cents from {want:.2} Hz"
+            );
+            // Every step must be long enough to hear.
+            let ms = (*b - *a) as f64 * DT * 1000.0;
+            assert!((150.0..320.0).contains(&ms), "step {k} lasted {ms:.0} ms");
+        }
+    }
+
+    /// Fundamental frequency from upward zero crossings, interpolated.
+    fn pitch_of(v: &[f64]) -> f64 {
+        let mean = v.iter().sum::<f64>() / v.len() as f64;
+        let (mut first, mut last, mut n) = (None, 0.0, 0u32);
+        for i in 1..v.len() {
+            if v[i - 1] <= mean && v[i] > mean {
+                let frac = (mean - v[i - 1]) / (v[i] - v[i - 1]);
+                let t = (i - 1) as f64 * DT + frac * DT;
+                match first {
+                    None => first = Some(t),
+                    Some(_) => {
+                        n += 1;
+                        last = t;
+                    }
+                }
+            }
+        }
+        match first {
+            Some(f) if n > 0 => n as f64 / (last - f),
+            _ => 0.0,
+        }
+    }
+
+    /// The same contract the showcase signs: a demo is not a trap. Every
+    /// switch closed and every pot wound to the end that dissipates most,
+    /// and nothing may settle at its failure temperature. An 8 ohm speaker
+    /// passes its 0.5 W rating at 2 V rms, which is why the voice's level is
+    /// set by a fixed resistor rather than by a knob.
+    #[test]
+    fn the_synth_room_never_cooks_itself() {
+        let mut elems = synth::synth_room_circuit();
+        ensure_fixture(&mut elems, SYNTH_HOIST_RECT);
+        for e in elems.iter_mut() {
+            if reserved_id(e.id) {
+                continue;
+            }
+            match &mut e.kind {
+                K::Switch { closed } | K::Button { closed } => *closed = true,
+                K::Potentiometer { wiper: w, .. } => *w = 0.98,
+                _ => {}
+            }
+        }
+        let mut run = DamageRun::new(&elems);
+        let mut sum: Vec<(u32, f64, u32)> = Vec::new();
+        let ticks = (4.0 * TICK_HZ) as u32;
+        for _ in 0..ticks {
+            run.tick();
+            for f in run.eng.frame() {
+                let Some(rt) = run.dmg.rating_of(f.id) else {
+                    continue;
+                };
+                let hot = damage::heat(rt.metric, damage::load(&rt, &f));
+                match sum.iter_mut().find(|(id, _, _)| *id == f.id) {
+                    Some(e) => {
+                        e.1 += hot;
+                        e.2 += 1;
+                    }
+                    None => sum.push((f.id, hot, 1)),
+                }
+            }
+        }
+        assert!(run.broke.is_empty(), "the synth room broke {:?}", run.broke);
+        let worst = sum
+            .iter()
+            .map(|(id, s, n)| (*id, s / *n as f64))
+            .fold((0u32, 0.0f64), |m, e| if e.1 > m.1 { e } else { m });
+        assert!(
+            worst.1 < 0.9,
+            "part #{} settles at {:.2} of its failure temperature",
+            worst.0,
+            worst.1
+        );
+        eprintln!(
+            "synth worst case: part #{} settles at {:.2} of failure",
+            worst.0, worst.1
+        );
+    }
+
+    /// Every knob and toggle a player can reach, driven live: the pitch pots,
+    /// the beat toggles, the tempo, the cutoff and the snare tone. None of it
+    /// may quarantine the room, and the pitch row must actually move.
+    #[test]
+    fn synth_room_knobs_are_playable() {
+        let elems = synth::synth_room_circuit();
+        let ids = synth::seq_ids();
+        let sq = synth::seq_config();
+        let mut eng = Engine::new(DT);
+        eng.set_elements(&elems);
+        eng.advance(60_000);
+        let mut seen: Vec<f64> = Vec::new();
+        for k in 0..60u32 {
+            // Wind step 1's pitch across its whole legal travel.
+            let w = 0.01 + 0.98 * (k as f64 / 59.0);
+            eng.interact(ids.pots[0], InteractOp::SetValue { value: w });
+            eng.interact(
+                ids.tempo,
+                InteractOp::SetValue {
+                    value: 0.2 + 0.01 * k as f64,
+                },
+            );
+            eng.interact(synth::ID_CUTOFF, InteractOp::SetValue { value: w });
+            eng.interact(synth::ID_SNARE_TONE, InteractOp::SetValue { value: w });
+            for (n, sw) in ids.switches.iter().take(ids.steps).enumerate() {
+                eng.interact(
+                    *sw,
+                    InteractOp::SetSwitch {
+                        closed: (k as usize + n) % 2 == 0,
+                    },
+                );
+            }
+            eng.advance(2_000);
+            assert!(
+                !eng.is_quarantined(),
+                "quarantined after knob update {k} (wiper {w:.3})"
+            );
+            seen.push(eng.voltage_at(sq.cv()).unwrap_or(0.0));
+        }
+        let lo = seen.iter().cloned().fold(f64::INFINITY, f64::min);
+        let hi = seen.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        assert!(
+            hi - lo > 2.0,
+            "the pitch knob only moved the CV bus {:.2} V",
+            hi - lo
+        );
+    }
+
+    /// The panels are the only words in the world -- without them a player
+    /// sees eighty anonymous glyphs -- so they must be well formed and must
+    /// name the parts a player is looking for.
+    #[test]
+    fn the_synth_room_is_labelled() {
+        let panels = synth::synth_panels();
+        assert!(panels.len() >= 2 * synth::SEQ_STEPS + 5 && panels.len() <= MAX_PANELS);
+        for p in &panels {
+            assert!(
+                p.x1 - p.x0 >= MIN_PANEL_SPAN,
+                "panel {} is too narrow",
+                p.name
+            );
+            assert!(
+                p.y1 - p.y0 >= MIN_PANEL_SPAN,
+                "panel {} is too short",
+                p.name
+            );
+            assert!(
+                p.name.len() <= MAX_PANEL_NAME,
+                "panel name {:?} is too long",
+                p.name
+            );
+        }
+        let names: Vec<&str> = panels.iter().map(|p| p.name).collect();
+        for want in ["VCO  1V/OCT", "SNARE  (TONE)", "STEP 1 PITCH", "BEAT 1"] {
+            assert!(names.contains(&want), "no panel named {want:?}");
+        }
     }
 
     #[test]
