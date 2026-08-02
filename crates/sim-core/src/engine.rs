@@ -66,10 +66,55 @@ const BE_STEPS_AFTER_EVENT: u32 = 2;
 
 const TWO_PI: f64 = core::f64::consts::TAU;
 
+// ---------------------------------------------------------- noise stream
+//
+// A deterministic solver has no thermal agitation of its own, so a noise
+// source has to carry its own. The requirement that makes this delicate is
+// the project's determinism invariant: native and wasm32 must agree BIT FOR
+// BIT, forever, across saves. That rules out anything seeded from a clock or
+// the OS, and it rules out float-state generators (a float recurrence is
+// exactly reproducible in principle but leaves no margin, and nothing here
+// needs one). What follows is integer-only.
+
+/// SplitMix64 finalizer over `(seed, n)`. Counter-based on purpose: the
+/// word is a pure function of its inputs, so nothing has to be carried
+/// forward except an integer index, and any state rollback (`step()`'s
+/// rescue path, a save/reload) reproduces the stream exactly.
+///
+/// `wrapping_mul`/`wrapping_add`/xor/shift on `u64` are exact on every
+/// target — no FMA, no libm, no float rounding anywhere in the advance.
+#[inline]
+fn noise_word(seed: u32, n: u64) -> u64 {
+    // The trailing constant breaks the finalizer's fixed point: without it
+    // seed 0 at n = 0 hashes to 0, i.e. the default noise source would open
+    // with one sample pinned at exactly -volts.
+    let mut z = (seed as u64)
+        .wrapping_mul(0xD1B5_4A32_D192_ED03)
+        .wrapping_add(n.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        .wrapping_add(0xA076_1D64_78BD_642F);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Uniform on [-1, 1). The top 32 bits of the word scaled by 2/2^32 — an
+/// exact power of two — then shifted by 1: `u32 -> f64` is exact, the
+/// multiply is exact, the subtraction is exact. The map introduces no
+/// rounding at all, so it cannot differ between targets even in principle.
+///
+/// Mean 0, RMS 1/sqrt(3) = 0.577350, peak just under 1.
+#[inline]
+fn noise_unit(seed: u32, n: u64) -> f64 {
+    ((noise_word(seed, n) >> 32) as u32 as f64) * (2.0 / 4_294_967_296.0) - 1.0
+}
+
 #[derive(Clone, Copy, Default)]
 struct ElemState {
     /// Companion history: capacitor voltage / inductor current at the
-    /// previous accepted step.
+    /// previous accepted step. A `Noise` source borrows `v_prev` for the
+    /// EMF it holds constant across the current step's NR iterations (it
+    /// has no companion model of its own, and reusing the slot keeps it
+    /// in the state digest and in `step()`'s snapshot for free).
     v_prev: f64,
     i_prev: f64,
     /// Junction-voltage NR guesses: diode vd / BJT (vbe, vbc) — stored
@@ -83,6 +128,11 @@ struct ElemState {
     lastv: [f64; MAX_PINS],
     /// Currents INTO the element per pin, from the last accepted step.
     pin_i: [f64; MAX_PINS],
+    /// A `Noise` source's position in its own PRNG stream. Counter-based,
+    /// so the sample is a pure function of (seed, n) and restoring this
+    /// integer restores the generator exactly — `Default` (0) is a valid
+    /// start and there is no "uninitialized" sentinel to get wrong.
+    noise_n: u64,
 }
 
 struct CompiledElem {
@@ -330,6 +380,9 @@ impl Engine {
                 ElementKind::VoltageSource { dc, .. } | ElementKind::Rail { dc, .. } => *dc = value,
                 ElementKind::CurrentSource { amps } => *amps = value,
                 ElementKind::Potentiometer { wiper, .. } => *wiper = value.clamp(0.01, 0.99),
+                // The noise knob is its level, not its seed: dragging it
+                // must change how loud the hiss is, never which hiss it is.
+                ElementKind::Noise { volts, .. } => *volts = value,
                 _ => return,
             },
             _ => return,
@@ -549,12 +602,25 @@ impl Engine {
         // Reset per-pass discrete-state-change budgets for the op-amp rail
         // region and the 555 latch (lastv[0] doubles as the counter for
         // both; neither has MOS damping state).
+        // The same pre-pass draws each noise source's sample for this step.
         for e in self.elems.iter_mut() {
-            if matches!(
-                e.spec.kind,
-                ElementKind::OpAmp { .. } | ElementKind::Timer555
-            ) {
+            let kind = e.spec.kind;
+            if matches!(kind, ElementKind::OpAmp { .. } | ElementKind::Timer555) {
                 e.state.lastv[0] = 0.0;
+            }
+            // Drawn ONCE, before the NR loop, and held constant through it:
+            // a source that moved under Newton's feet would never converge.
+            // `step()` snapshots every ElemState before calling us and
+            // restores it if we fail, so a rescued step rewinds the counter
+            // and its two half-size backward-Euler retries each draw their
+            // own sample — deterministic on every path through the ladder.
+            // A part that has failed open freezes its stream, matching the
+            // way `accept()` freezes a broken part's history.
+            if let ElementKind::Noise { volts, seed, .. } = kind {
+                if !e.broken {
+                    e.state.v_prev = volts * noise_unit(seed, e.state.noise_n);
+                    e.state.noise_n = e.state.noise_n.wrapping_add(1);
+                }
             }
         }
         for _ in 0..iters {
@@ -694,6 +760,20 @@ impl Engine {
                 ElementKind::CurrentSource { amps } => {
                     self.stamp_i_into(node[0], amps);
                     self.stamp_i_into(node[1], -amps);
+                }
+                ElementKind::Noise { ohms, .. } => {
+                    // Norton form of (EMF in series with `ohms`): a fixed
+                    // conductance plus an injected current. The conductance
+                    // never changes, so it sits under `need_factor` exactly
+                    // like a resistor's — a noise source is RHS-only and
+                    // forces no refactorization, which is what makes a
+                    // linear noise circuit stay on the reused factorization.
+                    if need_factor {
+                        self.stamp_g(node[0], node[1], 1.0 / ohms);
+                    }
+                    let i = state.v_prev / ohms;
+                    self.stamp_i_into(node[0], -i);
+                    self.stamp_i_into(node[1], i);
                 }
                 ElementKind::VoltageSource { dc, amp, hz, phase } => {
                     let v = if amp == 0.0 {
@@ -1181,6 +1261,10 @@ impl Engine {
                     two(i);
                 }
                 ElementKind::CurrentSource { amps } => two(amps),
+                // Current into pin 0 across the internal resistance: zero
+                // on open circuit, -v_emf/R into a short. (`v_prev` is this
+                // step's held EMF, drawn in `solve_step`'s pre-pass.)
+                ElementKind::Noise { ohms, .. } => two((v01 - st.v_prev) / ohms),
                 ElementKind::VoltageSource { .. } => two(bi_val.unwrap_or(0.0)),
                 ElementKind::Rail { .. } => {
                     // One real pin: its current is the branch unknown; the
@@ -1458,6 +1542,20 @@ impl Engine {
             if e.broken {
                 put(e.spec.id as f64);
             }
+            // A noise source's stream POSITION is discrete state: two
+            // engines can agree on every voltage in the circuit and still
+            // diverge on the very next step if they disagree about where
+            // they are in the sequence, and the cross-target harness would
+            // never see it. Conditional for the same reason `broken` is —
+            // a world with no noise source hashes exactly as it did before
+            // this device existed, so no golden hash moved.
+            if matches!(e.spec.kind, ElementKind::Noise { .. }) {
+                // Two exact halves: every u32 is exactly representable in
+                // f64, so this is a lossless view of the counter through
+                // the f64-shaped `put`.
+                put((e.state.noise_n >> 32) as u32 as f64);
+                put((e.state.noise_n & 0xffff_ffff) as u32 as f64);
+            }
         }
         h.digest()
     }
@@ -1547,5 +1645,212 @@ fn pnjlim(vnew: f64, vold: f64, vt: f64, vcrit: f64) -> f64 {
         }
     } else {
         vnew
+    }
+}
+
+/// Noise-source tests. These live inside `engine` rather than in the crate's
+/// public test module because two of them have to reach the private
+/// `ElemState` — the whole point is that the generator's state snapshots and
+/// restores correctly, and that is not observable from the public API.
+#[cfg(test)]
+mod noise_tests {
+    use super::*;
+
+    /// Noise source -> 1 MΩ to ground: the loaded node sits within 0.1 % of
+    /// the raw EMF, so `voltage_at` reads the generator almost directly.
+    fn open_noise(volts: f64, seed: u32) -> Vec<ElementSpec> {
+        vec![
+            ElementSpec::two(
+                1,
+                ElementKind::Noise {
+                    volts,
+                    ohms: 1000.0,
+                    seed,
+                },
+                (0, 0),
+                (0, 8),
+            ),
+            ElementSpec::two(2, ElementKind::Resistor { ohms: 1e6 }, (0, 0), (0, 8)),
+            ElementSpec::ground(3, (0, 8)),
+        ]
+    }
+
+    fn samples(volts: f64, seed: u32, n: usize) -> Vec<f64> {
+        let mut eng = Engine::new(20e-6);
+        eng.set_elements(&open_noise(volts, seed));
+        (0..n)
+            .map(|_| {
+                eng.advance(1);
+                eng.voltage_at((0, 0)).unwrap()
+            })
+            .collect()
+    }
+
+    /// The stream is a pure function of (seed, index): same seed, same
+    /// sequence, every time and on every target. Different seeds must be
+    /// genuinely independent, or two "independent" hiss sources in one patch
+    /// would be the same signal played twice.
+    #[test]
+    fn noise_is_reproducible_from_its_seed() {
+        assert_eq!(samples(1.0, 7, 256), samples(1.0, 7, 256));
+        let a = samples(1.0, 7, 4096);
+        let b = samples(1.0, 8, 4096);
+        assert_ne!(a, b, "different seeds must give different noise");
+        // Correlation between two seeds should be ~1/sqrt(N) = 0.016.
+        let dot: f64 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+        let na: f64 = a.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let nb: f64 = b.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let corr = dot / (na * nb);
+        assert!(
+            corr.abs() < 0.1,
+            "two seeds must be uncorrelated, got r = {corr}"
+        );
+        // ...and so must consecutive samples of ONE stream: a generator with
+        // lag-1 correlation is not white noise, it is a coloured rumble.
+        let lag: f64 = a.windows(2).map(|w| w[0] * w[1]).sum::<f64>() / (na * na);
+        assert!(lag.abs() < 0.05, "stream must be white, lag-1 r = {lag}");
+    }
+
+    /// Exactly what `step()` does on its rescue path: snapshot every
+    /// ElemState, roll it back, re-run. The stream counter lives in
+    /// ElemState, so the replayed steps must reproduce the same samples —
+    /// otherwise one dt-halving rescue would silently fork the generator and
+    /// two engines could diverge from an identical starting state.
+    #[test]
+    fn snapshot_restore_replays_the_same_stream() {
+        let mut eng = Engine::new(20e-6);
+        eng.set_elements(&open_noise(1.0, 4242));
+        eng.advance(100);
+        let saved: Vec<ElemState> = eng.elems.iter().map(|e| e.state).collect();
+        let saved_time = eng.time;
+        let hash = eng.state_hash();
+        let first: Vec<f64> = (0..200)
+            .map(|_| {
+                eng.advance(1);
+                eng.voltage_at((0, 0)).unwrap()
+            })
+            .collect();
+        assert_ne!(eng.state_hash(), hash, "200 steps must move the digest");
+        for (e, s) in eng.elems.iter_mut().zip(saved.iter()) {
+            e.state = *s;
+        }
+        eng.time = saved_time;
+        let again: Vec<f64> = (0..200)
+            .map(|_| {
+                eng.advance(1);
+                eng.voltage_at((0, 0)).unwrap()
+            })
+            .collect();
+        assert_eq!(first, again, "restored state must replay identically");
+    }
+
+    /// A recompile (any unrelated edit anywhere in the document) must not
+    /// restart the stream: `set_elements` carries ElemState across by id, and
+    /// the counter has to ride along with it.
+    #[test]
+    fn an_edit_elsewhere_does_not_restart_the_stream() {
+        let specs = open_noise(1.0, 900);
+        let mut a = Engine::new(20e-6);
+        a.set_elements(&specs);
+        let mut b = Engine::new(20e-6);
+        b.set_elements(&specs);
+        for _ in 0..50 {
+            a.advance(1);
+            b.advance(1);
+        }
+        b.set_elements(&specs); // recompile, same document
+        let ta: Vec<f64> = (0..50)
+            .map(|_| {
+                a.advance(1);
+                a.voltage_at((0, 0)).unwrap()
+            })
+            .collect();
+        let tb: Vec<f64> = (0..50)
+            .map(|_| {
+                b.advance(1);
+                b.voltage_at((0, 0)).unwrap()
+            })
+            .collect();
+        assert_eq!(ta, tb, "a recompile must not rewind the generator");
+    }
+
+    /// Uniform on [-volts, volts): mean 0, RMS volts/sqrt(3), peak < volts.
+    /// A biased or mis-scaled generator is a DC offset or a drum at the wrong
+    /// level, and both are silent failures without this.
+    #[test]
+    fn noise_statistics_are_sane() {
+        const N: usize = 20_000;
+        let s = samples(2.0, 99, N);
+        let mean = s.iter().sum::<f64>() / N as f64;
+        let rms = (s.iter().map(|x| x * x).sum::<f64>() / N as f64).sqrt();
+        let peak = s.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+        // sigma of the mean is 2/sqrt(3)/sqrt(N) = 0.0082; 0.05 is 6 sigma.
+        assert!(mean.abs() < 0.05, "mean must be ~0, got {mean}");
+        // Expected 2/sqrt(3) = 1.1547, less the 0.1 % divider loss.
+        let want = 2.0 / 3.0f64.sqrt() * (1e6 / 1.001e6);
+        assert!(
+            (rms / want - 1.0).abs() < 0.03,
+            "RMS must be volts/sqrt(3) = {want}, got {rms}"
+        );
+        assert!(peak <= 2.0, "amplitude must not exceed volts, got {peak}");
+        assert!(peak > 1.9, "a full-scale stream must reach its peak: {peak}");
+    }
+
+    /// The generator is RHS-only: its conductance is constant, so a linear
+    /// noise circuit must keep reusing one factorization. If this regresses,
+    /// every noise source costs an LU per step and the synth stops holding
+    /// real time.
+    #[test]
+    fn noise_never_forces_a_refactorization() {
+        let mut eng = Engine::new(20e-6);
+        eng.set_elements(&open_noise(1.0, 1));
+        eng.advance(1);
+        assert!(
+            eng.linear,
+            "a noise source must not make a circuit nonlinear"
+        );
+        eng.advance(5000);
+        assert!(eng.factor_valid, "the factorization must survive the stream");
+        assert!(!eng.is_quarantined(), "noise must never diverge the solver");
+    }
+
+    /// Nothing in the advance may touch a float, and the [-1, 1) map must be
+    /// exactly representable, or the two targets have room to disagree.
+    #[test]
+    fn noise_unit_is_exact_and_bounded() {
+        for n in 0..1000u64 {
+            let x = noise_unit(31, n);
+            assert!((-1.0..1.0).contains(&x), "out of range: {x}");
+            // Every sample is an exact multiple of 2^-31 offset by -1, so
+            // reconstructing the integer must be lossless.
+            let k = (x + 1.0) * 2147483648.0;
+            assert_eq!(k, k.floor(), "sample {x} is not on the 2^-31 grid");
+        }
+        // Pinned vectors: changing the generator changes every saved world
+        // that contains one, so it has to be a deliberate act.
+        assert_eq!(noise_word(0, 0), 0x7DE5_3DE7_72EA_694C);
+        assert_eq!(noise_word(1, 0), 0x38DD_62C4_22DA_381F);
+        assert_eq!(noise_word(0, 1), 0x4396_D60D_BD85_37AF);
+    }
+
+    /// A part that has failed open stamps nothing and its stream stops:
+    /// a dead noise source is silent, and it does not quietly keep burning
+    /// through samples where the digest cannot see the effect.
+    #[test]
+    fn a_broken_noise_source_is_silent_and_frozen() {
+        let mut eng = Engine::new(20e-6);
+        eng.set_elements(&open_noise(1.0, 5));
+        eng.advance(10);
+        eng.set_broken(1, true);
+        eng.advance(10);
+        let v = eng.voltage_at((0, 0)).unwrap();
+        assert!(v.abs() < 1e-9, "a dead source must stop driving, got {v}");
+        let n_after = eng.elems[0].state.noise_n;
+        eng.advance(100);
+        assert_eq!(
+            eng.elems[0].state.noise_n,
+            n_after,
+            "a dead source must not advance its stream"
+        );
     }
 }

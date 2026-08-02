@@ -129,6 +129,7 @@ const PART_HOTKEYS: Record<string, string> = {
   z: 'Zener',
   e: 'LED',
   n: 'NPN',
+  N: 'Noise',
   p: 'PNP',
   m: 'NMOS',
   M: 'PMOS',
@@ -241,6 +242,8 @@ function applyOp(e: ElementSpec, op: InteractOp) {
     else if (e.kind.t === 'Inductor') e.kind.henries = op.value;
     else if (e.kind.t === 'VoltageSource' || e.kind.t === 'Rail') e.kind.dc = op.value;
     else if (e.kind.t === 'CurrentSource') e.kind.amps = op.value;
+    // The knob is the level. The seed is identity, not a value.
+    else if (e.kind.t === 'Noise') e.kind.volts = op.value;
     else if (e.kind.t === 'Potentiometer') e.kind.wiper = Math.min(0.99, Math.max(0.01, op.value));
   }
 }
@@ -796,6 +799,8 @@ const FIELD_LABELS: Record<string, string> = {
   k: 'k A/V²',
   rail: 'rail ±V',
   wiper: 'wiper 0-1',
+  volts: 'amplitude ±V',
+  seed: 'seed (whole number)',
 };
 
 /** The property editor, rendered into any host box. Used twice: docked

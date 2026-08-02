@@ -490,6 +490,29 @@ export function drawElement(d: DrawCtx, e: ElementSpec) {
       twoPinDots();
       break;
     }
+    case 'Noise': {
+      // A source circle (same family as the AC source) with a jagged trace
+      // instead of a sine. The trace is a FIXED sequence, not Math.random:
+      // the symbol must not shimmer, and a redraw is not a new sample.
+      const r = s * 0.42;
+      stroke(ctx, voltageColor(v(0)), [A, add(mid, u, -r)]);
+      stroke(ctx, voltageColor(v(1)), [add(mid, u, r), B]);
+      ctx.strokeStyle = '#c9c9d4';
+      ctx.beginPath();
+      ctx.arc(mid[0], mid[1], r, 0, Math.PI * 2);
+      ctx.stroke();
+      const HISS = [0.15, -0.85, 0.55, -0.3, 0.95, -0.6, 0.35, -0.95, 0.7, -0.1];
+      ctx.beginPath();
+      for (let k = 0; k < HISS.length; k++) {
+        const t = k / (HISS.length - 1);
+        const p = add(add(mid, u, (t - 0.5) * r * 1.3), n, HISS[k]! * r * 0.6);
+        if (k === 0) ctx.moveTo(...p);
+        else ctx.lineTo(...p);
+      }
+      ctx.stroke();
+      twoPinDots(-i0);
+      break;
+    }
     case 'Switch': {
       const t1 = lerp(A, B, 0.3);
       const t2 = lerp(A, B, 0.7);

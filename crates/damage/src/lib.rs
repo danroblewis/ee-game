@@ -186,7 +186,7 @@ pub fn rating(kind: &ElementKind) -> Option<Rating> {
         // GND pins are modelled, so the frame's power really is the chip's.
         K::OpAmp { .. } | K::Ota => return None,
         K::Timer555 => Rating::new(Power, 0.6, 3.0),
-        K::VoltageSource { .. } | K::CurrentSource { .. } | K::Rail { .. } => {
+        K::VoltageSource { .. } | K::CurrentSource { .. } | K::Rail { .. } | K::Noise { .. } => {
             Rating::new(Current, 10.0, 5.0)
         }
     })
@@ -221,6 +221,7 @@ pub fn kind_name(kind: &ElementKind) -> &'static str {
         K::Timer555 => "555",
         K::Potentiometer { .. } => "Potentiometer",
         K::Motor { .. } => "Motor",
+        K::Noise { .. } => "Noise source",
     }
 }
 

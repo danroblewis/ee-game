@@ -26,6 +26,9 @@ export interface PartDef {
   make(): ElementKind;
 }
 
+/** A u32 nobody else in the room is likely to be holding. */
+const nextSeed = () => Math.floor(Math.random() * 0x1_0000_0000) >>> 0;
+
 export const CATALOG: PartDef[] = [
   { name: 'Wire', keys: 'w line', cat: 'Passive', key: 'W', make: () => ({ t: 'Wire' }) },
   { name: 'Ground', keys: 'gnd earth', cat: 'Passive', key: 'G', make: () => ({ t: 'Ground' }) },
@@ -84,6 +87,17 @@ export const CATALOG: PartDef[] = [
     cat: 'Sources',
     key: '⇧V',
     make: () => ({ t: 'Rail', dc: 5, amp: 0, hz: 0, phase: 0 }),
+  },
+  {
+    name: 'Noise',
+    keys: 'n white hiss random drum snare noise',
+    cat: 'Sources',
+    key: '⇧N',
+    // A fresh seed per placement: two noise sources with the same seed are
+    // literally the same signal, so defaulting them all to one number would
+    // make every "independent" hiss in a patch move in lockstep. The seed is
+    // a document parameter once placed — editable, saved, and reproducible.
+    make: () => ({ t: 'Noise', volts: 1, ohms: 1000, seed: nextSeed() }),
   },
   {
     name: 'Switch',
