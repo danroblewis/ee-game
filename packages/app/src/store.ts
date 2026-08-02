@@ -19,9 +19,17 @@ export const lsSet = (key: string, value: string) => {
   }
 };
 
-/** A stored number, or `fallback` when it is missing or unparseable. */
+/** A stored number, or `fallback` when it is missing or unparseable.
+ *
+ * The missing case has to be tested BEFORE the conversion: `Number(null)` and
+ * `Number('')` are both 0, and 0 is finite, so the obvious one-liner silently
+ * returns 0 for every key that was never written. That is not a hypothetical —
+ * it is why a player who had never touched the volume slider had a master
+ * gain of zero and heard nothing at all. */
 export const lsNum = (key: string, fallback: number): number => {
-  const n = Number(lsGet(key));
+  const raw = lsGet(key);
+  if (raw === null || raw.trim() === '') return fallback;
+  const n = Number(raw);
   return Number.isFinite(n) ? n : fallback;
 };
 
