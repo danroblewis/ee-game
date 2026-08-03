@@ -466,13 +466,17 @@ pub fn sequencer(sq: &Seq) -> Vec<ElementSpec> {
     sh.ground(p(X_OTA, y_lo(0)), LEFT);
 
     // ---- one bias resistor for every comparator, straight up off the bottom
-    // rail run into the bias bus.
+    // rail run into the bias bus. The resistor BODY stays below the last
+    // lane's output row and a wire covers the rest of the column: the last
+    // lane's gate wire has to pass this column, and a wire crossing a wire
+    // is a schematic, while a wire crossing a resistor's body is a misprint.
     sh.two(
         id!(),
         r(R_CBIAS),
         p(X_CBIAS, Y_RAILBOT),
-        p(X_CBIAS, lane(n - 1)),
+        p(X_CBIAS, Y_RAILBOT - 2),
     );
+    sh.wire(p(X_CBIAS, Y_RAILBOT - 2), p(X_CBIAS, lane(n - 1)));
 
     // ---- WINDOW DECODER, one lane per step. The two comparators of a lane
     // are mirror images of each other stacked about the lane's centre line.
@@ -544,7 +548,11 @@ pub fn sequencer(sq: &Seq) -> Vec<ElementSpec> {
             true,
         );
         sh.ground(pot[0], RIGHT);
-        sh.two(id!(), K::Diode, pot[1], p(X_CVBUS, lane(k)));
+        // The diode stops SHORT of the CV bus and a wire covers the last
+        // stretch: the beat bus runs down that gap, and it must cross a
+        // wire's interior, not the diode's body.
+        sh.two(id!(), K::Diode, pot[1], p(X_CVBUS - 3, lane(k)));
+        sh.wire(p(X_CVBUS - 3, lane(k)), p(X_CVBUS, lane(k)));
         if k > 0 {
             sh.wire(p(X_CVBUS, lane(k - 1)), p(X_CVBUS, lane(k)));
         }
@@ -601,13 +609,20 @@ pub fn sequencer(sq: &Seq) -> Vec<ElementSpec> {
             sh.wire(p(X_BEATBUS, lane(k - 1) + 6), p(X_BEATBUS, lane(k) + 6));
         }
     }
+    // The pull-down hangs BELOW the last beat panel's rect, level with the
+    // CV bus's own pull-down beside it: a shared bus resistor drawn inside
+    // "BEAT 3"'s window would be listed as if it were that step's part.
+    sh.wire(
+        p(X_BEATBUS, lane(n - 1) + 6),
+        p(X_BEATBUS, lane(n - 1) + 8),
+    );
     sh.two(
         id!(),
         r(R_BEAT),
-        p(X_BEATBUS, lane(n - 1) + 6),
-        p(X_BEATBUS, lane(n - 1) + 10),
+        p(X_BEATBUS, lane(n - 1) + 8),
+        p(X_BEATBUS, lane(n - 1) + 12),
     );
-    sh.ground(p(X_BEATBUS, lane(n - 1) + 10), DOWN);
+    sh.ground(p(X_BEATBUS, lane(n - 1) + 12), DOWN);
     // BEAT out, up the riser beside the CV's.
     sh.run(&[p(X_BEATBUS, lane(0) + 6), p(X_BEATBUS, Y_TOP)]);
 

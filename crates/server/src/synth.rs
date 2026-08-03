@@ -460,7 +460,10 @@ pub fn synth_panels() -> Vec<PanelDef> {
     let (ox, oy) = (SEQ_ORIGIN.0 as f64, SEQ_ORIGIN.1 as f64);
     let mut v = vec![
         PanelDef { x0: 42.5, y0: -10.6, x1: 59.0, y1: 0.0, name: "VCO  1V/OCT" },
-        PanelDef { x0: 22.0, y0: -8.4, x1: 39.0, y1: 1.0, name: "FILTER  CUTOFF" },
+        // x1 reaches to 42.2 so R30's input pin at (42, -5) is inside: a
+        // panel lists a part only when EVERY pin is in the rect, and the
+        // divider is the filter's front door. The VCO's rect starts at 42.5.
+        PanelDef { x0: 22.0, y0: -8.4, x1: 42.2, y1: 1.0, name: "FILTER  CUTOFF" },
         PanelDef { x0: 7.0, y0: -6.0, x1: 22.0, y1: 0.0, name: "MIXER + SPEAKER" },
         PanelDef { x0: -6.0, y0: -10.4, x1: 6.6, y1: -8.4, name: "LFO  BAR SWEEP" },
         PanelDef { x0: 24.0, y0: 1.6, x1: 45.0, y1: 10.6, name: "SNARE  (TONE)" },
