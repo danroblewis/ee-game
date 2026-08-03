@@ -3697,6 +3697,37 @@ impl Engine {
         self.islands.get(island).map(|i| i.xv(node)).unwrap_or(0.0)
     }
 
+    /// GLOBAL node index at a geometric point, if that point is a junction of
+    /// the compiled document. None = nothing connects there.
+    ///
+    /// The same lookup `voltage_at` does, stopping one step earlier. It exists
+    /// so a caller can ask "are these two places the same net?" — which is an
+    /// integer compare on the answer — WITHOUT a second union-find over the
+    /// document, and without node numbers leaving as anything but an opaque
+    /// token. They are not stable identities: they are a function of document
+    /// order, so an answer is only good for the compile that produced it. The
+    /// server re-derives per tick for exactly that reason.
+    ///
+    /// Read-only. Nothing here stamps, integrates or touches state, so it
+    /// cannot move a state hash.
+    pub fn node_at(&self, p: Point) -> Option<usize> {
+        let base = self.node_base();
+        self.junctions
+            .iter()
+            .find(|(q, _, _)| *q == p)
+            .map(|(_, isl, node)| Self::global_node(&base, *isl, *node))
+    }
+
+    /// GLOBAL node index of one pin of an element. Same namespace as
+    /// [`Engine::node_at`], so the two compare directly.
+    pub fn pin_node(&self, id: u32, pin: usize) -> Option<usize> {
+        let (isl, e) = self.find(id)?;
+        if pin >= e.spec.pins.len() {
+            return None;
+        }
+        Some(Self::global_node(&self.node_base(), isl, e.node[pin]))
+    }
+
     /// Voltage at a geometric point, if it is a junction.
     pub fn voltage_at(&self, p: Point) -> Option<f64> {
         self.junctions

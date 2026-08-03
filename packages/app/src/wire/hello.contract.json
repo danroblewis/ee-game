@@ -6,8 +6,10 @@
     "things a template promises ride on it: the parts, the panels, the camera",
     "(view.home), the instruments the room was SEEDED with (view.scopes) and",
     "the instruments it actually HAS (scopes, room state like panels) — plus",
-    "whether the room has a goal at all (machine). Two of those once went",
-    "missing for a release,",
+    "whether the room has a goal at all (machine). The room's ANNOTATION rides",
+    "beside them (labelboxes, netlabels) for the same reason: it is room state",
+    "a late joiner has to arrive holding, or the sheet loses its words for",
+    "that player alone. Two of those once went missing for a release,",
     "because the server wrote `view` and `machine` beside `room` while the",
     "client forwarded `room` alone as its RoomHello. Both halves compiled. The",
     "TypeScript interface declared the fields it never received.",
@@ -41,6 +43,8 @@
     "probes": "array",
     "panels": "array",
     "scopes": "array",
+    "labelboxes": "array",
+    "netlabels": "array",
     "room": "object",
     "room.id": "string",
     "room.name": "string",
@@ -115,6 +119,8 @@
         "pids": [1, 2]
       }
     ],
+    "labelboxes": [],
+    "netlabels": [],
     "room": {
       "id": "7AWF4N",
       "name": "Hoist practice",

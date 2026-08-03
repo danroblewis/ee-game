@@ -1094,6 +1094,192 @@ impl Scope {
         self
     }
 }
+/// A LABEL BOX: a rectangle with a title that a player draws round some parts
+/// purely to say what they are. Room state, shared and persisted, exactly like
+/// `Panel` — and that is the whole of the resemblance.
+///
+/// IT IS A LABEL. Everything a `Panel` additionally MEANS is deliberately
+/// absent, and each of those absences is load-bearing:
+///
+///   * no control window. `Panel` gets one per plid on every client, which is
+///     what made a panel the only way to put words on the sheet, which is how
+///     a five-knob synth grew a thirteen-window sidebar.
+///   * no membership. A `Panel` collects the elements whose pins all sit
+///     inside it; a label box collects nothing, so its rectangle can be sized
+///     for legibility instead of being stretched to swallow a stray pin.
+///   * no scope capture, no rails, no widget list, no template census.
+///
+/// Hence a SEPARATE list and a SEPARATE id space rather than a `no_window`
+/// flag on `Panel`: a flag would leave every one of those behaviours to be
+/// individually suppressed on every client, forever, and one missed suppression
+/// is a control panel a player never asked for.
+///
+/// Nothing here reaches the solver. A label box is not an `ElementSpec`, so
+/// `check_document` never sees one, and drawing one round a part changes
+/// nothing about that part.
+#[derive(Clone, Debug, serde::Serialize, Deserialize)]
+struct LabelBox {
+    blid: u32,
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+    name: String,
+}
+
+const MAX_LABEL_BOXES: usize = 256;
+const MAX_LABEL_BOX_NAME: usize = 28;
+/// Smallest accepted box in grid units: a stray click must not make one.
+const MIN_LABEL_BOX_SPAN: f64 = 1.0;
+
+#[derive(Clone, Deserialize)]
+#[serde(tag = "t", rename_all = "lowercase")]
+enum LabelBoxOp {
+    Add {
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+        #[serde(default)]
+        name: Option<String>,
+    },
+    Remove {
+        blid: u32,
+    },
+    /// Move/resize the box (the client drags the title tab or a grip).
+    Rect {
+        blid: u32,
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+    },
+    Rename {
+        blid: u32,
+        name: String,
+    },
+}
+
+// ------------------------------------------------------------- NAMED NETS
+//
+// THE ANCHORING DECISION LIVES HERE, because this struct IS the decision.
+//
+// THE PROBLEM. There is no net object in this codebase and there must not be
+// one. A net is an emergent equivalence class: `Engine::rebuild` interns every
+// pin coordinate in first-seen document order, runs union-find over coincident
+// points and `Wire` elements, and numbers the resulting sets 1..N in that same
+// order. So a node number is a function of the document's ORDER, not of the
+// net's identity. Delete an unrelated element and every number after it
+// shifts. Add a ground and node 0 changes sets. A part BREAKING splits a net
+// and renumbers the room with no player edit at all (`e.broken` skips the
+// union step). "Name node 7" is therefore not a thing that can be said.
+//
+// A name has to hang on something that survives an edit. There were three
+// candidates, and each one behaves differently when the player deletes it:
+//
+//   A. a grid POINT          <- CHOSEN
+//   B. a specific Wire element id
+//   C. a PIN of a part, `(elem, pin)`
+//
+// WHY THE POINT. In order:
+//
+//   1. It is the only anchor an edit cannot destroy. B dies when you delete
+//      that one wire segment; C dies when you delete the part. Both of those
+//      are edits players make constantly, and both would silently take a
+//      player's WORDS with them. A label is language, not instrumentation:
+//      losing "5V RAIL" because you redrew a wire under it is worse than any
+//      failure mode the point has.
+//   2. It is the only anchor that can name every net. A net needs no wires at
+//      all — two coincident pins are a net — so B cannot name one. The point
+//      can also be placed BEFORE the circuit exists, which is how people
+//      actually draw schematics: label the rail, then wire to it.
+//   3. The lookup already exists. `Engine::junctions` is
+//      `(Point, island, local_node)` and `voltage_at(Point)` already resolves
+//      exactly this question; `node_at` is the same body returning the node.
+//      No new union-find, no new solver surface, and by construction it cannot
+//      reach the solver, because a `NetLabel` is not an `ElementSpec` and
+//      `check_document` never sees one.
+//   4. It matches how this codebase already annotates. `Panel` and `Layer` are
+//      world-space geometry plus a name, with membership re-derived from
+//      element geometry every frame and never persisted. A net label is the
+//      degenerate case: a POINT in world space plus a name.
+//
+// WHY NOT THE ALTERNATIVES. B anchors the most durable thing in a room (a
+// player's chosen word) to one of the most ephemeral (a wire segment), and
+// cannot name a wireless net. C is genuinely tempting — the label would travel
+// with the part, which is right for "VCO OUT" — but it makes the label a
+// property OF THE PART, colliding head-on with `ElementSpec::name`, which
+// already exists and means something else. Two different names on one object
+// with two different meanings is a worse UI than any of the above.
+//
+// WHAT HAPPENS WHEN THE NAMED THING IS DELETED — written down, because "it
+// depends" is how annotation features rot:
+//
+//   * delete a wire in the MIDDLE of a named net -> the label keeps its point.
+//     The net is now smaller; the label names the half its point is on. The
+//     other half is unnamed. Nothing is deleted, nothing is reported.
+//   * delete or move the LAST part touching the labelled point -> the label
+//     goes DETACHED. It is not deleted, not moved and not auto-repaired: it
+//     stays exactly where the player put it, renders dimmed, and reports no
+//     net. Reconnect anything to that point and it names that net again. This
+//     is the one deliberate difference from `Probe`, which IS destroyed with
+//     its element (main.rs, `DocOp::Remove`) — losing a probe loses a
+//     measurement you can retake, losing a label loses a sentence.
+//   * a net SPLITS -> exactly one half keeps the name, deterministically: the
+//     half containing the point. Never auto-duplicated. Place a second label
+//     if you want both halves named.
+//   * two named nets are JOINED -> the net now has two names, both of them
+//     real, both rendered at their own points. Readouts that have room for one
+//     string take the lowest `(y, x)`, resolved server-side so every client
+//     agrees. Never an error, never a rename, never a merge.
+//   * SAME NAME ON TWO SEPARATE NETS -> allowed, and it joins NOTHING. These
+//     are annotation, full stop. Making a name conduct would mean a string a
+//     player typed could change what the solver solves, which is the exact
+//     opposite of the pillar that every number comes from the solver.
+#[derive(Clone, Debug, serde::Serialize, Deserialize)]
+struct NetLabel {
+    nlid: u32,
+    /// THE ANCHOR: a grid point, in the same integer lattice `ElementSpec.pins`
+    /// live in. Integers, not the `f64` a `Panel` rect uses — junctions are
+    /// `(i32, i32)` and a fractional anchor could never intern-match one.
+    x: i32,
+    y: i32,
+    name: String,
+}
+
+const MAX_NET_LABELS: usize = 64;
+/// Same cap as a part name (`sim_core::MAX_NAME`): the two are read side by
+/// side in the same probe rows, so one of them being longer just makes the
+/// column ragged.
+const MAX_NET_LABEL_NAME: usize = 24;
+/// The world is large but not unbounded; `sim_core::shape::MAX_ABS_COORD` is
+/// the same fence the document's own pins stand behind.
+const MAX_NET_LABEL_COORD: i32 = 1_000_000_000;
+
+#[derive(Clone, Deserialize)]
+#[serde(tag = "t", rename_all = "lowercase")]
+enum NetLabelOp {
+    Add {
+        x: i32,
+        y: i32,
+        #[serde(default)]
+        name: Option<String>,
+    },
+    Remove {
+        nlid: u32,
+    },
+    /// Drag the label onto a different point. The name does not change; which
+    /// net it names does, because the anchor IS which net it names.
+    Move {
+        nlid: u32,
+        x: i32,
+        y: i32,
+    },
+    Rename {
+        nlid: u32,
+        name: String,
+    },
+}
 
 /// A SENSOR LAYER: a rectangle of the world that a player's browser points a
 /// real-world source at (a camera today; a microphone spectrum strip and a
@@ -1385,6 +1571,14 @@ enum Cmd {
     Scope {
         op: ScopeOp,
     },
+    /// A label box: words on the sheet, and nothing else. See `LabelBox`.
+    LabelBox {
+        op: LabelBoxOp,
+    },
+    /// A net label: a name pinned to a grid point. See `NetLabel`.
+    NetLabel {
+        op: NetLabelOp,
+    },
     Layer {
         op: LayerOp,
     },
@@ -1449,6 +1643,11 @@ struct Room {
     /// Room-scoped in-place oscilloscopes (shared, same rationale again: an
     /// instrument on the bench is an instrument everyone is reading).
     scopes: std::sync::Mutex<Vec<Scope>>,
+    /// Room-scoped LABEL BOXES: words on the sheet. Shared and persisted like
+    /// panels, and carrying none of their meaning (see `LabelBox`).
+    label_boxes: std::sync::Mutex<Vec<LabelBox>>,
+    /// Room-scoped NET LABELS: a name pinned to a grid point (see `NetLabel`).
+    net_labels: std::sync::Mutex<Vec<NetLabel>>,
     /// Room-scoped sensor layers (shared: everybody sees where the light is).
     layers: std::sync::Mutex<Vec<Layer>>,
     /// Who is currently driving each layer, `(lid, who)`. Live only — NEVER
@@ -1459,6 +1658,8 @@ struct Room {
     next_pid: AtomicU32,
     next_plid: AtomicU32,
     next_sid: AtomicU32,
+    next_blid: AtomicU32,
+    next_nlid: AtomicU32,
     next_lid: AtomicU32,
     population: AtomicU32,
     /// Set when the document changes; the sim task checkpoints to disk.
@@ -1528,6 +1729,18 @@ struct SaveFile {
     scopes: Option<Vec<Scope>>,
     #[serde(default)]
     next_sid: u32,
+    /// LABEL BOXES and NET LABELS: the room's annotation, persisted for the
+    /// same reason the parts are — somebody wrote it down on purpose.
+    /// Defaulted, so every save and every template written before either
+    /// existed loads with none, which is exactly what it had.
+    #[serde(default)]
+    labelboxes: Vec<LabelBox>,
+    #[serde(default)]
+    next_blid: u32,
+    #[serde(default)]
+    netlabels: Vec<NetLabel>,
+    #[serde(default)]
+    next_nlid: u32,
     /// Sensor layers: WHERE in the world a real-world source is pointed.
     /// Defaulted, so every save written before external inputs existed loads
     /// with no layers, which is exactly what it had.
@@ -1612,6 +1825,10 @@ impl Default for SaveFile {
             next_plid: 1,
             scopes: None,
             next_sid: 1,
+            labelboxes: Vec::new(),
+            next_blid: 1,
+            netlabels: Vec::new(),
+            next_nlid: 1,
             layers: Vec::new(),
             next_lid: 1,
             machine: None,
@@ -1646,6 +1863,10 @@ impl SaveFile {
             next_plid: self.next_plid.max(1),
             scopes: self.scopes,
             next_sid: self.next_sid.max(1),
+            label_boxes: self.labelboxes,
+            next_blid: self.next_blid.max(1),
+            net_labels: self.netlabels,
+            next_nlid: self.next_nlid.max(1),
             layers: self.layers,
             next_lid: self.next_lid.max(1),
             machine,
@@ -1681,6 +1902,10 @@ impl SaveFile {
             next_plid: s.next_plid,
             scopes: s.scopes.clone(),
             next_sid: s.next_sid,
+            labelboxes: s.label_boxes.clone(),
+            next_blid: s.next_blid,
+            netlabels: s.net_labels.clone(),
+            next_nlid: s.next_nlid,
             layers: s.layers.clone(),
             next_lid: s.next_lid,
             machine: Some(s.machine),
@@ -1862,6 +2087,14 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
     // after the room goes quiet, so clients clear their overlays; after that,
     // silence costs nothing.
     let mut damage_shown = false;
+
+    // The last net map we told clients about, so the derived broadcast goes
+    // out on CHANGE rather than every tick. See `derive_net_map`: it is a
+    // read-out of the compiled document, never persisted and never an input to
+    // anything, and it has to be re-derived rather than cached-on-edit because
+    // node membership can change with NO player edit at all — a part breaking
+    // splits its net.
+    let mut netmap_shown: Option<(Vec<u32>, Vec<(u32, u32)>)> = None;
 
     // ---- external inputs. All three of these are LIVE state: none of them
     // is persisted, none of them is in the document, and none of them
@@ -2187,6 +2420,28 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
                             .send(json!({"t": "scopes", "list": *scopes}).to_string());
                     }
                 }
+                // The whole list goes out, never a delta, for the same reason
+                // panels do: a lagging subscriber SKIPS messages
+                // (`RecvError::Lagged` -> continue), and a skipped delta would
+                // desync that player's sheet permanently.
+                Cmd::LabelBox { op } => {
+                    let mut boxes = room.label_boxes.lock().unwrap();
+                    if apply_label_box_op(&mut boxes, &room.next_blid, &op) {
+                        room.dirty.store(true, Ordering::Relaxed);
+                        let _ = room
+                            .events
+                            .send(json!({"t": "labelboxes", "list": *boxes}).to_string());
+                    }
+                }
+                Cmd::NetLabel { op } => {
+                    let mut labels = room.net_labels.lock().unwrap();
+                    if apply_net_label_op(&mut labels, &room.next_nlid, &op) {
+                        room.dirty.store(true, Ordering::Relaxed);
+                        let _ = room
+                            .events
+                            .send(json!({"t": "netlabels", "list": *labels}).to_string());
+                    }
+                }
                 Cmd::Layer { op } => {
                     // A removed layer takes its claim with it, and everything
                     // it was driving goes dark on this tick.
@@ -2270,6 +2525,14 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
                     let _ = room
                         .events
                         .send(json!({"t": "presence", "n": n}).to_string());
+                    // THE COST OF BROADCASTING DERIVED STATE ON CHANGE: a
+                    // player who joins after the last change never saw it.
+                    // `hello` cannot carry the net map — it is built on the
+                    // session task, which has no engine — so the join is what
+                    // re-arms it, and the next tick re-sends it to everyone.
+                    // (Cheap: it is one message, and only in a room that has
+                    // net labels at all.)
+                    netmap_shown = None;
                 }
                 Cmd::Stop { checkpoint } => {
                     // Last one wins: a delete arriving after a park request
@@ -2637,6 +2900,37 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
             if let Some(msg) = damage_msg(&damage, &mut damage_shown) {
                 let _ = room.events.send(msg);
             }
+            // WHICH NET IS NAMED WHAT, re-derived and sent only when it moves.
+            // A room with no net labels pays a length check and nothing else,
+            // which is why this sits in front of the work rather than inside
+            // it.
+            {
+                // ONE LOCK AT A TIME. `hello_msg` takes `probes` before
+                // `net_labels`; holding `net_labels` here while reaching for
+                // `probes` would be the other order, and two threads doing
+                // that is a deadlock, not a race — the room would simply stop.
+                // A room with no net labels never allocates.
+                let labels: Vec<NetLabel> = {
+                    let g = room.net_labels.lock().unwrap();
+                    if g.is_empty() {
+                        Vec::new()
+                    } else {
+                        g.clone()
+                    }
+                };
+                let next = if labels.is_empty() {
+                    (Vec::new(), Vec::new())
+                } else {
+                    let probes = room.probes.lock().unwrap().clone();
+                    derive_net_map(&eng, &labels, &probes)
+                };
+                if netmap_shown.as_ref() != Some(&next) {
+                    let _ = room.events.send(
+                        json!({"t": "netmap", "live": next.0, "probes": next.1}).to_string(),
+                    );
+                    netmap_shown = Some(next);
+                }
+            }
             // Sensor readings, CHANGED ONLY. Twelve bytes per moved sensor
             // per tick, and a camera pointed at a still wall sends nothing at
             // all. This is the only thing about a player's camera that any
@@ -2969,10 +3263,18 @@ fn apply_doc_op_to(elems: &mut Vec<ElementSpec>, op: &DocOp) -> bool {
     }
 }
 
-fn clean_panel_name(name: &str) -> String {
+/// THE RULE FOR EVERY PLAYER-WRITTEN NAME the server broadcasts and writes to
+/// disk: strip control characters, cap the length in CHARACTERS (not bytes, so
+/// a cap is a cap in every script), trim the ends.
+///
+/// One implementation, four callers — panels, sensor layers, label boxes and
+/// net labels — because four copies of a sanitiser is four chances for one of
+/// them to be the lenient one. `DocOp::SetName` does the same thing to a part
+/// name against `sim_core::MAX_NAME`.
+fn clean_name(name: &str, max: usize) -> String {
     name.chars()
         .filter(|c| !c.is_control())
-        .take(MAX_PANEL_NAME)
+        .take(max)
         .collect::<String>()
         .trim()
         .to_string()
@@ -2980,16 +3282,225 @@ fn clean_panel_name(name: &str) -> String {
 
 /// Normalize a drag rectangle. None = degenerate or non-finite input, which
 /// the caller drops (same "validate then apply" rule as document ops).
-fn norm_panel_rect(x0: f64, y0: f64, x1: f64, y1: f64) -> Option<(f64, f64, f64, f64)> {
+/// Shared by every room-state rectangle; only `min_span` differs.
+fn norm_rect(x0: f64, y0: f64, x1: f64, y1: f64, min_span: f64) -> Option<(f64, f64, f64, f64)> {
     if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite()) {
         return None;
     }
     let (ax, bx) = (x0.min(x1), x0.max(x1));
     let (ay, by) = (y0.min(y1), y0.max(y1));
-    if bx - ax < MIN_PANEL_SPAN || by - ay < MIN_PANEL_SPAN {
+    if bx - ax < min_span || by - ay < min_span {
         return None;
     }
     Some((ax, ay, bx, by))
+}
+
+fn clean_panel_name(name: &str) -> String {
+    clean_name(name, MAX_PANEL_NAME)
+}
+
+fn norm_panel_rect(x0: f64, y0: f64, x1: f64, y1: f64) -> Option<(f64, f64, f64, f64)> {
+    norm_rect(x0, y0, x1, y1, MIN_PANEL_SPAN)
+}
+
+fn clean_label_box_name(name: &str) -> String {
+    clean_name(name, MAX_LABEL_BOX_NAME)
+}
+
+fn norm_label_box_rect(x0: f64, y0: f64, x1: f64, y1: f64) -> Option<(f64, f64, f64, f64)> {
+    norm_rect(x0, y0, x1, y1, MIN_LABEL_BOX_SPAN)
+}
+
+/// Apply a label-box op. Returns false to drop the op (malformed rect,
+/// unknown blid, budget reached) — the same silent-drop rule panels use, and
+/// for the same reason: there is nothing a player could do about it.
+fn apply_label_box_op(
+    boxes: &mut Vec<LabelBox>,
+    next_blid: &AtomicU32,
+    op: &LabelBoxOp,
+) -> bool {
+    match op {
+        LabelBoxOp::Add {
+            x0,
+            y0,
+            x1,
+            y1,
+            name,
+        } => {
+            let Some((x0, y0, x1, y1)) = norm_label_box_rect(*x0, *y0, *x1, *y1) else {
+                return false;
+            };
+            if boxes.len() >= MAX_LABEL_BOXES {
+                return false;
+            }
+            let blid = next_blid.fetch_add(1, Ordering::Relaxed);
+            let name = name
+                .as_deref()
+                .map(clean_label_box_name)
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| format!("LABEL {blid}"));
+            boxes.push(LabelBox {
+                blid,
+                x0,
+                y0,
+                x1,
+                y1,
+                name,
+            });
+            true
+        }
+        LabelBoxOp::Remove { blid } => {
+            let before = boxes.len();
+            boxes.retain(|b| b.blid != *blid);
+            boxes.len() != before
+        }
+        LabelBoxOp::Rect {
+            blid,
+            x0,
+            y0,
+            x1,
+            y1,
+        } => {
+            let Some((x0, y0, x1, y1)) = norm_label_box_rect(*x0, *y0, *x1, *y1) else {
+                return false;
+            };
+            let Some(b) = boxes.iter_mut().find(|b| b.blid == *blid) else {
+                return false;
+            };
+            (b.x0, b.y0, b.x1, b.y1) = (x0, y0, x1, y1);
+            true
+        }
+        LabelBoxOp::Rename { blid, name } => {
+            let name = clean_label_box_name(name);
+            if name.is_empty() {
+                return false;
+            }
+            let Some(b) = boxes.iter_mut().find(|b| b.blid == *blid) else {
+                return false;
+            };
+            b.name = name;
+            true
+        }
+    }
+}
+
+fn clean_net_label_name(name: &str) -> String {
+    clean_name(name, MAX_NET_LABEL_NAME)
+}
+
+/// The anchor a net label may hold. None = off the edge of the world, which
+/// the caller drops. This is the whole of the validation a net name gets from
+/// the circuit's side: a label is allowed to point at a coordinate where
+/// nothing is connected (it renders detached), because refusing that would
+/// forbid labelling a rail before you have drawn it.
+fn norm_net_label_point(x: i32, y: i32) -> Option<(i32, i32)> {
+    if x.abs() > MAX_NET_LABEL_COORD || y.abs() > MAX_NET_LABEL_COORD {
+        return None;
+    }
+    Some((x, y))
+}
+
+/// Apply a net-label op. Returns false to drop it (out-of-world anchor,
+/// unknown nlid, budget reached, empty rename).
+///
+/// TWO LABELS ON ONE POINT are refused on Add and on Move: the second one
+/// would render exactly on top of the first and there would be no way to
+/// pick either up again. Two labels on one NET are fine and expected — that
+/// is what happens when a player joins two named rails.
+fn apply_net_label_op(
+    labels: &mut Vec<NetLabel>,
+    next_nlid: &AtomicU32,
+    op: &NetLabelOp,
+) -> bool {
+    match op {
+        NetLabelOp::Add { x, y, name } => {
+            let Some((x, y)) = norm_net_label_point(*x, *y) else {
+                return false;
+            };
+            if labels.len() >= MAX_NET_LABELS {
+                return false;
+            }
+            if labels.iter().any(|l| l.x == x && l.y == y) {
+                return false;
+            }
+            let nlid = next_nlid.fetch_add(1, Ordering::Relaxed);
+            let name = name
+                .as_deref()
+                .map(clean_net_label_name)
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| format!("NET {nlid}"));
+            labels.push(NetLabel { nlid, x, y, name });
+            true
+        }
+        NetLabelOp::Remove { nlid } => {
+            let before = labels.len();
+            labels.retain(|l| l.nlid != *nlid);
+            labels.len() != before
+        }
+        NetLabelOp::Move { nlid, x, y } => {
+            let Some((x, y)) = norm_net_label_point(*x, *y) else {
+                return false;
+            };
+            if labels.iter().any(|l| l.nlid != *nlid && l.x == x && l.y == y) {
+                return false;
+            }
+            let Some(l) = labels.iter_mut().find(|l| l.nlid == *nlid) else {
+                return false;
+            };
+            (l.x, l.y) = (x, y);
+            true
+        }
+        NetLabelOp::Rename { nlid, name } => {
+            let name = clean_net_label_name(name);
+            if name.is_empty() {
+                return false;
+            }
+            let Some(l) = labels.iter_mut().find(|l| l.nlid == *nlid) else {
+                return false;
+            };
+            l.name = name;
+            true
+        }
+    }
+}
+
+/// WHICH NET EACH LABEL AND EACH PROBE IS ON, derived from the compiled
+/// document. Pure read-out: it never persists, never rides a save file, and
+/// never influences a stamp.
+///
+/// Returns `(live, probe_names)`:
+///   * `live` — the nlids whose anchor is a junction of the compiled document,
+///     i.e. the labels that are naming something. Everything else is DETACHED
+///     and says so on the canvas rather than lying about a net.
+///   * `probe_names` — `(pid, nlid)` for every probe sitting on a named net.
+///     The tie-break when one net carries two names is the lowest `(y, x)`,
+///     done HERE so every client shows the same string.
+fn derive_net_map(
+    eng: &Engine,
+    labels: &[NetLabel],
+    probes: &[Probe],
+) -> (Vec<u32>, Vec<(u32, u32)>) {
+    // (node, nlid, y, x) for every label that resolves to a net.
+    let mut on_net: Vec<(usize, u32, i32, i32)> = Vec::new();
+    let mut live: Vec<u32> = Vec::new();
+    for l in labels {
+        if let Some(node) = eng.node_at((l.x, l.y)) {
+            live.push(l.nlid);
+            on_net.push((node, l.nlid, l.y, l.x));
+        }
+    }
+    // Lowest (y, x) wins a net that carries more than one name.
+    on_net.sort_by_key(|(node, _, y, x)| (*node, *y, *x));
+    let mut probe_names: Vec<(u32, u32)> = Vec::new();
+    for p in probes {
+        let Some(node) = eng.pin_node(p.elem, p.pin) else {
+            continue;
+        };
+        if let Some((_, nlid, _, _)) = on_net.iter().find(|(n, _, _, _)| *n == node) {
+            probe_names.push((p.pid, *nlid));
+        }
+    }
+    (live, probe_names)
 }
 
 /// Apply a panel op to the room's panel list. Returns false to drop the op
@@ -3232,24 +3743,11 @@ impl TokenBucket {
 }
 
 fn clean_layer_name(name: &str) -> String {
-    name.chars()
-        .filter(|c| !c.is_control())
-        .take(MAX_LAYER_NAME)
-        .collect::<String>()
-        .trim()
-        .to_string()
+    clean_name(name, MAX_LAYER_NAME)
 }
 
 fn norm_layer_rect(x0: f64, y0: f64, x1: f64, y1: f64) -> Option<(f64, f64, f64, f64)> {
-    if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite()) {
-        return None;
-    }
-    let (ax, bx) = (x0.min(x1), x0.max(x1));
-    let (ay, by) = (y0.min(y1), y0.max(y1));
-    if bx - ax < MIN_LAYER_SPAN || by - ay < MIN_LAYER_SPAN {
-        return None;
-    }
-    Some((ax, ay, bx, by))
+    norm_rect(x0, y0, x1, y1, MIN_LAYER_SPAN)
 }
 
 /// Apply a layer op. Returns false to drop it (bad rect, unknown lid, budget).
@@ -3418,6 +3916,14 @@ enum ClientMsg {
     Scope {
         op: ScopeOp,
     },
+    /// `{"t":"labelbox","op":{...}}` — draw/move/rename/delete a label box.
+    Labelbox {
+        op: LabelBoxOp,
+    },
+    /// `{"t":"netlabel","op":{...}}` — name a net (annotation only).
+    Netlabel {
+        op: NetLabelOp,
+    },
     Layer {
         op: LayerOp,
     },
@@ -3493,6 +3999,8 @@ fn hello_msg(handle: &RoomHandle, me: u32) -> String {
     let probes = room.probes.lock().unwrap();
     let panels = room.panels.lock().unwrap();
     let scopes = room.scopes.lock().unwrap();
+    let label_boxes = room.label_boxes.lock().unwrap();
+    let net_labels = room.net_labels.lock().unwrap();
     let layers = room.layers.lock().unwrap();
     let claims = room.claims.lock().unwrap();
     let view = handle.view.lock().unwrap();
@@ -3504,6 +4012,11 @@ fn hello_msg(handle: &RoomHandle, me: u32) -> String {
         },
         "elements": *elems,
         "probes": *probes, "panels": *panels, "scopes": *scopes,
+        "probes": *probes, "panels": *panels,
+        // The two annotation primitives, beside `panels` and routed through
+        // the same client handlers the live broadcasts use, so a late joiner
+        // and a running client can never disagree about what one is.
+        "labelboxes": *label_boxes, "netlabels": *net_labels,
         // The rectangles, and who is currently driving each. Never a device
         // id, never a resolution, never a frame: a late joiner learns WHERE
         // the hole in the world is and WHOSE eye is behind it, and nothing
@@ -3592,6 +4105,12 @@ async fn client_session(mut socket: WebSocket, reg: Arc<Registry>, handle: Arc<R
                         }
                         Ok(ClientMsg::Scope { op }) => {
                             let _ = room.cmds.send(Cmd::Scope { op });
+                        }
+                        Ok(ClientMsg::Labelbox { op }) => {
+                            let _ = room.cmds.send(Cmd::LabelBox { op });
+                        }
+                        Ok(ClientMsg::Netlabel { op }) => {
+                            let _ = room.cmds.send(Cmd::NetLabel { op });
                         }
                         Ok(ClientMsg::Layer { op }) => {
                             let _ = room.cmds.send(Cmd::Layer { op });
@@ -3723,6 +4242,10 @@ async fn main() {
     }
     tracing::info!("parked {} rooms", live.len());
 }
+
+#[cfg(test)]
+#[path = "annotation_hash_tests.rs"]
+mod annotation_hash_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4332,6 +4855,10 @@ mod tests {
             next_pid: AtomicU32::new(1),
             next_plid: AtomicU32::new(1),
             next_sid: AtomicU32::new(1),
+            label_boxes: std::sync::Mutex::new(Vec::new()),
+            net_labels: std::sync::Mutex::new(Vec::new()),
+            next_blid: AtomicU32::new(1),
+            next_nlid: AtomicU32::new(1),
             layers: std::sync::Mutex::new(Vec::new()),
             claims: std::sync::Mutex::new(Vec::new()),
             next_lid: AtomicU32::new(1),
@@ -4803,6 +5330,10 @@ mod tests {
             next_pid: AtomicU32::new(1),
             next_plid: AtomicU32::new(1),
             next_sid: AtomicU32::new(1),
+            label_boxes: std::sync::Mutex::new(Vec::new()),
+            net_labels: std::sync::Mutex::new(Vec::new()),
+            next_blid: AtomicU32::new(1),
+            next_nlid: AtomicU32::new(1),
             layers: std::sync::Mutex::new(Vec::new()),
             claims: std::sync::Mutex::new(Vec::new()),
             next_lid: AtomicU32::new(1),
@@ -5726,6 +6257,706 @@ mod tests {
             serde_json::from_str(r#"{"elements":[],"probes":[],"next_pid":3}"#).unwrap();
         assert!(s.panels.is_empty());
         assert_eq!(s.next_plid, 0);
+    }
+
+    // ------------------------------------------------------------ annotation
+    //
+    // The two primitives that put WORDS on the sheet. Everything below is
+    // about their bounds and their persistence; the tests that matter most
+    // are the last three, which are about what they must NOT do.
+
+    #[test]
+    fn label_box_ops_add_move_rename_remove() {
+        let mut boxes: Vec<LabelBox> = Vec::new();
+        let next = AtomicU32::new(7);
+
+        // A backwards drag is normalized; the blid comes from the room.
+        assert!(apply_label_box_op(
+            &mut boxes,
+            &next,
+            &LabelBoxOp::Add {
+                x0: 10.0,
+                y0: 9.0,
+                x1: 2.0,
+                y1: 1.0,
+                name: None,
+            }
+        ));
+        assert_eq!(boxes.len(), 1);
+        let blid = boxes[0].blid;
+        assert_eq!((boxes[0].x0, boxes[0].y0), (2.0, 1.0));
+        assert_eq!((boxes[0].x1, boxes[0].y1), (10.0, 9.0));
+        assert_eq!(boxes[0].name, format!("LABEL {blid}"));
+
+        // Degenerate and non-finite drags are dropped, not clamped: a stray
+        // click must not leave a box behind.
+        for bad in [
+            LabelBoxOp::Add {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 0.5,
+                y1: 4.0,
+                name: None,
+            },
+            LabelBoxOp::Add {
+                x0: f64::NAN,
+                y0: 0.0,
+                x1: 4.0,
+                y1: 4.0,
+                name: None,
+            },
+        ] {
+            assert!(!apply_label_box_op(&mut boxes, &next, &bad));
+        }
+        assert_eq!(boxes.len(), 1);
+
+        assert!(apply_label_box_op(
+            &mut boxes,
+            &next,
+            &LabelBoxOp::Rect {
+                blid,
+                x0: 4.0,
+                y0: 4.0,
+                x1: 20.0,
+                y1: 10.0,
+            }
+        ));
+        assert_eq!((boxes[0].x0, boxes[0].y1), (4.0, 10.0));
+
+        // Names: control characters stripped, capped in CHARS, trimmed —
+        // exactly what a panel name gets, from the same `clean_name`.
+        assert!(apply_label_box_op(
+            &mut boxes,
+            &next,
+            &LabelBoxOp::Rename {
+                blid,
+                name: "  VCO\u{7}  1V/OCT  ".into(),
+            }
+        ));
+        assert_eq!(boxes[0].name, "VCO  1V/OCT");
+        let long = "é".repeat(MAX_LABEL_BOX_NAME + 40);
+        assert!(apply_label_box_op(
+            &mut boxes,
+            &next,
+            &LabelBoxOp::Rename {
+                blid,
+                name: long.clone(),
+            }
+        ));
+        assert_eq!(boxes[0].name.chars().count(), MAX_LABEL_BOX_NAME);
+        assert!(!apply_label_box_op(
+            &mut boxes,
+            &next,
+            &LabelBoxOp::Rename {
+                blid,
+                name: "   ".into(),
+            }
+        ));
+        assert!(!apply_label_box_op(
+            &mut boxes,
+            &next,
+            &LabelBoxOp::Rect {
+                blid: blid + 999,
+                x0: 0.0,
+                y0: 0.0,
+                x1: 4.0,
+                y1: 4.0,
+            }
+        ));
+
+        while boxes.len() < MAX_LABEL_BOXES {
+            assert!(apply_label_box_op(
+                &mut boxes,
+                &next,
+                &LabelBoxOp::Add {
+                    x0: 0.0,
+                    y0: 0.0,
+                    x1: 4.0,
+                    y1: 4.0,
+                    name: None,
+                }
+            ));
+        }
+        assert!(!apply_label_box_op(
+            &mut boxes,
+            &next,
+            &LabelBoxOp::Add {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 4.0,
+                y1: 4.0,
+                name: None,
+            }
+        ));
+        assert!(apply_label_box_op(
+            &mut boxes,
+            &next,
+            &LabelBoxOp::Remove { blid }
+        ));
+        assert!(!apply_label_box_op(
+            &mut boxes,
+            &next,
+            &LabelBoxOp::Remove { blid }
+        ));
+        assert_eq!(boxes.len(), MAX_LABEL_BOXES - 1);
+    }
+
+    #[test]
+    fn net_label_ops_and_their_bounds() {
+        let mut labels: Vec<NetLabel> = Vec::new();
+        let next = AtomicU32::new(1);
+
+        assert!(apply_net_label_op(
+            &mut labels,
+            &next,
+            &NetLabelOp::Add {
+                x: 4,
+                y: -7,
+                name: Some("  5V RAIL  ".into()),
+            }
+        ));
+        assert_eq!(labels.len(), 1);
+        assert_eq!((labels[0].x, labels[0].y), (4, -7));
+        assert_eq!(labels[0].name, "5V RAIL");
+        let nlid = labels[0].nlid;
+
+        // Two labels on ONE POINT would render exactly on top of each other,
+        // with no way to pick either up again. Two labels on one NET are fine
+        // and expected — that is what joining two named rails does.
+        assert!(!apply_net_label_op(
+            &mut labels,
+            &next,
+            &NetLabelOp::Add {
+                x: 4,
+                y: -7,
+                name: None,
+            }
+        ));
+        assert_eq!(labels.len(), 1);
+
+        // Off the edge of the world.
+        assert!(!apply_net_label_op(
+            &mut labels,
+            &next,
+            &NetLabelOp::Add {
+                x: MAX_NET_LABEL_COORD + 1,
+                y: 0,
+                name: None,
+            }
+        ));
+
+        assert!(apply_net_label_op(
+            &mut labels,
+            &next,
+            &NetLabelOp::Move { nlid, x: 9, y: 9 }
+        ));
+        assert_eq!((labels[0].x, labels[0].y), (9, 9));
+        assert!(apply_net_label_op(
+            &mut labels,
+            &next,
+            &NetLabelOp::Add {
+                x: 4,
+                y: -7,
+                name: None,
+            }
+        ));
+        // ...and a move onto an occupied point is refused for the same reason
+        // an add onto one is.
+        assert!(!apply_net_label_op(
+            &mut labels,
+            &next,
+            &NetLabelOp::Move { nlid, x: 4, y: -7 }
+        ));
+
+        assert!(apply_net_label_op(
+            &mut labels,
+            &next,
+            &NetLabelOp::Rename {
+                nlid,
+                name: "\u{1}CUTOFF".into(),
+            }
+        ));
+        assert_eq!(labels[0].name, "CUTOFF");
+        assert!(!apply_net_label_op(
+            &mut labels,
+            &next,
+            &NetLabelOp::Rename {
+                nlid,
+                name: " ".into(),
+            }
+        ));
+        let long = "N".repeat(MAX_NET_LABEL_NAME + 10);
+        assert!(apply_net_label_op(
+            &mut labels,
+            &next,
+            &NetLabelOp::Rename { nlid, name: long }
+        ));
+        assert_eq!(labels[0].name.chars().count(), MAX_NET_LABEL_NAME);
+
+        while labels.len() < MAX_NET_LABELS {
+            let n = labels.len() as i32;
+            assert!(apply_net_label_op(
+                &mut labels,
+                &next,
+                &NetLabelOp::Add {
+                    x: 1000 + n,
+                    y: 0,
+                    name: None,
+                }
+            ));
+        }
+        assert!(!apply_net_label_op(
+            &mut labels,
+            &next,
+            &NetLabelOp::Add {
+                x: -50,
+                y: -50,
+                name: None,
+            }
+        ));
+        assert!(apply_net_label_op(
+            &mut labels,
+            &next,
+            &NetLabelOp::Remove { nlid }
+        ));
+        assert!(!apply_net_label_op(
+            &mut labels,
+            &next,
+            &NetLabelOp::Remove { nlid }
+        ));
+    }
+
+    #[test]
+    fn old_saves_without_annotation_load() {
+        let s: SaveFile =
+            serde_json::from_str(r#"{"elements":[],"probes":[],"next_pid":3}"#).unwrap();
+        assert!(s.labelboxes.is_empty());
+        assert!(s.netlabels.is_empty());
+        assert_eq!(s.next_blid, 0);
+        assert_eq!(s.next_nlid, 0);
+        // ...and the setup they become is legal, with the id allocators
+        // repaired past whatever a file happened to carry.
+        let setup = s.into_setup().normalize().unwrap();
+        assert_eq!(setup.next_blid, 1);
+        assert_eq!(setup.next_nlid, 1);
+    }
+
+    /// A save file is HAND-EDITABLE, so the load path is the other half of
+    /// every bound the op handler enforces. Without this, "cap the name at 28
+    /// characters" is a rule that only applies to honest clients.
+    #[test]
+    fn a_hand_edited_save_cannot_smuggle_unbounded_annotation() {
+        let mut setup = RoomSetup {
+            label_boxes: vec![
+                LabelBox {
+                    blid: 500,
+                    x0: 0.0,
+                    y0: 0.0,
+                    x1: 10.0,
+                    y1: 10.0,
+                    name: "x".repeat(4000),
+                },
+                // Degenerate: repaired away rather than kept as an invisible
+                // click target.
+                LabelBox {
+                    blid: 501,
+                    x0: 3.0,
+                    y0: 3.0,
+                    x1: 3.0,
+                    y1: 9.0,
+                    name: "SLIVER".into(),
+                },
+            ],
+            net_labels: vec![
+                NetLabel {
+                    nlid: 900,
+                    x: 5,
+                    y: 5,
+                    name: "\u{7}\u{7}RAIL\n".into(),
+                },
+                // A second label on the same point: first one wins.
+                NetLabel {
+                    nlid: 901,
+                    x: 5,
+                    y: 5,
+                    name: "GHOST".into(),
+                },
+                NetLabel {
+                    nlid: 902,
+                    x: MAX_NET_LABEL_COORD + 9,
+                    y: 0,
+                    name: "OFF THE MAP".into(),
+                },
+            ],
+            ..RoomSetup::default()
+        };
+        setup.label_boxes.extend((0..600).map(|k| LabelBox {
+            blid: 1000 + k,
+            x0: 0.0,
+            y0: 0.0,
+            x1: 4.0,
+            y1: 4.0,
+            name: "SPAM".into(),
+        }));
+        let setup = setup.normalize().unwrap();
+        assert_eq!(setup.label_boxes.len(), MAX_LABEL_BOXES);
+        assert_eq!(setup.label_boxes[0].name.chars().count(), MAX_LABEL_BOX_NAME);
+        assert!(
+            !setup.label_boxes.iter().any(|b| b.name == "SLIVER"),
+            "a zero-width box is not a box"
+        );
+        assert_eq!(setup.net_labels.len(), 1);
+        assert_eq!(setup.net_labels[0].name, "RAIL");
+        // The allocators must clear every id that SURVIVED, or the next label
+        // a player draws would collide with one already on the sheet. (Ids
+        // the budget truncated away no longer exist, so reusing one is not a
+        // collision — this is the same rule `next_plid` has always had.)
+        let max_blid = setup.label_boxes.iter().map(|b| b.blid).max().unwrap();
+        assert!(setup.next_blid > max_blid, "{} vs {max_blid}", setup.next_blid);
+        assert!(setup.next_nlid > 900);
+    }
+
+    /// THE ONE THAT MATTERS. Two separate nets, given the SAME NAME, must
+    /// stay two separate nets — a string a player typed may never change what
+    /// the solver solves.
+    ///
+    /// Asserted against the compiled document rather than against the labels:
+    /// the labels are not in the engine at all, which IS the proof, so the
+    /// test shows the engine reaching the same answer with and without them
+    /// and shows the two anchors resolving to DIFFERENT nodes.
+    #[test]
+    fn the_same_name_on_two_nets_joins_nothing() {
+        // Two islands, deliberately unconnected: a 1 V source across a
+        // resistor at the origin, and a 5 V source across a resistor 100
+        // units east. Nothing bridges them.
+        let elems = vec![
+            ElementSpec {
+                id: 1,
+                kind: ElementKind::VoltageSource {
+                    dc: 1.0,
+                    amp: 0.0,
+                    hz: 0.0,
+                    phase: 0.0,
+                    wave: Default::default(),
+                },
+                pins: vec![(0, 0), (0, 4)],
+                ..Default::default()
+            },
+            ElementSpec {
+                id: 2,
+                kind: ElementKind::Resistor { ohms: 1000.0 },
+                pins: vec![(0, 0), (0, 4)],
+                ..Default::default()
+            },
+            ElementSpec {
+                id: 3,
+                kind: ElementKind::Ground,
+                pins: vec![(0, 4)],
+                ..Default::default()
+            },
+            ElementSpec {
+                id: 4,
+                kind: ElementKind::VoltageSource {
+                    dc: 5.0,
+                    amp: 0.0,
+                    hz: 0.0,
+                    phase: 0.0,
+                    wave: Default::default(),
+                },
+                pins: vec![(100, 0), (100, 4)],
+                ..Default::default()
+            },
+            ElementSpec {
+                id: 5,
+                kind: ElementKind::Resistor { ohms: 1000.0 },
+                pins: vec![(100, 0), (100, 4)],
+                ..Default::default()
+            },
+            ElementSpec {
+                id: 6,
+                kind: ElementKind::Ground,
+                pins: vec![(100, 4)],
+                ..Default::default()
+            },
+        ];
+        let mut eng = Engine::new(DT);
+        eng.set_elements(&elems);
+        eng.advance(20);
+        let (v_left, v_right) = (
+            eng.voltage_at((0, 0)).unwrap(),
+            eng.voltage_at((100, 0)).unwrap(),
+        );
+        assert!((v_left - 1.0).abs() < 1e-9, "left rail is 1 V: {v_left}");
+        assert!((v_right - 5.0).abs() < 1e-9, "right rail is 5 V: {v_right}");
+
+        // Now name BOTH "VCC". The labels never touch the engine — there is
+        // no call that could hand them to it — so the assertion is that the
+        // two anchors are still different nodes and the two voltages are
+        // still different voltages.
+        let mut labels: Vec<NetLabel> = Vec::new();
+        let next = AtomicU32::new(1);
+        for x in [0, 100] {
+            assert!(apply_net_label_op(
+                &mut labels,
+                &next,
+                &NetLabelOp::Add {
+                    x,
+                    y: 0,
+                    name: Some("VCC".into()),
+                }
+            ));
+        }
+        assert_eq!(labels.len(), 2);
+        assert_eq!(labels[0].name, labels[1].name);
+
+        let n_left = eng.node_at((0, 0)).expect("the left rail is a junction");
+        let n_right = eng.node_at((100, 0)).expect("the right rail is a junction");
+        assert_ne!(
+            n_left, n_right,
+            "two nets with the same name were joined by the name"
+        );
+        assert_eq!(eng.voltage_at((0, 0)).unwrap(), v_left);
+        assert_eq!(eng.voltage_at((100, 0)).unwrap(), v_right);
+
+        // And the derived read-out says what it should: both labels are
+        // attached, and they are attached to different things.
+        let (live, _) = derive_net_map(&eng, &labels, &[]);
+        assert_eq!(live.len(), 2);
+    }
+
+    /// WHAT HAPPENS WHEN THE NAMED THING IS DELETED — the decision written
+    /// down in `NetLabel`, executed.
+    ///
+    /// A label anchored to a POINT cannot be destroyed by an edit. Delete the
+    /// wire under it and the label survives, DETACHED: still exactly where the
+    /// player put it, reporting no net. Reconnect anything to that point and
+    /// it names that net again.
+    #[test]
+    fn deleting_the_wire_under_a_net_label_detaches_it_but_never_deletes_it() {
+        let mut elems = vec![
+            ElementSpec {
+                id: 1,
+                kind: ElementKind::VoltageSource {
+                    dc: 2.0,
+                    amp: 0.0,
+                    hz: 0.0,
+                    phase: 0.0,
+                    wave: Default::default(),
+                },
+                pins: vec![(0, 0), (0, 4)],
+                ..Default::default()
+            },
+            ElementSpec {
+                id: 2,
+                kind: ElementKind::Wire,
+                pins: vec![(0, 0), (6, 0)],
+                ..Default::default()
+            },
+            ElementSpec {
+                id: 3,
+                kind: ElementKind::Resistor { ohms: 1000.0 },
+                pins: vec![(6, 0), (6, 4)],
+                ..Default::default()
+            },
+            ElementSpec {
+                id: 4,
+                kind: ElementKind::Ground,
+                pins: vec![(0, 4)],
+                ..Default::default()
+            },
+            ElementSpec {
+                id: 5,
+                kind: ElementKind::Wire,
+                pins: vec![(0, 4), (6, 4)],
+                ..Default::default()
+            },
+        ];
+        // The label is anchored to the middle of the top wire, which is a
+        // junction of nothing but that wire's own span... so anchor it to the
+        // wire's far END, which IS a junction.
+        let mut labels = vec![NetLabel {
+            nlid: 1,
+            x: 6,
+            y: 0,
+            name: "OUT".into(),
+        }];
+        let mut eng = Engine::new(DT);
+        eng.set_elements(&elems);
+        eng.advance(20);
+        let (live, _) = derive_net_map(&eng, &labels, &[]);
+        assert_eq!(live, vec![1], "the label names the node it stands on");
+        let named_node = eng.node_at((6, 0)).unwrap();
+        assert_eq!(named_node, eng.node_at((0, 0)).unwrap(), "the wire ties them");
+
+        // Delete the RESISTOR and the WIRE — nothing is left at (6, 0).
+        elems.retain(|e| e.id != 2 && e.id != 3);
+        eng.set_elements(&elems);
+        eng.advance(20);
+        let (live, _) = derive_net_map(&eng, &labels, &[]);
+        assert!(
+            live.is_empty(),
+            "nothing connects at the anchor, so the label reports no net"
+        );
+        assert_eq!(labels.len(), 1, "a detached label is NEVER auto-deleted");
+        assert_eq!(labels[0].name, "OUT", "and it still says what it said");
+        assert_eq!((labels[0].x, labels[0].y), (6, 0), "and has not moved");
+
+        // Reconnect. The label names the new net with no op at all: the
+        // anchor is the whole of its identity.
+        elems.push(ElementSpec {
+            id: 6,
+            kind: ElementKind::Resistor { ohms: 500.0 },
+            pins: vec![(6, 0), (6, 4)],
+            ..Default::default()
+        });
+        elems.push(ElementSpec {
+            id: 7,
+            kind: ElementKind::Wire,
+            pins: vec![(0, 0), (6, 0)],
+            ..Default::default()
+        });
+        eng.set_elements(&elems);
+        eng.advance(20);
+        let (live, _) = derive_net_map(&eng, &labels, &[]);
+        assert_eq!(live, vec![1], "reconnecting re-attaches it, with no op");
+        labels[0].name = "OUT".into(); // (unchanged; the name never moved)
+    }
+
+    /// When one net carries TWO names, the readouts that have room for one
+    /// string must all pick the SAME one — so the choice is made server-side,
+    /// lowest `(y, x)`, and every client shows it.
+    #[test]
+    fn one_net_two_names_resolves_the_same_way_for_everybody() {
+        let elems = vec![
+            ElementSpec {
+                id: 1,
+                kind: ElementKind::VoltageSource {
+                    dc: 3.0,
+                    amp: 0.0,
+                    hz: 0.0,
+                    phase: 0.0,
+                    wave: Default::default(),
+                },
+                pins: vec![(0, 0), (0, 8)],
+                ..Default::default()
+            },
+            ElementSpec {
+                id: 2,
+                kind: ElementKind::Resistor { ohms: 1000.0 },
+                pins: vec![(0, 0), (0, 8)],
+                ..Default::default()
+            },
+            ElementSpec {
+                id: 3,
+                kind: ElementKind::Ground,
+                pins: vec![(0, 8)],
+                ..Default::default()
+            },
+        ];
+        let mut eng = Engine::new(DT);
+        eng.set_elements(&elems);
+        eng.advance(20);
+        // Both anchors are the SAME junction, reached from two labels.
+        let labels = vec![
+            NetLabel {
+                nlid: 9,
+                x: 0,
+                y: 0,
+                name: "LATER".into(),
+            },
+            NetLabel {
+                nlid: 2,
+                x: 0,
+                y: 0,
+                name: "SHOULD NOT HAPPEN".into(),
+            },
+        ];
+        // (The op path refuses two labels on one point; this vector is built
+        // by hand to prove the tie-break itself is total.)
+        let probes = vec![Probe {
+            pid: 1,
+            elem: 1,
+            pin: 0,
+            kind: ProbeKind::V,
+            r: None,
+        }];
+        let (live, named) = derive_net_map(&eng, &labels, &probes);
+        assert_eq!(live.len(), 2, "both labels are on a real net");
+        assert_eq!(named.len(), 1, "the probe gets exactly one name");
+        // Lowest (y, x) wins; the two are equal here, so the lowest nlid in
+        // the sort's stable order does — deterministic either way, which is
+        // the whole requirement.
+        assert_eq!(named[0].0, 1);
+        assert!(labels.iter().any(|l| l.nlid == named[0].1));
+    }
+
+    /// A probe on a named net gets that net's name; a probe on an unnamed one
+    /// gets nothing, silently. This is the whole of what the scope, dock and
+    /// panel readouts consume.
+    #[test]
+    fn a_probe_reports_the_name_of_the_net_it_sits_on() {
+        let elems = vec![
+            ElementSpec {
+                id: 1,
+                kind: ElementKind::VoltageSource {
+                    dc: 3.0,
+                    amp: 0.0,
+                    hz: 0.0,
+                    phase: 0.0,
+                    wave: Default::default(),
+                },
+                pins: vec![(0, 0), (0, 8)],
+                ..Default::default()
+            },
+            ElementSpec {
+                id: 2,
+                kind: ElementKind::Resistor { ohms: 1000.0 },
+                pins: vec![(0, 0), (0, 4)],
+                ..Default::default()
+            },
+            ElementSpec {
+                id: 3,
+                kind: ElementKind::Resistor { ohms: 1000.0 },
+                pins: vec![(0, 4), (0, 8)],
+                ..Default::default()
+            },
+            ElementSpec {
+                id: 4,
+                kind: ElementKind::Ground,
+                pins: vec![(0, 8)],
+                ..Default::default()
+            },
+        ];
+        let mut eng = Engine::new(DT);
+        eng.set_elements(&elems);
+        eng.advance(20);
+        let labels = vec![NetLabel {
+            nlid: 3,
+            x: 0,
+            y: 4,
+            name: "MID".into(),
+        }];
+        let probes = vec![
+            // On the labelled midpoint.
+            Probe {
+                pid: 1,
+                elem: 2,
+                pin: 1,
+                kind: ProbeKind::V,
+                r: None,
+            },
+            // On the unlabelled rail.
+            Probe {
+                pid: 2,
+                elem: 1,
+                pin: 0,
+                kind: ProbeKind::V,
+                r: None,
+            },
+        ];
+        let (live, named) = derive_net_map(&eng, &labels, &probes);
+        assert_eq!(live, vec![3]);
+        assert_eq!(named, vec![(1, 3)], "only the probe on MID is named");
     }
 
     // ---------------------------------------------------------------- damage
@@ -6961,6 +8192,83 @@ mod tests {
             );
         }
         assert_eq!(panels[0].name, "SYNTHESIZER");
+    }
+
+    /// THE ACCEPTANCE TEST FOR THE LABEL BOX: the thirteen block headings this
+    /// sheet lost are back on it, and they cost exactly one control panel.
+    ///
+    /// The room used to carry thirteen PANEL regions named VCO, FILTER
+    /// CUTOFF, MIXER + SPEAKER, STEP DECODER... because a panel name was the
+    /// only way to put words on a schematic. Parts carry their own names now,
+    /// so those thirteen collapsed into one region — and the sheet lost its
+    /// headings, because the headings WERE the panels. This is the primitive
+    /// that was invented to get them back, doing the job it was invented for.
+    #[test]
+    fn the_synth_block_headings_are_label_boxes_and_cost_no_windows() {
+        let boxes = synth::synth_label_boxes();
+        assert_eq!(
+            boxes.len(),
+            13,
+            "seven modules plus two per sequencer step = the thirteen headings"
+        );
+        // Every one of them has to be a LEGAL label box, or the template
+        // fails on load rather than here.
+        for b in &boxes {
+            assert!(
+                norm_label_box_rect(b.x0, b.y0, b.x1, b.y1).is_some(),
+                "label box {:?} is degenerate",
+                b.name
+            );
+            assert_eq!(
+                clean_label_box_name(b.name),
+                b.name,
+                "label box name {:?} would be rewritten on the way in",
+                b.name
+            );
+        }
+        for want in [
+            "VCO  1V/OCT",
+            "FILTER  CUTOFF",
+            "MIXER + SPEAKER",
+            "LFO  BAR SWEEP",
+            "SNARE  (TONE)",
+            "CLOCK  TEMPO",
+            "STEP DECODER",
+            "STEP 1 PITCH",
+            "BEAT 3",
+        ] {
+            assert!(
+                boxes.iter().any(|b| b.name == want),
+                "the sheet lost its {want} heading"
+            );
+        }
+
+        // AND THE POINT OF THE WHOLE FEATURE: the room the template builds
+        // has thirteen headings and exactly ONE control panel. Thirteen more
+        // windows is the regression this exists to undo.
+        let setup = templates::resolve(std::path::Path::new("/nonexistent"), "synth").unwrap();
+        assert_eq!(setup.label_boxes.len(), 13);
+        assert_eq!(setup.panels.len(), 1, "one window, not fourteen");
+        assert_eq!(setup.panels[0].name, "SYNTHESIZER");
+        // Ids are distinct and the allocator is clear of all of them.
+        let ids: std::collections::HashSet<u32> =
+            setup.label_boxes.iter().map(|b| b.blid).collect();
+        assert_eq!(ids.len(), 13);
+        assert!(setup.next_blid > *ids.iter().max().unwrap());
+
+        // The FILTER heading is sized for READING, not for membership. Its
+        // old panel rect had to reach x1 = 42.2 to swallow a divider's input
+        // pin at (42, -5); a label box collects nothing, so it stops short of
+        // the VCO — and the divider is still on the one panel that lists it.
+        let filter = boxes.iter().find(|b| b.name == "FILTER  CUTOFF").unwrap();
+        let vco = boxes.iter().find(|b| b.name == "VCO  1V/OCT").unwrap();
+        assert!(
+            filter.x1 < vco.x0,
+            "the two headings overlap: {} vs {}",
+            filter.x1,
+            vco.x0
+        );
+        assert!(filter.x1 < 42.0, "still stretched to catch a pin");
     }
 
     #[test]

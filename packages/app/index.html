@@ -67,6 +67,18 @@
         padding: 10px; font: 13px/1.7 ui-monospace, monospace; color: #c9c9d4;
       }
       #props { top: 54px; right: calc(12px + var(--rail-r)); }
+      /* THE ON-CANVAS RENAME BOX. A label box and a net label have no window
+         to hold a title field, so the field comes to them: it is parked over
+         the very plate it is editing, sized like it, and it is the only DOM
+         either primitive owns. */
+      #nameedit {
+        position: fixed; display: none; z-index: 35;
+        background: #0d0d13; color: #e8e8f0;
+        border: 1px solid #6a6a80; border-radius: 4px;
+        padding: 1px 5px; font: 11px/1.4 ui-monospace, monospace;
+        outline: none; min-width: 70px;
+      }
+      #nameedit:focus { border-color: #8ee7ff; }
       /* Floating editor: same box, parked next to the part by double-click. */
       #propsdlg {
         left: 0; top: 0; z-index: 30; background: #17171ef7;
@@ -657,6 +669,7 @@
   </head>
   <body>
     <canvas id="canvas"></canvas>
+    <input id="nameedit" type="text" autocomplete="off" spellcheck="false" />
     <div id="hud"></div>
     <div id="scope" class="collapsed">
       <div id="scopebar"><span id="scopecaret">scope ▴</span><span id="scopesum"></span><span

@@ -50,6 +50,7 @@ import type { ElementSpec } from './circuit';
 import type { Panel } from './panel';
 import type { Layer } from './layer';
 import type { Probe, WireScope } from './scope';
+import type { LabelBox, NetLabel } from './annotate';
 
 // This file runs under node (see package.json), never in the browser, and the
 // repo carries no @types/node — one honest declaration beats a dependency.
@@ -297,12 +298,16 @@ def('window', { setTimeout: () => 0, clearTimeout: () => {} });
 
 /** Exactly the six arguments `onHello` is handed — the client's whole idea of
  * the room it just joined. */
+/** Exactly the arguments `onHello` is handed — the client's whole idea of the
+ * room it just joined. */
 interface HelloCall {
   you: number;
   elements: ElementSpec[];
   probes: Probe[];
   panels: Panel[];
   scopes: WireScope[];
+  labelBoxes: LabelBox[];
+  netLabels: NetLabel[];
   room: RoomHello | null;
 }
 
@@ -312,11 +317,14 @@ function dial(code: string | null = null) {
   const hellos: HelloCall[] = [];
   const drifts: WireDrift[][] = [];
   const layerCalls: { list: Layer[]; claims: [number, number][] }[] = [];
+  const boxCalls: LabelBox[][] = [];
+  const netLabelCalls: NetLabel[][] = [];
+  const netMapCalls: { live: number[]; probe: [number, number][] }[] = [];
   const sensorCalls: [number, number][][] = [];
   const nop = () => {};
   const handlers: NetHandlers = {
-    onHello: (you, elements, probes, panels, scopes, room) =>
-      hellos.push({ you, elements, probes, panels, scopes, room }),
+    onHello: (you, elements, probes, panels, scopes, labelBoxes, netLabels, room) =>
+      hellos.push({ you, elements, probes, panels, scopes, labelBoxes, netLabels, room }),
     onRoomMeta: nop,
     onRoomGone: nop,
     onFrame: nop,
@@ -325,6 +333,9 @@ function dial(code: string | null = null) {
     onProbes: nop,
     onPanels: nop,
     onScopes: nop,
+    onLabelBoxes: (list) => boxCalls.push(list),
+    onNetLabels: (list) => netLabelCalls.push(list),
+    onNetMap: (live, probe) => netMapCalls.push({ live, probe }),
     onLayers: (list, cl) => layerCalls.push({ list, claims: cl }),
     onSensors: (list) => sensorCalls.push(list),
     onMachine: nop,
@@ -348,6 +359,9 @@ function dial(code: string | null = null) {
     hellos,
     drifts,
     layerCalls,
+    boxCalls,
+    netLabelCalls,
+    netMapCalls,
     sensorCalls,
     deliver,
     socket: () => sockets[sockets.length - 1],
@@ -436,7 +450,59 @@ console.log('connect — a pre-rooms server still joins');
   d.deliver({ t: 'hello', you: 3, elements: [], probes: [], panels: [] });
   check('room is null, not fabricated', d.hellos[0]?.room === null);
   check('no drift', d.drifts.length === 0);
+  check('and it brought no annotation, quietly', d.hellos[0]?.labelBoxes.length === 0);
+  check('nor any net labels', d.hellos[0]?.netLabels.length === 0);
   check('and the retry loop keeps aiming at the default room', d.net.code() === null);
+}
+
+// ANNOTATION ON THE WIRE. Both primitives are room state, so both have to
+// arrive on the hello AND on their own broadcast, through the same handler —
+// a late joiner and a running client must never disagree about what the sheet
+// says. The `netmap` is the third message and the only DERIVED one: which net
+// each label is on, computed server-side because the client has no netlist.
+console.log('annotate — label boxes and net labels reach the client');
+{
+  const d = dial();
+  const withAnn = JSON.parse(JSON.stringify(sample)) as Record<string, unknown>;
+  withAnn.labelboxes = [{ blid: 1, x0: 2, y0: 3, x1: 12, y1: 9, name: 'VCO 1V/OCT' }];
+  withAnn.netlabels = [{ nlid: 1, x: 7, y: 4, name: '5V RAIL' }];
+  d.deliver(withAnn);
+  check('hello carried the label box', d.hellos[0]?.labelBoxes.length === 1);
+  check('with its title', d.hellos[0]?.labelBoxes[0]?.name === 'VCO 1V/OCT');
+  check('hello carried the net label', d.hellos[0]?.netLabels.length === 1);
+  // The anchor is a POINT — integers, the same lattice pins live in. A
+  // fractional anchor could never intern-match a junction.
+  check('anchored to a grid point', d.hellos[0]?.netLabels[0]?.x === 7);
+  check('no drift', d.drifts.length === 0, describeDrift(d.drifts[0] ?? []));
+
+  d.deliver({ t: 'labelboxes', list: [{ blid: 2, x0: 0, y0: 0, x1: 4, y1: 4, name: 'PSU' }] });
+  check('the broadcast uses the same shape', d.boxCalls.length === 1);
+  check('whole list, never a delta', d.boxCalls[0]?.length === 1);
+  d.deliver({ t: 'netlabels', list: [{ nlid: 2, x: 1, y: 1, name: 'GND' }] });
+  check('net labels broadcast too', d.netLabelCalls[0]?.[0]?.name === 'GND');
+
+  d.deliver({ t: 'netmap', live: [1, 2], probes: [[1, 2]] });
+  check('netmap says which labels are attached', eq(d.netMapCalls[0]?.live, [1, 2]));
+  check('and which net each probe is on', eq(d.netMapCalls[0]?.probe, [[1, 2]]));
+}
+
+console.log('annotate — the client cannot put a fractional anchor on the wire');
+{
+  const d = dial();
+  d.deliver(sample);
+  const before = d.socket()?.sent.length ?? 0;
+  d.net.sendNetLabel({ t: 'add', x: 3.7, y: -2.2, name: 'BUS' });
+  const sent = JSON.parse(d.socket()?.sent[before] ?? '{}') as {
+    t: string;
+    op: { x: number; y: number };
+  };
+  check('it is a netlabel message', sent.t === 'netlabel');
+  check('x is rounded to the grid', Number.isInteger(sent.op.x), String(sent.op.x));
+  check('y is rounded to the grid', Number.isInteger(sent.op.y), String(sent.op.y));
+  // A rename carries no coordinates at all and must not grow any.
+  d.net.sendNetLabel({ t: 'rename', nlid: 1, name: 'BUS' });
+  const ren = JSON.parse(d.socket()?.sent[before + 1] ?? '{}') as { op: Record<string, unknown> };
+  check('a rename is nlid + name and nothing else', eq(Object.keys(ren.op).sort(), ['name', 'nlid', 't']));
 }
 
 console.log('connect — the code in the URL is the room you get');
