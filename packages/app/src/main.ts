@@ -184,7 +184,9 @@ import {
   aperturesOn,
   drawLayerGhost,
   drawSensorLayers,
+  layerAt,
   layerPlateAt,
+  layerPlateRect,
   normLayerRect,
   type Aperture,
   type Layer,
@@ -403,6 +405,16 @@ function applyDoc(op: DocOp) {
     // nothing to re-file. It is a label, all the way down.
     if (e) e.name = op.name;
   }
+  // WHICH PART READS WHICH PATCH IS GEOMETRY, so it has to be re-derived
+  // whenever the geometry changes. This is the hook that was missing: the
+  // aperture set was only ever recomputed when a LAYER moved or a claim
+  // changed, never when the document did — so a photocell dropped onto a
+  // camera that was ALREADY live was never handed to the sampler, and the
+  // feature's own documented order (click the plate, then press Y and drop
+  // the part on the video) produced a live camera driving nothing. Free
+  // unless a camera is running: `pushApertures` returns immediately when it
+  // is not.
+  pushApertures();
 }
 
 let idCounter = 1;
@@ -643,6 +655,7 @@ const net = connect({
     elements = serverElements;
     docVersion++;
     space.rebuild(elements);
+    pushApertures(); // a whole new document is the biggest geometry change there is
     probes = serverProbes;
     panels = serverPanels;
     live = new Map();
@@ -1155,7 +1168,7 @@ const apertureScratch: Aperture[] = [];
 function pushApertures() {
   const l = myLayer();
   if (!l || !camera.isLive()) return;
-  aperturesOn(l, elements, apertureScratch);
+  aperturesOn(l, layers, elements, apertureScratch);
   camera.setApertures(apertureScratch, (l.x1 - l.x0) / (l.y1 - l.y0));
 }
 
@@ -1178,15 +1191,24 @@ async function claimLayer(l: Layer) {
   }
   if (online) net.sendLayerClaim(l.lid, true);
   else claims.set(l.lid, myId);
+  // A click while the browser's own permission prompt is still up joins that
+  // request rather than starting a second one — but it must not look like a
+  // dead button while it waits.
+  if (camera.getStatus().state === 'starting') {
+    toast('still waiting on the browser — answer its camera prompt');
+  }
   const ok = await camera.start();
   if (!ok) {
     if (online) net.sendLayerClaim(l.lid, false);
     else claims.delete(l.lid);
     const st = camera.getStatus();
+    // THE REASON, ALWAYS. A player who cannot have a camera is told which of
+    // the three things happened: the browser will not offer one on this
+    // origin, there is none, or the answer was no.
     toast(
       st.state === 'denied'
-        ? 'camera refused — nothing was captured'
-        : `no camera here (${st.detail})`,
+        ? `no camera — nothing was captured (${st.detail})`
+        : `no camera here — ${st.detail}`,
     );
   }
   syncSensorChrome();
@@ -1336,6 +1358,14 @@ function nearestPin(e: ElementSpec, x: number, y: number): number {
 const canvas = document.getElementById('canvas') as HTMLCanvasElement;
 const hud = document.getElementById('hud') as HTMLDivElement;
 const ctx = canvas.getContext('2d')!;
+
+/** The screen a sensor layer's plate has to stay inside: the canvas minus the
+ *  HUD rail it would otherwise hide under. One definition, so the draw and
+ *  the hit test cannot drift apart. */
+function plateView(): [number, number, number] {
+  const r = hud.getBoundingClientRect();
+  return [window.innerWidth, window.innerHeight, r.height > 0 ? r.bottom + 6 : 0];
+}
 
 const cam: Camera = { scale: 48, ox: 60, oy: 60 };
 // Exposed for end-to-end tests.
@@ -2155,6 +2185,7 @@ function deleteIds(all: number[]) {
   }
   elements = elements.filter((e) => !gone.has(e.id));
   docVersion++; // the bulk path bypasses applyDoc, so bump it by hand
+  pushApertures(); // ...and its aperture re-derive with it
   if (!online) localSim.setElements(elements);
   history.end();
 }
@@ -2901,7 +2932,7 @@ canvas.addEventListener('pointerdown', (ev) => {
     // The layer's name plate is the ONLY thing that opens a camera, and this
     // click is the user gesture the browser requires. Never on load, never on
     // join, never restored from storage.
-    const l = layerPlateAt(cam, layers, ev.clientX, ev.clientY);
+    const l = layerPlateAt(cam, layers, ev.clientX, ev.clientY, ...plateView());
     if (l) {
       if (ev.shiftKey) layerOp({ t: 'remove', lid: l.lid });
       else void claimLayer(l);
@@ -3313,6 +3344,27 @@ canvas.addEventListener('pointerup', (ev) => {
     const [gx0, gy0] = toGrid(Math.min(marquee.x0, marquee.x1), Math.min(marquee.y0, marquee.y1));
     const [gx1, gy1] = toGrid(Math.max(marquee.x0, marquee.x1), Math.max(marquee.y0, marquee.y1));
     const dragged = Math.abs(marquee.x1 - marquee.x0) + Math.abs(marquee.y1 - marquee.y0) > 6;
+    // A CLICK THAT HIT NOTHING, INSIDE A CAMERA LAYER. This is the click the
+    // player means by "I clicked the camera layer and nothing happened": the
+    // plate is a 20-pixel strip and the rectangle is the size of a district.
+    // It stays a click on empty canvas — opening a camera is a decision, and
+    // the labelled plate is where that decision is made — but it says so,
+    // because silence was the whole defect.
+    if (!dragged) {
+      const l = layerAt(cam, layers, marquee.x1, marquee.y1);
+      if (l) {
+        const holder = claims.get(l.lid);
+        toast(
+          holder !== undefined && holder !== myId
+            ? `${l.name} is driven by player ${holder}`
+            : layerPlateRect(cam, l, ...plateView())
+              ? holder === myId && camera.isLive()
+                ? `${l.name} is live — click its plate (top-left) to stop`
+                : `${l.name} — click its plate (top-left) to point a camera at it`
+              : `${l.name} — zoom in until its plate is on screen, then click that`,
+        );
+      }
+    }
     // Only an UNMODIFIED click clears. A stray shift- or alt-click on empty
     // space leaves a hard-won selection exactly as it was.
     if (marquee.mode === 'replace') {
@@ -3563,7 +3615,20 @@ window.addEventListener('keydown', (ev) => {
     }
     return;
   }
-  if (ev.key === 'x' || ev.key === 'X' || ev.key === 'y' || ev.key === 'Y') {
+  // MIRROR — but only when there is something to mirror.
+  //
+  // `y` is also the Photocell's hotkey (⇧Y draws the camera layer it reads,
+  // and the two are meant to be one gesture). The mirror keys landed first,
+  // on a different line, so git merged both cleanly and `y` silently stopped
+  // placing the part: the flip arm ran `flipSelection('y')` on an empty
+  // selection — a no-op — and returned before the part table was consulted.
+  // The camera feature's step 3 has been dead ever since.
+  //
+  // A flip with no target was always a no-op, so falling through when there
+  // is no target cannot change what a flip does. It only fills in the case
+  // where the key did nothing at all.
+  const flipKey = ev.key === 'x' || ev.key === 'X' || ev.key === 'y' || ev.key === 'Y';
+  if (flipKey && (pasting || placing || selectedIds.size > 0)) {
     const axis: 'x' | 'y' = ev.key === 'x' || ev.key === 'X' ? 'x' : 'y';
     if (pasting) {
       // Ghost pins are relative to the cursor, so the centroid is the origin.
@@ -4087,7 +4152,8 @@ function frame(now: number) {
     claims,
     myId,
     camera.previewEl(),
-    mouse ? (layerPlateAt(cam, layers, mouse.x, mouse.y)?.lid ?? null) : null,
+    mouse ? (layerPlateAt(cam, layers, mouse.x, mouse.y, ...plateView())?.lid ?? null) : null,
+    ...plateView(),
   );
   if (layerDrag) {
     drawLayerGhost(ctx, cam, layerDrag.a, layerDrag.b, normLayerRect(layerDrag.a, layerDrag.b) !== null);

@@ -73,6 +73,9 @@ export class CameraSource {
   };
   /** Reused across every message: the sampler must not allocate per frame. */
   private apertures: Aperture[] = [];
+  /** The in-flight `start()`. A second click must JOIN it, not be told "yes"
+   *  and handed nothing — see `start()`. */
+  private pending: Promise<boolean> | null = null;
 
   constructor(private onChange: () => void) {}
 
@@ -97,10 +100,43 @@ export class CameraSource {
     return this.status.state === 'live';
   }
 
-  /** MUST be called from a user gesture. Returns true once the track is up. */
-  async start(): Promise<boolean> {
-    if (this.status.state === 'live' || this.status.state === 'starting') return true;
+  /**
+   * MUST be called from a user gesture. Returns true once the track is up.
+   *
+   * A second call while the first is still waiting on the browser's
+   * permission prompt JOINS that call and settles with it. It used to return
+   * `true` on sight of `state === 'starting'`, which meant a player who
+   * ignored the prompt once had a plate that reported success and produced
+   * no camera on every click thereafter — the silent failure this whole file
+   * exists to avoid.
+   */
+  start(): Promise<boolean> {
+    if (this.status.state === 'live') return Promise.resolve(true);
+    if (this.pending) return this.pending;
+    const p = this.begin();
+    this.pending = p;
+    void p.finally(() => {
+      if (this.pending === p) this.pending = null;
+    });
+    return p;
+  }
+
+  private async begin(): Promise<boolean> {
     this.set({ state: 'starting', detail: 'asking for the camera' });
+    // SECURE CONTEXT. This is not a bug and cannot be fixed in code — a
+    // browser will not hand out a camera to a plain-http origin, and it does
+    // not even define `navigator.mediaDevices` there. Nothing about that is
+    // obvious to a player looking at a rectangle that will not turn on, so
+    // the message names the origin AND the two origins that do work.
+    if (!window.isSecureContext) {
+      this.set({
+        state: 'unsupported',
+        detail:
+          `${location.protocol}//${location.host} is not a secure origin — ` +
+          'browsers only hand out a camera over https:// or on localhost',
+      });
+      return false;
+    }
     if (!navigator.mediaDevices?.getUserMedia) {
       this.set({ state: 'unsupported', detail: 'this browser has no camera API' });
       return false;
@@ -121,7 +157,14 @@ export class CameraSource {
         audio: false,
       });
     } catch (err) {
-      this.set({ state: 'denied', detail: String((err as Error)?.name ?? err) });
+      // The NAME is the actionable half (`NotAllowedError` = you or the OS
+      // said no, `NotFoundError` = there is no camera on this machine), so it
+      // goes in the message a player sees rather than only in the console.
+      const e = err as Error;
+      this.set({
+        state: 'denied',
+        detail: e?.name ? `${e.name}${e.message ? `: ${e.message}` : ''}` : String(err),
+      });
       return false;
     }
     this.stream = stream;
@@ -231,6 +274,7 @@ export class CameraSource {
    * not just to you.
    */
   stop() {
+    this.pending = null;
     const w = this.worker;
     this.worker = null;
     if (w) {
