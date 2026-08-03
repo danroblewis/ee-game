@@ -338,7 +338,12 @@ fn synth_setup() -> RoomSetup {
         // No machine: the synth's goal is that it makes a noise.
         machine: MachineSpec::None,
         view: View {
-            home: Some([-4.0, -4.0, 76.0, 44.0]),
+            // The whole instrument: element pins span x -10..58, y -10..58
+            // (`synth_room_pins_clear_the_hoist` pins that box) and the
+            // outermost panel rects reach -10.6. The old rect predated the
+            // re-layout and cut off everything below y = 44 — the STEP 3 /
+            // BEAT 3 lane and both bus pull-downs were off screen on join.
+            home: Some([-12.0, -12.0, 61.0, 60.0]),
             scopes: Vec::new(),
         },
         ..RoomSetup::default()
