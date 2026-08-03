@@ -2,6 +2,54 @@
 
 export type Point = [number, number];
 
+/** What a `Gate` computes. A plain string in the document, mirroring
+ *  `sim_core::GateOp` — inversion is folded into the op rather than carried
+ *  as a separate flag, so the properties panel has one field. */
+export type GateOp = 'And' | 'Nand' | 'Or' | 'Nor' | 'Xor' | 'Xnor' | 'Buf' | 'Not';
+
+/** Buffers and inverters take exactly one input whatever `ins` says — the
+ *  mirror of `GateOp::fixed_ins`, and what keeps `pinCount` agreeing with
+ *  the solver about how wide the part is. */
+export const gateFixedIns = (op: GateOp): number | null =>
+  op === 'Buf' || op === 'Not' ? 1 : null;
+
+/** Pin roles for a logic chip, mirroring `sim_core::LogicPins`. Used by the
+ *  symbol so the legs are labelled and grouped the way the model sees them. */
+export interface LogicPins {
+  nIn: number;
+  in0: number;
+  nOut: number;
+  out0: number;
+  clk: number | null;
+}
+
+export function logicPins(kind: ElementKind): LogicPins | null {
+  switch (kind.t) {
+    case 'Gate': {
+      const n = gateFixedIns(kind.op) ?? clampW(kind.ins, 1, 4);
+      return { nIn: n, in0: 2, nOut: 1, out0: 2 + n, clk: null };
+    }
+    case 'FlipFlop':
+      return { nIn: 3, in0: 2, nOut: 2, out0: 5, clk: 0 };
+    case 'ShiftReg':
+      return { nIn: 3, in0: 2, nOut: clampW(kind.bits, 2, 4), out0: 5, clk: 0 };
+    case 'Counter':
+      return { nIn: 2, in0: 2, nOut: clampW(kind.bits, 2, 4), out0: 4, clk: 0 };
+    case 'Mux': {
+      const s = clampW(kind.sel, 1, 2);
+      // The I pins are a pass gate: analog, bidirectional, neither input
+      // nor output. Only the select lines are thresholded.
+      return { nIn: s, in0: 2 + (1 << s), nOut: 0, out0: 0, clk: null };
+    }
+    default:
+      return null;
+  }
+}
+
+const clampW = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, Math.round(n)));
+
+export const isLogic = (kind: ElementKind): boolean => logicPins(kind) !== null;
+
 export type ElementKind =
   | { t: 'Wire' }
   | { t: 'Ground' }
@@ -35,6 +83,15 @@ export type ElementKind =
   // `seed` picks WHICH noise, `volts` how loud. Two sources with the same
   // seed are the same signal, so each placement gets its own (catalog.ts).
   | { t: 'Noise'; volts: number; ohms: number; seed: number }
+  // The CMOS logic family. A chip here is a passive conductance network
+  // whose values are picked by discrete state, so its outputs source real
+  // current out of its VCC pin and its levels are fractions of whatever
+  // supply it is actually on.
+  | { t: 'Gate'; op: GateOp; ins: number }
+  | { t: 'FlipFlop'; edge: boolean }
+  | { t: 'ShiftReg'; bits: number }
+  | { t: 'Counter'; bits: number; modulus: number }
+  | { t: 'Mux'; sel: number }
   // Machine fixtures. Not in the parts catalogue — a player cannot place one —
   // but they are ordinary elements in the document, so the client's model of
   // the document has to know them or their pins are untyped and unnamed.
@@ -100,10 +157,34 @@ export function pinLabels(kind: ElementKind): string[] {
       return ['out', 'ref'];
     case 'Photocell':
       return ['a', 'b'];
+    // The logic family. Pin 0/1 are always VCC/GND, matching the 555.
+    case 'Gate': {
+      const n = gateFixedIns(kind.op) ?? clampW(kind.ins, 1, 4);
+      const ins = ['A', 'B', 'C', 'D'].slice(0, n);
+      return ['VCC', 'GND', ...ins, 'Y'];
+    }
+    case 'FlipFlop':
+      return ['VCC', 'GND', 'CLK', 'D', '/RST', 'Q', '/Q'];
+    case 'ShiftReg': {
+      const b = clampW(kind.bits, 2, 4);
+      return ['VCC', 'GND', 'CLK', 'SER', '/RST', ...qNames(b)];
+    }
+    case 'Counter': {
+      const b = clampW(kind.bits, 2, 4);
+      return ['VCC', 'GND', 'CLK', '/RST', ...qNames(b)];
+    }
+    case 'Mux': {
+      const s = clampW(kind.sel, 1, 2);
+      const chans = Array.from({ length: 1 << s }, (_, j) => `I${j}`);
+      const sels = Array.from({ length: s }, (_, j) => `S${j}`);
+      return ['VCC', 'GND', ...chans, ...sels, 'Y'];
+    }
     default:
       return ['a', 'b'];
   }
 }
+
+const qNames = (b: number) => Array.from({ length: b }, (_, j) => `Q${j}`);
 
 /** The offline-fallback circuit: battery -> switch -> lamp. */
 export function demoCircuit(): ElementSpec[] {
@@ -131,9 +212,11 @@ export interface ElemLive {
   power: number;
 }
 
-/** [id, npins, v0..v5, i0..i5, power] — MAX_PINS is 6 (the 555 timer). */
-export const FRAME_STRIDE = 15;
-export const MAX_PINS = 6;
+/** `[id, npins, v0..vN, i0..iN, power]` — the TS mirror of
+ *  `sim_core::FRAME_STRIDE` and `sim_core::MAX_PINS`. 10 is set by the
+ *  widest logic parts (4-bit shift register, 4:1 mux, both 9 pins). */
+export const MAX_PINS = 10;
+export const FRAME_STRIDE = 3 + 2 * MAX_PINS;
 
 export function unpackFrame(flat: ArrayLike<number>): Map<number, ElemLive> {
   const out = new Map<number, ElemLive>();

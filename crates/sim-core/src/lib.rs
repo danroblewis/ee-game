@@ -9,9 +9,12 @@ pub mod shape;
 pub mod validate;
 
 pub use constraint::{constraint_of, Constraint, ConstraintKey};
-pub use engine::{AdvanceReport, ElemFrame, ElemTap, Engine, Island, Tuning, GMIN};
+pub use engine::{
+    AdvanceReport, ElemFrame, ElemTap, Engine, Island, Tuning, FRAME_STRIDE, GMIN,
+};
 pub use netlist::{
-    photocell_ohms, DocOp, ElementKind, ElementSpec, InteractOp, ParamWrite, Point,
+    photocell_ohms, DocOp, ElementKind, ElementSpec, GateOp, InteractOp, LogicPins, ParamWrite,
+    Point,
     DEFAULT_OPAMP_ISC, MAX_PINS, MAX_TIER,
 };
 pub use shape::{is_rigid, Handle, Placement, Shape};

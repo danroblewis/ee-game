@@ -691,5 +691,10 @@ pub fn kind_name(k: &ElementKind) -> &'static str {
         Motor { .. } => "motor",
         Noise { .. } => "noise",
         Photocell { .. } => "photocell",
+        Gate { .. } => "gate",
+        FlipFlop { .. } => "flipflop",
+        ShiftReg { .. } => "shiftreg",
+        Counter { .. } => "counter",
+        Mux { .. } => "mux",
     }
 }

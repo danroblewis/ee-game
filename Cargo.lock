@@ -1285,6 +1285,7 @@ dependencies = [
 name = "sim-golden"
 version = "0.1.0"
 dependencies = [
+ "damage",
  "libm",
  "serde_json",
  "sim-core",

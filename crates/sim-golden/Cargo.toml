@@ -16,3 +16,6 @@ libm.workspace = true
 # (a reading is `serde(skip)`), which needs the serde impls the server uses.
 sim-core = { path = "../sim-core", features = ["serde"] }
 serde_json.workspace = true
+# Adversarial verification asserts against the REAL damage ladder rather
+# than a copy of its numbers.
+damage = { path = "../damage" }

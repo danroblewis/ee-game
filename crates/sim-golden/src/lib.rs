@@ -403,6 +403,297 @@ pub fn noise_rc() -> Vec<ElementSpec> {
     ]
 }
 
+// ------------------------------------------------------ the CMOS logic family
+//
+// Six circuits, and they are a hard prerequisite rather than a follow-up: a
+// device gets NO `pwl_reuse` coverage, no cross-target determinism coverage
+// and no golden coverage until it appears in `all_golden()` below.
+// `pwl_reuse::a_reused_matrix_is_bitwise_what_a_refactor_would_have_stamped`
+// in particular is what keeps the `is_discrete_nonlinear` classification
+// honest, and it only tests what is listed here.
+
+/// A logic part of any width.
+pub fn logic(id: u32, kind: ElementKind, pins: &[Point]) -> ElementSpec {
+    ElementSpec::pins(id, kind, pins)
+}
+
+/// A 5 V supply between `(0,0)` and `(0,24)`, grounded at the bottom: the
+/// rail every logic golden hangs off. Ids 1 and 2.
+fn logic_rail(volts: f64) -> Vec<ElementSpec> {
+    vec![spec(1, dc(volts), (0, 0), (0, 24)), gnd(2, (0, 24))]
+}
+
+/// A 2-input NAND on 5 V with both inputs switch-driven and the output
+/// loaded. Static: no clock anywhere, so it is also the family's entry in
+/// the "piecewise-linear circuits stop refactoring" argument.
+///
+/// Each input is pulled down through 10 kΩ and pulled up by a switch to the
+/// rail, which is the SPST way a player would actually wire a test input.
+/// Switch 5 drives A, switch 6 drives B; both start open, so the cold state
+/// is A=B=low and NAND reads high.
+pub fn gate_nand_dc() -> Vec<ElementSpec> {
+    let mut v = logic_rail(5.0);
+    v.extend([
+        // [VCC, GND, A, B, Y]
+        logic(
+            3,
+            ElementKind::Gate {
+                op: sim_core::GateOp::Nand,
+                ins: 2,
+            },
+            &[(0, 0), (0, 24), (6, 4), (6, 8), (14, 6)],
+        ),
+        spec(4, r(1000.0), (14, 6), (0, 24)), // output load
+        spec(5, ElementKind::Switch { closed: false }, (0, 0), (6, 4)),
+        spec(6, ElementKind::Switch { closed: false }, (0, 0), (6, 8)),
+        spec(7, r(10_000.0), (6, 4), (0, 24)), // pull-down on A
+        spec(8, r(10_000.0), (6, 8), (0, 24)), // pull-down on B
+    ]);
+    v
+}
+
+/// A rising-edge D flip-flop wired /Q -> D: the textbook divide-by-two.
+///
+/// The clock is a 1 kHz sine squared up by a `Buf` gate rather than fed in
+/// raw, which is the honest way to clock logic here: a logic-driven signal
+/// is piecewise-constant across a whole substep, so the flip-flop's edge
+/// detection carries NO threshold-crossing error at all. Only logic driven
+/// by an analog ramp is quantized, and that error is the same `slew × dt`
+/// the 555 already has.
+pub fn dff_divide_by_2() -> Vec<ElementSpec> {
+    let mut v = logic_rail(5.0);
+    v.extend([
+        // A 0..5 V sine: dc 2.5, amp 2.5, so it crosses both Schmitt
+        // thresholds every cycle.
+        spec(
+            3,
+            ElementKind::VoltageSource {
+                dc: 2.5,
+                amp: 2.5,
+                hz: 1000.0,
+                phase: 0.0,
+            },
+            (4, 12),
+            (0, 24),
+        ),
+        // [VCC, GND, IN, Y] — the clock shaper.
+        logic(
+            4,
+            ElementKind::Gate {
+                op: sim_core::GateOp::Buf,
+                ins: 1,
+            },
+            &[(0, 0), (0, 24), (4, 12), (10, 12)],
+        ),
+        // [VCC, GND, CLK, D, RST, Q, /Q]. RST tied high = never reset.
+        logic(
+            5,
+            ElementKind::FlipFlop { edge: true },
+            &[
+                (0, 0),
+                (0, 24),
+                (10, 12),
+                (20, 16),
+                (0, 0),
+                (18, 8),
+                (20, 16),
+            ],
+        ),
+        spec(6, r(1000.0), (18, 8), (0, 24)), // load on Q
+    ]);
+    v
+}
+
+/// A 4-bit shift register with `SER = NOR(Q0, Q1, Q2)`: a SELF-CORRECTING
+/// one-hot ring counter, and the part the synth's sequencer wants.
+///
+/// From the all-zeros power-up state the NOR of three lows is high, which
+/// injects exactly one 1 — so it self-starts with no seeding and no reset
+/// ritual. If noise ever produced two 1s they are squeezed out within four
+/// clocks. This is how a real Baby-8 sequencer is built, and it replaces the
+/// eight OTAs and four zeners the current `sequencer.rs` uses to turn a 555
+/// ramp into a one-hot code.
+pub fn shiftreg_ring4() -> Vec<ElementSpec> {
+    let mut v = logic_rail(5.0);
+    v.extend([
+        spec(
+            3,
+            ElementKind::VoltageSource {
+                dc: 2.5,
+                amp: 2.5,
+                hz: 500.0,
+                phase: 0.0,
+            },
+            (4, 12),
+            (0, 24),
+        ),
+        logic(
+            4,
+            ElementKind::Gate {
+                op: sim_core::GateOp::Buf,
+                ins: 1,
+            },
+            &[(0, 0), (0, 24), (4, 12), (10, 12)],
+        ),
+        // [VCC, GND, CLK, SER, RST, Q0..Q3]. RST tied high.
+        logic(
+            5,
+            ElementKind::ShiftReg { bits: 4 },
+            &[
+                (0, 0),
+                (0, 24),
+                (10, 12),
+                (30, 12),
+                (0, 0),
+                (20, 4),
+                (20, 8),
+                (20, 12),
+                (20, 16),
+            ],
+        ),
+        // [VCC, GND, Q0, Q1, Q2, Y] -> SER. The feedback that makes it a
+        // self-correcting ring.
+        logic(
+            6,
+            ElementKind::Gate {
+                op: sim_core::GateOp::Nor,
+                ins: 3,
+            },
+            &[(0, 0), (0, 24), (20, 4), (20, 8), (20, 12), (30, 12)],
+        ),
+        // A load on every step output, which is what a sequencer's pots are.
+        spec(7, r(10_000.0), (20, 4), (0, 24)),
+        spec(8, r(10_000.0), (20, 8), (0, 24)),
+        spec(9, r(10_000.0), (20, 12), (0, 24)),
+        spec(10, r(10_000.0), (20, 16), (0, 24)),
+    ]);
+    v
+}
+
+/// A 3-bit synchronous counter running full scale: Q2 divides the clock by
+/// eight. The octave divider a synth wants off its master clock.
+pub fn counter_div8() -> Vec<ElementSpec> {
+    let mut v = logic_rail(5.0);
+    v.extend([
+        spec(
+            3,
+            ElementKind::VoltageSource {
+                dc: 2.5,
+                amp: 2.5,
+                hz: 1000.0,
+                phase: 0.0,
+            },
+            (4, 12),
+            (0, 24),
+        ),
+        logic(
+            4,
+            ElementKind::Gate {
+                op: sim_core::GateOp::Buf,
+                ins: 1,
+            },
+            &[(0, 0), (0, 24), (4, 12), (10, 12)],
+        ),
+        // [VCC, GND, CLK, RST, Q0, Q1, Q2]. RST tied high.
+        logic(
+            5,
+            ElementKind::Counter {
+                bits: 3,
+                modulus: 8,
+            },
+            &[(0, 0), (0, 24), (10, 12), (0, 0), (20, 4), (20, 8), (20, 12)],
+        ),
+        spec(6, r(1000.0), (20, 12), (0, 24)),
+    ]);
+    v
+}
+
+/// A 4:1 analog mux with four DC levels on its channels, addressed by a
+/// 2-bit counter. Y drives a 10 kΩ load, so the selected channel's level
+/// appears at Y through the 50 Ω pass gate — and because the pass gate is a
+/// CONDUCTANCE, those levels are arbitrary analog voltages, not logic
+/// levels. That is the whole point of modelling a 4051 rather than a '153.
+pub fn mux4_select() -> Vec<ElementSpec> {
+    let mut v = logic_rail(5.0);
+    v.extend([
+        spec(
+            3,
+            ElementKind::VoltageSource {
+                dc: 2.5,
+                amp: 2.5,
+                hz: 1000.0,
+                phase: 0.0,
+            },
+            (4, 20),
+            (0, 24),
+        ),
+        logic(
+            4,
+            ElementKind::Gate {
+                op: sim_core::GateOp::Buf,
+                ins: 1,
+            },
+            &[(0, 0), (0, 24), (4, 20), (10, 20)],
+        ),
+        // [VCC, GND, CLK, RST, Q0, Q1] driving the two select lines.
+        logic(
+            5,
+            ElementKind::Counter {
+                bits: 2,
+                modulus: 4,
+            },
+            &[(0, 0), (0, 24), (10, 20), (0, 0), (16, 18), (16, 22)],
+        ),
+        // Four analog levels, deliberately NOT logic levels.
+        spec(6, dc(1.0), (24, 2), (0, 24)),
+        spec(7, dc(2.0), (24, 6), (0, 24)),
+        spec(8, dc(3.0), (24, 10), (0, 24)),
+        spec(9, dc(4.0), (24, 14), (0, 24)),
+        // [VCC, GND, I0..I3, S0, S1, Y]
+        logic(
+            10,
+            ElementKind::Mux { sel: 2 },
+            &[
+                (0, 0),
+                (0, 24),
+                (24, 2),
+                (24, 6),
+                (24, 10),
+                (24, 14),
+                (16, 18),
+                (16, 22),
+                (34, 8),
+            ],
+        ),
+        spec(11, r(10_000.0), (34, 8), (0, 24)),
+    ]);
+    v
+}
+
+/// An inverter run straight off a 9 V rail: 2 V over the 74HC absolute
+/// maximum, so the parasitic SCR fires and the part becomes 10 Ω across its
+/// own supply — 8.1 W into a 0.35 W package.
+///
+/// A golden rather than only a damage test, because latch-up is DISCRETE
+/// STATE that is sticky across substeps: it belongs on the cross-target
+/// harness for exactly the reason `noise_n` does.
+pub fn logic_latchup() -> Vec<ElementSpec> {
+    let mut v = logic_rail(9.0);
+    v.extend([
+        logic(
+            3,
+            ElementKind::Gate {
+                op: sim_core::GateOp::Not,
+                ins: 1,
+            },
+            &[(0, 0), (0, 24), (6, 8), (14, 8)],
+        ),
+        spec(4, r(10_000.0), (6, 8), (0, 24)),
+        spec(5, r(1000.0), (14, 8), (0, 24)),
+    ]);
+    v
+}
+
 /// Every golden circuit, for the determinism harness.
 pub fn all_golden() -> Vec<(&'static str, Vec<ElementSpec>)> {
     vec![
@@ -427,5 +718,11 @@ pub fn all_golden() -> Vec<(&'static str, Vec<ElementSpec>)> {
         ("photocell_dark", photocell_divider(0.0)),
         ("photocell_dim", photocell_divider(0.37)),
         ("photocell_lit", photocell_divider(1.0)),
+        ("gate_nand_dc", gate_nand_dc()),
+        ("dff_divide_by_2", dff_divide_by_2()),
+        ("shiftreg_ring4", shiftreg_ring4()),
+        ("counter_div8", counter_div8()),
+        ("mux4_select", mux4_select()),
+        ("logic_latchup", logic_latchup()),
     ]
 }

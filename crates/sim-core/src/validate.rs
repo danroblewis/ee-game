@@ -739,6 +739,47 @@ fn check_kind(kind: &ElementKind) -> Result<(), &'static str> {
             }
             Ok(())
         }
+        // The logic family. Every width here also decides a PIN COUNT, so a
+        // value out of range is not merely a silly part — it is a document
+        // whose pin list cannot match the model. `pin_count` clamps so it
+        // stays total; this is where the player finds out why.
+        K::Gate { op, ins } => {
+            if let Some(fixed) = op.fixed_ins() {
+                if ins != fixed {
+                    return Err("a buffer or inverter has exactly one input");
+                }
+            } else if !(1..=4).contains(&ins) {
+                return Err("a gate takes between 1 and 4 inputs");
+            }
+            Ok(())
+        }
+        // Nothing to range-check: `edge` picks edge-triggered flip-flop vs
+        // transparent latch, and both settings are valid parts.
+        K::FlipFlop { .. } => Ok(()),
+        K::ShiftReg { bits } => {
+            if !(2..=4).contains(&bits) {
+                return Err("a shift register is 2 to 4 bits wide - cascade two for 8");
+            }
+            Ok(())
+        }
+        K::Counter { bits, modulus } => {
+            if !(2..=4).contains(&bits) {
+                return Err("a counter is 2 to 4 bits wide");
+            }
+            // A modulus above 2^bits could never be reached, and one below 2
+            // would leave the counter stuck: both are a part that cannot do
+            // anything rather than a part that does something surprising.
+            if !(2..=(1u8 << bits)).contains(&modulus) {
+                return Err("the counter's modulus must be between 2 and 2^bits");
+            }
+            Ok(())
+        }
+        K::Mux { sel } => {
+            if !(1..=2).contains(&sel) {
+                return Err("a multiplexer has 1 or 2 select lines (2 or 4 channels)");
+            }
+            Ok(())
+        }
     }
 }
 

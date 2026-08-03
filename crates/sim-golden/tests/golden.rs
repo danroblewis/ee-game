@@ -936,25 +936,44 @@ fn refining_the_room_dt_never_makes_the_answer_worse() {
 /// in `docs/scale-baseline.md` before quoting "bit for bit" anywhere.
 #[test]
 fn with_both_levers_off_the_engine_is_the_pre_lever_engine_bit_for_bit() {
+    // RE-BASELINED ONCE, when the logic family landed, and this is the note
+    // that says it was safe.
+    //
+    // `state_hash` used to hash a fixed `MAX_PINS` pin-slots per element. The
+    // slots past a part's own `pin_count()` are structurally dead — nothing
+    // ever writes them — so they contributed a run of guaranteed zeros, but
+    // they made every digest here a function of the CEILING. Raising it from
+    // 6 to 10 for a 9-pin shift register therefore moved all 18, which would
+    // have destroyed exactly the provenance this test exists to carry.
+    //
+    // Before touching these numbers I checked the claim rather than assuming
+    // it: the current engine was hashed in the OLD shape (a fixed 6 slots) and
+    // reproduced all 18 of the previous digests EXACTLY, 18/18. So the engine's
+    // physical state is still bit-identical to the pre-island engine; only the
+    // digest's shape moved. The values below are the same states, hashed by
+    // `pin_count()`.
+    //
+    // It cannot happen again: the digest no longer mentions `MAX_PINS`, so the
+    // ceiling and the provenance are decoupled permanently.
     let want: &[(&str, u64)] = &[
-        ("demo_lamp", 0x8ea6635af49d7cac),
-        ("rc_step", 0x81501c4d4de6f40d),
-        ("rl_step", 0x3e87234f3f92f577),
-        ("rlc_ring", 0x73c8d122d5f0385d),
-        ("half_wave_rectifier", 0x80a7cfb690de1c7f),
-        ("npn_switch", 0x854cefa9a46cb938),
-        ("emitter_follower", 0x89aeff94fab2f084),
-        ("nmos_switch", 0x4514efde3a618625),
-        ("opamp_follower", 0x41e2e1d8df28af5c),
-        ("opamp_comparator", 0x539b9cdfa8b92244),
-        ("zener_regulator", 0xa3126d892895678f),
-        ("opamp_relaxation", 0x61d0292acee94cc4),
-        ("ota_vco", 0x6e972258d2b8fa35),
-        ("timer555_astable", 0x3a6caa090f0e09ae),
-        ("pot_divider", 0x690dcc11c656ea76),
-        ("led_loop", 0x20adc6d1dbcb0cfe),
-        ("motor_step", 0xef8d8ee93986bba0),
-        ("noise_rc", 0xde7b8af17db3ee3e),
+        ("demo_lamp", 0x26639ed708949eb2),
+        ("rc_step", 0xfeb99464a4692742),
+        ("rl_step", 0xf13c12d96068c10d),
+        ("rlc_ring", 0x8f28c8a7c8103e74),
+        ("half_wave_rectifier", 0x7cd85f59a06d992e),
+        ("npn_switch", 0x803fd0a436d800ed),
+        ("emitter_follower", 0x994d15b6344c583d),
+        ("nmos_switch", 0x556570d232acd154),
+        ("opamp_follower", 0xf7889d7a1900e92e),
+        ("opamp_comparator", 0xef1ebb70bf3ef665),
+        ("zener_regulator", 0x0dc6f82d8d8ab1d9),
+        ("opamp_relaxation", 0x8d4a73a1f30be841),
+        ("ota_vco", 0x42e3f319321f44d7),
+        ("timer555_astable", 0x6bcb48371102e492),
+        ("pot_divider", 0x90b2fca650426e51),
+        ("led_loop", 0x4dabf8ed7ebac6a4),
+        ("motor_step", 0xa9acbdeac931cb13),
+        ("noise_rc", 0x6ada062a5993bfad),
     ];
     // The determinism harness's own protocol: 1 us, 10k steps, every golden
     // circuit, in order.

@@ -81,15 +81,17 @@
 // pointer hit-tests go through the grid-space spatial index in spatial.ts,
 // and the zoom band 0.4..200 px/unit drops symbol detail below ~6 px/unit.
 
-import init, { Sim, checkEdit } from './wasm/sim_wasm';
+import init, { Sim, checkEdit, frameStride } from './wasm/sim_wasm';
 import {
   demoCircuit,
   MAX_PINS,
+  FRAME_STRIDE,
   unpackFrame,
   type DocOp,
   type ElementKind,
   type ElementSpec,
   type ElemLive,
+  type GateOp,
   type InteractOp,
   type Point,
 } from './circuit';
@@ -217,6 +219,15 @@ const PART_HOTKEYS: Record<string, string> = {
   B: 'Button',
   t: 'Potentiometer',
   y: 'Photocell',
+  // The logic family. All 26 unshifted letters were already taken, so these
+  // are shifted; the names match the catalogue entries exactly.
+  D: 'NAND Gate',
+  I: 'Inverter',
+  F: 'D Flip-Flop',
+  L: 'D Latch',
+  S: 'Shift Register',
+  C: 'Counter',
+  U: 'Multiplexer',
 };
 
 // Read `?stdvalues=` BEFORE anything can rewrite the query string. `rooms.ts`
@@ -229,6 +240,19 @@ const PART_HOTKEYS: Record<string, string> = {
 stdValuesMode();
 
 await init();
+
+// The frame stream is walked in fixed-size records, so `FRAME_STRIDE` here and
+// `sim_core::FRAME_STRIDE` there must agree EXACTLY. If they drift by one slot
+// every element after the first is read from the wrong offsets — voltages
+// arriving as currents, currents as power — with no error anywhere and every
+// number on screen quietly wrong. Raising MAX_PINS for a wider chip is now an
+// ordinary thing to do, so assert it instead of trusting the mirror.
+if (frameStride() !== FRAME_STRIDE) {
+  throw new Error(
+    `frame stride mismatch: wasm says ${frameStride()}, client says ${FRAME_STRIDE} ` +
+      `— update MAX_PINS in circuit.ts to match sim_core::MAX_PINS`,
+  );
+}
 
 // ---------------------------------------------------------------- state
 let elements: ElementSpec[] = demoCircuit();
@@ -1592,7 +1616,23 @@ const FIELD_LABELS: Record<string, string> = {
   // first faked number in the project.
   r_dark: 'dark',
   r_lit: 'lit',
+  // The logic family's own parameters.
+  op: 'function',
+  ins: 'inputs 1-4',
+  edge: 'edge triggered',
+  bits: 'bits 2-4',
+  modulus: 'counts to',
+  sel: 'select lines 1-2',
 };
+/** Gate functions, in menu order. Mirrors `sim_core::GateOp`. */
+const GATE_OPS: GateOp[] = ['And', 'Nand', 'Or', 'Nor', 'Xor', 'Xnor', 'Buf', 'Not'];
+
+/** Parameters that decide how many pins a part has. `SetKind` refuses any
+ *  change to the pin count (the footprint would have to move under the
+ *  wires), so the panel shows these read-only instead of offering an edit
+ *  the server will drop on the floor. */
+const WIDTH_FIELDS = new Set(['ins', 'bits', 'sel']);
+
 
 /** A property field that carries a physical quantity.
  *
@@ -1774,6 +1814,43 @@ function buildProps(host: HTMLElement, target: ElementSpec, onClose?: () => void
         editDoc({ t: 'SetKind', id: target.id, kind });
         mark(kind);
       };
+      label.appendChild(input);
+      host.appendChild(label);
+    } else if (typeof value === 'string') {
+      // A string field is an enum (only `Gate.op` today), so it gets a menu
+      // rather than a text box — and the menu lists ONLY the options that
+      // keep the part's pin count, because `SetKind` refuses a width change
+      // and a control that silently does nothing is worse than no control.
+      // Swapping a NAND for an inverter is placing a different part, not
+      // editing this one.
+      const sel = document.createElement('select');
+      const width = pinCount(target.kind);
+      for (const opt of GATE_OPS) {
+        const cand = { ...target.kind, [field]: opt } as ElementSpec['kind'];
+        if (pinCount(cand) !== width) continue;
+        const o = document.createElement('option');
+        o.value = opt;
+        o.textContent = opt.toUpperCase();
+        o.selected = opt === value;
+        sel.appendChild(o);
+      }
+      sel.onchange = () => {
+        const kind = { ...target.kind, [field]: sel.value } as ElementSpec['kind'];
+        editDoc({ t: 'SetKind', id: target.id, kind });
+        mark(kind);
+      };
+      label.appendChild(sel);
+      host.appendChild(label);
+    } else if (WIDTH_FIELDS.has(field)) {
+      // Fields that decide a PIN COUNT cannot be retargeted in place: the
+      // footprint would have to change under the wires. Shown, so the part
+      // stays legible, and disabled with the reason, rather than offered and
+      // then refused by the server.
+      const input = document.createElement('input');
+      input.type = 'number';
+      input.value = String(value);
+      input.disabled = true;
+      input.title = 'changes the pin count - place a different part instead';
       label.appendChild(input);
       host.appendChild(label);
     } else {

@@ -214,6 +214,14 @@ export const VOICES: { readonly [K in BreakableKind]?: BreakVoice } = {
   Nmos: SEMI,
   Pmos: SEMI,
   Timer555: IC,
+  // The CMOS logic family shares the 555's voice: it is the same DIP in the
+  // same package, and it dies the same way — a shorted output or a latched
+  // supply cooks the plastic rather than popping a junction.
+  Gate: IC,
+  FlipFlop: IC,
+  ShiftReg: IC,
+  Counter: IC,
+  Mux: IC,
   Speaker: SPEAKER,
   Motor: MOTOR,
   VoltageSource: SUPPLY,
