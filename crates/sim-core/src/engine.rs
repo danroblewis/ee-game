@@ -1345,6 +1345,23 @@ impl Engine {
                 if *light != new {
                     *light = new;
                     invalidate = true;
+                    // AND WAKE THE ISLAND, exactly as `Wiper` does one arm
+                    // up. A DC circuit goes quiet within a second of being
+                    // drawn, and refactoring a SLEEPING island changes
+                    // nothing a player can see: it stamps no `build()` and
+                    // runs no solve, so every reading after the circuit
+                    // settled was discarded in silence. A camera could only
+                    // ever move a circuit that something else was already
+                    // keeping awake.
+                    //
+                    // This is a perturbation from outside, which is the one
+                    // thing `wake()` is for — and it is still not an EDIT:
+                    // `wake()` touches neither `quarantined` nor
+                    // `be_steps`, so a driven part cannot resurrect a
+                    // diverged room 30 times a second. The `!=` guard above
+                    // keeps a still scene free, so an unchanged reading
+                    // still wakes nothing.
+                    changed = true;
                 }
             }
             (ParamWrite::Switch { closed }, ElementKind::Switch { closed: c }) => {

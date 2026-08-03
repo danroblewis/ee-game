@@ -255,6 +255,11 @@ export function drawSensorLayers(
   viewW: number,
   viewH: number,
   viewTop = 0,
+  /** MY camera is up but no frame has arrived for a while. A track can sit
+   *  at `readyState: "live"` forever and send nothing, and a plate reading
+   *  "● LIVE" over a black rectangle is a false statement, not a missing
+   *  one. Only ever true for the layer this client drives. */
+  stalled = false,
 ) {
   if (layers.length === 0) return;
   ctx.save();
@@ -301,7 +306,9 @@ export function drawSensorLayers(
     if (plate) {
       const [px, py, pw, ph] = plate;
       const label = live
-        ? `● LIVE — ${l.name} — click to stop`
+        ? stalled
+          ? `● NO FRAMES — ${l.name} — click to stop`
+          : `● LIVE — ${l.name} — click to stop`
         : driver !== undefined && !mine
           ? `${l.name} — driven by player ${driver}`
           : `▶ ${l.name} — click for camera`;

@@ -76,6 +76,11 @@ export class CameraSource {
   /** The in-flight `start()`. A second click must JOIN it, not be told "yes"
    *  and handed nothing — see `start()`. */
   private pending: Promise<boolean> | null = null;
+  /** When the track went live, and when the sampler last saw a frame. The
+   *  two together are the only evidence that a "live" camera is real — see
+   *  `silentMs()`. */
+  private liveAt = 0;
+  private lastFrameAt = 0;
 
   constructor(private onChange: () => void) {}
 
@@ -98,6 +103,24 @@ export class CameraSource {
 
   isLive(): boolean {
     return this.status.state === 'live';
+  }
+
+  /**
+   * How long the sampler has gone WITHOUT A FRAME, in ms. Zero when the
+   * camera is off.
+   *
+   * A track can be `readyState: "live"` and deliver nothing at all, forever —
+   * a camera another app has grabbed, a virtual device with no producer, a
+   * headless Chrome whose fake device was killed by `--disable-gpu`. The
+   * status already carried `frames` with a comment saying "zero while live
+   * means the track is delivering nothing", and nothing ever read it: the
+   * plate said LIVE and the chip said LIVE over a black rectangle, which is
+   * worse than saying nothing, because it is a claim that is false.
+   */
+  silentMs(): number {
+    if (this.status.state !== 'live') return 0;
+    const since = this.lastFrameAt || this.liveAt;
+    return since === 0 ? 0 : performance.now() - since;
   }
 
   /**
@@ -244,6 +267,8 @@ export class CameraSource {
         return false;
       }
     }
+    this.liveAt = performance.now();
+    this.lastFrameAt = 0;
     this.set({
       state: 'live',
       autoExposure: auto,
@@ -303,6 +328,10 @@ export class CameraSource {
     if (m.t === 's' && m.ids && m.vs) {
       for (let i = 0; i < m.ids.length; i++) this.readings.set(m.ids[i]!, m.vs[i]!);
       this.status.frames++;
+      // Liveness, counted even when the frame drove nothing: a camera with no
+      // photocell under it yet is still a working camera, and must not be
+      // reported as a dead one.
+      this.lastFrameAt = performance.now();
       if (typeof m.ms === 'number') {
         // EMA over ~60 frames, so the HUD reports a real cost rather than
         // one lucky frame.

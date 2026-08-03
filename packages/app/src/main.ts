@@ -1255,10 +1255,43 @@ function syncSensorChrome() {
   }
   const n = apertureScratch.length;
   sensorChip.style.display = 'flex';
+  // A TRACK THAT DELIVERS NOTHING still reports `readyState: "live"`, so
+  // "live" on its own is not a claim this chip is entitled to make. When no
+  // frame has arrived for `CAMERA_SILENT_MS` the chip stops saying LIVE and
+  // says what is actually true instead — the alternative is a black
+  // rectangle under a label insisting the camera works.
+  const silent = camera.silentMs();
+  if (silent > CAMERA_SILENT_MS) {
+    sensorChip.textContent =
+      `● CAMERA DELIVERING NO FRAMES for ${(silent / 1000).toFixed(0)}s — ` +
+      'the device is on but sending nothing; every sensor reads dark · click to stop';
+    return;
+  }
   sensorChip.textContent =
     `● CAMERA LIVE — driving ${n} sensor${n === 1 ? '' : 's'} · ` +
     `${st.msPerFrame.toFixed(2)} ms/frame · click to stop` +
     (st.autoExposure ? ' · AUTO-EXPOSURE fights the sensor' : '');
+}
+
+/** How long a live track may deliver nothing before the UI stops calling it
+ *  live. Generous: a real camera can take a moment to produce its first
+ *  frame, and crying dead on a slow start would be its own lie. */
+const CAMERA_SILENT_MS = 2500;
+
+/** Re-render the chip when, and only when, the stalled state flips. The chip
+ *  is a DOM write, so it must not happen every tick just to age a counter;
+ *  but a camera that dies while the document is untouched fires no other
+ *  event, so something has to notice. `pumpSensors` already runs at 30 Hz. */
+let cameraWasSilent = false;
+function watchCameraLiveness() {
+  const silent = camera.isLive() && camera.silentMs() > CAMERA_SILENT_MS;
+  if (silent !== cameraWasSilent) {
+    cameraWasSilent = silent;
+    if (silent) toast('the camera is on but delivering no frames — every sensor is reading dark');
+    syncSensorChrome();
+  } else if (silent) {
+    syncSensorChrome(); // the counter is part of the message
+  }
 }
 
 /**
@@ -1285,6 +1318,7 @@ const sensorAge = new Map<number, number>();
 const sensorBatch: [number, number][] = [];
 
 function pumpSensors() {
+  watchCameraLiveness();
   if (!camera.isLive()) {
     sensorLastSent.clear();
     sensorAge.clear();
@@ -4154,6 +4188,7 @@ function frame(now: number) {
     camera.previewEl(),
     mouse ? (layerPlateAt(cam, layers, mouse.x, mouse.y, ...plateView())?.lid ?? null) : null,
     ...plateView(),
+    camera.isLive() && camera.silentMs() > CAMERA_SILENT_MS,
   );
   if (layerDrag) {
     drawLayerGhost(ctx, cam, layerDrag.a, layerDrag.b, normLayerRect(layerDrag.a, layerDrag.b) !== null);
