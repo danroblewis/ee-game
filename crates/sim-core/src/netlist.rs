@@ -188,7 +188,64 @@ pub enum ElementKind {
         ohms: f64,
         seed: u32,
     },
+    /// Light-dependent resistor (CdS cell). Stamps exactly like a `Resistor`;
+    /// what makes it a different device is where its resistance comes from.
+    ///
+    /// `light` is NORMALIZED illumination in 0..1 — not lux, and nothing may
+    /// ever print it as one. Resistance falls LOG-linearly from `r_dark` at
+    /// light = 0 to `r_lit` at light = 1, which is how a real cell behaves
+    /// (log R is linear in log E over the cell's decade range).
+    ///
+    /// `light` is an INPUT to the electrical model, exactly the way
+    /// `Motor::bemf` is: the optical side lives outside sim-core and writes
+    /// the fraction back through `Engine::write_param` at the tick boundary.
+    /// **sim-core owns no optical state — it only ever sees a fraction.** It
+    /// has no idea a camera, a microphone or a gamepad exists, which is the
+    /// whole reason an external input cannot touch determinism.
+    ///
+    /// It is `serde(skip)` because a READING is world state, not document
+    /// state: `r_dark`/`r_lit` are the part's calibration and persist, the
+    /// illumination does not. A saved room loads DARK — a circuit that was
+    /// lit is dark again until somebody points a camera at it, rather than
+    /// loading with a light nobody is shining.
+    Photocell {
+        /// Resistance with no light on it. This is also the REST value: no
+        /// camera, no claim, no player — the cell reads dark.
+        r_dark: f64,
+        /// Resistance under full illumination.
+        r_lit: f64,
+        #[cfg_attr(feature = "serde", serde(skip))]
+        light: f64,
+    },
 }
+
+/// A photocell's resistance at a given illumination: log-linear between
+/// `r_dark` (light = 0) and `r_lit` (light = 1).
+///
+/// `libm` only — the same envelope the diode's `exp` already runs in — so
+/// native and wasm32 produce bit-identical resistances. No `mul_add`.
+pub fn photocell_ohms(r_dark: f64, r_lit: f64, light: f64) -> f64 {
+    let l = if light.is_finite() {
+        light.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let d = r_dark.max(MIN_PHOTOCELL_OHMS);
+    let t = r_lit.max(MIN_PHOTOCELL_OHMS);
+    if l == 0.0 {
+        return d;
+    }
+    if l == 1.0 {
+        return t;
+    }
+    let ln_d = libm::log(d);
+    libm::exp(ln_d + l * (libm::log(t) - ln_d))
+}
+
+/// Floor for either end of a photocell's range. The gate enforces
+/// `MIN_OHMS`; this is the belt-and-braces floor the stamp itself applies so
+/// a hand-edited save can never put `1/0` into the matrix.
+pub const MIN_PHOTOCELL_OHMS: f64 = 1e-6;
 
 impl ElementKind {
     /// The document tag — the `t` field serde writes, and the same string the
@@ -225,6 +282,7 @@ impl ElementKind {
             Potentiometer { .. } => "Potentiometer",
             Motor { .. } => "Motor",
             Noise { .. } => "Noise",
+            Photocell { .. } => "Photocell",
         }
     }
 
@@ -457,4 +515,14 @@ pub enum ParamWrite {
     /// Switch position. Changes the branch-unknown count, so it needs the
     /// full compile path — but only when the position actually differs.
     Switch { closed: bool },
+    /// Photocell illumination (0..1). Changes a conductance, never the
+    /// topology: invalidates the factorization only, and only when the value
+    /// actually moves — a camera pointed at a still wall refactors nothing.
+    ///
+    /// It cannot make the matrix singular: R is finite and non-zero across
+    /// the whole declared range, and the placement gate has already trialled
+    /// BOTH ends of that range (`validate::pin_at_peak`). That is the same
+    /// argument the hoist's `Wiper` write rests on — the guarantee is made at
+    /// placement time, so the per-tick write needs no gate.
+    Light { light: f64 },
 }

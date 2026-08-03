@@ -298,6 +298,17 @@ function buildCard(root: HTMLElement, reset: () => void): Card {
   const score = div('goal-score', body);
   score.style.display = 'none';
 
+  // The external-drive notice. Deliberately a permanent line on the card and
+  // not a toast: a run that was driven from outside stays labelled for as
+  // long as it lasts, so nobody has to remember how it was flown.
+  const ext = div('goal-score', body);
+  ext.style.display = 'none';
+  ext.style.color = '#ffd67a';
+  ext.textContent =
+    'EXTERNALLY DRIVEN — UNSCORED. A sensor is a legitimate way to run a ' +
+    'circuit, but this goal is about closing the loop IN the circuit. ' +
+    'Reset to try it on its own.';
+
   const row = div('goal-row', body);
   const btn = document.createElement('button');
   btn.className = 'goal-reset';
@@ -395,6 +406,10 @@ function buildCard(root: HTMLElement, reset: () => void): Card {
       const inBand = m.y >= m.band[0] && m.y <= m.band[1];
       badge.textContent = at.stale ? 'NO LINK' : m.win ? 'HELD' : inBand ? 'IN BAND' : 'OUT';
       badge.className = `goal-badge${at.stale ? '' : m.win ? ' win' : inBand ? ' in' : ''}`;
+      // An externally driven run is not cheating and is not refused — but it
+      // is not the goal this card sets either, and the player is told so from
+      // the first sensor write rather than at win time. Reset clears it.
+      ext.style.display = m.ext ? 'block' : 'none';
 
       // Height and speed go through the same formatter as everything else,
       // because the hand-rolled `* 1000 .toFixed(0)` printed `0 mm/s` for a

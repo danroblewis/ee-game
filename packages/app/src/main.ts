@@ -48,6 +48,20 @@
 //                         part to put it back into service (parts break when
 //                         you overload them — the server decides, from the
 //                         solver, and says so with a toast)
+//   Y / ⇧Y                the external-input pair. ⇧Y drags out a CAMERA
+//                         LAYER — a rectangle of the world you point a real
+//                         camera at (click its plate to allow the camera;
+//                         that click is the only thing in this app that ever
+//                         asks for one, and clicking again stops it). Y
+//                         places a PHOTOCELL: drop it on the layer and it
+//                         reads the light in the patch it covers, which the
+//                         server turns into a real resistance in the real
+//                         solve. No pixels leave your browser — the wire
+//                         carries one integer per cell per tick, and the
+//                         other players see the reading, never the picture.
+//                         Every external input is a 30 Hz signal (15 Hz of
+//                         bandwidth): loudness can dim a lamp, a whistle
+//                         cannot be a waveform.
 //   J                     drag a control-panel region around some parts
 //                         (its floating instrument window follows) — a scope
 //                         parked inside a region becomes a widget in that
@@ -161,6 +175,18 @@ import {
   seriesExplainer,
   stdValuesMode,
 } from './eseries';
+import {
+  applyLayerOp,
+  aperturesOn,
+  drawLayerGhost,
+  drawSensorLayers,
+  layerPlateAt,
+  normLayerRect,
+  type Aperture,
+  type Layer,
+  type LayerOp,
+} from './layer';
+import { CameraSource } from './sensor';
 
 const DT = 10e-6;
 const MAX_STEPS_PER_FRAME = 4000; // local-mode wall budget
@@ -190,6 +216,7 @@ const PART_HOTKEYS: Record<string, string> = {
   b: 'Lamp',
   B: 'Button',
   t: 'Potentiometer',
+  y: 'Photocell',
 };
 
 // Read `?stdvalues=` BEFORE anything can rewrite the query string. `rooms.ts`
@@ -232,6 +259,14 @@ let damageSeen = false;
 let probes: Probe[] = [];
 /** Shared control-panel regions (room-scoped, like probes). */
 let panels: Panel[] = [];
+
+// ---- EXTERNAL INPUTS. `layers` and `claims` are ROOM state (the server's
+// broadcast is the truth); the camera behind a layer is this browser's alone
+// and is never replicated, never described on the wire, never restored.
+let layers: Layer[] = [];
+/** lid -> the client id driving it. Session-scoped: a reload drops it. */
+let claims = new Map<number, number>();
+let localLidCounter = 1;
 /** What a control panel is pointing at: hovering a row (or a whole window)
  * highlights the part out on the canvas. Set by panel.ts on enter/leave. */
 let panelHover: PanelHover | null = null;
@@ -481,8 +516,15 @@ function resetForRoom(room: RoomHello | null) {
   pasting = null;
   placing = null;
   panelTool = false;
+  layerTool = false;
   repairing = false;
   canvas.style.cursor = 'default';
+  // Leaving a room STOPS the camera. A capture must never outlive the place
+  // it was pointed at; the next room's `hello` brings its own layers.
+  camera.stop();
+  layers = [];
+  claims = new Map();
+  localLidCounter = 1;
   listenWanted = null;
   audio.stop();
   damage = new Map();
@@ -633,6 +675,25 @@ const net = connect({
   },
   onPanels(list) {
     panels = list;
+  },
+  onLayers(list, cl) {
+    layers = list;
+    claims = new Map(cl);
+    // Lost the claim (released, taken, or the layer was deleted)? The camera
+    // now has nothing to drive, so it STOPS — hardware indicator and all.
+    // A capture with no purpose is a capture that should not be running.
+    if (camera.isLive() && ![...claims.values()].includes(myId)) camera.stop();
+    pushApertures();
+  },
+  onSensors(list) {
+    // EVERY client applies these, not just the one holding the camera: a
+    // photocell is room state and everybody watches it move. The value is
+    // the server's, straight out of `ParamWrite::Light`, so nobody is ever
+    // looking at a locally-guessed number — the design pillar, unbent.
+    for (const [id, q] of list) {
+      const e = elemById(id);
+      if (e && e.kind.t === 'Photocell') e.kind.light = q / 65535;
+    }
   },
   onMachine(m) {
     hoist.onMachine(m);
@@ -1021,6 +1082,193 @@ function panelOp(op: PanelOp) {
   });
 }
 
+// ------------------------------------------------------- external inputs
+//
+// THE PLAYER'S WHOLE INTERACTION, end to end:
+//
+//   1. press ⇧Y and drag out a rectangle — a CAMERA LAYER in the world;
+//   2. click its plate: the browser asks for the camera (that click IS the
+//      consent gesture, and nothing else in this app ever calls
+//      getUserMedia);
+//   3. press Y and drop a PHOTOCELL on top of the video;
+//   4. wire it into a circuit. Wave at the camera and the circuit responds.
+//
+// There is no binding dialog and there must never be one. Which part reads
+// which patch is re-derived from geometry every time the document or the
+// layer moves — drag the part off and it goes dark, drag it back and it
+// reads again.
+
+/** Layers are room state: online the server owns the list, offline the same
+ *  rules run locally (so the whole feature works with no server at all). */
+function layerOp(op: LayerOp) {
+  if (online) {
+    net.sendLayer(op);
+    return;
+  }
+  layers = applyLayerOp(layers, op, () => {
+    for (const l of layers) localLidCounter = Math.max(localLidCounter, l.lid + 1);
+    return localLidCounter++;
+  });
+  pushApertures();
+}
+
+/** The layer this client is driving, if any. */
+const myLayer = (): Layer | null =>
+  layers.find((l) => claims.get(l.lid) === myId) ?? (online ? null : (layers[0] ?? null));
+
+/** Reused across every push: this runs on document edits and layer moves,
+ *  and it must not litter. */
+const apertureScratch: Aperture[] = [];
+
+/** Re-derive which parts are over the driven layer and hand the sampler the
+ *  new geometry. Cheap, and called from edits — never from the draw loop. */
+function pushApertures() {
+  const l = myLayer();
+  if (!l || !camera.isLive()) return;
+  aperturesOn(l, elements, apertureScratch);
+  camera.setApertures(apertureScratch, (l.x1 - l.x0) / (l.y1 - l.y0));
+}
+
+/** This browser's camera. Constructed here, started only from a click. */
+const camera = new CameraSource(() => {
+  syncSensorChrome();
+  pushApertures();
+});
+
+/** Claim a layer and open the camera. MUST be called from a user gesture. */
+async function claimLayer(l: Layer) {
+  const holder = claims.get(l.lid);
+  if (holder !== undefined && holder !== myId) {
+    toast(`${l.name} is already driven by player ${holder}`);
+    return;
+  }
+  if (camera.isLive() && holder === myId) {
+    stopSensing();
+    return;
+  }
+  if (online) net.sendLayerClaim(l.lid, true);
+  else claims.set(l.lid, myId);
+  const ok = await camera.start();
+  if (!ok) {
+    if (online) net.sendLayerClaim(l.lid, false);
+    else claims.delete(l.lid);
+    const st = camera.getStatus();
+    toast(
+      st.state === 'denied'
+        ? 'camera refused — nothing was captured'
+        : `no camera here (${st.detail})`,
+    );
+  }
+  syncSensorChrome();
+  pushApertures();
+}
+
+/** ONE stop, always reachable, and it really stops the hardware. Every
+ *  photocell it was driving falls dark within a tick, visibly, for everyone
+ *  in the room — so switching your camera off is legible to the other
+ *  players and not just to you. */
+function stopSensing() {
+  const l = myLayer();
+  camera.stop();
+  if (l) {
+    if (online) net.sendLayerClaim(l.lid, false);
+    else claims.delete(l.lid);
+  }
+  syncSensorChrome();
+}
+
+// Auto-stop: a camera must not stay live because a tab was left open.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden' && camera.isLive()) stopSensing();
+});
+
+/**
+ * The live indicator. Persistent and non-dismissible for as long as a track
+ * is live — the browser's own tab dot is necessary and nowhere near
+ * sufficient when it is the GAME asking for the camera.
+ */
+const sensorChip = document.createElement('div');
+sensorChip.style.cssText =
+  'position:fixed;left:50%;transform:translateX(-50%);bottom:14px;z-index:60;display:none;' +
+  'align-items:center;gap:10px;padding:7px 12px;border-radius:20px;cursor:pointer;' +
+  'background:#3a1216;border:1px solid #ff5a5a;color:#ffd2d2;font:12px ui-monospace,monospace';
+sensorChip.onclick = () => stopSensing();
+document.body.appendChild(sensorChip);
+
+function syncSensorChrome() {
+  const st = camera.getStatus();
+  if (st.state !== 'live') {
+    sensorChip.style.display = 'none';
+    return;
+  }
+  const n = apertureScratch.length;
+  sensorChip.style.display = 'flex';
+  sensorChip.textContent =
+    `● CAMERA LIVE — driving ${n} sensor${n === 1 ? '' : 's'} · ` +
+    `${st.msPerFrame.toFixed(2)} ms/frame · click to stop` +
+    (st.autoExposure ? ' · AUTO-EXPOSURE fights the sensor' : '');
+}
+
+/**
+ * THE SENDER. One message per tick, at most, carrying `[[id, q]]` and
+ * nothing else.
+ *
+ * Deliberately a timer and NOT the render loop: an external input must never
+ * be able to make a frame late, and the render loop must never be the thing
+ * that decides how fast a sensor streams. 30 Hz because the server retires
+ * one write per part per tick and the tick is 30 Hz — sending faster buys
+ * exactly nothing.
+ */
+const SENSOR_HZ = 30;
+/** Below this many u16 counts, a reading has not moved. ~0.15% of full
+ *  scale: it kills sensor noise on a still scene (and with it the server's
+ *  refactorization) without being visible in a circuit. */
+const SENSOR_DEADBAND = 100;
+/** Resend an unchanged value at least this often anyway — the server fails a
+ *  part to dark after 3 silent ticks, and a still scene is not a dead one. */
+const SENSOR_KEEPALIVE_TICKS = 2;
+
+const sensorLastSent = new Map<number, number>();
+const sensorAge = new Map<number, number>();
+const sensorBatch: [number, number][] = [];
+
+function pumpSensors() {
+  if (!camera.isLive()) {
+    sensorLastSent.clear();
+    sensorAge.clear();
+    return;
+  }
+  const l = myLayer();
+  if (!l) return;
+  sensorBatch.length = 0;
+  for (const a of apertureScratch) {
+    const v = camera.read(a.id);
+    if (v === null) continue;
+    const q = Math.max(0, Math.min(65535, Math.round(v * 65535)));
+    const was = sensorLastSent.get(a.id);
+    const age = (sensorAge.get(a.id) ?? 99) + 1;
+    if (was !== undefined && Math.abs(q - was) < SENSOR_DEADBAND && age < SENSOR_KEEPALIVE_TICKS) {
+      sensorAge.set(a.id, age);
+      continue;
+    }
+    sensorLastSent.set(a.id, q);
+    sensorAge.set(a.id, 0);
+    sensorBatch.push([a.id, q]);
+    // Offline there is no server to write it, so the local sim gets the same
+    // value through the same clamp — one code path, two hosts.
+    if (!online) {
+      const e = elemById(a.id);
+      if (e && e.kind.t === 'Photocell') e.kind.light = q / 65535;
+    }
+  }
+  // Once per tick, not once per sensor: offline this is a full recompile,
+  // which is the local sim's only way in.
+  if (!online && sensorBatch.length > 0) localSim.setElements(elements);
+  if (online && sensorBatch.length > 0) net.sendSensor(sensorBatch);
+  syncSensorChrome();
+}
+window.setInterval(pumpSensors, 1000 / SENSOR_HZ);
+
 /** The floating instrument windows. panel.ts owns all DOM and widget logic;
  * we only hand it the shared list, the document, the live frame, the probe
  * traces (for scopes a region encloses) and the interact path. The
@@ -1192,7 +1440,16 @@ function fitHome() {
 /** shift+H: frame the whole document, however far it sprawls. */
 function fitAll() {
   const b = pinBounds(elements);
-  if (b) fitRect(...b, MIN_SCALE, 60);
+  // Sensor layers count as content. A room whose parts sit below a camera
+  // layer must frame BOTH, or ⇧H hides the very thing the parts are reading
+  // — and a room that is nothing but a layer must still frame something.
+  let r = b;
+  for (const l of layers) {
+    r = r
+      ? [Math.min(r[0], l.x0), Math.min(r[1], l.y0), Math.max(r[2], l.x1), Math.max(r[3], l.y1)]
+      : [l.x0, l.y0, l.x1, l.y1];
+  }
+  if (r) fitRect(...r, MIN_SCALE, 60);
   else fitHome();
 }
 
@@ -1321,11 +1578,20 @@ const FIELD_LABELS: Record<string, string> = {
   rail: 'rail ±',
   isc: 'out limit',
   wiper: 'wiper 0-1',
+  // The unit letter is dropped from these labels on purpose: the value field
+  // itself now renders "9 V" / "1 MΩ" through `units.ts`, so repeating it in
+  // the label just says the same thing twice.
   volts: 'amplitude ±',
   // A motor's back-EMF constant had NO entry here, so it rendered with its
   // raw serde field name.
   bemf: 'back-EMF K',
   seed: 'seed (whole)',
+  // The photocell's CALIBRATION — the two ends of its travel. Its reading is
+  // not here and must never be: `light` is world state, written by whoever
+  // has a camera on it, and a text box that pretended otherwise would be the
+  // first faked number in the project.
+  r_dark: 'dark',
+  r_lit: 'lit',
 };
 
 /** A property field that carries a physical quantity.
@@ -2199,6 +2465,14 @@ function canvasMenu(x: number, y: number): MenuItem[] {
     { sep: true },
     { label: 'Oscilloscope here', hint: 'O', run: () => addFloatScope(snap(x, y)) },
     { label: 'Control panel here', hint: 'J', run: () => (panelTool = true) },
+    {
+      label: 'Camera layer here',
+      hint: '⇧Y',
+      run: () => {
+        layerTool = true;
+        canvas.style.cursor = 'crosshair';
+      },
+    },
     { sep: true },
     { label: 'Select all', run: selectAll },
     { sep: true },
@@ -2269,6 +2543,10 @@ let buttonHeld: ElementSpec | null = null;
 /** J tool: dragging out a new control-panel region. */
 let panelTool = false;
 let panelDrag: { a: Point; b: Point } | null = null;
+
+/** ⇧Y: drag out a camera layer. */
+let layerTool = false;
+let layerDrag: { a: Point; b: Point } | null = null;
 /** Dragging an existing region by its name tab. */
 let panelMove: {
   plid: number;
@@ -2468,6 +2746,22 @@ canvas.addEventListener('pointerdown', (ev) => {
     if (e) repair(e.id);
     return;
   }
+  if (layerTool) {
+    const p = snap(ev.clientX, ev.clientY);
+    layerDrag = { a: p, b: p };
+    return;
+  }
+  {
+    // The layer's name plate is the ONLY thing that opens a camera, and this
+    // click is the user gesture the browser requires. Never on load, never on
+    // join, never restored from storage.
+    const l = layerPlateAt(cam, layers, ev.clientX, ev.clientY);
+    if (l) {
+      if (ev.shiftKey) layerOp({ t: 'remove', lid: l.lid });
+      else void claimLayer(l);
+      return;
+    }
+  }
   if (panelTool) {
     const p = snap(ev.clientX, ev.clientY);
     panelDrag = { a: p, b: p };
@@ -2647,6 +2941,10 @@ canvas.addEventListener('pointermove', (ev) => {
     const [gx, gy] = toGrid(ev.clientX, ev.clientY);
     scopeResize.s.w = Math.max(6, Math.round(gx - scopeResize.s.x));
     scopeResize.s.h = Math.max(4, Math.round(gy - scopeResize.s.y));
+    return;
+  }
+  if (layerDrag) {
+    layerDrag.b = snap(ev.clientX, ev.clientY);
     return;
   }
   if (panelDrag) {
@@ -2829,6 +3127,17 @@ canvas.addEventListener('pointerup', (ev) => {
   if (scopeDrag || scopeResize) {
     scopeDrag = null;
     scopeResize = null;
+    return;
+  }
+  if (layerDrag) {
+    const r = normLayerRect(layerDrag.a, layerDrag.b);
+    layerDrag = null;
+    if (r) {
+      layerTool = false;
+      canvas.style.cursor = 'default';
+      layerOp({ t: 'add', x0: r[0], y0: r[1], x1: r[2], y1: r[3] });
+      toast('camera layer placed — click its plate to point a camera at it');
+    }
     return;
   }
   if (panelDrag) {
@@ -3025,6 +3334,8 @@ window.addEventListener('keydown', (ev) => {
     pasting = null;
     panelTool = false;
     panelDrag = null;
+    layerTool = false;
+    layerDrag = null;
     repairing = false;
     selectedIds.clear();
     selectedProbe = null;
@@ -3051,6 +3362,19 @@ window.addEventListener('keydown', (ev) => {
     // The repair tool. Broken parts are found by eye (they are charred, and
     // they keep a marker when zoomed out) and fixed by clicking them.
     armRepair();
+    return;
+  }
+  if (ev.key === 'Y') {
+    // ⇧Y: the camera layer, next to Y (the photocell) because they are two
+    // halves of one gesture — draw the hole in the world, then put a part
+    // over it.
+    layerTool = true;
+    placing = null;
+    pasting = null;
+    panelTool = false;
+    repairing = false;
+    canvas.style.cursor = 'crosshair';
+    toast('drag out a camera layer, then click its plate to point a camera at it');
     return;
   }
   if (ev.key === 'j' || ev.key === 'J') {
@@ -3606,6 +3930,23 @@ function frame(now: number) {
   ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
   drawGrid(ctx, cam, window.innerWidth, window.innerHeight);
 
+  // Sensor layers sit UNDER everything: they are a hole in the world that
+  // the schematic is drawn on top of. The video only ever renders here, in
+  // the rectangle the player placed, so there is no configuration in which
+  // capture is running and the player cannot see what it sees.
+  drawSensorLayers(
+    ctx,
+    cam,
+    layers,
+    claims,
+    myId,
+    camera.previewEl(),
+    mouse ? (layerPlateAt(cam, layers, mouse.x, mouse.y)?.lid ?? null) : null,
+  );
+  if (layerDrag) {
+    drawLayerGhost(ctx, cam, layerDrag.a, layerDrag.b, normLayerRect(layerDrag.a, layerDrag.b) !== null);
+  }
+
   // Panel regions sit under the schematic: they frame parts, never hide them.
   // The one under the pointer (or being dragged) shows its resize grips.
   const hotPanel = mouse ? panelHotAt(cam, panels, mouse.x, mouse.y) : null;
@@ -3672,7 +4013,7 @@ function frame(now: number) {
   const md = moveDrag;
   const hover = md
     ? elemById(md.clickTarget)
-    : mouse && !placing && !pasting && !panelTool && !zHover
+    : mouse && !placing && !pasting && !panelTool && !layerTool && !zHover
       ? elementAt(mouse.x, mouse.y)
       : undefined;
   if (hover) drawHighlight(hover, true);

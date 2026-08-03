@@ -98,6 +98,16 @@ export const CATALOG: PartDef[] = [
     make: () => ({ t: 'Potentiometer', ohms: 10000, wiper: 0.5 }),
   },
   {
+    // The spine of the external-input feature, and deliberately a PART
+    // rather than a setting: you place it on the world and it reads what is
+    // under it. 1 MΩ dark / 1 kΩ lit is a garden-variety 5 mm CdS cell.
+    name: 'Photocell',
+    keys: 'ldr light photoresistor cds sensor camera cell',
+    cat: 'Passive',
+    key: 'Y',
+    make: () => ({ t: 'Photocell', r_dark: 1e6, r_lit: 1e3 }),
+  },
+  {
     name: 'Battery',
     keys: 'v dc source volt',
     cat: 'Sources',

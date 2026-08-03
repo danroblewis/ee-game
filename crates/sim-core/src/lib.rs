@@ -11,8 +11,8 @@ pub mod validate;
 pub use constraint::{constraint_of, Constraint, ConstraintKey};
 pub use engine::{AdvanceReport, ElemFrame, ElemTap, Engine, Island, Tuning, GMIN};
 pub use netlist::{
-    DocOp, ElementKind, ElementSpec, InteractOp, ParamWrite, Point, DEFAULT_OPAMP_ISC, MAX_PINS,
-    MAX_TIER,
+    photocell_ohms, DocOp, ElementKind, ElementSpec, InteractOp, ParamWrite, Point,
+    DEFAULT_OPAMP_ISC, MAX_PINS, MAX_TIER,
 };
 pub use shape::{is_rigid, Handle, Placement, Shape};
 pub use validate::{check_document, check_edit, check_shapes, rigid_hint, Reject, SmallIds};

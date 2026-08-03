@@ -47,6 +47,18 @@ export interface MachineMsg {
   win: boolean;
   /** Energy delivered by the player's sources, joules. */
   joules: number;
+  /** Has anything in this room been driven from OUTSIDE — a camera, a
+   * microphone, a gamepad — since the last reset?
+   *
+   * The measurement is safe either way: `win` latches off an integral of a
+   * real MNA branch unknown and the fixture ids are unwritable, so a sensor
+   * cannot fake a number. What it CAN do is let a player close the control
+   * loop in JavaScript against the 30 Hz frame feed instead of closing it in
+   * the circuit — which is the entire lesson this goal exists to teach. So
+   * the run is BADGED rather than refused, from the first external write, and
+   * a reset clears it. Optional: a server from before external inputs never
+   * sends it. */
+  ext?: boolean;
   /** The motor's nameplate current, amps — its safety limit, straight from
    * the server's damage table. Optional so a server from before parts could
    * break still renders (the faceplate then just omits the rating). */

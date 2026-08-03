@@ -4,6 +4,7 @@
 import type { DocOp, ElementSpec, InteractOp } from './circuit';
 import type { MachineMsg } from './hoist';
 import type { Panel, PanelOp } from './panel';
+import type { Layer, LayerOp } from './layer';
 import type { Probe, SeedScope } from './scope';
 
 /** Where a room wants the camera, and which in-place scopes it ships with.
@@ -259,6 +260,17 @@ export interface NetHandlers {
   onDoc(op: DocOp): void;
   onProbes(list: Probe[]): void;
   onPanels(list: Panel[]): void;
+  /** Sensor layers plus who is driving each, `[[lid, who], ...]`. Rectangles
+   * and claims only — there is no field on this message for a device, and
+   * there must never be one. */
+  onLayers(list: Layer[], claims: [number, number][]): void;
+  /** Live sensor readings, `[[element_id, q], ...]` with `q` a u16 over full
+   * scale, changed sensors only.
+   *
+   * This is what every OTHER player receives about somebody's camera: the
+   * number a photocell is reading. Not the picture, and there is no way to
+   * ask for the picture. */
+  onSensors(s: [number, number][]): void;
   /** Machine state (the hoist), broadcast once per tick beside "frame". */
   onMachine(m: MachineMsg): void;
   /** Damage SNAPSHOT: `[id, stress01, broken01]` for every part worth
@@ -297,6 +309,20 @@ export interface Net {
   sendProbe(elem: number, pin: number, kind: 'v' | 'i'): void;
   sendProbeRef(pid: number, elem: number, pin: number): void;
   sendPanel(op: PanelOp): void;
+  sendLayer(op: LayerOp): void;
+  /** Take or drop the right to drive a layer with your own device. */
+  sendLayerClaim(lid: number, claim: boolean): void;
+  /**
+   * THE ENTIRE EGRESS SURFACE of the camera/microphone feature: a list of
+   * `[element_id, q]` with `q` an integer 0..65535. One message per tick at
+   * most, ~12 bytes per moved sensor.
+   *
+   * Integers, not floats: no printed-double ambiguity, two bytes on the wire,
+   * and a canonical value that means the same thing on every machine. The
+   * server clamps and re-derives the binding anyway — this is a request to
+   * read a value, not an instruction to apply one.
+   */
+  sendSensor(s: [number, number][]): void;
   /** Lower the crate to the floor, zero the hold and re-arm the goal. */
   sendMachineReset(): void;
   /** Drag the whole machine assembly by an integer GRID delta. The server
@@ -388,6 +414,13 @@ export function connect(h: NetHandlers, room: string | null = null): Net {
           h.onWireDrift?.(p.drift);
         }
         h.onHello(p.you, p.elements, p.probes, p.panels, p.room);
+        // Sensor layers ride the hello beside `panels`. Deliberately routed
+        // through the SAME handler the live broadcast uses, so a late joiner
+        // and a running client can never disagree about what a layer is.
+        h.onLayers(
+          Array.isArray(m.layers) ? m.layers : [],
+          Array.isArray(m.claims) ? m.claims : [],
+        );
         if (p.room && p.room.id) want = p.room.id;
         break;
       }
@@ -411,6 +444,12 @@ export function connect(h: NetHandlers, room: string | null = null): Net {
         break;
       case 'panels':
         h.onPanels(m.list ?? []);
+        break;
+      case 'layers':
+        h.onLayers(m.list ?? [], m.claims ?? []);
+        break;
+      case 'sensors':
+        h.onSensors(m.s ?? []);
         break;
       case 'machine':
         h.onMachine(m as MachineMsg);
@@ -456,6 +495,20 @@ export function connect(h: NetHandlers, room: string | null = null): Net {
     sendProbe: (elem, pin, kind) => send({ t: 'probe', elem, pin, kind }),
     sendProbeRef: (pid, elem, pin) => send({ t: 'proberef', pid, elem, pin }),
     sendPanel: (op) => send({ t: 'panel', op }),
+    sendLayer: (op) => send({ t: 'layer', op }),
+    sendLayerClaim: (lid, claim) => send({ t: 'layerclaim', lid, claim }),
+    // Integers, enforced HERE and not merely expected: the one message a
+    // camera can produce is normalized to `[int, int]` pairs before it can
+    // reach the socket, so there is no shape a caller could hand this that
+    // would put anything else on the wire.
+    sendSensor: (list) => {
+      if (list.length === 0) return;
+      const s: [number, number][] = [];
+      for (const [id, q] of list) {
+        s.push([id | 0, Math.max(0, Math.min(65535, Math.round(q)))]);
+      }
+      send({ t: 'sensor', s });
+    },
     sendMachineReset: () => send({ t: 'machinereset' }),
     // Integers only: the server takes i32 grid units and drops the message
     // outright if it cannot parse them.

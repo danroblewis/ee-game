@@ -242,6 +242,10 @@ const RESISTOR: &[Tier] = &[
 const LAMP: &[Tier] = &[Tier::new("bulb", Power, 2.0, 4.0)];
 const SPEAKER: &[Tier] = &[Tier::new("8 ohm cone", Power, 0.25, 4.0)];
 const POT: &[Tier] = &[Tier::new("panel pot", Power, 0.2, 8.0)];
+/// A 5 mm CdS cell in an epoxy blob. 100 mW is generous for the package and
+/// it is the same order as a quarter-watt resistor, which is what it is:
+/// a resistor you are not allowed to choose the value of.
+const PHOTOCELL: &[Tier] = &[Tier::new("5 mm CdS cell", Power, 0.1, 6.0)];
 const CAPACITOR: &[Tier] = &[
     Tier::new("16 V electrolytic", Voltage, 16.0, 2.0),
     Tier::new("100 V film", Voltage, 100.0, 3.0),
@@ -303,6 +307,7 @@ pub fn tiers(kind: &ElementKind) -> &'static [Tier] {
         K::Lamp { .. } => LAMP,
         K::Speaker { .. } => SPEAKER,
         K::Potentiometer { .. } => POT,
+        K::Photocell { .. } => PHOTOCELL,
         K::Capacitor { .. } => CAPACITOR,
         K::Inductor { .. } => INDUCTOR,
         K::Motor { .. } => MOTOR,
@@ -415,6 +420,7 @@ pub fn kind_name(kind: &ElementKind) -> &'static str {
         K::Ota => "OTA",
         K::Timer555 => "555",
         K::Potentiometer { .. } => "Potentiometer",
+        K::Photocell { .. } => "Photocell",
         K::Motor { .. } => "Motor",
         K::Noise { .. } => "Noise source",
     }

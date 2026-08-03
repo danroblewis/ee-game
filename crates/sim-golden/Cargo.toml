@@ -12,3 +12,7 @@ sim-math = { path = "../sim-math" }
 
 [dev-dependencies]
 libm.workspace = true
+# The photocell test asserts what a saved document does and does NOT carry
+# (a reading is `serde(skip)`), which needs the serde impls the server uses.
+sim-core = { path = "../sim-core", features = ["serde"] }
+serde_json.workspace = true

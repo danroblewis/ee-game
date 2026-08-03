@@ -1,0 +1,48 @@
+--- purpose-built: k oscillates while a PWL device flips ---
+PASS  kicked 10 Hz                       levers=ON   factorizations 29962 vs 29962 (1x fewer)  k-changes=2 sleep-substeps=0 region-flips=1
+PASS  kicked 200 Hz                      levers=ON   factorizations 30059 vs 30059 (1x fewer)  k-changes=0 sleep-substeps=0 region-flips=12
+PASS  kicked 10 Hz + kicked 3 kHz        levers=ON   factorizations 60860 vs 60860 (1x fewer)  k-changes=2 sleep-substeps=0 region-flips=181
+PASS  kicked + 555 + settling RC         levers=ON   factorizations 30000 vs 59998 (2x fewer)  k-changes=7 sleep-substeps=0 region-flips=30
+PASS  kicked 10 Hz                       levers=off  factorizations 30008 vs 30008 (1x fewer)  k-changes=0 sleep-substeps=0 region-flips=1
+PASS  kicked 200 Hz                      levers=off  factorizations 30059 vs 30059 (1x fewer)  k-changes=0 sleep-substeps=0 region-flips=12
+PASS  kicked 10 Hz + kicked 3 kHz        levers=off  factorizations 60906 vs 60906 (1x fewer)  k-changes=0 sleep-substeps=0 region-flips=181
+PASS  kicked + 555 + settling RC         levers=off  factorizations 30041 vs 60039 (2x fewer)  k-changes=0 sleep-substeps=0 region-flips=30
+--- every golden, and all eighteen at once ---
+PASS  demo_lamp                          levers=ON   factorizations 7 vs 7 (1x fewer)  k-changes=5 sleep-substeps=0 region-flips=0
+PASS  rc_step                            levers=ON   factorizations 5 vs 5 (1x fewer)  k-changes=3 sleep-substeps=0 region-flips=0
+PASS  rl_step                            levers=ON   factorizations 7 vs 7 (1x fewer)  k-changes=5 sleep-substeps=0 region-flips=0
+PASS  rlc_ring                           levers=ON   factorizations 2 vs 2 (1x fewer)  k-changes=0 sleep-substeps=0 region-flips=0
+PASS  half_wave_rectifier                levers=ON   factorizations 12138 vs 12138 (1x fewer)  k-changes=0 sleep-substeps=0 region-flips=0
+PASS  npn_switch                         levers=ON   factorizations 586 vs 586 (1x fewer)  k-changes=5 sleep-substeps=0 region-flips=0
+PASS  emitter_follower                   levers=ON   factorizations 581 vs 581 (1x fewer)  k-changes=5 sleep-substeps=0 region-flips=0
+PASS  nmos_switch                        levers=ON   factorizations 586 vs 586 (1x fewer)  k-changes=5 sleep-substeps=0 region-flips=0
+PASS  opamp_follower                     levers=ON   factorizations 7 vs 575 (82x fewer)  k-changes=5 sleep-substeps=0 region-flips=0
+PASS  opamp_comparator                   levers=ON   factorizations 8 vs 576 (72x fewer)  k-changes=5 sleep-substeps=0 region-flips=1
+PASS  zener_regulator                    levers=ON   factorizations 582 vs 582 (1x fewer)  k-changes=5 sleep-substeps=0 region-flips=0
+PASS  opamp_relaxation                   levers=ON   factorizations 9 vs 8913 (990x fewer)  k-changes=5 sleep-substeps=0 region-flips=1
+PASS  ota_vco                            levers=ON   factorizations 10634 vs 10634 (1x fewer)  k-changes=0 sleep-substeps=0 region-flips=9
+PASS  timer555_astable                   levers=ON   factorizations 11 vs 10009 (910x fewer)  k-changes=0 sleep-substeps=0 region-flips=9
+PASS  pot_divider                        levers=ON   factorizations 7 vs 7 (1x fewer)  k-changes=5 sleep-substeps=0 region-flips=0
+PASS  led_loop                           levers=ON   factorizations 585 vs 585 (1x fewer)  k-changes=5 sleep-substeps=0 region-flips=0
+PASS  motor_step                         levers=ON   factorizations 2 vs 2 (1x fewer)  k-changes=0 sleep-substeps=0 region-flips=0
+PASS  noise_rc                           levers=ON   factorizations 2 vs 2 (1x fewer)  k-changes=0 sleep-substeps=0 region-flips=0
+PASS  all eighteen goldens at once       levers=ON   factorizations 25759 vs 45797 (2x fewer)  k-changes=58 sleep-substeps=0 region-flips=20
+PASS  demo_lamp                          levers=off  factorizations 2 vs 2 (1x fewer)  k-changes=0 sleep-substeps=0 region-flips=0
+PASS  rc_step                            levers=off  factorizations 2 vs 2 (1x fewer)  k-changes=0 sleep-substeps=0 region-flips=0
+PASS  rl_step                            levers=off  factorizations 2 vs 2 (1x fewer)  k-changes=0 sleep-substeps=0 region-flips=0
+PASS  rlc_ring                           levers=off  factorizations 2 vs 2 (1x fewer)  k-changes=0 sleep-substeps=0 region-flips=0
+PASS  half_wave_rectifier                levers=off  factorizations 12138 vs 12138 (1x fewer)  k-changes=0 sleep-substeps=0 region-flips=0
+PASS  npn_switch                         levers=off  factorizations 10011 vs 10011 (1x fewer)  k-changes=0 sleep-substeps=0 region-flips=0
+PASS  emitter_follower                   levers=off  factorizations 10006 vs 10006 (1x fewer)  k-changes=0 sleep-substeps=0 region-flips=0
+PASS  nmos_switch                        levers=off  factorizations 10010 vs 10010 (1x fewer)  k-changes=0 sleep-substeps=0 region-flips=0
+PASS  opamp_follower                     levers=off  factorizations 2 vs 10000 (5000x fewer)  k-changes=0 sleep-substeps=0 region-flips=0
+PASS  opamp_comparator                   levers=off  factorizations 3 vs 10001 (3334x fewer)  k-changes=0 sleep-substeps=0 region-flips=1
+PASS  zener_regulator                    levers=off  factorizations 10006 vs 10006 (1x fewer)  k-changes=0 sleep-substeps=0 region-flips=0
+PASS  opamp_relaxation                   levers=off  factorizations 4 vs 10002 (2500x fewer)  k-changes=0 sleep-substeps=0 region-flips=1
+PASS  ota_vco                            levers=off  factorizations 10634 vs 10634 (1x fewer)  k-changes=0 sleep-substeps=0 region-flips=9
+PASS  timer555_astable                   levers=off  factorizations 11 vs 10009 (910x fewer)  k-changes=0 sleep-substeps=0 region-flips=9
+PASS  pot_divider                        levers=off  factorizations 2 vs 2 (1x fewer)  k-changes=0 sleep-substeps=0 region-flips=0
+PASS  led_loop                           levers=off  factorizations 10009 vs 10009 (1x fewer)  k-changes=0 sleep-substeps=0 region-flips=0
+PASS  motor_step                         levers=off  factorizations 2 vs 2 (1x fewer)  k-changes=0 sleep-substeps=0 region-flips=0
+PASS  noise_rc                           levers=off  factorizations 2 vs 2 (1x fewer)  k-changes=0 sleep-substeps=0 region-flips=0
+PASS  all eighteen goldens at once       levers=off  factorizations 72848 vs 112840 (2x fewer)  k-changes=0 sleep-substeps=0 region-flips=20

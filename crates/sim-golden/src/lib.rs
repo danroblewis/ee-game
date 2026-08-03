@@ -334,6 +334,37 @@ pub fn motor_step() -> Vec<ElementSpec> {
     ]
 }
 
+/// Photocell in a divider from 9 V: 10 kΩ on top, the cell to ground.
+///
+/// The cell's resistance is log-linear between `r_dark` (1 MΩ) and `r_lit`
+/// (1 kΩ), so at `light` the divider reads
+/// `9 · R(l) / (10k + R(l))` with `R(l) = exp(ln(1e6) + l·(ln(1e3) − ln(1e6)))`
+/// — 8.91 V dark, 1.99 V at l = 0.37, 0.818 V in full light.
+///
+/// It is a golden circuit for ONE reason: `photocell_ohms` is the only new
+/// arithmetic external inputs add to the solver, and it runs two `libm`
+/// transcendentals. Three illuminations pin all three branches of it (the
+/// two exact endpoints and the interpolated middle) on native and on wasm32.
+/// The illumination itself never crosses a wire or a save file — the harness
+/// sets it in Rust, exactly the way a `ParamWrite::Light` would.
+pub fn photocell_divider(light: f64) -> Vec<ElementSpec> {
+    vec![
+        spec(1, dc(9.0), (0, 0), (0, 8)),
+        spec(2, r(10_000.0), (0, 0), (6, 0)),
+        spec(
+            3,
+            ElementKind::Photocell {
+                r_dark: 1e6,
+                r_lit: 1e3,
+                light,
+            },
+            (6, 0),
+            (0, 8),
+        ),
+        gnd(4, (0, 8)),
+    ]
+}
+
 /// LED through 330 Ω from 9 V: forward drop ≈ 2.1 V, I ≈ 21 mA.
 pub fn led_loop() -> Vec<ElementSpec> {
     vec![
@@ -393,5 +424,8 @@ pub fn all_golden() -> Vec<(&'static str, Vec<ElementSpec>)> {
         ("led_loop", led_loop()),
         ("motor_step", motor_step()),
         ("noise_rc", noise_rc()),
+        ("photocell_dark", photocell_divider(0.0)),
+        ("photocell_dim", photocell_divider(0.37)),
+        ("photocell_lit", photocell_divider(1.0)),
     ]
 }

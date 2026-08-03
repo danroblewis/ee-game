@@ -589,6 +589,104 @@ fn pot_divider_follows_wiper() {
     assert!((v - 1.8).abs() < 0.01, "wiper at 0.8: {v}");
 }
 
+// -------------------------------------------------------------- photocell
+
+/// The cell's law, and the fact that it is the ONLY thing the solver knows
+/// about an external input: R falls log-linearly with illumination, and the
+/// divider follows it. Every number here is a closed form, not a recorded
+/// value.
+#[test]
+fn photocell_resistance_is_log_linear_in_light() {
+    use sim_core::photocell_ohms;
+    let (d, t) = (1e6, 1e3);
+    assert_eq!(photocell_ohms(d, t, 0.0), d, "dark is exactly r_dark");
+    assert_eq!(photocell_ohms(d, t, 1.0), t, "full light is exactly r_lit");
+    // Halfway in LOG space is the geometric mean: sqrt(1e6 * 1e3) ~ 31.6 kOhm.
+    let mid = photocell_ohms(d, t, 0.5);
+    assert!((mid - 31_622.776_6).abs() < 1e-3, "half light {mid}");
+    // Clamped and NaN-proof: nothing outside 0..1 can reach the matrix.
+    assert_eq!(photocell_ohms(d, t, -5.0), d);
+    assert_eq!(photocell_ohms(d, t, 7.0), t);
+    assert_eq!(photocell_ohms(d, t, f64::NAN), d, "NaN reads dark, not inf");
+}
+
+#[test]
+fn photocell_divider_follows_the_light() {
+    let expect = |l: f64| {
+        let r = sim_core::photocell_ohms(1e6, 1e3, l);
+        9.0 * r / (10_000.0 + r)
+    };
+    let mut eng = settled(photocell_divider(0.0));
+    let v = eng.voltage_at((6, 0)).unwrap();
+    assert!((v - expect(0.0)).abs() < 1e-3, "dark: {v} vs {}", expect(0.0));
+
+    // The whole feature in one call: a scalar from outside becomes a
+    // resistance, through the path that never recompiles and never touches
+    // the solver's health flags.
+    assert!(eng.write_param(3, sim_core::ParamWrite::Light { light: 0.37 }));
+    eng.advance(200);
+    let v = eng.voltage_at((6, 0)).unwrap();
+    assert!((v - expect(0.37)).abs() < 1e-3, "dim: {v} vs {}", expect(0.37));
+
+    assert!(eng.write_param(3, sim_core::ParamWrite::Light { light: 1.0 }));
+    eng.advance(200);
+    let v = eng.voltage_at((6, 0)).unwrap();
+    assert!((v - expect(1.0)).abs() < 1e-3, "lit: {v} vs {}", expect(1.0));
+    assert!(!eng.is_quarantined());
+}
+
+/// The property the design turns on: a light write is not a player edit. It
+/// must never clear quarantine and never re-arm the post-event BE steps —
+/// otherwise a driven part resurrects a diverged room 30 times a second.
+#[test]
+fn a_light_write_is_not_an_edit() {
+    let mut eng = settled(photocell_divider(0.5));
+    // Same guard `Wiper` has: an unchanged reading is free.
+    assert!(eng.write_param(3, sim_core::ParamWrite::Light { light: 0.5 }));
+    // Wrong device, wrong parameter: refused rather than silently applied.
+    assert!(!eng.write_param(1, sim_core::ParamWrite::Light { light: 0.5 }));
+    assert!(!eng.write_param(3, sim_core::ParamWrite::Wiper { frac: 0.5 }));
+    // And the knob path cannot drive it at all: SetValue on a photocell is
+    // not a thing, so no panel widget and no `Cmd::Interact` can pretend to
+    // be a camera.
+    let before = eng.voltage_at((6, 0)).unwrap();
+    eng.interact(3, InteractOp::SetValue { value: 1.0 });
+    eng.advance(200);
+    let after = eng.voltage_at((6, 0)).unwrap();
+    assert!((before - after).abs() < 1e-6, "SetValue moved a photocell");
+}
+
+/// Old saves still load, and a saved room loads DARK. `light` is
+/// `serde(skip)`: a reading is world state, not document state.
+#[test]
+fn a_saved_photocell_loads_dark() {
+    let lit = sim_core::ElementKind::Photocell {
+        r_dark: 1e6,
+        r_lit: 1e3,
+        light: 1.0,
+    };
+    let json = serde_json::to_string(&lit).unwrap();
+    assert!(
+        !json.contains("light"),
+        "a reading reached the save file: {json}"
+    );
+    let back: sim_core::ElementKind = serde_json::from_str(&json).unwrap();
+    match back {
+        sim_core::ElementKind::Photocell { light, r_dark, .. } => {
+            assert_eq!(light, 0.0, "loaded lit");
+            assert_eq!(
+                r_dark, 1e6,
+                "calibration is document state and must survive"
+            );
+        }
+        _ => panic!("wrong kind"),
+    }
+    // A document written before photocells existed still parses, unchanged.
+    let old: sim_core::ElementKind =
+        serde_json::from_str(r#"{"t":"Resistor","ohms":1000.0}"#).unwrap();
+    assert!(matches!(old, sim_core::ElementKind::Resistor { .. }));
+}
+
 #[test]
 fn led_drops_about_two_volts() {
     let eng = settled(led_loop());
@@ -867,10 +965,15 @@ fn with_both_levers_off_the_engine_is_the_pre_lever_engine_bit_for_bit() {
         eng.set_elements(&elems);
         let report = eng.advance(10_000);
         assert_eq!(report.steps, 10_000, "{name}");
-        let (_, hash) = want
-            .iter()
-            .find(|(n, _)| *n == name)
-            .unwrap_or_else(|| panic!("no pre-lever digest recorded for {name}"));
+        // A golden added AFTER this baseline was captured has no pre-lever
+        // digest, and cannot: there was no pre-lever engine to run it on. Skip
+        // it rather than panic — but the `seen == want.len()` assertion below
+        // still means every one of the recorded circuits was exercised, so a
+        // golden that is renamed or quietly dropped is caught, and this cannot
+        // decay into a test that skips everything and passes.
+        let Some((_, hash)) = want.iter().find(|(n, _)| *n == name) else {
+            continue;
+        };
         assert_eq!(
             eng.state_hash(),
             *hash,
@@ -878,7 +981,11 @@ fn with_both_levers_off_the_engine_is_the_pre_lever_engine_bit_for_bit() {
         );
         seen += 1;
     }
-    assert_eq!(seen, want.len(), "a golden circuit went missing");
+    assert_eq!(
+        seen,
+        want.len(),
+        "a recorded golden circuit went missing from `all_golden()`"
+    );
 }
 
 /// ...and the same circuits, run with factorization reuse switched off as

@@ -694,6 +694,26 @@ fn check_kind(kind: &ElementKind) -> Result<(), &'static str> {
             }
             Ok(())
         }
+        K::Photocell {
+            r_dark,
+            r_lit,
+            light,
+        } => {
+            // Both ends of the range, because both ends are operating points
+            // the cell really visits and layer 4 trials both (see `swings`).
+            if !in_range(r_dark, MIN_OHMS, MAX_OHMS) || !in_range(r_lit, MIN_OHMS, MAX_OHMS) {
+                return Err("resistance must be a finite value between 1 uOhm and 1 TOhm");
+            }
+            // The reading itself. It never arrives through this gate in
+            // practice (`ParamWrite::Light` clamps it, and it is
+            // `serde(skip)` so no save or wire message carries one), but a
+            // hand-edited document must not be able to smuggle a NaN into a
+            // `libm::exp`.
+            if !in_range(light, 0.0, 1.0) {
+                return Err("illumination must be between 0 and 1");
+            }
+            Ok(())
+        }
         K::Potentiometer { ohms, wiper } => {
             if !in_range(ohms, MIN_OHMS, MAX_OHMS) {
                 return Err("resistance must be a finite value between 1 uOhm and 1 TOhm");
@@ -1119,6 +1139,11 @@ fn split_blocks(eng: &Engine, specs: &[ElementSpec]) -> Option<Blocks> {
             {
                 b.swings[k] = true
             }
+            // A photocell's resistance is driven from outside the document,
+            // so the range it can take IS a swing: the two peak states are
+            // where the gate judges a circuit that is only unsolvable in the
+            // dark, or only unsolvable in full light.
+            ElementKind::Photocell { r_dark, r_lit, .. } if r_dark != r_lit => b.swings[k] = true,
             _ => {}
         }
         b.nonlinear[k] |= s.kind.is_nonlinear();
@@ -1158,10 +1183,17 @@ fn block_doc(specs: &[ElementSpec], b: &Blocks, k: usize, out: &mut Vec<ElementS
 /// states are the same document as the all-closed one without one of these,
 /// which is how a block skips them.
 fn swings(kind: &ElementKind) -> bool {
-    matches!(
-        kind,
-        ElementKind::VoltageSource { amp, .. } | ElementKind::Rail { amp, .. } if *amp != 0.0
-    )
+    match kind {
+        ElementKind::VoltageSource { amp, .. } | ElementKind::Rail { amp, .. } => *amp != 0.0,
+        // Not a waveform, but the same question: the part takes a RANGE of
+        // values the document does not pin down, and the extreme states are
+        // where a range gets judged. This is what the design means by
+        // "gate the range once, stream the value ungated" — the reason
+        // `ParamWrite::Light` is allowed to skip the gate 30 times a second
+        // is that both ends of its travel were validated when it was placed.
+        ElementKind::Photocell { r_dark, r_lit, .. } => r_dark != r_lit,
+        _ => false,
+    }
 }
 
 /// Freeze every source in place at one end of its swing: `dc + sign·|amp|`,
@@ -1189,15 +1221,22 @@ fn swings(kind: &ElementKind) -> bool {
 /// orders of magnitude inside f64.
 fn pin_at_peak(specs: &mut [ElementSpec], sign: f64) {
     for s in specs.iter_mut() {
-        if let ElementKind::VoltageSource { dc, amp, hz, phase }
-        | ElementKind::Rail { dc, amp, hz, phase } = &mut s.kind
-        {
-            if *amp != 0.0 {
-                *dc += sign * amp.abs();
-                *amp = 0.0;
-                *hz = 0.0;
-                *phase = 0.0;
+        match &mut s.kind {
+            ElementKind::VoltageSource { dc, amp, hz, phase }
+            | ElementKind::Rail { dc, amp, hz, phase } => {
+                if *amp != 0.0 {
+                    *dc += sign * amp.abs();
+                    *amp = 0.0;
+                    *hz = 0.0;
+                    *phase = 0.0;
+                }
             }
+            // Full light at the high peak, pitch dark at the low one — the
+            // two ends of the travel an external input can drive it over,
+            // and therefore the two matrices the room can actually be asked
+            // to factor once the part is placed.
+            ElementKind::Photocell { light, .. } => *light = if sign > 0.0 { 1.0 } else { 0.0 },
+            _ => {}
         }
     }
 }

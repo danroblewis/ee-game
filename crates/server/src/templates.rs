@@ -23,8 +23,8 @@
 //! template *should* ship with the binary it is one entry in `BUILTINS`.
 
 use crate::{
-    demo_room_circuit, hoist_fixture_at, sane_rect, Panel, ProbeKind, SaveFile, SavedProbe,
-    HOIST_RECT, MAX_ELEMENTS, MAX_PANELS, MAX_PROBES,
+    demo_room_circuit, hoist_fixture_at, sane_rect, Layer, Panel, ProbeKind, SaveFile, SavedProbe,
+    HOIST_RECT, MAX_ELEMENTS, MAX_LAYERS, MAX_PANELS, MAX_PROBES,
 };
 use damage::DamageModel;
 use machine::Hoist;
@@ -125,11 +125,19 @@ impl View {
 /// per-run identity — which is why a checkpoint IS a template.
 #[derive(Clone, Debug)]
 pub struct RoomSetup {
+    /// Has this room ever been driven from outside? Travels with the setup so
+    /// `snapshot -> SaveFile` carries it; a TEMPLATE always resets it to false,
+    /// because a template is a starting point, not a playthrough.
+    pub ext: bool,
     pub elements: Vec<ElementSpec>,
     pub probes: Vec<SavedProbe>,
     pub next_pid: u32,
     pub panels: Vec<Panel>,
     pub next_plid: u32,
+    /// Sensor layers. Their RECTANGLES are room state and persist; who is
+    /// driving one never does.
+    pub layers: Vec<Layer>,
+    pub next_lid: u32,
     pub machine: MachineSpec,
     pub view: View,
     pub damage: DamageModel,
@@ -138,11 +146,14 @@ pub struct RoomSetup {
 impl Default for RoomSetup {
     fn default() -> Self {
         RoomSetup {
+            ext: false,
             elements: Vec::new(),
             probes: Vec::new(),
             next_pid: 1,
             panels: Vec::new(),
             next_plid: 1,
+            layers: Vec::new(),
+            next_lid: 1,
             machine: MachineSpec::None,
             view: View::default(),
             damage: DamageModel::new(),
@@ -187,6 +198,11 @@ impl RoomSetup {
         self.next_plid = self
             .next_plid
             .max(self.panels.iter().map(|p| p.plid + 1).max().unwrap_or(1))
+            .max(1);
+        self.layers.truncate(MAX_LAYERS);
+        self.next_lid = self
+            .next_lid
+            .max(self.layers.iter().map(|l| l.lid + 1).max().unwrap_or(1))
             .max(1);
         if let MachineSpec::Hoist { rect, state } = self.machine {
             self.machine = MachineSpec::Hoist {
