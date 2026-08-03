@@ -1,27 +1,62 @@
 //! THE SYNTHESIZER ROOM — the second selectable sample world.
 //!
 //! Boot a fresh room with `EE_WORLD=synth` (see `world()` in `main.rs`) and
-//! it is already playing: a four-step analog sequencer clocked by a 555
+//! it is already playing: a FOUR-step analog sequencer clocked by a 555
 //! drives a 1 V/octave VCO through a voltage-controlled filter that a
-//! bar-synced LFO sweeps open and shut; a noise source snares on whichever
-//! steps the player has toggled on; and both land in one 8 Ω speaker.
+//! bar-synced LFO sweeps open and shut, then through a VCA that an
+//! attack-decay envelope generator accents on the beat; a noise source snares
+//! through a second VCA and a second envelope on whichever steps the player
+//! has toggled on; and both land in one 8 Ω speaker.
 //!
 //! Every number in it is solved. There is no oscillator table, no sample
 //! playback and no software envelope generator: the pitch is a capacitor
 //! being charged by an OTA's bias current, the hiss is `ElementKind::Noise`,
-//! and the beat is a 555 charging 6.8 µF through a knob.
+//! the beat is a 555 charging 6.8 µF through a knob, and the two envelopes
+//! are two capacitors charging through a diode and discharging through a
+//! resistor. **Neither the VCA nor the envelope generator is a device model.**
+//! There is no `ElementKind::Vca` and no `ElementKind::Envelope`, and adding
+//! one would be a mistake — see `THE VCAs` below.
 //!
 //! ## Signal flow
 //!
 //! ```text
-//!            ┌─ 4 CV pots ─diode-OR─> CV ─> VCO ─> VCF ────────┐
-//!   555 ─ramp┤                                ^                 │  virtual
-//!   TEMPO    │        the same ramp ──> LFO sweep               ├─ ground
-//!            │                                                  │  mixer
-//!            └─ 4 BEAT toggles ──> gate ──> SNARE <── Noise ────┘     │
-//!                                          (MOSFET VCA)               v
-//!                                                              8 Ω speaker
+//!            ┌─ 4 CV pots ─diode-OR─> CV ─> VCO ─> VCF ─> VCA ──┐
+//!   555 ─ramp┤                                ^          ^       │  virtual
+//!   TEMPO    │        the same ramp ──> LFO sweep     AD EG 2    ├─ ground
+//!            │                                           ^       │  mixer
+//!            └─ 4 BEAT toggles ──> BEAT ──d/dt──> trigger┤       │     │
+//!                                                        v       │     │
+//!                             Noise ──> SNARE VCA <── AD EG 1 ───┘     v
+//!                                                                8 Ω speaker
 //! ```
+//!
+//! ## THE VCAs, and why neither is a new `ElementKind`
+//!
+//! Both VCAs are one `Nmos` each, run in the ohmic region as a
+//! voltage-controlled resistor: `Rds ≈ 1/(k(Vgs − Vt))`, so the envelope on
+//! the gate is the gain. Both envelope generators are a `Diode` into a
+//! `Capacitor` with a DECAY knob across it (a `Potentiometer` strapped as a
+//! rheostat) — attack is the cap charging through the trigger's source
+//! impedance, decay is `R·C` and a player can turn it, and there is no
+//! sustain stage because an AD generator does not have one.
+//!
+//! That is a deliberate decision against adding device models, and the reason
+//! is arithmetic, not taste. A real VCA's output is *gain × signal* — a
+//! product of two unknowns, which is a SMOOTH nonlinearity. A faithful `Vca`
+//! kind would land in `needs_newton` alongside `Ota`, and fact 4 below has
+//! already measured what that costs this room: 26.1 µs/substep against 17.1.
+//! It would be slower than the transistor it replaced. The only cheaper model
+//! samples its control voltage outside the solve and holds it constant
+//! through Newton — and a gain that does not come out of the solver is the
+//! one thing this game does not ship.
+//!
+//! The rest of the bill for a new kind is real too: a stamp, an arm in every
+//! exhaustive `match` in `netlist.rs`/`engine.rs`, a range check in
+//! `validate.rs` (nothing reaches the sim without one), a rigid `Shape` and
+//! its eleven mentions in `shape.rs`, a damage rating, a footprint, a golden
+//! circuit with a closed form, a client symbol and a catalogue entry. Against
+//! that: one transistor, which is also exactly what an MS-20-era VCA and
+//! every cheap noise gate really were, and which a player can take apart.
 //!
 //! ## Why it is shaped like this
 //!
@@ -112,6 +147,13 @@ const OUT: Point = (14, -4); // op-amp output / speaker terminal
 // -- VCO -------------------------------------------------------------------
 const SQ: Point = (44, -8); // comparator output: the square, +-5 V
 
+// -- envelopes -------------------------------------------------------------
+/// The bass envelope's storage node — the top of its bus, and the gate rail
+/// that runs from there down onto the bass VCA.
+const BASS_ENV: Point = (30, 2);
+/// The snare envelope's storage node, which is the snare VCA's own gate pin.
+const SNARE_ENV: Point = (30, 7);
+
 // ------------------------------------------------------------------ values
 //
 // The VCO's exponential converter, from `synth_vco.rs`, measured: the pitch
@@ -126,9 +168,29 @@ const R_HYST_BOT: f64 = 50_000.0;
 const C_VCO: f64 = 1e-9;
 /// Supply. 9 V keeps every capacitor at a third of its 25 V rating.
 const SUPPLY_V: f64 = 9.0;
-/// The snare gate's transconductance coefficient. `Rds ~= 1/(k*(Vgs - Vt))`,
-/// so this is the snare's level: trimmed by measurement against the bass.
+/// Both VCAs' transconductance coefficient. `Rds ~= 1/(k*(Vgs - Vt))`, so on
+/// the snare this is its level (trimmed by measurement against the bass) and
+/// on the bass it is how little the VCA costs when it is open: at the
+/// measured 3.0 V envelope peak `Rds` is 8 kOhm against the 220 kOhm that
+/// feeds it, which is 0.3 dB.
 const NMOS_K: f64 = 5e-5;
+/// The trigger differentiator's cap. Sized for the CHARGE two envelope
+/// storage caps need, not for a time constant: `C_TRIG * dV` is what the
+/// pulse can deliver, and 47 nF (enough when only the snare hung on it) left
+/// both envelopes at 1.4 V, barely over the MOSFETs' 1.0 V threshold.
+const C_TRIG: f64 = 100e-9;
+/// DECAY, one knob per envelope generator, wired as a rheostat across the
+/// storage cap: `tau = ohms*wiper*C` into 15 nF. The shipped positions are a
+/// 50 ms snare (a hit) and a 150 ms bass (a plucked note), and the whole
+/// travel is about 1 ms to 100 / 300 ms. This is what makes each of them an
+/// envelope GENERATOR rather than a fixed RC. Attack stays fixed: these two
+/// cost nothing in DEVICES (each replaced a resistor) but +0.40 µs for their
+/// two wiper nodes, and an attack knob would be two more devices on top. The
+/// margin is 1.11x, not 1.5x.
+const POT_SNARE_DECAY: f64 = 6.8e6;
+const W_SNARE_DECAY: f64 = 0.485; // 3.3 MOhm, tau = 50 ms
+const POT_BASS_DECAY: f64 = 20e6;
+const W_BASS_DECAY: f64 = 0.50; // 10 MOhm, tau = 150 ms
 /// CUTOFF knob to filter bias current: `Iabc = (V_cv - 0.45 V) / R`, and
 /// `fc = Iabc / (2 * 2*VT * pi * C)`. Sized so the knob's whole travel lands
 /// on the bass's own harmonics rather than far above them.
@@ -143,6 +205,11 @@ pub const ID_SPEAKER: u32 = 1;
 pub const ID_CUTOFF: u32 = 40;
 pub const ID_SNARE_TONE: u32 = 73;
 pub const ID_NOISE: u32 = 70;
+/// The two envelope generators' decay knobs — 79 keeps the id the snare's
+/// fixed decay resistor had, because it is the same part in the same place
+/// doing the same job with a shaft on it.
+pub const ID_SNARE_DECAY: u32 = 79;
+pub const ID_BASS_DECAY: u32 = 89;
 
 /// The sequencer's knobs and toggles, resolved against `SEQ_ID0`.
 #[allow(dead_code)]
@@ -157,21 +224,79 @@ pub fn vco_square() -> Point {
     SQ
 }
 
-/// How many steps the bar has. THREE, not four, and the reason is the
-/// real-time budget: a step costs seven devices, and at four steps the live
-/// server measured 0.86x real time — a synthesizer running 0.86x plays two
-/// and a half semitones FLAT, which is not a performance problem, it is a
-/// broken instrument. See `SCOPE NOTES`.
-pub const SEQ_STEPS: usize = 3;
+/// The mixer's output — the node the speaker hangs on.
+#[allow(dead_code)]
+pub fn out_node() -> Point {
+    OUT
+}
+
+/// The bass AD envelope's storage node, which is also the bass VCA's gate.
+#[allow(dead_code)]
+pub fn bass_env() -> Point {
+    BASS_ENV
+}
+
+/// The snare AD envelope's storage node, which is also the snare VCA's gate.
+#[allow(dead_code)]
+pub fn snare_env() -> Point {
+    SNARE_ENV
+}
+
+/// How many steps the bar has. FOUR — a bar of four is what everyone expects
+/// and this room did not have it, because a step costs eight devices and a
+/// four-step room once measured 0.86x on the live server, which is a
+/// synthesizer two and a half semitones FLAT.
+///
+/// It measures 0.999 live now, and NOT because the solver got faster. The
+/// 0.86 was measured on a room that still carried the gm-C kick and the
+/// two-pole OTA filter (see the ladder in `SCOPE NOTES`), and it was never
+/// re-taken against the room as it actually ships. Re-measured, on this
+/// machine, the fourth step costs **+3.20 µs/substep — 1.385x → 1.134x**,
+/// and the live server does not move off rt 0.999.
+///
+/// It also DID NOT WORK. `sequencer.rs` accepted `steps: 4` and nothing ever
+/// called it: its bottom rail row was a constant that assumed three lanes, so
+/// a fourth lane put the CV bus pull-down's ground symbol straight onto the
+/// CV bus and every step played 0 V. That is fixed (`Seq::railbot`), and the
+/// four-step path is now the one the room ships, so it is tested.
+///
+/// The step count is still not a free parameter: 1.134x is the margin, and
+/// `the_synth_room_fits_the_realtime_budget` is where the next person meets
+/// it.
+pub const SEQ_STEPS: usize = 4;
 
 /// Pitch knob positions. `synth_room_plays_a_tune` asserts what these
 /// actually sound like, in Hz, so they cannot silently drift out of tune.
-pub const SEQ_WIPERS: [f64; 4] = [0.438, 0.491, 0.560, 0.493];
+///
+/// One note per step: A3 220, C4 261.6, E4 329.6, D4 293.7 — A minor up and
+/// back down onto the fourth. Trimmed BY MEASUREMENT, because the CV row is
+/// linear in the wiper only to about 2 %; these land at 220.2 / 263.1 /
+/// 329.0 / 294.1, all inside 10 cents.
+///
+/// The fourth knob was 0.493 when the fourth step did not exist, a hair off
+/// the second's 0.491: the entry was in the array but had never been given a
+/// pitch of its own.
+///
+/// It is a D and not the G an A-minor-seventh would want, and that is fact 3
+/// in the module docs biting. The VCO's comparator can only flip on a substep
+/// boundary, so a period is an EVEN number of substeps and the pitch grid is
+/// `50000/2m` Hz — 27 cents wide at 392 Hz. Its nearest line there is 6 cents
+/// under G4 with the next 21 cents over, and the CV's own bar-to-bar wander
+/// is enough to pick either: swept, that knob measured 384.6 / 390.6 / 396.8
+/// from one bar to the next. At 294 Hz the grid line is 2.7 cents off D4 and
+/// its neighbours are 18 and 23 cents away, so it lands on the same note
+/// every bar — measured 294.09–294.12 over ten bars.
+pub const SEQ_WIPERS: [f64; 4] = [0.4418, 0.4943, 0.5632, 0.5283];
 
 /// The shipped pattern. Adjacent enabled steps TIE — the beat bus only dips
 /// to 4.3 V between them, so a differentiator hears one long gate instead of
 /// two hits — but the bar retrace always resets it to 4 mV, so steps 3 and 1
 /// across the bar line are two separate hits. Hence 1 and 3, not 1 and 2.
+///
+/// With two AD envelopes hanging off that bus this row is now the NOTE-ON
+/// row as well as the drum row: it accents the bass and fires the snare. The
+/// bass still sounds on every step (see the bypass resistor at the VCA), so
+/// all four pitch knobs are audible whatever the pattern is.
 pub const SEQ_BEATS: [bool; 4] = [true, false, true, false];
 
 pub fn seq_config() -> Seq {
@@ -181,7 +306,7 @@ pub fn seq_config() -> Seq {
         route_id0: SEQ_ROUTE_ID0,
         // ~3.9 steps/s: slow enough that every step is a distinct note,
         // fast enough to be a groove.
-        tempo: 0.34,
+        tempo: 0.50,
         wipers: SEQ_WIPERS,
         beats: SEQ_BEATS,
         steps: SEQ_STEPS,
@@ -328,18 +453,48 @@ pub fn synth_room_circuit() -> Vec<ElementSpec> {
     // CUTOFF — the headline knob. pins [end a, wiper, end b]
     let cut = sh.part(ID_CUTOFF, pot(10_000.0, 0.40), (26, -8), E, 6, true);
     debug_assert_eq!(cut[1], (29, -6));
-    // Out to the mixer, and deliberately a plain resistor rather than an OTA
-    // VCA. Two reasons, both measured. One: an 8 Ohm speaker passes its 0.5 W
-    // rating at 2 V rms and the op-amp's rail is 9 V, so a level control that
-    // could be wound up would be a way to burn the speaker by turning
-    // something clockwise — a demo is not a trap, and the damage test winds
-    // every pot to 0.98. With the level fixed, nothing a player can touch
-    // drives the output past ~1.3 V peak. Two: an OTA tracking an audio
-    // signal costs the WHOLE room a third of a Newton iteration per substep
-    // (3 us), because Newton is global. The filter's output impedance is
-    // 1/gm, so 220 kOhm is a light load when the filter is open and
-    // deliberately fades the voice as the cutoff knob closes it.
-    sh.two(41, r(220_000.0), (30, -5), (24, -5));
+    // Out to the mixer through a fixed resistor and THEN the bass VCA. The
+    // resistor is not a level control and must not become one: an 8 Ohm
+    // speaker passes its 0.5 W rating at 2 V rms against a 9 V rail, so a
+    // level a player could wind up is a way to burn the speaker by turning
+    // something clockwise, and the damage test winds every pot to 0.98. It is
+    // also the filter's DC RETURN — an `Ota` output has exactly zero output
+    // conductance, so with the VCA shut and nothing else on the node the
+    // filter output would float on GMIN. The resistor stays; the VCA goes
+    // after it, between it and the virtual ground, where its source really
+    // does sit at 0 V and the gate voltage alone sets the gain.
+    sh.two(41, r(220_000.0), (30, -5), (26, -5));
+
+    // ------------------------------------------------------- BASS VCA
+    // THE SECOND VCA, and the same part as the first: an `Nmos` in its ohmic
+    // region is a voltage-controlled resistor, so `gain = Rf/(220k + Rds)`
+    // and the envelope on the gate opens and shuts it. About 8 kOhm wide open
+    // (3 % off the level the room had when this path was a bare wire) and
+    // over 100 MOhm shut.
+    //
+    // This is deliberately NOT a new `ElementKind`. A real VCA multiplies two
+    // unknowns, which is a smooth nonlinearity — a `Vca` device would land in
+    // `needs_newton` and cost the room MORE than the transistor it replaced,
+    // which is exactly the trade fact 4 in the module docs already measured
+    // and rejected. The only cheaper model would sample its control voltage
+    // outside the solve, and a gain that does not come out of the solver is
+    // the one thing this game does not ship. So: a transistor, the way a
+    // Minimoog-era VCA and every cheap noise gate really were.
+    // pins [gate, drain, source]
+    let bass = sh.part(42, K::Nmos { vt: 1.0, k: NMOS_K }, (24, -1), N, 4, true);
+    let (benv_g, bin_d, bsum) = (bass[0], bass[1], bass[2]);
+    debug_assert_eq!(bin_d, (26, -5));
+    debug_assert_eq!(bsum, (22, -5));
+    // INITIAL GAIN — one resistor bypassing the channel, and it is what makes
+    // the pitch row audible. A hard-gated bass only sounds on the steps whose
+    // BEAT toggle is down, so two of the four pitch knobs would be knobs for
+    // a note nobody hears; and the sequencer's windows are contiguous, so
+    // there is no per-step trigger to gate them with instead (the gates OR
+    // into a constant, and the 0.24 V steps on the CV bus cannot push a
+    // diode). With the bypass the bass sings all four notes and the envelope
+    // ACCENTS the beats: measured 11.9 dB between shut and wide open, which
+    // is a VCA doing what a VCA's initial-gain trim does on real hardware.
+    sh.two(43, r(680_000.0), (26, -6), (22, -6));
 
     // ...and the wiring.
     sh.run(&[fy, (30, -2), (32, -2), (34, -2), fy_in]);
@@ -348,7 +503,8 @@ pub fn synth_room_circuit() -> Vec<ElementSpec> {
     sh.run(&[(36, -5), fa]);
     sh.ground((36, -2), DOWN);
     sh.run(&[fy, (30, -5)]);
-    sh.run(&[(24, -5), (22, -5), (21, -5)]);
+    sh.run(&[bin_d, (26, -6)]);
+    sh.run(&[(22, -6), bsum, (21, -5)]);
     sh.ground(cut[0], LEFT);
     sh.run(&[cut[2], (32, RAIL_Y)]);
 
@@ -397,28 +553,70 @@ pub fn synth_room_circuit() -> Vec<ElementSpec> {
     // and are a shape a potentiometer actually has.
     // pins [end a, wiper, end b]
     let tone = sh.part(ID_SNARE_TONE, pot(10_000.0, 0.47), (36, 3), S, 2, false);
-    // THE VCA. A MOSFET in its ohmic region is a voltage-controlled
+    // THE SNARE VCA. A MOSFET in its ohmic region is a voltage-controlled
     // resistor between the noise and the mixer's virtual ground, so the
     // gain is `Rf/Rds` and the envelope on the gate opens and closes it:
     // 100 MOhm of leak when shut, about 80 kOhm wide open, ~60 dB of range.
     // See fact 4 in the module docs for why this is not an OTA.
     // pins [gate, drain, source]
-    let vca = sh.part(76, K::Nmos { vt: 1.0, k: NMOS_K }, (30, 7), N, 4, true);
+    let vca = sh.part(76, K::Nmos { vt: 1.0, k: NMOS_K }, SNARE_ENV, N, 4, true);
     let (senv, sin_d, ssum) = (vca[0], vca[1], vca[2]);
+    debug_assert_eq!(senv, SNARE_ENV);
+    // ENVELOPE GENERATOR 1 — snare. Diode, storage cap, decay knob: an
+    // attack-decay contour with no sustain stage, which is what it is made
+    // of and not a curve read out of a table. ATTACK is the storage cap
+    // charging through the trigger's own source impedance (about 3 ms here);
+    // DECAY is the pot times the cap.
+    //
+    // The pot is a RHEOSTAT — wiper strapped back to the far end, so a to b
+    // is `ohms * wiper` — and the strap is a WIRE, because a potentiometer
+    // whose wiper pin sits on one of its own end pins is not a shape a
+    // potentiometer has and the placement gate would refuse it.
+    // pins [end a, wiper, end b]
     sh.two(77, K::Diode, (34, 7), senv);
     sh.two(78, cap(15e-9), senv, (30, 9));
-    sh.two(79, r(3.3e6), senv, (26, 7)); // decay, tau = 50 ms
+    let sdec = sh.part(
+        79,
+        pot(POT_SNARE_DECAY, W_SNARE_DECAY),
+        senv,
+        W,
+        4,
+        true,
+    );
+    debug_assert_eq!(sdec[2], (26, 7));
 
     // ------------------------------------------------------- trigger glue
-    // The snare fires on whichever steps the player has toggled on.
+    // ONE trigger bus, two envelope generators. Both voices fire on whichever
+    // steps the player has toggled on, so the BEAT row is the note-on row.
     //
-    // The trigger is differentiated, because a sequencer gate is high for
-    // a whole step (260 ms) and an envelope cap fed from a level would just
-    // sit there charged. The RC also keeps the envelope caps off an ideal
-    // source: charging a cap inside one substep makes the trapezoidal
-    // integrator ring (13.8 V was measured on a cap fed from a 7.8 V pulse).
-    sh.two(85, cap(47e-9), sq.beat(), (36, 8));
+    // The trigger is DIFFERENTIATED, because a sequencer gate is high for a
+    // whole step (170 ms) and an envelope cap fed from a level would just sit
+    // there charged. The RC also keeps the envelope caps off an ideal source:
+    // charging a cap inside one substep makes the trapezoidal integrator ring
+    // (13.8 V was measured on a cap fed from a 7.8 V pulse).
+    //
+    // `C_TRIG` is 100 nF rather than the 47 nF it was when one envelope hung
+    // on it: the pulse has to fill two storage caps now, and the charge it
+    // can deliver is `C_TRIG * dV`. Measured, both envelopes peak at 3.0 V
+    // against the single envelope's old 3.6 V, which is well clear of the
+    // MOSFETs' 1.0 V threshold.
+    sh.two(85, cap(C_TRIG), sq.beat(), (36, 8));
     sh.two(86, r(470_000.0), (34, 8), (34, 10));
+
+    // ------------------------------------------------- BASS AD ENVELOPE
+    // ENVELOPE GENERATOR 2 — bass, in its own bay under the mixer where the
+    // VCA it drives already is. Same three parts as the snare's, same shape
+    // on the sheet, a longer decay: this one has to sound like a plucked note
+    // rather than a hit, so 15 nF into 10 MOhm is 150 ms against the snare's
+    // 50. The envelope BUS is a run along one row with the storage cap and
+    // the decay resistor standing up off it, because a node with three things
+    // on it is a bus, and the gate rail then drops straight onto the VCA.
+    sh.two(87, K::Diode, (34, 2), BASS_ENV);
+    sh.two(88, cap(15e-9), (26, 2), (26, 0));
+    // pins [end a, wiper, end b]
+    let bdec = sh.part(89, pot(POT_BASS_DECAY, W_BASS_DECAY), (28, 2), N, 4, true);
+    debug_assert_eq!(bdec[1], (30, 0));
+    debug_assert_eq!(bdec[2], (28, -2));
 
     // ...and the snare's wiring.
     sh.ground((44, 3), RIGHT);
@@ -428,9 +626,22 @@ pub fn synth_room_circuit() -> Vec<ElementSpec> {
     sh.run(&[tone[0], sin_d]);
     sh.run(&[ssum, (22, 3), (22, -5)]);
     sh.ground((30, 9), DOWN);
-    sh.ground((26, 7), LEFT);
+    // SNARE DECAY's rheostat strap, and the ground its far end sits on.
+    sh.run(&[sdec[1], (26, 5), sdec[2]]);
+    sh.ground(sdec[2], LEFT);
     sh.run(&[(36, 8), (34, 8), (34, 7)]);
     sh.ground((34, 10), DOWN);
+
+    // ...and the bass envelope's. The trigger comes up the column the snare's
+    // own diode already stands on, so the two generators visibly share one
+    // bus rather than each tapping the beat riser for itself.
+    sh.run(&[(34, 7), (34, 2)]);
+    sh.run(&[BASS_ENV, (28, 2), (26, 2), (24, 2)]);
+    sh.run(&[(24, 2), benv_g]);
+    sh.ground((26, 0), UP);
+    // BASS DECAY's strap and ground.
+    sh.run(&[bdec[1], (30, -1), (28, -1), bdec[2]]);
+    sh.ground(bdec[2], LEFT);
 
     // ---------------------------------------------------------- SEQUENCER
     let mut els = sh.finish();
@@ -457,6 +668,8 @@ fn name_controls(els: &mut [ElementSpec], sq: &Seq) {
         (2, "SUPPLY".into()),
         (ID_CUTOFF, "CUTOFF".into()),
         (ID_SNARE_TONE, "SNARE TONE".into()),
+        (ID_SNARE_DECAY, "SNARE DECAY".into()),
+        (ID_BASS_DECAY, "BASS DECAY".into()),
         (ids.tempo, "TEMPO".into()),
     ];
     for k in 0..ids.steps {
@@ -518,9 +731,50 @@ pub fn synth_panels() -> Vec<PanelDef> {
 // several other agents building in parallel — load average 7.5, which is why
 // every figure below is quoted with its spread and against a control.
 //
-//   SHIPPED: 201 elements — 64 DEVICES plus 108 wires and 29 ground symbols
-//   of routing. The device count is the budget; the routing is very nearly
-//   free, and the two numbers must not be confused.
+//   SHIPPED: 250 elements — 77 DEVICES plus the wires and ground symbols of
+//   routing. The device count is the budget; the routing is very nearly free,
+//   and the two numbers must not be confused.
+//
+//   ---- THE FOURTH STEP, THE VCAs AND THE ENVELOPES (this change) ----
+//
+//   Re-measured from scratch, same machine, same session, load average 5–7,
+//   best of three passes of 160 000 substeps stepped the way the server steps
+//   (chunks of AUDIO_EVERY with a tap on each):
+//
+//     64 dev / 206 el   BEFORE: three steps, no VCA on the bass  12.88 µs  1.55x  NR 1.99
+//     69 dev / 219 el   + bass VCA + its AD envelope             14.44 µs  1.39x  NR 1.98
+//     77 dev / 245 el   + THE FOURTH STEP                        17.64 µs  1.13x  NR 2.00
+//     77 dev / 250 el   + two DECAY knobs (pots for resistors)   18.04 µs  1.11x  NR 2.00
+//
+//   So: the VCA and its envelope generator cost +1.56 µs for 5 devices, the
+//   fourth step +3.20 µs for 8, and putting a shaft on the two decay
+//   resistors +0.40 µs for no devices at all — a pot is a resistor plus a
+//   WIPER NODE, and unknowns are what the `^1.64` counts. Newton's iteration
+//   count never moved, which is the point: a MOSFET VCA is bought entirely
+//   out of the `devices^1.64` term and an OTA VCA would not be (fact 4).
+//
+//   LIVE SERVER, real binary over a websocket, reading its own `rt` off every
+//   audio frame, on the same loaded machine, interleaved:
+//
+//     64 dev, 60 s   median 0.999  min 0.990  mean 0.9995  0/1800 below 0.97
+//     77 dev, 60 s   median 0.999  min 0.990  mean 0.9992  0/1799 below 0.97
+//     77 dev, 3 x 90 s  median 0.999 / 0.999 / 0.999  mean 0.9988 / 0.9989 / 0.9984
+//     64 dev, 2 x 90 s  median 0.999 / 0.999          mean 0.9977 / 0.9993
+//
+//   The 90 s runs each catch a handful of samples under 0.97 — and so does
+//   the BEFORE room, worse (41/2694 against 25/2696, min 0.734 against
+//   0.851). Those are the OS descheduling the sim task on a machine with
+//   several agents compiling on it, not the circuit: the room's own cost is
+//   flat, and the median does not move. The instrument holds real time and
+//   plays in tune.
+//
+//   What was spent is the MARGIN: 1.55x to 1.11x offline. That is the number
+//   the next feature has to come out of, and it is why the four-VCA version
+//   of this was not built (a survey measured four voices plus four steps at
+//   0.86–0.94x live, which is one to two and a half semitones flat and
+//   sustained, not a blip).
+//
+//   ---- the earlier work, kept because it is why the room is shaped so ----
 //
 //   Solver, best of three passes of 30 000 substeps, interleaved against the
 //   same room drawn the OLD way (star of diagonals, 71 elements, the same 64
@@ -564,14 +818,23 @@ pub fn synth_panels() -> Vec<PanelDef> {
 // two and a half semitones flat, so it was cut. That is what the last row
 // cost and what it bought.
 //
+// AND THAT WAS THE TRAP IN IT. Every rung of that ladder is a DIFFERENT room:
+// the 79-element four-step version still carried things that were cut in the
+// rungs below it, so "the fourth step took the room from 0.86x to 1.0x" was
+// never a controlled comparison — it was the difference between two rooms
+// that differed in more than the step count. Measured against the room as it
+// ships, with only the step count changed, the fourth step is +3.20 µs and
+// the live rt does not move. The cut was right when it was made and wrong to
+// carry forward without re-measuring. When a scope note quotes a cost,
+// re-take the measurement on the room in front of you before believing it.
+//
 // What was cut, and why:
 //
-//   * THE FOURTH STEP (7 elements). Two comparator OTAs, a zener, a CV pot,
-//     a steering diode, a toggle and its diode, plus a ladder resistor. This
-//     is the cut that took the room from 0.86x to 1.0x on the live server.
-//     Three steps against a two-hit drum pattern is a real groove — a
-//     Baby-8 run at an odd step count is a sound, not a compromise — but a
-//     bar of four is what everyone expects, and this is not it.
+//   * THE FOURTH STEP — PUT BACK. Eight devices: two comparator OTAs, a
+//     zener, a CV pot, a steering diode, a toggle and its diode, plus a
+//     ladder resistor. Re-measured against the room as it ships it is
+//     +3.20 µs/substep and rt 0.999 live, so it is in, with a note of its own
+//     at `SEQ_STEPS`.
 //   * THE KICK (12 elements). `drums.rs` has a measured gm-C two-integrator
 //     resonator that sweeps 117 Hz → 49 Hz over 200 ms: a real kick with a
 //     continuous pitch envelope, no substep quantization, and a TUNE knob
@@ -586,8 +849,21 @@ pub fn synth_panels() -> Vec<PanelDef> {
 //     25 % tax on the WHOLE room, sequencer included, because Newton is
 //     global. The room ships a real voltage-controlled 6 dB/octave low-pass
 //     with a live CUTOFF knob and no resonance.
-//   * THE OTA VCA on the bass (2 elements) — see the note at the resistor
-//     that replaced it.
+//   * THE OTA VCA on the bass — still cut, and the bass has a VCA anyway. It
+//     is an `Nmos`, one device, for the reason in fact 4: an OTA tracking an
+//     audio signal costs the WHOLE room about a third of a Newton iteration
+//     (3 µs), because Newton is global, and a MOSFET run as a
+//     voltage-controlled resistor costs the `devices^1.64` term alone. A
+//     `Vca` DEVICE KIND was considered for this change and rejected on the
+//     same arithmetic — see `THE VCAs` in the module docs.
+//   * THE ATTACK KNOBS. Both AD generators got a DECAY knob — the pot
+//     replaces the decay resistor, so it is the same device count and only
+//     the wiper's extra node, measured at +0.40 µs for the pair (17.64 →
+//     18.04, 1.13x → 1.11x). An ATTACK knob is a pot in SERIES with each
+//     diode, which is two more devices and their nodes on top of that. It was
+//     not built: attack here is 3 ms and the interesting control is the
+//     decay. If it is ever wanted, measure first — this is the room's whole
+//     remaining margin, not a rounding error.
 //   * THE HI-HAT. The audio tap runs at 12.5 kHz, so Nyquist is 6.25 kHz and
 //     a real hi-hat's 8–12 kHz cannot be transmitted at all. Band-limited to
 //     fit, it measured a 3.1 kHz centroid — close enough to the snare that
