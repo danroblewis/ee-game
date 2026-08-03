@@ -47,7 +47,7 @@
 //! it induces is a genuine equivalence relation and is identical on native
 //! and wasm32.
 
-use crate::netlist::{ElementKind, MAX_PINS};
+use crate::netlist::{ElementKind, Wave, MAX_PINS};
 
 /// One ideal constraint in canonical form: `v(a) − v(b) = dc + amp·sin(...)`
 /// with `a < b` (except in the degenerate `a == b` short, which the
@@ -60,6 +60,9 @@ pub struct Constraint {
     pub amp: f64,
     pub hz: f64,
     pub phase: f64,
+    /// The AC shape. Part of the identity: a 5 V sine and a 5 V square agree
+    /// on every other field and are not remotely the same voltage.
+    pub wave: Wave,
     /// True when the element was DRAWN with its pins in the opposite order
     /// to the canonical `(a, b)`. Two members of one group whose `flipped`
     /// differs read the shared branch current with opposite signs.
@@ -72,7 +75,7 @@ pub struct Constraint {
 pub struct ConstraintKey {
     pub a: usize,
     pub b: usize,
-    w: [u64; 4],
+    w: [u64; 5],
 }
 
 /// Relative quantization of a waveform parameter, by mantissa truncation.
@@ -130,7 +133,15 @@ impl Constraint {
     /// player who writes `phase = 0` on one source and `phase = 2π` on
     /// another gets a conflict instead of a merge: rare, deterministic, and
     /// fail-safe (it refuses rather than silently simulating something else).
-    fn canonical(mut a: usize, mut b: usize, mut dc: f64, mut amp: f64, hz: f64, phase: f64) -> Self {
+    fn canonical(
+        mut a: usize,
+        mut b: usize,
+        mut dc: f64,
+        mut amp: f64,
+        hz: f64,
+        phase: f64,
+        wave: Wave,
+    ) -> Self {
         let mut hz = hz;
         let mut phase = phase;
         let flipped = a > b;
@@ -139,9 +150,15 @@ impl Constraint {
             dc = -dc;
             amp = -amp;
         }
-        if amp < 0.0 {
+        // −A·sin(x) = A·sin(x + π), and the same for square and triangle —
+        // but NOT for the sawtooth, whose negation is a reverse ramp rather
+        // than a shifted one. See `Wave::is_half_wave_antisymmetric`. An
+        // asymmetric wave therefore keeps a signed amplitude, which reaches
+        // the key, so two sources that disagree are reported as a conflict
+        // instead of being merged onto one row.
+        if amp < 0.0 && wave.is_half_wave_antisymmetric() {
             amp = -amp;
-            phase += core::f64::consts::PI; // −A·sin(x) = A·sin(x + π)
+            phase += core::f64::consts::PI;
         }
         if amp == 0.0 {
             // A DC constraint has no frequency and no phase. Without this,
@@ -161,6 +178,7 @@ impl Constraint {
             amp,
             hz,
             phase,
+            wave,
             flipped,
         }
     }
@@ -174,6 +192,9 @@ impl Constraint {
                 qkey(self.amp),
                 qkey(self.hz),
                 qkey(self.phase),
+                // Exact, not quantized: a shape is a discrete choice, so
+                // there is no representation noise to forgive.
+                self.wave as u64,
             ],
         }
     }
@@ -212,17 +233,31 @@ impl Constraint {
 /// source fall out of the SAME rule as source-vs-source, instead of needing
 /// three special cases.
 pub fn constraint_of(kind: &ElementKind, node: &[usize; MAX_PINS]) -> Option<Constraint> {
-    let (a, b, dc, amp, hz, phase) = match *kind {
-        ElementKind::VoltageSource { dc, amp, hz, phase } => (node[0], node[1], dc, amp, hz, phase),
-        ElementKind::Rail { dc, amp, hz, phase } => (node[0], 0, dc, amp, hz, phase),
+    let (a, b, dc, amp, hz, phase, wave) = match *kind {
+        ElementKind::VoltageSource {
+            dc,
+            amp,
+            hz,
+            phase,
+            wave,
+        } => (node[0], node[1], dc, amp, hz, phase, wave),
+        ElementKind::Rail {
+            dc,
+            amp,
+            hz,
+            phase,
+            wave,
+        } => (node[0], 0, dc, amp, hz, phase, wave),
         // A closed switch is a 0 V source. Including it here is what makes
-        // two-way lighting and an OR contact placeable.
+        // two-way lighting and an OR contact placeable. Its shape is
+        // irrelevant at zero amplitude, and `canonical` folds every
+        // zero-amplitude source onto one shape anyway.
         ElementKind::Switch { closed: true } | ElementKind::Button { closed: true } => {
-            (node[0], node[1], 0.0, 0.0, 0.0, 0.0)
+            (node[0], node[1], 0.0, 0.0, 0.0, 0.0, Wave::Sine)
         }
         _ => return None,
     };
-    Some(Constraint::canonical(a, b, dc, amp, hz, phase))
+    Some(Constraint::canonical(a, b, dc, amp, hz, phase, wave))
 }
 
 #[cfg(test)]
@@ -238,6 +273,7 @@ mod tests {
 
     fn vs(dc: f64) -> ElementKind {
         ElementKind::VoltageSource {
+            wave: crate::netlist::Wave::Sine,
             dc,
             amp: 0.0,
             hz: 0.0,
@@ -246,11 +282,12 @@ mod tests {
     }
 
     fn ac(dc: f64, amp: f64, hz: f64, phase: f64) -> ElementKind {
-        ElementKind::VoltageSource { dc, amp, hz, phase }
+        ElementKind::VoltageSource { dc, amp, hz, phase, wave: Wave::Sine }
     }
 
     fn rail(dc: f64) -> ElementKind {
         ElementKind::Rail {
+            wave: crate::netlist::Wave::Sine,
             dc,
             amp: 0.0,
             hz: 0.0,

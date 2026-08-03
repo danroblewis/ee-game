@@ -384,6 +384,7 @@ fn divider(hz: f64) -> Vec<ElementSpec> {
     v.push(spec(
         3,
         K::VoltageSource {
+            wave: sim_core::Wave::Sine,
             dc: 2.5,
             amp: 2.5,
             hz,
@@ -865,6 +866,7 @@ fn adv_a_rescue_must_not_double_clock() {
     v.push(spec(
         3,
         K::VoltageSource {
+            wave: sim_core::Wave::Sine,
             dc: 2.5,
             amp: 2.5,
             hz: 200.0,

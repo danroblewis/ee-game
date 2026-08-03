@@ -11,6 +11,7 @@ const DT: f64 = 20e-6;
 
 fn dc(v: f64) -> ElementKind {
     ElementKind::VoltageSource {
+        wave: sim_core::Wave::Sine,
         dc: v,
         amp: 0.0,
         hz: 0.0,
@@ -19,11 +20,12 @@ fn dc(v: f64) -> ElementKind {
 }
 
 fn ac(dc: f64, amp: f64, hz: f64, phase: f64) -> ElementKind {
-    ElementKind::VoltageSource { dc, amp, hz, phase }
+    ElementKind::VoltageSource { dc, amp, hz, phase, wave: sim_core::Wave::Sine }
 }
 
 fn rail(v: f64) -> ElementKind {
     ElementKind::Rail {
+        wave: sim_core::Wave::Sine,
         dc: v,
         amp: 0.0,
         hz: 0.0,

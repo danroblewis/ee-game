@@ -690,6 +690,7 @@ mod tests {
             Capacitor { farads: 1e-6 },
             Inductor { henries: 1e-3 },
             VoltageSource {
+                wave: crate::netlist::Wave::Sine,
                 dc: 9.0,
                 amp: 0.0,
                 hz: 0.0,
@@ -697,6 +698,7 @@ mod tests {
             },
             CurrentSource { amps: 1e-3 },
             Rail {
+                wave: crate::netlist::Wave::Sine,
                 dc: 9.0,
                 amp: 0.0,
                 hz: 0.0,

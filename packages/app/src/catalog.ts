@@ -122,7 +122,7 @@ export const CATALOG: PartDef[] = [
     keys: 'sine ac oscillator signal',
     cat: 'Sources',
     key: 'F',
-    make: () => ({ t: 'VoltageSource', dc: 0, amp: 5, hz: 2, phase: 0 }),
+    make: () => ({ t: 'VoltageSource', dc: 0, amp: 5, hz: 2, phase: 0, wave: 'Sine' }),
   },
   {
     name: 'Current Source',

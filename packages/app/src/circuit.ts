@@ -7,6 +7,13 @@ export type Point = [number, number];
  *  as a separate flag, so the properties panel has one field. */
 export type GateOp = 'And' | 'Nand' | 'Or' | 'Nor' | 'Xor' | 'Xnor' | 'Buf' | 'Not';
 
+/** The shape a source's AC component traces. Mirrors `sim_core::Wave`.
+ *
+ *  Absent on documents written before waveforms existed, and serde defaults
+ *  those to `Sine` — so the field is optional here for exactly the same
+ *  reason, and `undefined` MEANS sine rather than meaning "unset". */
+export type Wave = 'Sine' | 'Square' | 'Triangle' | 'Saw';
+
 /** Buffers and inverters take exactly one input whatever `ins` says — the
  *  mirror of `GateOp::fixed_ins`, and what keeps `pinCount` agreeing with
  *  the solver about how wide the part is. */
@@ -58,9 +65,9 @@ export type ElementKind =
   | { t: 'Speaker'; ohms: number }
   | { t: 'Capacitor'; farads: number }
   | { t: 'Inductor'; henries: number }
-  | { t: 'VoltageSource'; dc: number; amp: number; hz: number; phase: number }
+  | { t: 'VoltageSource'; dc: number; amp: number; hz: number; phase: number; wave?: Wave }
   | { t: 'CurrentSource'; amps: number }
-  | { t: 'Rail'; dc: number; amp: number; hz: number; phase: number }
+  | { t: 'Rail'; dc: number; amp: number; hz: number; phase: number; wave?: Wave }
   | { t: 'Switch'; closed: boolean }
   | { t: 'Button'; closed: boolean }
   | { t: 'Diode' }

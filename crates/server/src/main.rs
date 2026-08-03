@@ -198,6 +198,7 @@ fn demo_room_circuit() -> Vec<ElementSpec> {
         spec(
             39,
             K::VoltageSource {
+                wave: sim_core::Wave::Sine,
                 dc: 3.0,
                 amp: 3.0,
                 hz: 0.3,
@@ -4832,6 +4833,7 @@ mod tests {
             spec(
                 1,
                 K::VoltageSource {
+                    wave: sim_core::Wave::Sine,
                     dc: 0.0,
                     amp: 5.0,
                     hz: 440.0,
@@ -6820,6 +6822,7 @@ mod tests {
                 with_rail.push(ElementSpec {
                     id: 5100,
                     kind: K::Rail {
+                        wave: sim_core::Wave::Sine,
                         dc: 12.0,
                         amp: 0.0,
                         hz: 0.0,
@@ -6908,6 +6911,7 @@ mod tests {
                 spec: ElementSpec {
                     id: 6003,
                     kind: K::Rail {
+                        wave: sim_core::Wave::Sine,
                         dc: 5.0,
                         amp: 0.0,
                         hz: 0.0,
@@ -6965,6 +6969,7 @@ mod tests {
         for source in [
             dc(9.0),
             K::VoltageSource {
+                wave: sim_core::Wave::Sine,
                 dc: 0.0,
                 amp: 9.0,
                 hz: 50.0,

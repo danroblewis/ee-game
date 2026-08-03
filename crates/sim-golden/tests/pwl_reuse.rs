@@ -210,6 +210,7 @@ fn a_diode_district_does_not_disarm_reuse_next_door() {
         ElementSpec::two(
             80,
             ElementKind::VoltageSource {
+                wave: sim_core::Wave::Sine,
                 dc: 9.0,
                 amp: 0.0,
                 hz: 0.0,
@@ -356,6 +357,7 @@ fn pathological_circuit_still_quarantines_identically() {
         ElementSpec::two(
             3,
             ElementKind::VoltageSource {
+                wave: sim_core::Wave::Sine,
                 dc: 1.0,
                 amp: 0.0,
                 hz: 0.0,

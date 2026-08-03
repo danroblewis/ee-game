@@ -27,6 +27,7 @@ fn digital_room(n: i32, clock_hz: f64) -> Vec<ElementSpec> {
         spec(
             3,
             K::VoltageSource {
+                wave: sim_core::Wave::Sine,
                 dc: 2.5,
                 amp: 2.5,
                 hz: clock_hz,
@@ -239,6 +240,7 @@ fn one_chip_in_an_analog_room() {
     with_logic.push(spec(
         90,
         K::VoltageSource {
+            wave: sim_core::Wave::Sine,
             dc: 2.5,
             amp: 2.5,
             hz: 1000.0,

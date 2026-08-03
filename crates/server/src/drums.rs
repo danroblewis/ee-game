@@ -137,6 +137,7 @@ pub fn drum_kit(o: Point, id0: u32, seed: u32) -> Drums {
     e.push(ElementSpec {
         id: id(0),
         kind: K::Rail {
+            wave: sim_core::Wave::Sine,
             dc: 9.0,
             amp: 0.0,
             hz: 0.0,

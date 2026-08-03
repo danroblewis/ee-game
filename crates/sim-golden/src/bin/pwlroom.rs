@@ -169,6 +169,7 @@ fn main() {
         ElementSpec::two(
             800_000_002,
             ElementKind::VoltageSource {
+                wave: sim_core::Wave::Sine,
                 dc: 9.0,
                 amp: 0.0,
                 hz: 0.0,
