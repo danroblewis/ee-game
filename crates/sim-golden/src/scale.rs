@@ -333,6 +333,7 @@ impl Builder {
         self.out.push(ElementSpec::two(
             id,
             ElementKind::VoltageSource {
+            wave: sim_core::Wave::Sine,
                 dc: 0.0,
                 amp: 1.0,
                 hz: 1_000.0,
@@ -364,6 +365,7 @@ fn district(index: usize, target: usize, params: GenParams) -> (Vec<ElementSpec>
     b.out.push(ElementSpec::two(
         id,
         ElementKind::VoltageSource {
+            wave: sim_core::Wave::Sine,
             dc: 12.0,
             amp: 0.0,
             hz: 0.0,

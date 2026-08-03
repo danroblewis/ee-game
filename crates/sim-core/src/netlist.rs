@@ -51,6 +51,105 @@ fn default_opamp_isc() -> f64 {
     DEFAULT_OPAMP_ISC
 }
 
+/// The shape a source's AC component traces.
+///
+/// All four are PHASE-ALIGNED with the sine: each starts at 0 and rises, and
+/// each has the same period and the same +/-`amp` extremes. Switching a
+/// running source's waveform therefore changes its shape without jumping its
+/// phase, so a scope trace stays put and a circuit built around the timing
+/// keeps working.
+///
+/// Only `Sine` needs a transcendental. The other three are exact piecewise
+/// arithmetic — cheaper than the sine and, unlike it, carrying no library
+/// approximation at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum Wave {
+    /// The default, and what every document written before this existed is.
+    #[default]
+    Sine,
+    /// +amp for the first half of the period, -amp for the second.
+    /// DISCONTINUOUS: see `Wave::has_edges`.
+    Square,
+    /// 0 -> +amp -> 0 -> -amp -> 0. Continuous, with slope breaks the
+    /// trapezoidal integrator handles without help.
+    Triangle,
+    /// Ramps 0 -> +amp across the first half, jumps to -amp, ramps back to 0.
+    /// DISCONTINUOUS: see `Wave::has_edges`.
+    Saw,
+}
+
+impl Wave {
+    /// Does this shape JUMP — a step change of 2*amp in zero time?
+    ///
+    /// This is the load-bearing question, not a cosmetic one. Trapezoidal
+    /// integration assumes the state moved smoothly across the step, so a
+    /// genuine discontinuity into a reactive load makes it ring: the digital
+    /// logic work measured an output driven to +5.53 V and -0.55 V on a 5 V
+    /// rail from exactly this, and a pin a volt outside its rails is how a
+    /// part gets destroyed. The engine already owns the cure — the backward-
+    /// Euler steps it takes after a switch flip — and a waveform edge arms
+    /// them the same way.
+    pub fn has_edges(self) -> bool {
+        matches!(self, Wave::Square | Wave::Saw)
+    }
+
+    /// Is `-f(u)` the same shape half a period along — `-f(u) == f(u + 1/2)`?
+    ///
+    /// This is what lets `Constraint::canonical` fold a NEGATIVE amplitude
+    /// into a pi phase shift and keep amplitudes positive, so a source and
+    /// its mirror image (drawn the other way round, amplitude negated) are
+    /// recognised as the same net rather than as a conflict.
+    ///
+    /// It holds for sine, square and triangle. It is FALSE for the sawtooth,
+    /// and that is not a detail: negating a ramp gives a REVERSE ramp, which
+    /// is a different shape and not one this enum can even name. Folding it
+    /// anyway would quietly merge two sources demanding genuinely different
+    /// voltages onto one branch row and solve the wrong circuit. So an
+    /// asymmetric wave keeps its amplitude SIGNED, its sign reaches the key,
+    /// and a saw drawn against a saw is correctly reported as a conflict.
+    pub fn is_half_wave_antisymmetric(self) -> bool {
+        !matches!(self, Wave::Saw)
+    }
+
+    /// The shape at normalized phase `u` in `[0, 1)`, in `[-1, 1]`.
+    ///
+    /// Sine is NOT evaluated here: it keeps its original
+    /// `libm::sin(2*pi*hz*t + phase)` call so that every document that
+    /// predates this enum produces bit-identical numbers. Re-deriving it from
+    /// `u` would round differently in the last place and move every golden
+    /// digest for no reason.
+    pub fn eval_unit(self, u: f64) -> f64 {
+        match self {
+            // Handled by the caller; see above.
+            Wave::Sine => 0.0,
+            Wave::Square => {
+                if u < 0.5 {
+                    1.0
+                } else {
+                    -1.0
+                }
+            }
+            Wave::Triangle => {
+                if u < 0.25 {
+                    4.0 * u
+                } else if u < 0.75 {
+                    2.0 - 4.0 * u
+                } else {
+                    4.0 * u - 4.0
+                }
+            }
+            Wave::Saw => {
+                if u < 0.5 {
+                    2.0 * u
+                } else {
+                    2.0 * u - 2.0
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(tag = "t"))]
@@ -83,12 +182,16 @@ pub enum ElementKind {
     Inductor {
         henries: f64,
     },
-    /// v(pin0) - v(pin1) = dc + amp * sin(2*pi*hz*t + phase). Pin 0 is +.
+    /// v(pin0) - v(pin1) = dc + amp * wave(2*pi*hz*t + phase). Pin 0 is +.
     VoltageSource {
         dc: f64,
         amp: f64,
         hz: f64,
         phase: f64,
+        /// Defaulted, so a save written before waveforms existed loads as the
+        /// sine it has always been.
+        #[cfg_attr(feature = "serde", serde(default))]
+        wave: Wave,
     },
     /// Constant current driven from pin 0 to pin 1 through the element.
     CurrentSource {
@@ -103,6 +206,8 @@ pub enum ElementKind {
         amp: f64,
         hz: f64,
         phase: f64,
+        #[cfg_attr(feature = "serde", serde(default))]
+        wave: Wave,
     },
     /// Closed switch stamps as a 0 V source (its branch current is an MNA
     /// unknown); open switch stamps nothing.

@@ -893,6 +893,7 @@ mod tests {
             K::Pmos { vt: 1.5, k: 0.05 },
             K::Timer555,
             K::VoltageSource {
+                wave: sim_core::Wave::Sine,
                 dc: 9.0,
                 amp: 0.0,
                 hz: 0.0,
@@ -1033,6 +1034,7 @@ mod tests {
         // 3 A is 1.5x its 2 A rating, but the LED is gone within one tick
         // and the pack has barely warmed by then.
         let cell = K::VoltageSource {
+            wave: sim_core::Wave::Sine,
             dc: 9.0,
             amp: 0.0,
             hz: 0.0,

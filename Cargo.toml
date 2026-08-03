@@ -9,6 +9,7 @@ members = [
     "crates/machine",
     "crates/damage",
     "crates/server",
+    "crates/sim-gpu-spike",
 ]
 # Standalone measurement crates (docs/scale-parallelism.md). Excluded on
 # purpose: their dependencies (rayon, wgpu) must never reach a shipping

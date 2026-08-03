@@ -11,3 +11,10 @@ packages/app/src/wasm/
 room-save.json
 
 .claude/
+
+# Live server state, not source: the rooms directory is a running server's save
+# dir (EE_ROOMS). A room file committed here would be one player's world frozen
+# into the repo, and would fight every other checkout.
+rooms/
+room-save.json.migrated
+reuse.txt

@@ -86,6 +86,7 @@ import {
   demoCircuit,
   MAX_PINS,
   FRAME_STRIDE,
+  type Wave,
   unpackFrame,
   type DocOp,
   type ElementKind,
@@ -1618,6 +1619,7 @@ const FIELD_LABELS: Record<string, string> = {
   r_lit: 'lit',
   // The logic family's own parameters.
   op: 'function',
+  wave: 'waveform',
   ins: 'inputs 1-4',
   edge: 'edge triggered',
   bits: 'bits 2-4',
@@ -1626,6 +1628,21 @@ const FIELD_LABELS: Record<string, string> = {
 };
 /** Gate functions, in menu order. Mirrors `sim_core::GateOp`. */
 const GATE_OPS: GateOp[] = ['And', 'Nand', 'Or', 'Nor', 'Xor', 'Xnor', 'Buf', 'Not'];
+
+/** Source waveforms, in menu order. Mirrors `sim_core::Wave`. */
+const WAVES: Wave[] = ['Sine', 'Square', 'Triangle', 'Saw'];
+
+/** The options for an enum-valued property field.
+ *
+ *  Keyed by FIELD NAME rather than by part, because the field name is what
+ *  `buildProps` is iterating and every enum field in the document happens to
+ *  have a name unique to its meaning. A field with no entry gets a plain text
+ *  box, so adding an enum without touching this is a visible omission rather
+ *  than a silent one. */
+const ENUM_OPTIONS: Record<string, readonly string[]> = {
+  op: GATE_OPS,
+  wave: WAVES,
+};
 
 /** Parameters that decide how many pins a part has. `SetKind` refuses any
  *  change to the pin count (the footprint would have to move under the
@@ -1799,7 +1816,19 @@ function buildProps(host: HTMLElement, target: ElementSpec, onClose?: () => void
     h.appendChild(x);
   }
 
-  for (const [field, value] of Object.entries(target.kind)) {
+  // A source written before waveforms existed has NO `wave` key, and serde
+  // defaults it to sine on the way in. Iterating the object alone would then
+  // show no picker at all on exactly the sources a player most wants to
+  // change, so the default is materialised here: choosing a shape writes the
+  // field, and leaving it alone writes nothing.
+  const entries = Object.entries(target.kind);
+  if (
+    (target.kind.t === 'VoltageSource' || target.kind.t === 'Rail') &&
+    !entries.some(([f]) => f === 'wave')
+  ) {
+    entries.push(['wave', 'Sine']);
+  }
+  for (const [field, value] of entries) {
     if (field === 't') continue;
     const label = document.createElement('label');
     const span = document.createElement('span');
@@ -1825,7 +1854,7 @@ function buildProps(host: HTMLElement, target: ElementSpec, onClose?: () => void
       // editing this one.
       const sel = document.createElement('select');
       const width = pinCount(target.kind);
-      for (const opt of GATE_OPS) {
+      for (const opt of ENUM_OPTIONS[field] ?? []) {
         const cand = { ...target.kind, [field]: opt } as ElementSpec['kind'];
         if (pinCount(cand) !== width) continue;
         const o = document.createElement('option');

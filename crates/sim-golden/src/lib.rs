@@ -20,6 +20,7 @@ pub fn gnd(id: u32, at: Point) -> ElementSpec {
 
 pub fn dc(volts: f64) -> ElementKind {
     ElementKind::VoltageSource {
+        wave: sim_core::Wave::Sine,
         dc: volts,
         amp: 0.0,
         hz: 0.0,
@@ -29,6 +30,19 @@ pub fn dc(volts: f64) -> ElementKind {
 
 pub fn sine(amp: f64, hz: f64) -> ElementKind {
     ElementKind::VoltageSource {
+        wave: sim_core::Wave::Sine,
+        dc: 0.0,
+        amp,
+        hz,
+        phase: 0.0,
+    }
+}
+
+/// An AC source of any shape. `sine(amp, hz)` stays the sine special case so
+/// every existing golden keeps its exact construction.
+pub fn shaped(amp: f64, hz: f64, wave: sim_core::Wave) -> ElementKind {
+    ElementKind::VoltageSource {
+        wave,
         dc: 0.0,
         amp,
         hz,
@@ -468,6 +482,7 @@ pub fn dff_divide_by_2() -> Vec<ElementSpec> {
         spec(
             3,
             ElementKind::VoltageSource {
+        wave: sim_core::Wave::Sine,
                 dc: 2.5,
                 amp: 2.5,
                 hz: 1000.0,
@@ -519,6 +534,7 @@ pub fn shiftreg_ring4() -> Vec<ElementSpec> {
         spec(
             3,
             ElementKind::VoltageSource {
+        wave: sim_core::Wave::Sine,
                 dc: 2.5,
                 amp: 2.5,
                 hz: 500.0,
@@ -578,6 +594,7 @@ pub fn counter_div8() -> Vec<ElementSpec> {
         spec(
             3,
             ElementKind::VoltageSource {
+        wave: sim_core::Wave::Sine,
                 dc: 2.5,
                 amp: 2.5,
                 hz: 1000.0,
@@ -619,6 +636,7 @@ pub fn mux4_select() -> Vec<ElementSpec> {
         spec(
             3,
             ElementKind::VoltageSource {
+        wave: sim_core::Wave::Sine,
                 dc: 2.5,
                 amp: 2.5,
                 hz: 1000.0,

@@ -130,6 +130,7 @@
 
 use crate::constraint::{constraint_of, Constraint, ConstraintKey};
 use crate::netlist::{
+    Wave,
     ElementKind, ElementSpec, InteractOp, LogicPins, ParamWrite, Point, MAX_PINS,
 };
 use sim_math::DenseLu;
@@ -300,6 +301,10 @@ const RESCUE_DEPTH: u32 = 4;
 const BE_STEPS_AFTER_EVENT: u32 = 2;
 
 const TWO_PI: f64 = core::f64::consts::TAU;
+/// 1/2pi, so a phase in radians becomes a phase in TURNS with one multiply.
+/// Precomputed as a constant rather than divided at each use so that every
+/// source in the room does the identical operation, in the identical order.
+const INV_TWO_PI: f64 = 1.0 / core::f64::consts::TAU;
 
 /// Tunable thresholds for the two work-skipping levers. Every field is a
 /// property of the *state*, never of the machine: nothing here may ever be
@@ -756,6 +761,19 @@ pub struct Island {
     /// without reaching back out of the island. Written by `rebuild` and by
     /// `Engine::set_reuse_pwl`, never by the solve.
     reuse_pwl: bool,
+    /// Indices into `elems` of the sources whose waveform JUMPS (square and
+    /// sawtooth). Almost always empty — a room with no such source pays one
+    /// `is_empty()` per step and nothing else.
+    ///
+    /// They are tracked because a jump is an EVENT, and the trapezoidal rule
+    /// assumes the state moved smoothly across the step it is integrating.
+    /// Drive a capacitor from a square wave and trapezoid will ring on every
+    /// edge — the same failure the logic family hit, where an output reached
+    /// +5.53 V and -0.55 V on a 5 V rail and would have destroyed healthy
+    /// parts through the damage model. The engine already owns the cure: the
+    /// backward-Euler steps it takes after a switch flip. A waveform edge
+    /// arms them exactly the same way, and for exactly the same reason.
+    edge_sources: Vec<usize>,
     be_steps: u32,
     quarantined: bool,
     /// Count of numeric factorizations since construction (instrumentation
@@ -1738,6 +1756,17 @@ impl Engine {
             }
             let tuning = self.tuning;
             let reuse_pwl = self.reuse_pwl;
+            // Only the ACTIVE prefix can stamp, so only it can produce an
+            // edge; a parked or broken source drives nothing.
+            let edge_sources: Vec<usize> = (0..active)
+                .filter(|&i| match elems[i].spec.kind {
+                    ElementKind::VoltageSource { amp, hz, wave, .. }
+                    | ElementKind::Rail { amp, hz, wave, .. } => {
+                        amp != 0.0 && hz != 0.0 && wave.has_edges()
+                    }
+                    _ => false,
+                })
+                .collect();
             islands.push(Island {
                 elems,
                 active,
@@ -1755,6 +1784,7 @@ impl Engine {
                 factored_h: 0.0,
                 factored_be: false,
                 reuse_pwl,
+                edge_sources,
                 be_steps: BE_STEPS_AFTER_EVENT,
                 quarantined: false,
                 factorizations: 0,
@@ -1865,7 +1895,77 @@ impl Engine {
     }
 }
 
+/// `dc + amp · wave(2π·hz·t + phase)`.
+///
+/// SINE IS EVALUATED EXACTLY AS IT ALWAYS WAS. Re-deriving it from the
+/// normalized phase would round differently in the last place and move every
+/// golden digest for a refactor, so the original expression is kept verbatim
+/// and only the other three shapes go through `eval_unit`.
+///
+/// The normalized phase is `hz·t + phase/2π`, taken to its fractional part.
+/// `libm::floor` is exact — no approximation enters — and every operation
+/// here is plain f64, so this is bit-identical on native and wasm32 like the
+/// rest of the kernel. Nothing is reduced modulo 2π: the division by the
+/// constant happens once, on the phase alone.
+#[inline]
+fn source_value(dc: f64, amp: f64, hz: f64, phase: f64, wave: Wave, t: f64) -> f64 {
+    if amp == 0.0 {
+        return dc;
+    }
+    match wave {
+        Wave::Sine => dc + amp * libm::sin(TWO_PI * hz * t + phase),
+        w => {
+            let x = hz * t + phase * INV_TWO_PI;
+            let u = x - libm::floor(x);
+            dc + amp * w.eval_unit(u)
+        }
+    }
+}
+
+/// Does the source's shape JUMP somewhere in `(t0, t1]`?
+///
+/// Both answers are one integer comparison on the phase counter, which is
+/// what makes them exact at any step size — including a step that straddles
+/// several edges at once (a source far above the sample rate, where the
+/// answer is "yes" regardless).
+///
+/// With `x = hz·t + phase/2π` the normalized phase is `frac(x)`, so:
+///   * SQUARE jumps at `u = 0` and `u = 1/2`, i.e. whenever `floor(2x)` moves;
+///   * SAW jumps at `u = 1/2` only, i.e. whenever `floor(x − 1/2)` moves.
+#[inline]
+fn crosses_edge(hz: f64, phase: f64, wave: Wave, t0: f64, t1: f64) -> bool {
+    if !wave.has_edges() || hz == 0.0 {
+        return false;
+    }
+    let x = |t: f64| hz * t + phase * INV_TWO_PI;
+    match wave {
+        Wave::Square => libm::floor(2.0 * x(t0)) != libm::floor(2.0 * x(t1)),
+        _ => libm::floor(x(t0) - 0.5) != libm::floor(x(t1) - 0.5),
+    }
+}
+
 impl Island {
+    /// Does any source jump inside `(t0, t1]`?
+    ///
+    /// The `is_empty()` short-circuit is the point: rooms without a square or
+    /// sawtooth source — which is nearly all of them — never look at a single
+    /// element.
+    #[inline]
+    fn step_has_edge(&self, t0: f64, t1: f64) -> bool {
+        if self.edge_sources.is_empty() {
+            return false;
+        }
+        self.edge_sources.iter().any(|&i| {
+            match self.elems[i].spec.kind {
+                ElementKind::VoltageSource { hz, phase, wave, .. }
+                | ElementKind::Rail { hz, phase, wave, .. } => {
+                    crosses_edge(hz, phase, wave, t0, t1)
+                }
+                _ => false,
+            }
+        })
+    }
+
     // ------------------------------------------------------ instrumentation
 
     /// MNA unknowns in this island: `nodes + branches`.
@@ -2235,6 +2335,19 @@ impl Island {
         while self.pending >= self.k {
             let k = self.k;
             let h = dt * k as f64;
+            // A waveform edge is an EVENT, and it arms the same two backward-
+            // Euler steps a switch flip does rather than just one. One is not
+            // enough: the step containing the jump is integrated cleanly, but
+            // the transient it kicks off is still moving when trapezoid
+            // resumes, and it rings on that. Measured on a 5 V square into an
+            // RC at tau = dt/10 — peak node voltage 5.163 V with no arming,
+            // 5.082 V arming only the edge step, 5.028 V with the full two.
+            // The 0.5% that remains is not ringing: it is the edge landing
+            // between two samples, which is inherent to sampling a
+            // discontinuity at finite dt and cannot be integrated away.
+            if self.step_has_edge(t, t + h) {
+                self.be_steps = self.be_steps.max(BE_STEPS_AFTER_EVENT);
+            }
             let be = self.be_steps > 0;
             let nr0 = report.nr_iters;
             let resc0 = report.rescues;
@@ -2540,12 +2653,14 @@ impl Island {
                     self.stamp_i_into(node[0], -i);
                     self.stamp_i_into(node[1], i);
                 }
-                ElementKind::VoltageSource { dc, amp, hz, phase } => {
-                    let v = if amp == 0.0 {
-                        dc
-                    } else {
-                        dc + amp * libm::sin(TWO_PI * hz * t_new + phase)
-                    };
+                ElementKind::VoltageSource {
+                    dc,
+                    amp,
+                    hz,
+                    phase,
+                    wave,
+                } => {
+                    let v = source_value(dc, amp, hz, phase, wave, t_new);
                     let bi = self.num_nodes + branch.ok_or(())?;
                     if need_factor {
                         for (pin, sgn) in [(node[0], 1.0), (node[1], -1.0)] {
@@ -2557,15 +2672,17 @@ impl Island {
                     }
                     self.b[bi] = v;
                 }
-                ElementKind::Rail { dc, amp, hz, phase } => {
+                ElementKind::Rail {
+                    dc,
+                    amp,
+                    hz,
+                    phase,
+                    wave,
+                } => {
                     // A voltage source whose far terminal IS ground: only the
                     // one pin stamps, and node 0 has no row to receive the
                     // return current (exactly like a grounded two-pin source).
-                    let v = if amp == 0.0 {
-                        dc
-                    } else {
-                        dc + amp * libm::sin(TWO_PI * hz * t_new + phase)
-                    };
+                    let v = source_value(dc, amp, hz, phase, wave, t_new);
                     let bi = self.num_nodes + branch.ok_or(())?;
                     if need_factor && node[0] > 0 {
                         self.a[bi * n + (node[0] - 1)] += 1.0;

@@ -1,0 +1,22 @@
+[package]
+name = "sim-gpu-spike"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Dev-only GPU throughput spike (design doc Phase 1). NOT part of the server
+# dependency graph; nothing in sim-core/sim-math/server depends on this.
+# Answers: at what batch size does batched GPU dense LU beat the CPU path,
+# and is f32 / f32+iterative-refinement precision survivable for MNA?
+
+[dependencies]
+sim-math = { path = "../sim-math" }
+wgpu = "24"
+pollster = "0.4"
+rayon = "1.10"
+bytemuck = "1"
+
+[[bin]]
+name = "gpu-bench"
+path = "src/main.rs"

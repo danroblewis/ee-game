@@ -641,7 +641,7 @@ fn check_kind(kind: &ElementKind) -> Result<(), &'static str> {
             }
             Ok(())
         }
-        K::VoltageSource { dc, amp, hz, phase } | K::Rail { dc, amp, hz, phase } => {
+        K::VoltageSource { dc, amp, hz, phase, .. } | K::Rail { dc, amp, hz, phase, .. } => {
             if !mag_ok(dc, MAX_SOURCE_VOLTS) || !mag_ok(amp, MAX_SOURCE_VOLTS) {
                 return Err("source voltage is limited to 1 MV");
             }
@@ -1263,8 +1263,12 @@ fn swings(kind: &ElementKind) -> bool {
 fn pin_at_peak(specs: &mut [ElementSpec], sign: f64) {
     for s in specs.iter_mut() {
         match &mut s.kind {
-            ElementKind::VoltageSource { dc, amp, hz, phase }
-            | ElementKind::Rail { dc, amp, hz, phase } => {
+            // The waveform is deliberately untouched here: this pins a source
+            // at one EXTREME of its travel for the placement trial, and every
+            // shape has the same +/-`amp` extremes, so the worst case the gate
+            // must survive is the same whatever the shape.
+            ElementKind::VoltageSource { dc, amp, hz, phase, .. }
+            | ElementKind::Rail { dc, amp, hz, phase, .. } => {
                 if *amp != 0.0 {
                     *dc += sign * amp.abs();
                     *amp = 0.0;
@@ -1605,6 +1609,7 @@ mod tests {
 
     fn dc(volts: f64) -> ElementKind {
         ElementKind::VoltageSource {
+            wave: crate::netlist::Wave::Sine,
             dc: volts,
             amp: 0.0,
             hz: 0.0,
@@ -1613,11 +1618,12 @@ mod tests {
     }
 
     fn ac(dc: f64, amp: f64, hz: f64, phase: f64) -> ElementKind {
-        ElementKind::VoltageSource { dc, amp, hz, phase }
+        ElementKind::VoltageSource { dc, amp, hz, phase, wave: crate::netlist::Wave::Sine }
     }
 
     fn rail(volts: f64) -> ElementKind {
         ElementKind::Rail {
+            wave: crate::netlist::Wave::Sine,
             dc: volts,
             amp: 0.0,
             hz: 0.0,

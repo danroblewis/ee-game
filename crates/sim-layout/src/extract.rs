@@ -81,7 +81,7 @@ fn is_part(kind: &ElementKind) -> bool {
 }
 
 pub fn rail_key(kind: &ElementKind) -> Option<RailKey> {
-    if let ElementKind::Rail { dc, amp, hz, phase } = kind {
+    if let ElementKind::Rail { dc, amp, hz, phase, .. } = kind {
         Some(RailKey {
             dc: dc.to_bits(),
             amp: amp.to_bits(),

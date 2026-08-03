@@ -13,6 +13,7 @@ pub use engine::{
     AdvanceReport, ElemFrame, ElemTap, Engine, Island, Tuning, FRAME_STRIDE, GMIN,
 };
 pub use netlist::{
+    Wave,
     photocell_ohms, DocOp, ElementKind, ElementSpec, GateOp, InteractOp, LogicPins, ParamWrite,
     Point,
     DEFAULT_OPAMP_ISC, MAX_PINS, MAX_TIER,
@@ -27,6 +28,7 @@ mod tests {
     /// Battery -> switch -> lamp loop: the M1 demo circuit.
     fn demo_circuit(closed: bool) -> Vec<ElementSpec> {
         let dc9 = ElementKind::VoltageSource {
+            wave: crate::netlist::Wave::Sine,
             dc: 9.0,
             amp: 0.0,
             hz: 0.0,
@@ -85,6 +87,7 @@ mod tests {
     fn divider_is_exact() {
         // 10 V across 1k + 3k: midpoint at 7.5 V (pin-0 side is +).
         let dc10 = ElementKind::VoltageSource {
+            wave: crate::netlist::Wave::Sine,
             dc: 10.0,
             amp: 0.0,
             hz: 0.0,
@@ -111,6 +114,7 @@ mod tests {
         // 5 V peak 440 Hz across an 8 Ω speaker in series with 8 Ω: the coil
         // sees exactly half the source, and the tap sees the coil.
         let ac = ElementKind::VoltageSource {
+            wave: crate::netlist::Wave::Sine,
             dc: 0.0,
             amp: 5.0,
             hz: 440.0,
@@ -160,6 +164,7 @@ mod tests {
             ElementSpec::two(
                 1,
                 ElementKind::VoltageSource {
+                    wave: crate::netlist::Wave::Sine,
                     dc: 12.0,
                     amp: 0.0,
                     hz: 0.0,
@@ -233,6 +238,7 @@ mod tests {
             ElementSpec::two(
                 1,
                 ElementKind::VoltageSource {
+                    wave: crate::netlist::Wave::Sine,
                     dc: 9.0,
                     amp: 0.0,
                     hz: 0.0,
@@ -292,6 +298,7 @@ mod tests {
             ElementSpec::two(
                 1,
                 ElementKind::VoltageSource {
+                    wave: crate::netlist::Wave::Sine,
                     dc: 9.0,
                     amp: 0.0,
                     hz: 0.0,
@@ -360,6 +367,7 @@ mod tests {
     #[test]
     fn rail_is_a_grounded_battery() {
         let rail = ElementKind::Rail {
+            wave: crate::netlist::Wave::Sine,
             dc: 5.0,
             amp: 0.0,
             hz: 0.0,
@@ -405,6 +413,7 @@ mod tests {
 
     fn dc(v: f64) -> ElementKind {
         ElementKind::VoltageSource {
+            wave: crate::netlist::Wave::Sine,
             dc: v,
             amp: 0.0,
             hz: 0.0,
@@ -765,6 +774,7 @@ mod tests {
             ElementSpec::two(
                 1,
                 ElementKind::VoltageSource {
+                    wave: crate::netlist::Wave::Sine,
                     dc: 0.0,
                     amp: 10.0,
                     hz: 60.0,
@@ -1187,6 +1197,7 @@ mod tests {
             ElementSpec::two(
                 10,
                 ElementKind::VoltageSource {
+                    wave: crate::netlist::Wave::Sine,
                     dc: 0.0,
                     amp: 5.0,
                     hz: 1000.0,

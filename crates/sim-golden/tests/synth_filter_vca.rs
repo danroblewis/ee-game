@@ -70,6 +70,7 @@ fn pot(ohms: f64, wiper: f64) -> K {
 }
 fn sine(amp: f64, hz: f64) -> K {
     K::VoltageSource {
+        wave: sim_core::Wave::Sine,
         dc: 0.0,
         amp,
         hz,
@@ -78,6 +79,7 @@ fn sine(amp: f64, hz: f64) -> K {
 }
 fn rail(dc: f64) -> K {
     K::Rail {
+        wave: sim_core::Wave::Sine,
         dc,
         amp: 0.0,
         hz: 0.0,
