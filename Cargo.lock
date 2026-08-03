@@ -1781,15 +1781,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sim-layout"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "sim-core",
-]
-
-[[package]]
 name = "sim-gpu-spike"
 version = "0.1.0"
 dependencies = [
@@ -1798,6 +1789,15 @@ dependencies = [
  "rayon",
  "sim-math",
  "wgpu",
+]
+
+[[package]]
+name = "sim-layout"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sim-core",
 ]
 
 [[package]]
