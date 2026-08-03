@@ -7765,6 +7765,27 @@ mod tests {
     /// So this guard rail is on the device count, which is what costs, with
     /// a loose cap on the routing so a runaway wire generator still trips
     /// something.
+    ///
+    /// THE CAP IS 80, AND IT IS RE-DERIVED FROM A LIVE MEASUREMENT, not
+    /// raised because something did not fit. The room went 64 → 77 devices to
+    /// pick up a fourth step, a second VCA and a second AD envelope generator;
+    /// measured on this machine, same session, load average 5–7:
+    ///
+    ///     64 devices / 206 els   12.88 us/substep  1.55x   NR 1.99
+    ///     77 devices / 250 els   18.04 us/substep  1.11x   NR 2.00
+    ///
+    /// and over a websocket against the real server, reading its own `rt`:
+    ///
+    ///     64 devices, 60 s   rt median 0.999  min 0.990  0/1800 below 0.97
+    ///     77 devices, 60 s   rt median 0.999  min 0.990  0/1799 below 0.97
+    ///     77 devices, 90 s   rt median 0.999, three runs, and so does the
+    ///                        64-device room — whose worst 90 s run was the
+    ///                        worse of the two (min 0.734 against 0.851).
+    ///
+    /// Both hold real time; what changed is the MARGIN, from 1.55x to 1.11x.
+    /// 80 is where 1.11x still has somewhere to go on a slower machine — the
+    /// measured slope near here is about 0.40 us per device, so 80 devices is
+    /// ~1.09x and 90 would be ~0.93x, which is a synthesizer a semitone flat.
     #[test]
     fn the_synth_room_fits_the_realtime_budget() {
         let els = synth::synth_room_circuit();
@@ -7773,14 +7794,15 @@ mod tests {
             .filter(|e| !matches!(e.kind, K::Wire | K::Ground))
             .count();
         assert!(
-            devices <= 64,
-            "the synth room grew to {devices} devices; at 1.38x real time it \
-             had 64, and the margin is not there to spend"
+            devices <= 80,
+            "the synth room grew to {devices} devices; at 77 it measured 1.11x \
+             real time offline and rt 0.999 live, and past ~80 the margin is \
+             gone — re-measure before raising this, do not just raise it"
         );
         assert!(
-            els.len() <= 260,
+            els.len() <= 280,
             "the synth room is drawn with {} elements; routing is nearly free \
-             but not free, and past ~260 `solve_wire_currents` starts to show",
+             but not free, and past ~280 `solve_wire_currents` starts to show",
             els.len()
         );
     }
@@ -8011,8 +8033,14 @@ mod tests {
             "only found {} steps in 3.2 s -- is the clock running?",
             steps.len()
         );
-        // A minor: A3 C4 E4, repeating.
-        const RIFF: [f64; 3] = [220.0, 261.626, 329.628];
+        // One note per step: A3 C4 E4 D4, repeating — A minor up and back
+        // down onto the fourth. See `SEQ_WIPERS` for why the last one is a D
+        // and not the G an Am7 would want: at 392 Hz the VCO's substep pitch
+        // grid is 27 cents wide and its nearest line sits 6 cents low with
+        // the next 21 cents high, so the note lands on whichever side the CV
+        // wanders to. At 294 Hz the grid line is 2.7 cents from D4 and its
+        // neighbours are 18 and 23 cents away, which is a note that stays put.
+        const RIFF: [f64; 4] = [220.0, 261.626, 329.628, 293.665];
         // Which step of the bar the first plateau is depends on where the
         // settling run stopped, so lock the phase onto the lowest note.
         let f0 = pitch_of(&osc[steps[0].0..steps[0].1]);
@@ -8034,6 +8062,97 @@ mod tests {
             let ms = (*b - *a) as f64 * DT * 1000.0;
             assert!((150.0..320.0).contains(&ms), "step {k} lasted {ms:.0} ms");
         }
+    }
+
+    /// THE VCAs AND THEIR ENVELOPE GENERATORS, end to end.
+    ///
+    /// Both are built out of parts — an `Nmos` in its ohmic region is the
+    /// VCA, and a diode into a cap with a decay resistor across it is the AD
+    /// contour — so there is no device model to unit-test and this is the
+    /// only thing that can say they work. It asserts the facts that make them
+    /// a VCA and an envelope rather than four spare components:
+    ///
+    /// 1. Each envelope RISES well past its MOSFET's 1.0 V threshold and
+    ///    FALLS back near zero — it is a contour, not a level.
+    /// 2. The bass's decays slower than the snare's, which is the whole
+    ///    difference between a plucked note and a hit.
+    /// 3. The output is LOUDER while the bass envelope is open than while it
+    ///    is shut: the VCA is in the signal path and the gate is driving it.
+    /// 4. And it never MUTES, because a hard-gated bass would silence the two
+    ///    steps that carry no beat and with them half the pitch row.
+    #[test]
+    fn the_synth_vcas_follow_their_envelopes() {
+        let elems = synth::synth_room_circuit();
+        let mut eng = Engine::new(DT);
+        eng.set_elements(&elems);
+        eng.advance(120_000); // 2.4 s: let the bar and the LFO cap settle
+        let n = 120_000usize; // 2.4 s, three bars
+        let mut be = Vec::with_capacity(n);
+        let mut se = Vec::with_capacity(n);
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            eng.advance(1);
+            be.push(eng.voltage_at(synth::bass_env()).unwrap_or(0.0));
+            se.push(eng.voltage_at(synth::snare_env()).unwrap_or(0.0));
+            out.push(eng.voltage_at(synth::out_node()).unwrap_or(0.0));
+        }
+        assert!(!eng.is_quarantined(), "quarantined with the VCAs running");
+        let hi = |v: &[f64]| v.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let lo = |v: &[f64]| v.iter().cloned().fold(f64::INFINITY, f64::min);
+        for (what, v) in [("bass", &be), ("snare", &se)] {
+            assert!(
+                hi(v) > 2.0,
+                "the {what} envelope only reached {:.2} V, and the MOSFET's \
+                 threshold is 1.0 V — it barely opens",
+                hi(v)
+            );
+            assert!(
+                lo(v) < 0.5,
+                "the {what} envelope never fell below {:.2} V — that is a \
+                 level, not an envelope",
+                lo(v)
+            );
+        }
+        // How much of the bar each envelope spends over its threshold is the
+        // decay resistors talking: 10 M for the bass against 3.3 M for the
+        // snare, into the same 15 nF.
+        let open = |v: &[f64]| v.iter().filter(|x| **x > 1.0).count() as f64 / n as f64;
+        assert!(
+            open(&be) > open(&se) * 1.4,
+            "bass open {:.3} of the run against the snare's {:.3} — the two \
+             envelopes have the same shape, so the decay resistors are not \
+             doing anything",
+            open(&be),
+            open(&se)
+        );
+        // ...and the VCA is actually in the signal path.
+        let rms = |want_open: bool| {
+            let (mut s, mut k) = (0.0f64, 0usize);
+            for i in 0..n {
+                if (want_open && be[i] > 2.0) || (!want_open && be[i] < 0.2) {
+                    s += out[i] * out[i];
+                    k += 1;
+                }
+            }
+            (k, if k > 0 { (s / k as f64).sqrt() } else { 0.0 })
+        };
+        let (n_hi, loud) = rms(true);
+        let (n_lo, quiet) = rms(false);
+        assert!(
+            n_hi > n / 50 && n_lo > n / 50,
+            "not enough of the run in each state: {n_hi} open, {n_lo} shut"
+        );
+        assert!(
+            loud > quiet * 1.3,
+            "output rms {loud:.4} with the bass VCA open against {quiet:.4} \
+             with it shut — the VCA is not gating anything"
+        );
+        assert!(
+            quiet > 0.01,
+            "output rms is {quiet:.4} with the VCA shut: the bass has gone \
+             silent on the steps that carry no beat, so two of the four pitch \
+             knobs set a note nobody hears"
+        );
     }
 
     /// Fundamental frequency from upward zero crossings, interpolated.

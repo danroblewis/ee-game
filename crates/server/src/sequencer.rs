@@ -7,9 +7,14 @@
 //!
 //! # How it works
 //!
-//! There is no digital logic in the engine — no gate, no flip-flop, no
-//! counter — so the "which step are we on" decision is made the way analog
-//! hardware made it before CMOS: with a ramp and a bank of comparators.
+//! The "which step are we on" decision is made the way analog hardware made
+//! it before CMOS: with a ramp and a bank of comparators. (An earlier version
+//! of this note said the engine HAD no gate, flip-flop or counter, which
+//! stopped being true at the `digital-chips` merge. A `Counter` + `Mux`
+//! decoder would be far cheaper — measured elsewhere at 0.45 µs/substep
+//! against this decoder's 5.5 — and it is the obvious lever if this module
+//! ever needs more steps than four. It would also want its own regulated
+//! rail: `LOGIC_V_ABSMAX` is 7 V and this room's is 9.)
 //!
 //! 1. **Clock.** A 555 in *sawtooth* astable (charge through `RA`, discharge
 //!    straight into DIS through a small `RB`) puts a 3.000 → 6.000 V ramp on
@@ -59,12 +64,23 @@
 //!   +9V rail | ladder | ramp |  OTA pairs  |  zener/pot/toggle | CV, BEAT
 //! ```
 //!
-//! and top to bottom in three identical STEP LANES, one per step of the bar.
-//! The threshold ladder is a single vertical chain whose junctions land at
-//! the lane boundaries, because step *n*'s upper window edge *is* step
-//! *n+1*'s lower one — so the divider that decodes the bar is drawn as the
-//! staircase it actually is, and its taps reach their comparators in two
-//! grid units.
+//! and top to bottom in one identical STEP LANE per step of the bar. The
+//! threshold ladder is a single vertical chain whose junctions land at the
+//! lane boundaries, because step *n*'s upper window edge *is* step *n+1*'s
+//! lower one — so the divider that decodes the bar is drawn as the staircase
+//! it actually is, and its taps reach their comparators in two grid units.
+//!
+//! **The block's height is exactly its lanes.** That is a constraint, not an
+//! observation: the synth room's home view is 72 grid units tall and the
+//! voice takes the top twenty, so a fourth lane only fitted once the two
+//! things that scaled with the lane count stopped doing so. The zener clamp
+//! came in from four rows to two and the beat row moved up with it
+//! (`LANE_PITCH` 12 → 10), and the CV follower and both bus pull-downs moved
+//! OUT of a twelve-row tail under the last lane and INTO the empty corner
+//! above the first one, where the buses leave anyway. FOUR lanes now end on
+//! exactly the row three used to, so the room did not grow at all — the
+//! whole instrument is still 73 × 70 units and still fits its home view at
+//! the same zoom.
 //!
 //! Everything multi-pin is placed through `sim_core::shape::place`, so every
 //! part in the room is a rotation/mirror of its canonical symbol and a
@@ -76,6 +92,17 @@
 //! # Measured behaviour (default config: 46 devices from this module,
 //! 48 with the world's rail and ground symbol; 24 nodes + 5 branches = 29
 //! unknowns, 31 with all four toggles closed)
+//!
+//! **The four-step path was, until this was written, unreachable and broken.**
+//! `steps: 4` has always been in the API and `TAPS4`, `wipers: [f64; 4]` and
+//! `beats: [bool; 4]` have always been sized for it, but nothing in the tree
+//! ever called it — `synth.rs` asked for three — and the bottom rail row was
+//! the CONSTANT 38, which assumes three lanes. At four, `lane(3)` is 44 and
+//! the CV bus pull-down's ground symbol landed at (48, 44): on the CV bus
+//! itself. The pitch CV sat at 0.0001 V and every step played the same note
+//! while four gates swung correctly into a dead bus. The row is derived from
+//! the lane count now ([`Seq::railbot`]) and the four-step path is the one
+//! the room ships, so it is exercised by every synth test there is.
 //!
 //! | quantity | measured |
 //! |---|---|
@@ -231,14 +258,28 @@ const X_BUF: i32 = 52;
 const X_CVOUT: i32 = 56;
 
 /// Centre line of the first step lane, and the pitch between lanes.
+///
+/// A lane is drawn between `lane - 3` (its lower comparator's ladder input)
+/// and `lane + 4` (its beat toggle's row), so the pitch is EIGHT rows of
+/// content and two of air. It used to be twelve because the zener hung four
+/// units down and the beat row sat under it; both were pulled in when the bar
+/// went to four steps, because four lanes at the old pitch pushed the block
+/// off the bottom of the room's home view.
 const Y_LANE0: i32 = 8;
-const LANE_PITCH: i32 = 12;
+const LANE_PITCH: i32 = 10;
 /// The top edge of the block: where the rail arrives and the outputs leave.
 const Y_TOP: i32 = -4;
-/// The bottom rail run, under the lanes.
-const Y_RAILBOT: i32 = 38;
-/// The CV buffer's row, at the foot of the CV bus.
-const Y_BUF: i32 = 36;
+/// The CV follower's row, in the block's top-right corner.
+///
+/// The buffer and both bus pull-downs used to hang BELOW the last lane, which
+/// cost twelve rows of sheet that grew with every step added. They are up here
+/// now, in the empty corner between the clock and the first lane, where the
+/// buses leave anyway — so the block's height is exactly its lanes and adding
+/// a step costs one lane pitch and nothing else.
+const Y_BUF: i32 = -2;
+/// The CV bus pull-down's row, and the beat bus's, in the same corner.
+const Y_PD_CV: i32 = 0;
+const Y_PD_BEAT: i32 = 2;
 
 /// Where the sequencer sits, and what its knobs and toggles are set to.
 ///
@@ -263,10 +304,12 @@ pub struct Seq {
     /// How many steps the bar has. Three or four; only the first `steps`
     /// entries of `wipers` and `beats` are used.
     ///
-    /// Each step costs SEVEN devices — two comparator OTAs, a zener, a CV
-    /// pot, a steering diode, a toggle and its steering diode — plus a
-    /// ladder resistor. In a room that has to hold real time to stay in
-    /// tune, that is not a free parameter: see `SCOPE NOTES` in `synth.rs`.
+    /// Each step costs EIGHT devices — two comparator OTAs, a zener, a CV
+    /// pot, a steering diode, a toggle and its steering diode, plus a ladder
+    /// resistor — and one lane pitch of sheet. Measured on the synth room as
+    /// it ships, the fourth is +3.20 µs/substep against a 20 µs budget. In a
+    /// room that has to hold real time to stay in tune, that is not a free
+    /// parameter: see `SCOPE NOTES` in `synth.rs`.
     pub steps: usize,
 }
 
@@ -291,6 +334,14 @@ impl Seq {
     /// Centre line of step lane `n`.
     fn lane(&self, n: usize) -> i32 {
         Y_LANE0 + LANE_PITCH * n as i32
+    }
+    /// The bottom rail run, two rows under the last lane's beat toggles. It
+    /// is DERIVED from the step count: it used to be a constant that assumed
+    /// three lanes, so a four-step block dropped its CV pull-down and that
+    /// pull-down's ground symbol straight onto the CV bus — a four-step
+    /// sequencer built from this module played every step at 0 V.
+    fn railbot(&self) -> i32 {
+        self.lane(self.steps.clamp(3, 4) - 1) + 6
     }
     /// Where the world's +9 V bus must arrive.
     pub fn rail_in(&self) -> Point {
@@ -374,6 +425,7 @@ pub fn sequencer(sq: &Seq) -> Vec<ElementSpec> {
     let n = sq.steps.clamp(3, 4);
     let p = |dx, dy| sq.p(dx, dy);
     let lane = |k: usize| Y_LANE0 + LANE_PITCH * k as i32;
+    let y_railbot = sq.railbot();
     // A lane's four input rows: the ladder taps sit outside, the ramp inside.
     let y_lo = |k: usize| lane(k) - 3;
     let y_hi = |k: usize| lane(k) + 1;
@@ -385,9 +437,9 @@ pub fn sequencer(sq: &Seq) -> Vec<ElementSpec> {
         p(X_RAIL, Y_TOP),
         p(X_RAIL, 6),
         p(X_RAIL, 10),
-        p(X_RAIL, Y_RAILBOT),
-        p(X_LADDER, Y_RAILBOT),
-        p(X_CBIAS, Y_RAILBOT),
+        p(X_RAIL, y_railbot),
+        p(X_LADDER, y_railbot),
+        p(X_CBIAS, y_railbot),
     ]);
 
     // ---- CLOCK: a 555 sawtooth astable on the client's 4x4 DIP footprint.
@@ -453,7 +505,7 @@ pub fn sequencer(sq: &Seq) -> Vec<ElementSpec> {
         if last {
             // The top of the ladder IS the rail: carry on down to the bottom
             // rail run rather than reaching across the block for it.
-            sh.run(&[p(X_LADDER, hi_y), p(X_LADDER, Y_RAILBOT)]);
+            sh.run(&[p(X_LADDER, hi_y), p(X_LADDER, y_railbot)]);
             sh.wire(p(X_LADDER, hi_y), p(X_OTA, hi_y));
         } else {
             sh.run(&[p(X_LADDER, hi_y), p(X_LADDER, y_lo(i + 1))]);
@@ -473,10 +525,10 @@ pub fn sequencer(sq: &Seq) -> Vec<ElementSpec> {
     sh.two(
         id!(),
         r(R_CBIAS),
-        p(X_CBIAS, Y_RAILBOT),
-        p(X_CBIAS, Y_RAILBOT - 2),
+        p(X_CBIAS, y_railbot),
+        p(X_CBIAS, y_railbot - 2),
     );
-    sh.wire(p(X_CBIAS, Y_RAILBOT - 2), p(X_CBIAS, lane(n - 1)));
+    sh.wire(p(X_CBIAS, y_railbot - 2), p(X_CBIAS, lane(n - 1)));
 
     // ---- WINDOW DECODER, one lane per step. The two comparators of a lane
     // are mirror images of each other stacked about the lane's centre line.
@@ -518,16 +570,18 @@ pub fn sequencer(sq: &Seq) -> Vec<ElementSpec> {
     // ---- GATE CLAMP. Mandatory: an OTA output has zero output conductance,
     // and this is also what stops the drum row detuning the pitch row. The
     // zener hangs straight down off the gate rail onto its own ground symbol.
-    // Zener anode = pin 0, so ground goes first.
+    // Zener anode = pin 0, so ground goes first. Two rows, not four: the lane
+    // pitch is the block's whole height budget and a zener drawn twice as long
+    // as it needs to be was two of those rows per step.
     for k in 0..n {
         let y = lane(k) + 2;
-        sh.two(id!(), K::Zener { vz: VZ_GATE }, p(X_GATE, y + 4), p(X_GATE, y));
+        sh.two(id!(), K::Zener { vz: VZ_GATE }, p(X_GATE, y + 2), p(X_GATE, y));
     }
     // The zeners' shared ground used to be one symbol at one point; it is a
     // symbol per lane now, and the first of them keeps the old id.
     let mut zgnd = id!();
     for k in 0..n {
-        sh.ground_as(zgnd, p(X_GATE, lane(k) + 6), DOWN);
+        sh.ground_as(zgnd, p(X_GATE, lane(k) + 4), DOWN);
         zgnd = sh.next_route_id();
     }
 
@@ -557,35 +611,37 @@ pub fn sequencer(sq: &Seq) -> Vec<ElementSpec> {
             sh.wire(p(X_CVBUS, lane(k - 1)), p(X_CVBUS, lane(k)));
         }
     }
-    // Bus pull-down and the unity-gain buffer. The follower's inverting input
-    // and its output are one node; that is a strap, and a strap is a wire —
-    // an op-amp whose in- pin sat ON its out pin was not an op-amp shape.
+    // Bus pull-down and the unity-gain buffer, in the block's TOP-RIGHT
+    // corner — the empty quadrant between the clock and the first lane, which
+    // the buses have to cross on their way out anyway. They used to hang
+    // below the last lane, which cost twelve rows of sheet that moved down
+    // with every step added; up here the block's height is exactly its lanes.
+    //
+    // The follower's inverting input and its output are one node; that is a
+    // strap, and a strap is a wire — an op-amp whose in- pin sat ON its out
+    // pin was not an op-amp shape.
     sh.run(&[
         p(X_CVBUS, lane(n - 1)),
-        p(X_CVBUS, Y_BUF),
-        p(X_CVBUS, Y_RAILBOT + 2),
+        p(X_CVBUS, lane(0)),
+        p(X_CVBUS, Y_PD_CV),
+        p(X_CVBUS, Y_BUF - 1),
     ]);
-    sh.two(
-        id!(),
-        r(R_CV),
-        p(X_CVBUS, Y_RAILBOT + 2),
-        p(X_CVBUS, Y_RAILBOT + 6),
-    );
-    sh.ground_as(id!(), p(X_CVBUS, Y_RAILBOT + 6), DOWN);
-    sh.wire(p(X_CVBUS, Y_BUF), p(X_BUF, Y_BUF));
+    sh.two(id!(), r(R_CV), p(X_CVBUS, Y_PD_CV), p(X_BUF, Y_PD_CV));
+    sh.ground_as(id!(), p(X_BUF, Y_PD_CV), RIGHT);
+    sh.wire(p(X_CVBUS, Y_BUF - 1), p(X_BUF, Y_BUF - 1));
     // pins [in+, in-, out]
     let buf = sh.part(
         id!(),
         K::OpAmp { rail: SUPPLY_V, isc: sim_core::DEFAULT_OPAMP_ISC },
-        p(X_BUF, Y_BUF + 1),
+        p(X_BUF, Y_BUF),
         E,
         4,
         false,
     );
     sh.run(&[
         buf[2],
-        p(X_CVOUT, Y_BUF + 4),
-        p(X_BUF, Y_BUF + 4),
+        p(X_CVOUT, Y_BUF + 1),
+        p(X_BUF, Y_BUF + 1),
         buf[1],
     ]);
     // CV out, up its own riser on the outside of everything.
@@ -597,34 +653,32 @@ pub fn sequencer(sq: &Seq) -> Vec<ElementSpec> {
     // each other when several toggles are closed at once.
     for k in 0..n {
         let y = lane(k) + 2;
-        sh.wire(p(X_POT - L_POT, y), p(X_POT - L_POT, y + 4));
+        sh.wire(p(X_POT - L_POT, y), p(X_POT - L_POT, y + 2));
         sh.two(
             id!(),
             K::Switch { closed: sq.beats[k] },
-            p(X_POT - L_POT, y + 4),
-            p(X_SW + 4, y + 4),
+            p(X_POT - L_POT, y + 2),
+            p(X_SW + 4, y + 2),
         );
-        sh.two(id!(), K::Diode, p(X_SW + 4, y + 4), p(X_BEATBUS, y + 4));
+        sh.two(id!(), K::Diode, p(X_SW + 4, y + 2), p(X_BEATBUS, y + 2));
         if k > 0 {
-            sh.wire(p(X_BEATBUS, lane(k - 1) + 6), p(X_BEATBUS, lane(k) + 6));
+            sh.wire(p(X_BEATBUS, lane(k - 1) + 4), p(X_BEATBUS, lane(k) + 4));
         }
     }
-    // The pull-down hangs BELOW the last beat panel's rect, level with the
-    // CV bus's own pull-down beside it: a shared bus resistor drawn inside
-    // "BEAT 3"'s window would be listed as if it were that step's part.
-    sh.wire(
-        p(X_BEATBUS, lane(n - 1) + 6),
-        p(X_BEATBUS, lane(n - 1) + 8),
-    );
+    // The pull-down goes up top beside the CV bus's own, clear of every step
+    // lane: a shared bus resistor drawn level with "BEAT 3" would read as if
+    // it were that step's part. It reaches LEFT off the riser, so the CV bus
+    // outboard of it never has to cross a resistor body.
+    sh.run(&[p(X_BEATBUS, lane(0) + 4), p(X_BEATBUS, Y_PD_BEAT)]);
     sh.two(
         id!(),
         r(R_BEAT),
-        p(X_BEATBUS, lane(n - 1) + 8),
-        p(X_BEATBUS, lane(n - 1) + 12),
+        p(X_BEATBUS, Y_PD_BEAT),
+        p(X_BEATBUS - 4, Y_PD_BEAT),
     );
-    sh.ground(p(X_BEATBUS, lane(n - 1) + 12), DOWN);
+    sh.ground(p(X_BEATBUS - 4, Y_PD_BEAT), LEFT);
     // BEAT out, up the riser beside the CV's.
-    sh.run(&[p(X_BEATBUS, lane(0) + 6), p(X_BEATBUS, Y_TOP)]);
+    sh.run(&[p(X_BEATBUS, Y_PD_BEAT), p(X_BEATBUS, Y_TOP)]);
 
     sh.finish()
 }
