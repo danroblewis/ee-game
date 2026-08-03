@@ -775,7 +775,30 @@ pub struct ElementSpec {
     /// `ElementKind` because it must cost the netlist nothing.
     #[cfg_attr(feature = "serde", serde(default))]
     pub rot: u8,
+    /// What a player calls this part: "TEMPO", "CUTOFF", "BEAT 1".
+    ///
+    /// A LABEL, and nothing else. It never reaches a stamp, never changes a
+    /// node count and never moves a state hash, exactly like `tier` — two
+    /// parts differing only in their names are the same circuit. It exists
+    /// because a control panel listing "SW #431" tells a player nothing, and
+    /// the only way to name a control used to be to wrap it in its own panel
+    /// region just to borrow the region's name.
+    ///
+    /// Shared document state, not client-local: two players looking at one
+    /// room must read the same labels on the same knobs.
+    ///
+    /// Empty means unnamed, and the UI falls back to the part's kind and id.
+    /// Absent in old saves and old clients' ops, so serde defaults it empty
+    /// and every existing part is unnamed.
+    #[cfg_attr(feature = "serde", serde(default))]
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "String::is_empty"))]
+    pub name: String,
 }
+
+/// Longest part name accepted. Generous for a knob label, short enough that
+/// a hostile client cannot push a megabyte through the op pipeline and into
+/// every other player's document.
+pub const MAX_NAME: usize = 24;
 
 impl ElementSpec {
     pub fn two(id: u32, kind: ElementKind, a: Point, b: Point) -> Self {
@@ -786,6 +809,7 @@ impl ElementSpec {
             pins: vec![a, b],
             tier: 0,
             rot: 0,
+            name: String::new(),
         }
     }
 
@@ -797,6 +821,7 @@ impl ElementSpec {
             pins: vec![a, b, c],
             tier: 0,
             rot: 0,
+            name: String::new(),
         }
     }
 
@@ -810,6 +835,7 @@ impl ElementSpec {
             pins: pins.to_vec(),
             tier: 0,
             rot: 0,
+            name: String::new(),
         }
     }
 
@@ -820,6 +846,7 @@ impl ElementSpec {
             pins: vec![at],
             tier: 0,
             rot: 0,
+            name: String::new(),
         }
     }
 
@@ -867,6 +894,14 @@ pub enum DocOp {
     SetKind {
         id: u32,
         kind: ElementKind,
+    },
+    /// Rename a part. Its own op rather than a field on `Move` or `SetKind`
+    /// because renaming is neither a geometric nor an electrical change: it
+    /// must not be able to move a pin or a value by accident, and it reads
+    /// as one undo entry saying "renamed", which is what a player expects.
+    SetName {
+        id: u32,
+        name: String,
     },
 }
 

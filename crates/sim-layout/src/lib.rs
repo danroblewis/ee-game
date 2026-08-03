@@ -406,6 +406,7 @@ pub fn relayout(input: &[ElementSpec]) -> Result<LayoutResult, String> {
             pins: vec![a, b],
             tier: 0,
             rot: 0,
+            name: String::new(),
         });
     }
     let flags_after = flags.len();
@@ -416,6 +417,7 @@ pub fn relayout(input: &[ElementSpec]) -> Result<LayoutResult, String> {
             pins: vec![at],
             tier: 0,
             rot,
+            name: String::new(),
         });
     }
 

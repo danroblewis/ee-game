@@ -285,6 +285,7 @@ fn demo_room_circuit() -> Vec<ElementSpec> {
         // (Vwiper - 0.6)/100k sweeps the frequency ~0.05..8 Hz. The LED
         // blinks at the VCO rate.
         ElementSpec {
+            name: String::new(),
             id: 120,
             kind: K::Ota,
             pins: vec![(4, 36), (4, 38), (8, 37), (6, 40)],
@@ -344,6 +345,7 @@ fn demo_room_circuit() -> Vec<ElementSpec> {
         spec(164, K::Wire, (34, 36), (40, 36)), // rail -> VCC pin
         // pins: [vcc, gnd, trig, thr, out, dis]
         ElementSpec {
+            name: String::new(),
             id: 165,
             kind: K::Timer555,
             pins: vec![(40, 36), (40, 44), (40, 38), (40, 42), (46, 42), (46, 38)],
@@ -1102,7 +1104,10 @@ fn supersede(cmds: &mut Vec<Cmd>) {
             Cmd::Sensor { id, .. } => Some(*id),
             Cmd::Edit { op, .. } => Some(match op {
                 DocOp::Add { spec } => spec.id,
-                DocOp::Remove { id } | DocOp::Move { id, .. } | DocOp::SetKind { id, .. } => *id,
+                DocOp::Remove { id }
+                | DocOp::Move { id, .. }
+                | DocOp::SetKind { id, .. }
+                | DocOp::SetName { id, .. } => *id,
             }),
             Cmd::Repair { id, .. } => Some(*id),
             _ => None,
@@ -2628,7 +2633,10 @@ fn apply_doc_op_to(elems: &mut Vec<ElementSpec>, op: &DocOp) -> bool {
     // op on the player's own wire.
     let target = match op {
         DocOp::Add { spec } => spec.id,
-        DocOp::Remove { id } | DocOp::Move { id, .. } | DocOp::SetKind { id, .. } => *id,
+        DocOp::Remove { id }
+        | DocOp::Move { id, .. }
+        | DocOp::SetKind { id, .. }
+        | DocOp::SetName { id, .. } => *id,
     };
     if reserved_id(target) {
         return false;
@@ -2677,6 +2685,24 @@ fn apply_doc_op_to(elems: &mut Vec<ElementSpec>, op: &DocOp) -> bool {
                 return false;
             }
             e.kind = *kind;
+            true
+        }
+        DocOp::SetName { id, name } => {
+            let Some(e) = elems.iter_mut().find(|e| e.id == *id) else {
+                return false;
+            };
+            // Trimmed and control-stripped HERE as well as refused by the
+            // gate: `check_document` decides whether a document is legal,
+            // this decides what the document actually becomes. Trailing
+            // whitespace is not worth a rejection message to a player who
+            // simply tabbed out of the field.
+            e.name = name
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(sim_core::MAX_NAME)
+                .collect::<String>()
+                .trim()
+                .to_string();
             true
         }
     }
@@ -4609,6 +4635,7 @@ mod tests {
         use sim_core::ElementKind as K;
         let full: Vec<ElementSpec> = (0..MAX_ELEMENTS as u32)
             .map(|k| ElementSpec {
+                name: String::new(),
                 id: k + 1,
                 kind: K::Wire,
                 pins: vec![(0, 0), (1, 0)],
@@ -4619,6 +4646,7 @@ mod tests {
         let room = test_room(full);
         let wire = |id: u32| DocOp::Add {
             spec: ElementSpec {
+                name: String::new(),
                 id,
                 kind: K::Wire,
                 pins: vec![(2, 2), (3, 2)],
@@ -4638,6 +4666,7 @@ mod tests {
             &room,
             &DocOp::Add {
                 spec: ElementSpec {
+                    name: String::new(),
                     id: 900_002,
                     kind: K::Wire,
                     pins: vec![(0, 0)],
@@ -5987,53 +6016,57 @@ mod tests {
     /// Every panel must hold its module, and the ones that name a control
     /// must hold that control.
     #[test]
-    fn every_synth_panel_contains_the_parts_it_names() {
+    fn every_control_is_in_the_panel_and_carries_a_name() {
+        // THE NEW CONTRACT, and it is stronger than the one it replaces.
+        //
+        // The room used to carry thirteen panel regions, most holding exactly
+        // one control, because a region's name was the only way to label a
+        // knob. Parts name themselves now, so there is ONE region and the
+        // thing worth asserting changed: not "every label has parts under it"
+        // but "every control a player can touch is listed, and reads as
+        // something other than SW #431".
         let els = synth::synth_room_circuit();
         let panels = synth::synth_panels();
-        let holds = |p: &synth::PanelDef, e: &ElementSpec| {
+        assert_eq!(panels.len(), 1, "the synth is one control surface");
+        let p = &panels[0];
+        let holds = |e: &ElementSpec| {
             e.pins.iter().all(|(x, y)| {
                 let (x, y) = (*x as f64, *y as f64);
                 x >= p.x0 && x <= p.x1 && y >= p.y0 && y <= p.y1
             })
         };
-        for p in &panels {
-            let inside: Vec<&ElementSpec> = els
-                .iter()
-                .filter(|e| !matches!(e.kind, K::Wire | K::Ground) && holds(p, e))
-                .collect();
+
+        // Everything a panel turns into a widget: if it is touchable it has
+        // to be reachable, or the control exists and nobody can find it.
+        let controls: Vec<&ElementSpec> = els
+            .iter()
+            .filter(|e| matches!(e.kind, K::Potentiometer { .. } | K::Switch { .. }))
+            .collect();
+        assert!(
+            controls.len() >= 3 + synth::SEQ_STEPS * 2,
+            "expected the knobs and one toggle per step, found {}",
+            controls.len()
+        );
+        for e in &controls {
+            assert!(holds(e), "control {} is outside the panel", e.id);
             assert!(
-                inside.len() >= 2,
-                "panel {:?} contains {} devices; a label with nothing under it \
-                 is worse than no label",
-                p.name,
-                inside.len()
+                !e.name.trim().is_empty(),
+                "control {} has no name — it would render as a kind and an id",
+                e.id
             );
         }
-        // And the named controls are under the label that names them.
-        let named: [(&str, u32); 6] = [
-            ("FILTER  CUTOFF", synth::ID_CUTOFF),
-            ("MIXER + SPEAKER", synth::ID_SPEAKER),
-            ("SNARE  (TONE)", synth::ID_SNARE_TONE),
-            ("SNARE  (TONE)", synth::ID_NOISE),
-            ("CLOCK  TEMPO", synth::seq_ids().tempo),
-            ("STEP 1 PITCH", synth::seq_ids().pots[0]),
-        ];
-        for (name, id) in named {
-            let p = panels
-                .iter()
-                .find(|p| p.name == name)
-                .unwrap_or_else(|| panic!("no panel {name:?}"));
-            let e = els.iter().find(|e| e.id == id).expect("the part exists");
-            assert!(holds(p, e), "part {id} is not inside panel {name:?}");
+
+        // The legend a player actually reads.
+        let names: Vec<&str> = controls.iter().map(|e| e.name.as_str()).collect();
+        for want in ["CUTOFF", "SNARE TONE", "TEMPO", "STEP 1 PITCH", "BEAT 1"] {
+            assert!(names.contains(&want), "no control named {want:?}: {names:?}");
         }
-        // Every step's toggle is under its own BEAT panel.
-        let ids = synth::seq_ids();
-        for n in 0..synth::SEQ_STEPS {
-            let name = ["BEAT 1", "BEAT 2", "BEAT 3", "BEAT 4"][n];
-            let p = panels.iter().find(|p| p.name == name).unwrap();
-            let e = els.iter().find(|e| e.id == ids.switches[n]).unwrap();
-            assert!(holds(p, e), "toggle {} is not inside {name:?}", e.id);
-        }
+        // Two knobs with one name is a worse panel than two knobs with none.
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        let before = sorted.len();
+        sorted.dedup();
+        assert_eq!(before, sorted.len(), "two controls share a name: {names:?}");
     }
 
     /// Nothing in the instrument may sit inside the machine's footprint: an
@@ -6324,7 +6357,12 @@ mod tests {
     #[test]
     fn the_synth_room_is_labelled() {
         let panels = synth::synth_panels();
-        assert!(panels.len() >= 2 * synth::SEQ_STEPS + 5 && panels.len() <= MAX_PANELS);
+        // One region, not thirteen — see `every_control_is_in_the_panel_and_
+        // carries_a_name` for why. It still has to be a LEGAL panel: the
+        // server would refuse one that was too small or too long-named, and a
+        // template that ships an illegal panel fails on load, not here.
+        assert_eq!(panels.len(), 1);
+        assert!(panels.len() <= MAX_PANELS);
         for p in &panels {
             assert!(
                 p.x1 - p.x0 >= MIN_PANEL_SPAN,
@@ -6342,10 +6380,7 @@ mod tests {
                 p.name
             );
         }
-        let names: Vec<&str> = panels.iter().map(|p| p.name).collect();
-        for want in ["VCO  1V/OCT", "SNARE  (TONE)", "STEP 1 PITCH", "BEAT 1"] {
-            assert!(names.contains(&want), "no panel named {want:?}");
-        }
+        assert_eq!(panels[0].name, "SYNTHESIZER");
     }
 
     #[test]
@@ -6820,6 +6855,7 @@ mod tests {
                 // Two-step repro: rail first (legal), then the ground.
                 let mut with_rail = room.clone();
                 with_rail.push(ElementSpec {
+                    name: String::new(),
                     id: 5100,
                     kind: K::Rail {
                         wave: sim_core::Wave::Sine,
@@ -6909,6 +6945,7 @@ mod tests {
             // the canonical hoist drive.
             DocOp::Add {
                 spec: ElementSpec {
+                    name: String::new(),
                     id: 6003,
                     kind: K::Rail {
                         wave: sim_core::Wave::Sine,

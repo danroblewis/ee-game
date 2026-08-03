@@ -880,6 +880,22 @@ function sender(deps: PanelHostDeps, get: () => ElementSpec | undefined) {
   };
 }
 
+/** What to print on a control's row.
+ *
+ *  A part's own name wins whenever it has one. The fallback is the kind and
+ *  id — "POT #40" — which is honest but tells a player nothing, and is the
+ *  reason the synth used to wrap every switch in its own panel region purely
+ *  to borrow the region's name for it.
+ *
+ *  `extra` (a resistance, say) is appended only in the UNNAMED case: once a
+ *  knob is called CUTOFF, its ohms are a detail for the property editor, not
+ *  something to compete with the name for row width. */
+function rowLabel(spec: ElementSpec | undefined, fallback: string, extra?: string): string {
+  const named = spec?.name?.trim();
+  if (named) return named;
+  return extra ? `${fallback} ${extra}` : fallback;
+}
+
 /** Potentiometer: a real slider, or a knob you drag — per-widget choice. */
 function potWidget(plid: number, id: number, deps: PanelHostDeps): Widget {
   const { el, lab, ctl, val } = makeRow(`pot:${id}`, `POT #${id}`);
@@ -964,7 +980,11 @@ function potWidget(plid: number, id: number, deps: PanelHostDeps): Widget {
       spec = ctx.byId.get(id);
       const k = spec?.kind;
       if (k?.t !== 'Potentiometer') return;
-      lab.textContent = `POT #${id} ${fmtEntry(k.ohms, quantityOf('Potentiometer', 'ohms'))}`;
+      lab.textContent = rowLabel(
+        spec,
+        `POT #${id}`,
+        fmtEntry(k.ohms, quantityOf('Potentiometer', 'ohms')),
+      );
       if (!dragging) {
         slider.value = String(k.wiper);
         needle.style.transform = `rotate(${-135 + k.wiper * 270}deg)`;
@@ -995,7 +1015,7 @@ function switchWidget(id: number, deps: PanelHostDeps): Widget {
       spec = ctx.byId.get(id);
       const k = spec?.kind;
       if (k?.t !== 'Switch') return;
-      lab.textContent = `SW #${id}`;
+      lab.textContent = rowLabel(spec, `SW #${id}`);
       btn.textContent = k.closed ? 'ON' : 'OFF';
       btn.classList.toggle('on', k.closed);
       const l = ctx.live.get(id);
@@ -1021,12 +1041,12 @@ function indicatorWidget(id: number): Widget {
       if (k?.t === 'Lamp') {
         // Same normalization the schematic symbol uses: P / rated W.
         bright = clamp(Math.abs(l?.power ?? 0) / Math.max(1e-9, k.rated_watts), 0, 1);
-        lab.textContent = `LAMP #${id}`;
+        lab.textContent = rowLabel(ctx.byId.get(id), `LAMP #${id}`);
         val.textContent = l ? fmtEng(l.power, 'W') : '—';
       } else if (k?.t === 'Led') {
         bright = clamp(Math.abs(l?.i[0] ?? 0) / 0.02, 0, 1);
         color = LED_COLORS[k.color] ?? LED_COLORS[0]!;
-        lab.textContent = `LED #${id}`;
+        lab.textContent = rowLabel(ctx.byId.get(id), `LED #${id}`);
         val.textContent = l ? fmtEng(l.i[0] ?? 0, 'A') : '—';
       }
       dot.style.background = color;
@@ -1102,7 +1122,7 @@ function sourceWidget(id: number, dc0: number, deps: PanelHostDeps): Widget {
       spec = ctx.byId.get(id);
       const k = spec?.kind;
       if (k?.t !== 'VoltageSource') return;
-      lab.textContent = `SRC #${id}`;
+      lab.textContent = rowLabel(spec, `SRC #${id}`);
       if (Math.abs(k.dc) > span) {
         span = Math.ceil(Math.abs(k.dc) * 1.2);
         applySpan();
@@ -1731,7 +1751,10 @@ class PanelWindow {
    * letter-spacing and uppercase transform are all accounted for. */
   private fitTitle() {
     const focused = document.activeElement === this.title;
-    const key = `${this.title.value} ${focused ? 1 : 0}`;
+    // JSON rather than a NUL separator. The NUL was unambiguous, but it made
+    // the whole FILE read as binary to grep and friends, which silently
+    // disables a tool nobody expects to be disabled.
+    const key = JSON.stringify([this.title.value, focused]);
     if (key === this.fitKey) return;
     this.fitKey = key;
     // A focused field shows the raw text; unfocused it is uppercased by CSS.

@@ -1337,6 +1337,24 @@ pub fn check_document(specs: &[ElementSpec], dt: f64) -> Result<(), Reject> {
                 hint: "rotation must be 0, 1, 2 or 3 quarter turns",
             });
         }
+        // A name is a label and cannot make a document unsolvable, so this is
+        // not about the solver — it is about what travels. Every op is
+        // broadcast to every other player and written into the room's save,
+        // so an unbounded string is a way to push a megabyte into everybody
+        // else's document, and a control character is a way to put a line
+        // break or a terminal escape into someone else's panel.
+        if s.name.chars().count() > crate::netlist::MAX_NAME {
+            return Err(Reject::BadValue {
+                id: s.id,
+                hint: "that name is too long",
+            });
+        }
+        if s.name.chars().any(|c| c.is_control()) {
+            return Err(Reject::BadValue {
+                id: s.id,
+                hint: "a name cannot contain control characters",
+            });
+        }
         if collapses_when_coincident(&s.kind) && s.pins[0] == s.pins[1] {
             return Err(Reject::CollapsedPins { id: s.id });
         }

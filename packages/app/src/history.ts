@@ -67,6 +67,11 @@ export function invertOp(op: DocOp, before: ElementSpec | null | undefined): Doc
         : null;
     case 'SetKind':
       return before ? { t: 'SetKind', id: op.id, kind: clone(before.kind) } : null;
+    case 'SetName':
+      // `?? ''` rather than a null return: a part that HAD no name inverts to
+      // the empty name, which is a real, applicable op. Returning null would
+      // make naming an unnamed part the one edit undo silently refused.
+      return before ? { t: 'SetName', id: op.id, name: before.name ?? '' } : null;
   }
 }
 
@@ -75,6 +80,7 @@ const VERB: Record<DocOp['t'], string> = {
   Remove: 'delete',
   Move: 'move',
   SetKind: 'edit',
+  SetName: 'rename',
 };
 
 /** Human label for an entry, e.g. "move 3 parts". Pure. */

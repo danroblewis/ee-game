@@ -422,6 +422,7 @@ fn ota_output_current_saturates_at_iabc() {
     // resistor must saturate at Iabc = (5 - Vbe)/100k ≈ 43 µA.
     let elems = vec![
         ElementSpec {
+            name: String::new(),
             id: 1,
             kind: sim_core::ElementKind::Ota,
             pins: vec![(0, 0), (0, 2), (4, 1), (2, 4)],
@@ -509,6 +510,7 @@ fn timer555_astable_frequency_and_duty() {
 #[test]
 fn unpowered_timer555_is_harmless() {
     let elems = vec![ElementSpec {
+        name: String::new(),
         id: 1,
         kind: sim_core::ElementKind::Timer555,
         pins: vec![(0, 0), (0, 4), (0, 1), (0, 3), (4, 3), (4, 1)],
@@ -533,6 +535,7 @@ fn timer555_button_holds_output_high() {
     let mut elems = timer555_astable();
     // Button from the THR/TRIG node to ground.
     elems.push(ElementSpec {
+        name: String::new(),
         id: 20,
         kind: sim_core::ElementKind::Button { closed: false },
         pins: vec![(2, 4), (2, 8)],

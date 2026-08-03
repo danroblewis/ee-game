@@ -259,6 +259,7 @@ pub fn ota_vco(vctrl: f64) -> Vec<ElementSpec> {
     vec![
         // OTA pins: [in+, in-, out, bias]
         ElementSpec {
+            name: String::new(),
             id: 1,
             kind: ElementKind::Ota,
             pins: vec![(0, 0), (0, 2), (4, 1), (2, 4)],
@@ -301,6 +302,7 @@ pub fn timer555_astable() -> Vec<ElementSpec> {
         spec(4, ElementKind::Wire, (2, 0), (6, 0)),
         // pins: [vcc, gnd, trig, thr, out, dis]
         ElementSpec {
+            name: String::new(),
             id: 5,
             kind: ElementKind::Timer555,
             pins: vec![(6, 0), (6, 10), (4, 6), (4, 4), (10, 4), (2, 2)],

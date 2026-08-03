@@ -13,6 +13,7 @@ pub use engine::{
     AdvanceReport, ElemFrame, ElemTap, Engine, Island, Tuning, FRAME_STRIDE, GMIN,
 };
 pub use netlist::{
+    MAX_NAME,
     Wave,
     photocell_ohms, DocOp, ElementKind, ElementSpec, GateOp, InteractOp, LogicPins, ParamWrite,
     Point,
@@ -375,6 +376,7 @@ mod tests {
         };
         let elems = vec![
             ElementSpec {
+                name: String::new(),
                 id: 1,
                 kind: rail,
                 pins: vec![(0, 0)],

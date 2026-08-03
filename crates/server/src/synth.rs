@@ -435,7 +435,45 @@ pub fn synth_room_circuit() -> Vec<ElementSpec> {
     // ---------------------------------------------------------- SEQUENCER
     let mut els = sh.finish();
     els.extend(sequencer::sequencer(&sq));
+    name_controls(&mut els, &sq);
     els
+}
+
+/// Put the front-panel legend on the parts a player actually touches.
+///
+/// This is why the room no longer needs a panel region per switch. A panel
+/// used to be the only way to put words in the world, so a knob got a name by
+/// being wrapped in a box that had one — which is how a five-knob instrument
+/// ended up with thirteen windows. A part carries its own name now, so one
+/// region can hold the whole control surface and every row still reads.
+///
+/// Names are the ONLY thing set here: no pin moves, no value changes, and
+/// nothing reaches the solver. The netlist is exactly what it was.
+fn name_controls(els: &mut [ElementSpec], sq: &Seq) {
+    let ids = sequencer::seq_ids(sq);
+    let mut named: Vec<(u32, String)> = vec![
+        // The supply is a widget too — it has a voltage box — so it needs a
+        // legend for the same reason the knobs do.
+        (2, "SUPPLY".into()),
+        (ID_CUTOFF, "CUTOFF".into()),
+        (ID_SNARE_TONE, "SNARE TONE".into()),
+        (ids.tempo, "TEMPO".into()),
+    ];
+    for k in 0..ids.steps {
+        named.push((ids.pots[k], format!("STEP {} PITCH", k + 1)));
+        named.push((ids.switches[k], format!("BEAT {}", k + 1)));
+    }
+    for e in els.iter_mut() {
+        if let Some((_, n)) = named.iter().find(|(id, _)| *id == e.id) {
+            e.name = n.clone();
+        }
+    }
+    debug_assert!(
+        named
+            .iter()
+            .all(|(id, _)| els.iter().any(|e| e.id == *id)),
+        "a control was named that the circuit does not contain"
+    );
 }
 
 /// A labelled region of the schematic. The client turns each one into a
@@ -449,63 +487,29 @@ pub struct PanelDef {
     pub name: &'static str,
 }
 
-/// The room's labels. Without them a player sees a hundred anonymous glyphs;
-/// with them they see the VCO, the filter, the snare and a row of numbered
-/// steps.
+/// ONE region, holding the whole control surface.
 ///
-/// A panel is a WINDOW onto the parts inside it — the client only lists a
-/// part whose every pin is inside the rect — so these are drawn round whole
-/// modules now that the modules are actually contiguous.
+/// It used to be thirteen. A panel was the only way to put words in the
+/// world, so every knob and switch that needed a legend got wrapped in its
+/// own box purely to borrow that box's name — which is how a five-knob
+/// instrument grew a thirteen-window sidebar, most of them holding exactly
+/// one control.
+///
+/// Parts carry their own names now (`name_controls`), so one region does the
+/// job: a panel lists every part whose pins all sit inside it, and this one
+/// spans the instrument, so it lists every control there is — each row
+/// reading TEMPO or BEAT 2 rather than POT #405 or SW #433.
+///
+/// The rect is the sheet plus a margin. It has to CONTAIN each control
+/// wholly, pins included, or that control silently drops off the panel.
 pub fn synth_panels() -> Vec<PanelDef> {
-    let (ox, oy) = (SEQ_ORIGIN.0 as f64, SEQ_ORIGIN.1 as f64);
-    let mut v = vec![
-        PanelDef { x0: 42.5, y0: -10.6, x1: 59.0, y1: 0.0, name: "VCO  1V/OCT" },
-        // x1 reaches to 42.2 so R30's input pin at (42, -5) is inside: a
-        // panel lists a part only when EVERY pin is in the rect, and the
-        // divider is the filter's front door. The VCO's rect starts at 42.5.
-        PanelDef { x0: 22.0, y0: -8.4, x1: 42.2, y1: 1.0, name: "FILTER  CUTOFF" },
-        PanelDef { x0: 7.0, y0: -6.0, x1: 22.0, y1: 0.0, name: "MIXER + SPEAKER" },
-        PanelDef { x0: -6.0, y0: -10.4, x1: 6.6, y1: -8.4, name: "LFO  BAR SWEEP" },
-        PanelDef { x0: 24.0, y0: 1.6, x1: 45.0, y1: 10.6, name: "SNARE  (TONE)" },
-        PanelDef {
-            x0: ox - 0.6,
-            y0: oy - 1.0,
-            x1: ox + 16.0,
-            y1: oy + 13.5,
-            name: "CLOCK  TEMPO",
-        },
-        PanelDef {
-            x0: ox + 20.5,
-            y0: oy + 2.0,
-            x1: ox + 33.0,
-            y1: oy + 40.0,
-            name: "STEP DECODER",
-        },
-    ];
-    let pitch = ["STEP 1 PITCH", "STEP 2 PITCH", "STEP 3 PITCH", "STEP 4 PITCH"];
-    let beat = ["BEAT 1", "BEAT 2", "BEAT 3", "BEAT 4"];
-    // One box per step, drawn round the knob and its steering diode, and one
-    // round the toggle and its own. A panel is a WINDOW onto the parts inside
-    // it — the client lists a part only when EVERY pin is in the rect — so
-    // these have to enclose whole devices, not just look like they do.
-    for n in 0..SEQ_STEPS {
-        let y = oy + 8.0 + 12.0 * n as f64;
-        v.push(PanelDef {
-            x0: ox + 37.0,
-            y0: y - 1.0,
-            x1: ox + 48.6,
-            y1: y + 3.0,
-            name: pitch[n],
-        });
-        v.push(PanelDef {
-            x0: ox + 37.0,
-            y0: y + 4.6,
-            x1: ox + 46.6,
-            y1: y + 7.4,
-            name: beat[n],
-        });
-    }
-    v
+    vec![PanelDef {
+        x0: -13.0,
+        y0: -13.0,
+        x1: 62.0,
+        y1: 61.0,
+        name: "SYNTHESIZER",
+    }]
 }
 
 // ------------------------------------------------------------ SCOPE NOTES

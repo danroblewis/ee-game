@@ -85,6 +85,7 @@ import init, { Sim, checkEdit, frameStride } from './wasm/sim_wasm';
 import {
   demoCircuit,
   MAX_PINS,
+  MAX_NAME,
   FRAME_STRIDE,
   type Wave,
   unpackFrame,
@@ -396,6 +397,11 @@ function applyDoc(op: DocOp) {
       e.kind = op.kind;
       space.update(e); // pin count can change with the kind
     }
+  } else if (op.t === 'SetName') {
+    const e = elemById(op.id);
+    // No `space.update`: a name has no geometry, so the spatial index has
+    // nothing to re-file. It is a label, all the way down.
+    if (e) e.name = op.name;
   }
 }
 
@@ -911,13 +917,12 @@ const GATE_MAX_ELEMENTS = 800;
 function candidateDoc(op: DocOp): ElementSpec[] {
   if (op.t === 'Add') return space.get(op.spec.id) ? elements : [...elements, op.spec];
   if (op.t === 'Remove') return elements.filter((e) => e.id !== op.id);
-  return elements.map((e) =>
-    e.id !== op.id
-      ? e
-      : op.t === 'Move'
-        ? { ...e, pins: op.pins }
-        : { ...e, kind: op.kind },
-  );
+  return elements.map((e) => {
+    if (e.id !== op.id) return e;
+    if (op.t === 'Move') return { ...e, pins: op.pins };
+    if (op.t === 'SetName') return { ...e, name: op.name };
+    return { ...e, kind: op.kind };
+  });
 }
 
 /** Point the player at the parts a refusal named, and say what is wrong.
@@ -1807,6 +1812,41 @@ function buildProps(host: HTMLElement, target: ElementSpec, onClose?: () => void
   const tier = target.tier ?? 0;
   h.textContent = `${target.kind.t}  #${target.id}${tier > 0 ? `  ·  tier ${tier}` : ''}`;
   host.appendChild(h);
+
+  // The NAME, first, above the electrical parameters — it is what a player
+  // reads on the control panel, and it is the only field here that is purely
+  // for them. Naming a knob CUTOFF is why the synth no longer needs a panel
+  // region per switch just to borrow the region's name.
+  {
+    const label = document.createElement('label');
+    const span = document.createElement('span');
+    span.textContent = 'name';
+    label.appendChild(span);
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.maxLength = MAX_NAME;
+    input.placeholder = `${target.kind.t} #${target.id}`;
+    input.value = target.name ?? '';
+    input.autocomplete = 'off';
+    input.spellcheck = false;
+    const commit = () => {
+      const name = input.value.trim().slice(0, MAX_NAME);
+      // No op when nothing changed: tabbing through a field must not fill a
+      // player's undo stack, and must not broadcast to the room.
+      if (name === (target.name ?? '')) return;
+      editDoc({ t: 'SetName', id: target.id, name });
+    };
+    input.onchange = commit;
+    input.onblur = commit;
+    input.onkeydown = (ev) => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        input.blur();
+      }
+    };
+    label.appendChild(input);
+    host.appendChild(label);
+  }
   if (onClose) {
     const x = document.createElement('button');
     x.className = 'xbtn';

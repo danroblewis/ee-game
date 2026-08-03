@@ -121,6 +121,10 @@ export interface ElementSpec {
    *  (Ground, Rail) use it: everything else takes its orientation from its
    *  pin geometry. Absent on older parts; treat as 0. */
   rot?: number;
+  /** What a player calls this part — "TEMPO", "BEAT 1". A label only: it
+   *  never reaches the solver. Absent means unnamed, and the UI falls back
+   *  to the kind and id. Mirrors `sim_core::ElementSpec::name`. */
+  name?: string;
 }
 
 export type InteractOp =
@@ -135,7 +139,12 @@ export type DocOp =
    *  whole of the turn for one-pin parts, whose pins a rotation cannot
    *  move. */
   | { t: 'Move'; id: number; pins: Point[]; rot?: number }
-  | { t: 'SetKind'; id: number; kind: ElementKind };
+  | { t: 'SetKind'; id: number; kind: ElementKind }
+  /** Rename a part. Its own op, not a field on Move or SetKind: renaming is
+   *  neither geometric nor electrical, so it must not be able to nudge a pin
+   *  or a value by accident, and it reads as one undo entry saying
+   *  "renamed". */
+  | { t: 'SetName'; id: number; name: string };
 
 /** Pin labels for tooltips, by kind. */
 export function pinLabels(kind: ElementKind): string[] {
@@ -223,6 +232,11 @@ export interface ElemLive {
  *  `sim_core::FRAME_STRIDE` and `sim_core::MAX_PINS`. 10 is set by the
  *  widest logic parts (4-bit shift register, 4:1 mux, both 9 pins). */
 export const MAX_PINS = 10;
+
+/** Longest part name the server accepts. Mirrors `sim_core::MAX_NAME`; the
+ *  gate refuses anything longer, so the input caps at the same number rather
+ *  than letting a player type a name that will bounce. */
+export const MAX_NAME = 24;
 export const FRAME_STRIDE = 3 + 2 * MAX_PINS;
 
 export function unpackFrame(flat: ArrayLike<number>): Map<number, ElemLive> {
