@@ -65,6 +65,7 @@ use axum::{
     routing::get,
     Router,
 };
+mod layout;
 mod sequencer;
 mod synth;
 // The measured module library the synth room was assembled from. `synth.rs`
@@ -1651,13 +1652,17 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
                     let candidate = {
                         let elems = room.elements.lock().unwrap();
                         let mut next = elems.clone();
-                        apply_doc_op_to(&mut next, &op).then_some(next)
+                        // The document being replaced is kept alongside the
+                        // candidate: the shape rule is a rule about the
+                        // CHANGE (a legacy skewed part may move, but nothing
+                        // may become newly skewed), so the gate needs both.
+                        apply_doc_op_to(&mut next, &op).then(|| (elems.clone(), next))
                     };
                     // Syntactic failures (unknown/duplicate/reserved id) stay
                     // silent drops, as before: they are client bugs or races,
                     // not placements a player can act on.
-                    let Some(next) = candidate else { continue };
-                    if let Err(r) = check_room_doc(&next) {
+                    let Some((prev, next)) = candidate else { continue };
+                    if let Err(r) = check_room_edit(&prev, &next) {
                         tracing::info!("edit refused ({}): {:?}", r.code(), op);
                         let _ = room.events.send(reject_msg(who, "edit", &r));
                         continue;
@@ -2188,6 +2193,19 @@ fn sample_probes(eng: &Engine, probes: &[Probe], bufs: &mut [Vec<f32>]) {
 /// placement, only refused.
 fn check_room_doc(elems: &[ElementSpec]) -> Result<(), sim_core::Reject> {
     sim_core::check_document(elems, DT)
+}
+
+/// The gate for a DOCUMENT EDIT: everything `check_room_doc` judges, plus the
+/// shape rule, which needs both halves of the change.
+///
+/// The shape rule is deliberately not inside `check_room_doc`. That function
+/// runs on candidates for interacts, repairs and machine moves too — none of
+/// which can change a part's geometry — and it is the only gate a room being
+/// loaded ever sees. Keeping the rule on the edit path means an old room full
+/// of skewed parts still opens, still runs, and still accepts every op that
+/// does not make the skew worse. See `sim_core::check_shapes`.
+fn check_room_edit(before: &[ElementSpec], after: &[ElementSpec]) -> Result<(), sim_core::Reject> {
+    sim_core::check_edit(before, after, DT)
 }
 
 /// The broadcast telling client `who` why its op was refused, with a
@@ -2772,14 +2790,29 @@ mod tests {
 
     impl HoistRun {
         fn new(player_circuit: Vec<ElementSpec>) -> Self {
-            let mut elems = hoist_fixture();
+            let fixture = hoist_fixture();
+            let mut elems = fixture.clone();
             elems.extend(player_circuit);
             // Every hoist run is a document a player could have placed, so
             // it has to pass the same gate a placement does. This is what
             // keeps the placement gate honest about the ONE circuit the game
             // is built to teach: tighten the gate and break the intended
             // solution, and this fails before the win test even runs.
-            assert_eq!(check_room_doc(&elems), Ok(()), "the run must be placeable");
+            // The EDIT gate, not just the document gate -- `check_room_edit`
+            // is what a placement actually runs, and it is the one that
+            // enforces rigid geometry. The fixture is passed as `before` so
+            // the machine's own collinear sensor pot (#901, drawn by the
+            // package renderer rather than placed) stays grandfathered.
+            //
+            // This assertion was previously `check_room_doc`, which does NOT
+            // check geometry -- so when rigid parts landed, the intended
+            // solution silently stopped being placeable and this guard, whose
+            // whole purpose is to catch exactly that, did not fire.
+            assert_eq!(
+                check_room_edit(&fixture, &elems),
+                Ok(()),
+                "the run must be placeable by a player"
+            );
             let sources = source_ids(&elems);
             let mut eng = Engine::new(DT);
             eng.set_elements(&elems);
@@ -3045,9 +3078,25 @@ mod tests {
         let (sa, sw, sb) = (sensor.pins[0], sensor.pins[1], sensor.pins[2]);
         let (sup_p, sup_n) = ((sa.0 - 17, sa.1), (sb.0 - 17, sb.1));
         let (ref_p, ref_n) = ((sa.0 - 17, sa.1 + 8), (sa.0 - 17, sa.1 + 12));
+        // The comparator's two NET points -- where the setpoint and the wiper
+        // arrive -- and, separately, the op-amp's own terminals.
+        //
+        // These used to be the same points, which put the op-amp's inputs SIX
+        // units apart. That was a skewed symbol, and once multi-pin parts
+        // became rigid it stopped being placeable: the one circuit this goal
+        // exists to teach was no longer drawable by a player. The symbol is
+        // canonical now (inputs 2 apart, output at the tip) and two short
+        // wires reach out to the original nodes -- which is exactly what a
+        // player would have to do, so the test drives the real gesture.
+        //
+        // Mirrored on purpose: `+` sits BELOW `-` here because the setpoint
+        // enters from below. The reach wires then occupy disjoint spans of
+        // the same column (y+6..y+8 and y+2..y+4) instead of overlapping,
+        // which would have shorted the two inputs together.
+        let (net_p, net_m) = ((sa.0 - 9, sa.1 + 8), (sa.0 - 9, sa.1 + 2));
         let (in_p, in_m, out) = (
-            (sa.0 - 9, sa.1 + 8),
-            (sa.0 - 9, sa.1 + 2),
+            (sa.0 - 9, sa.1 + 6),
+            (sa.0 - 9, sa.1 + 4),
             (sa.0 - 5, sa.1 + 5),
         );
         // Power stage, to the right of the terminal column.
@@ -3068,7 +3117,8 @@ mod tests {
             // Setpoint: 3.2 V = 4 V · (0.32 / 0.40).
             spec(5, dc(3.2), ref_p, ref_n),
             gnd(6, ref_n),
-            spec(7, K::Wire, ref_p, in_p),
+            spec(7, K::Wire, ref_p, net_p),
+            spec(22, K::Wire, net_p, in_p),
             // Comparator: in+ = setpoint, in- = wiper. Its output goes to a
             // GATE, not to the motor: 25 mA cannot lift a crate, and the
             // gate of a MOSFET draws exactly none.
@@ -3082,7 +3132,8 @@ mod tests {
                 in_m,
                 out,
             ),
-            spec(9, K::Wire, in_m, sw),
+            spec(9, K::Wire, net_m, sw),
+            spec(23, K::Wire, net_m, in_m),
             spec(10, K::Wire, out, corner),
             spec(11, K::Wire, corner, gate),
             // ---- muscle: 12 V through the motor, low-side switched by a
@@ -4741,9 +4792,13 @@ mod tests {
         let (sa, sw, sb) = (sensor.pins[0], sensor.pins[1], sensor.pins[2]);
         let (sup_p, sup_n) = ((sa.0 - 17, sa.1), (sb.0 - 17, sb.1));
         let (ref_p, ref_n) = ((sa.0 - 17, sa.1 + 8), (sa.0 - 17, sa.1 + 12));
+        // Canonical symbol + two reach wires, for the same reason as
+        // `comparator_feedback_circuit` -- a player has to be able to draw
+        // the circuit a test claims they can draw.
+        let (net_p, net_m) = ((sa.0 - 9, sa.1 + 8), (sa.0 - 9, sa.1 + 2));
         let (in_p, in_m, out) = (
-            (sa.0 - 9, sa.1 + 8),
-            (sa.0 - 9, sa.1 + 2),
+            (sa.0 - 9, sa.1 + 6),
+            (sa.0 - 9, sa.1 + 4),
             (sa.0 - 5, sa.1 + 5),
         );
         let mut run = HoistRun::new(vec![
@@ -4753,7 +4808,9 @@ mod tests {
             spec(4, K::Wire, sup_n, sb),
             spec(5, dc(3.2), ref_p, ref_n),
             gnd(6, ref_n),
-            spec(7, K::Wire, ref_p, in_p),
+            spec(7, K::Wire, ref_p, net_p),
+            spec(13, K::Wire, net_p, in_p),
+            spec(14, K::Wire, net_m, in_m),
             spec3(
                 8,
                 K::OpAmp {
@@ -4764,7 +4821,7 @@ mod tests {
                 in_m,
                 out,
             ),
-            spec(9, K::Wire, in_m, sw),
+            spec(9, K::Wire, net_m, sw),
             spec(10, K::Wire, out, mp), // straight into the motor
             spec(11, K::Wire, mm, (mm.0 - 5, mm.1)),
             gnd(12, (mm.0 - 5, mm.1)),
@@ -5048,21 +5105,130 @@ mod tests {
 
     /// The room is a musical instrument, and an instrument that cannot hold
     /// real time plays FLAT: sim-time dilation is a pitch error, not a frame
-    /// drop. Measured on an Apple M4 (release, pinned cargo 1.95.0, machine
-    /// under load from other builds, two runs of three passes): **13.60-13.73
-    /// µs per substep = 1.46-1.47x real time**, and the LIVE server reports
-    /// rt 0.993 against the shipped showcase room's 0.985 on the same
-    /// machine. Cost in this engine goes as
-    /// `newton_iterations x elements^1.64`, so the element count is the
-    /// budget, and this is the guard rail on it.
+    /// drop. Cost in this engine goes as `newton_iterations x unknowns^1.64`,
+    /// so what has to be rationed is DEVICES — the things that add a node or
+    /// a branch and get stamped every Newton iteration.
+    ///
+    /// Wires and ground symbols are not devices. A `Wire` merges its ends in
+    /// `compile`'s union-find and stamps nothing; a `Ground` pins its point
+    /// to node 0 and stamps nothing. Measured on this room (M4, release,
+    /// pinned 1.95.0), the schematic re-layout took it from 71 elements to
+    /// 201 by adding 108 wires and 23 ground symbols, and the solver went
+    /// from 13.98 to 14.50 us per substep — 1.43x real time to 1.38x. The
+    /// live server reports the numbers in `SCOPE NOTES`.
+    ///
+    /// So this guard rail is on the device count, which is what costs, with
+    /// a loose cap on the routing so a runaway wire generator still trips
+    /// something.
     #[test]
     fn the_synth_room_fits_the_realtime_budget() {
-        let n = synth::synth_room_circuit().len();
+        let els = synth::synth_room_circuit();
+        let devices = els
+            .iter()
+            .filter(|e| !matches!(e.kind, K::Wire | K::Ground))
+            .count();
         assert!(
-            n <= 72,
-            "the synth room grew to {n} elements; at 1.45x real time it had \
-             71, and the margin is not there to spend"
+            devices <= 64,
+            "the synth room grew to {devices} devices; at 1.38x real time it \
+             had 64, and the margin is not there to spend"
         );
+        assert!(
+            els.len() <= 260,
+            "the synth room is drawn with {} elements; routing is nearly free \
+             but not free, and past ~260 `solve_wire_currents` starts to show",
+            els.len()
+        );
+    }
+
+    /// An op-amp always looks like an op-amp. Every multi-pin part in a
+    /// shipped room must be a rotation/mirror of its canonical symbol —
+    /// otherwise the room is a document the editor itself would refuse, and
+    /// a player who nudges one of its parts gets a rejection.
+    #[test]
+    fn every_part_in_the_synth_is_a_legal_shape() {
+        for e in synth::synth_room_circuit() {
+            assert!(
+                sim_core::shape::is_rigid(&e.kind, &e.pins),
+                "element {} ({}) is not in its own family: {:?}",
+                e.id,
+                e.kind.tag(),
+                e.pins
+            );
+        }
+    }
+
+    /// Every wire is orthogonal. A diagonal in a routed schematic is the
+    /// thing that made the old room unreadable, and this is the invariant
+    /// that says it cannot come back.
+    #[test]
+    fn every_wire_in_the_synth_is_orthogonal() {
+        for e in synth::synth_room_circuit() {
+            if !matches!(e.kind, K::Wire) {
+                continue;
+            }
+            let (a, b) = (e.pins[0], e.pins[1]);
+            assert!(
+                a.0 == b.0 || a.1 == b.1,
+                "wire {} runs diagonally from {a:?} to {b:?}",
+                e.id
+            );
+        }
+    }
+
+    /// A panel is a WINDOW: the client lists a part in it only when EVERY pin
+    /// is inside the rect. Before the re-layout twelve of the room's thirteen
+    /// panels contained nothing at all — the parts had been dragged out of
+    /// their own labels — so the mission-control UI of the room was dead.
+    /// Every panel must hold its module, and the ones that name a control
+    /// must hold that control.
+    #[test]
+    fn every_synth_panel_contains_the_parts_it_names() {
+        let els = synth::synth_room_circuit();
+        let panels = synth::synth_panels();
+        let holds = |p: &synth::PanelDef, e: &ElementSpec| {
+            e.pins.iter().all(|(x, y)| {
+                let (x, y) = (*x as f64, *y as f64);
+                x >= p.x0 && x <= p.x1 && y >= p.y0 && y <= p.y1
+            })
+        };
+        for p in &panels {
+            let inside: Vec<&ElementSpec> = els
+                .iter()
+                .filter(|e| !matches!(e.kind, K::Wire | K::Ground) && holds(p, e))
+                .collect();
+            assert!(
+                inside.len() >= 2,
+                "panel {:?} contains {} devices; a label with nothing under it \
+                 is worse than no label",
+                p.name,
+                inside.len()
+            );
+        }
+        // And the named controls are under the label that names them.
+        let named: [(&str, u32); 6] = [
+            ("FILTER  CUTOFF", synth::ID_CUTOFF),
+            ("MIXER + SPEAKER", synth::ID_SPEAKER),
+            ("SNARE  (TONE)", synth::ID_SNARE_TONE),
+            ("SNARE  (TONE)", synth::ID_NOISE),
+            ("CLOCK  TEMPO", synth::seq_ids().tempo),
+            ("STEP 1 PITCH", synth::seq_ids().pots[0]),
+        ];
+        for (name, id) in named {
+            let p = panels
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| panic!("no panel {name:?}"));
+            let e = els.iter().find(|e| e.id == id).expect("the part exists");
+            assert!(holds(p, e), "part {id} is not inside panel {name:?}");
+        }
+        // Every step's toggle is under its own BEAT panel.
+        let ids = synth::seq_ids();
+        for n in 0..synth::SEQ_STEPS {
+            let name = ["BEAT 1", "BEAT 2", "BEAT 3", "BEAT 4"][n];
+            let p = panels.iter().find(|p| p.name == name).unwrap();
+            let e = els.iter().find(|e| e.id == ids.switches[n]).unwrap();
+            assert!(holds(p, e), "toggle {} is not inside {name:?}", e.id);
+        }
     }
 
     /// Nothing in the instrument may sit inside the machine's footprint: an
@@ -5133,7 +5299,7 @@ mod tests {
                 eng.time()
             );
             // The VCO's comparator output, +-5 V.
-            let osc = eng.voltage_at((44, -8)).unwrap_or(0.0) > 0.0;
+            let osc = eng.voltage_at(synth::vco_square()).unwrap_or(0.0) > 0.0;
             if osc != osc_high {
                 osc_flips += 1;
                 osc_high = osc;
@@ -5174,7 +5340,7 @@ mod tests {
         let mut cv = Vec::with_capacity(n);
         for _ in 0..n {
             eng.advance(1);
-            osc.push(eng.voltage_at((44, -8)).unwrap_or(0.0));
+            osc.push(eng.voltage_at(synth::vco_square()).unwrap_or(0.0));
             cv.push(eng.voltage_at(sq.cv()).unwrap_or(0.0));
         }
         // Cut the run into CV plateaus: one per step.

@@ -109,6 +109,30 @@ impl Sim {
 /// sentence for the DRC callout.
 #[wasm_bindgen(js_name = checkDocument)]
 pub fn check_document(specs: JsValue, dt: f64) -> Result<JsValue, JsValue> {
+    let specs = specs_in(specs)?;
+    verdict(sim_core::check_document(&specs, dt))
+}
+
+/// [`check_document`] plus the shape rule — the gate for a document EDIT.
+///
+/// `before` is the document being replaced. Alone among the gate's rules the
+/// shape rule cannot be decided from the candidate: it is a rule about the
+/// CHANGE, so that a part which predates it may still be dragged, rotated
+/// and flipped while nothing may become newly skewed. Same return shape as
+/// `checkDocument` (with one more code, "skewed_part"), and the same Rust
+/// behind it as the server's edit path.
+#[wasm_bindgen(js_name = checkEdit)]
+pub fn check_edit(before: JsValue, after: JsValue, dt: f64) -> Result<JsValue, JsValue> {
+    let before = specs_in(before)?;
+    let after = specs_in(after)?;
+    verdict(sim_core::check_edit(&before, &after, dt))
+}
+
+fn specs_in(v: JsValue) -> Result<Vec<ElementSpec>, JsValue> {
+    serde_wasm_bindgen::from_value(v).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+fn verdict(r: Result<(), sim_core::Reject>) -> Result<JsValue, JsValue> {
     #[derive(serde::Serialize)]
     struct RejectOut {
         code: &'static str,
@@ -116,9 +140,7 @@ pub fn check_document(specs: JsValue, dt: f64) -> Result<JsValue, JsValue> {
         ids: Vec<u32>,
         hint: String,
     }
-    let specs: Vec<ElementSpec> =
-        serde_wasm_bindgen::from_value(specs).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    match sim_core::check_document(&specs, dt) {
+    match r {
         Ok(()) => Ok(JsValue::NULL),
         Err(r) => serde_wasm_bindgen::to_value(&RejectOut {
             code: r.code(),
@@ -127,6 +149,126 @@ pub fn check_document(specs: JsValue, dt: f64) -> Result<JsValue, JsValue> {
             hint: r.hint(),
         })
         .map_err(|e| JsValue::from_str(&e.to_string())),
+    }
+}
+
+// ------------------------------------------------------- rigid part shapes
+//
+// The geometry of multi-pin parts is `sim_core::shape`, reached from here so
+// the client has no second copy of it. A second copy would be a second set of
+// rounding rules, and they diverge on the first odd number — which is exactly
+// how the old TypeScript `makePins` came to place a pot's wiper on a
+// different grid unit depending on which way the drag went.
+//
+// Pins cross as a flat Int32Array (x, y, x, y, ...) rather than as JSON: no
+// serde on a path the pointer runs through 60 times a second, and the client
+// already thinks in flat frame buffers.
+
+fn pins_in(flat: &[i32]) -> Vec<sim_core::Point> {
+    flat.chunks_exact(2).map(|c| (c[0], c[1])).collect()
+}
+
+fn pins_out(pins: &[sim_core::Point]) -> Vec<i32> {
+    pins.iter().flat_map(|p| [p.0, p.1]).collect()
+}
+
+/// The canonical pin layout for a part of document tag `t` dragged from
+/// (`ax`, `ay`) to (`bx`, `by`). Axis-snapped: a diagonal drag gives an
+/// axis-aligned part, never a skewed one.
+#[wasm_bindgen(js_name = partPins)]
+pub fn part_pins(t: &str, ax: i32, ay: i32, bx: i32, by: i32) -> Vec<i32> {
+    pins_out(&sim_core::shape::canonical_pins(
+        sim_core::Shape::for_tag(t),
+        (ax, ay),
+        (bx, by),
+    ))
+}
+
+/// Is this pin list a legal placement of `t` — the canonical layout under a
+/// rotation and an optional mirror? Two-pin and one-pin parts are always
+/// legal. This is the SAME predicate the placement gate enforces.
+#[wasm_bindgen(js_name = partIsRigid)]
+pub fn part_is_rigid(t: &str, pins: &[i32]) -> bool {
+    let shape = sim_core::Shape::for_tag(t);
+    !shape.is_rigid_family() || sim_core::shape::decompose(shape, &pins_in(pins)).is_some()
+}
+
+/// Snap a skewed pin list back into formation, keeping its orientation,
+/// handedness and rough size. The identity on a part already in formation.
+#[wasm_bindgen(js_name = partStraighten)]
+pub fn part_straighten(t: &str, pins: &[i32]) -> Vec<i32> {
+    pins_out(&sim_core::shape::straighten(
+        sim_core::Shape::for_tag(t),
+        &pins_in(pins),
+    ))
+}
+
+/// Drag terminal `k` of a rigid part to (`cx`, `cy`) and give back the WHOLE
+/// part: the reshape gesture, in the same code the gate judges. Empty when
+/// the drag changes nothing (or the part is not a rigid family).
+///
+/// The client has no other way to author a multi-pin placement, which is what
+/// makes "the client cannot draw a skewed part" a structural fact rather than
+/// a convention.
+#[wasm_bindgen(js_name = partReshape)]
+pub fn part_reshape(t: &str, pins: &[i32], k: usize, cx: i32, cy: i32) -> Vec<i32> {
+    let shape = sim_core::Shape::for_tag(t);
+    let pins = pins_in(pins);
+    match sim_core::shape::reshape_shape(shape, &pins, k, (cx, cy)) {
+        Some(out) => pins_out(&out),
+        None => Vec::new(),
+    }
+}
+
+/// The grid point a reshape of terminal `k` turns about — the far end of
+/// the part, which stays exactly where it is while the rest swings. Empty
+/// for a terminal that carries the part instead of reorienting it, and for
+/// parts that are not a rigid family.
+///
+/// The client draws it. A rigid swing moves EVERY pin (the perpendicular
+/// offsets turn with the axis), so "which pins did not move" is not a
+/// pivot — this is, and it is the one point the gesture promises to hold
+/// still.
+#[wasm_bindgen(js_name = partPivot)]
+pub fn part_pivot(t: &str, pins: &[i32], k: usize) -> Vec<i32> {
+    let shape = sim_core::Shape::for_tag(t);
+    let pins = pins_in(pins);
+    if !shape.is_rigid_family() || pins.len() != shape.pins() || k >= pins.len() {
+        return Vec::new();
+    }
+    let Some(pl) = sim_core::shape::decompose(shape, &sim_core::shape::straighten(shape, &pins))
+    else {
+        return Vec::new();
+    };
+    match sim_core::shape::handle(shape, k) {
+        sim_core::Handle::Tip => vec![pl.origin.0, pl.origin.1],
+        sim_core::Handle::Anchor => vec![pl.tip().0, pl.tip().1],
+        sim_core::Handle::Body => Vec::new(),
+    }
+}
+
+/// The sentence the gate would print if this part were skewed — used by the
+/// client when it straightens a legacy part, so the editor says the same
+/// thing about rigid symbols wherever the subject comes up.
+#[wasm_bindgen(js_name = partRigidHint)]
+pub fn part_rigid_hint(t: &str) -> String {
+    sim_core::rigid_hint(t)
+}
+
+/// What dragging terminal `k` does: 0 = nothing special (free part), 1 =
+/// reorient/resize about the far end, 2 = carry the whole part. The client
+/// uses it for the hover cursor and for the undo entry's name, so the
+/// gesture announces itself before the pointer moves and is still called the
+/// right thing afterwards.
+#[wasm_bindgen(js_name = partHandle)]
+pub fn part_handle(t: &str, k: usize) -> u8 {
+    let shape = sim_core::Shape::for_tag(t);
+    if !shape.is_rigid_family() || k >= shape.pins() {
+        return 0;
+    }
+    match sim_core::shape::handle(shape, k) {
+        sim_core::Handle::Anchor | sim_core::Handle::Tip => 1,
+        sim_core::Handle::Body => 2,
     }
 }
 

@@ -67,7 +67,7 @@
 // pointer hit-tests go through the grid-space spatial index in spatial.ts,
 // and the zoom band 0.4..200 px/unit drops symbol detail below ~6 px/unit.
 
-import init, { Sim, checkDocument } from './wasm/sim_wasm';
+import init, { Sim, checkEdit } from './wasm/sim_wasm';
 import {
   demoCircuit,
   MAX_PINS,
@@ -80,7 +80,21 @@ import {
   type Point,
 } from './circuit';
 import { AudioPlayer } from './audio';
-import { CATALOG, CATEGORIES, makePins, partsInCategory, pinCount, type PartDef } from './catalog';
+import {
+  CATALOG,
+  CATEGORIES,
+  isRigidPlacement,
+  makePins,
+  partsInCategory,
+  pinCount,
+  pinGesture,
+  pinPivot,
+  reshapePins,
+  rigidHint,
+  straightenPins,
+  type PartDef,
+  type PinGesture,
+} from './catalog';
 import { History, isTypingTarget } from './history';
 import { createHoist, type MachineRect } from './hoist';
 import { connect, type RoomHello } from './net';
@@ -720,7 +734,7 @@ function toast(text: string) {
 // ------------------------------------------------- the placement gate (DRC)
 //
 // The SAME Rust implementation the server enforces, reached through
-// `checkDocument` in sim-wasm. Running it here before we send means the two
+// `checkEdit` in sim-wasm. Running it here before we send means the two
 // sides cannot disagree about what is placeable: a move that breaks the
 // simulation is refused at the moment it is made, with a sentence saying
 // why, instead of being applied optimistically and then silently dropped —
@@ -780,7 +794,7 @@ const GATE_MAX_ELEMENTS = 800;
 
 /** The document `op` would produce, WITHOUT touching the live one. Mirrors
  * the server's `apply_doc_op_to`: same verbs, same order, applied to a copy.
- * Only the changed element is cloned; `checkDocument` serializes and never
+ * Only the changed element is cloned; the gate serializes and never
  * mutates. */
 function candidateDoc(op: DocOp): ElementSpec[] {
   if (op.t === 'Add') return space.get(op.spec.id) ? elements : [...elements, op.spec];
@@ -808,7 +822,13 @@ function showReject(hint: string, ids: number[], ctx: string) {
 
 /** Run the gate on a candidate document. Returns true when it was REFUSED
  * (and the callout has already been shown), so callers read as
- * `if (refused(...)) return;`. */
+ * `if (refused(...)) return;`.
+ *
+ * `checkEdit`, not `checkDocument`: the shape rule is a rule about the
+ * CHANGE, so the gate is given the live document as well as the candidate.
+ * Every caller here builds its candidate from `elements`, which is exactly
+ * the document the server is about to replace, so the two sides judge the
+ * same before/after pair. */
 function refused(candidate: ElementSpec[], ctx: string): boolean {
   if (candidate.length > GATE_MAX_ELEMENTS) return false;
   // The client sim runs at its own dt. Structural refusals do not depend on
@@ -817,7 +837,7 @@ function refused(candidate: ElementSpec[], ctx: string): boolean {
   type GateReject = { hint?: string; ids?: number[]; id?: number | null };
   let r: GateReject | null;
   try {
-    r = checkDocument(candidate, DT) as GateReject | null;
+    r = checkEdit(elements, candidate, DT) as GateReject | null;
   } catch {
     return false; // a gate that cannot run must never block a legal edit
   }
@@ -1196,6 +1216,40 @@ function mirrorPins(pins: Point[], axis: 'x' | 'y'): Point[] {
   return pins.map(([x, y]) => (i === 0 ? [sum - x, y] : [x, sum - y]) as Point);
 }
 
+/** What each pin gesture is called in the undo list. */
+const GESTURE_LABEL: Record<PinGesture, string> = {
+  free: 'reshape part',
+  swing: 'reorient part',
+  carry: 'move part',
+};
+
+/** Put a part that predates the shape rule back into formation, the moment a
+ *  player takes hold of one of its terminals. Returns false only if the
+ *  straightened document would not run, in which case the drag never starts.
+ *
+ *  DELIBERATELY NOT UNDOABLE back to the skew, and this is the one place the
+ *  editor throws away a state on purpose. The reason is that the shape rule
+ *  is monotone — a skewed part may be moved, rotated and flipped, but nothing
+ *  may become newly skewed — so an undo entry holding the old shape would be
+ *  an entry the server refuses. Better to have no way back to a shape the
+ *  editor can no longer draw than a ⌘Z that fails with a sentence about
+ *  rigid bodies. The straightening is announced instead, which is what an
+ *  irreversible change owes the player.
+ *
+ *  Old rooms are the only place this fires: it is the migration, done one
+ *  part at a time, by the person who asked for that part to move. Nothing
+ *  rewrites a saved document behind anyone's back. */
+function straightenBeforeDrag(e: ElementSpec): boolean {
+  if (pinCount(e.kind) <= 2 || isRigidPlacement(e.kind, e.pins)) return true;
+  const op: DocOp = { t: 'Move', id: e.id, pins: straightenPins(e.kind, e.pins) };
+  if (refused(candidateDoc(op), 'edit')) return false;
+  applyDoc(op);
+  if (online) net.sendEdit(op);
+  else localSim.setElements(elements);
+  toast(`#${e.id} straightened — ${rigidHint(e.kind)}`);
+  return true;
+}
+
 /** Pin layout for a placement, with the armed mirrors applied. */
 function placePins(kind: ElementKind, a: Point, b: Point): Point[] {
   let pins = makePins(kind, a, b);
@@ -1531,7 +1585,14 @@ function copyElements(sel: ElementSpec[]) {
   const [cx, cy] = centroidOf(sel);
   clipboard = sel.map((e) => ({
     kind: JSON.parse(JSON.stringify(e.kind)) as ElementKind,
-    pins: e.pins.map(([x, y]) => [x - cx, y - cy] as Point),
+    // Copied geometry is STRAIGHTENED. A paste is an `Add`, and an added
+    // part must be in formation — there is no grandfather clause for a part
+    // that did not exist a moment ago. Doing it here rather than at the
+    // paste means the ghost under the cursor shows what will actually land,
+    // and copying a legacy op-amp out of an old room is how you get a good
+    // one. Nothing is connected to a part that has not been pasted yet, so
+    // the snap cannot pull a terminal off a junction.
+    pins: straightenPins(e.kind, e.pins).map(([x, y]) => [x - cx, y - cy] as Point),
     tier: e.tier ?? 0,
     rot: e.rot ?? 0,
   }));
@@ -2304,8 +2365,8 @@ canvas.addEventListener('pointerdown', (ev) => {
   // never by pin-dragging.
   if (!modifiedSelect(ev)) {
     const own = pinOwnerAt(ev.clientX, ev.clientY);
-    if (own) {
-      history.begin([own.e], 'reshape part'); // pins mutate in place mid-drag
+    if (own && straightenBeforeDrag(own.e)) {
+      history.begin([own.e], GESTURE_LABEL[pinGesture(own.e.kind, own.k)]); // pins mutate in place
       pinDrag = { id: own.e.id, k: own.k, moved: false, lastSent: 0 };
       selectedIds = new Set([own.e.id]);
       selectedProbe = null;
@@ -2460,14 +2521,27 @@ canvas.addEventListener('pointermove', (ev) => {
     const here = snap(ev.clientX, ev.clientY);
     const e = elemById(pinDrag.id);
     if (e) {
-      const cur = e.pins[pinDrag.k]!;
-      const collides = e.pins.some(
-        (p, i) => i !== pinDrag!.k && p[0] === here[0] && p[1] === here[1],
-      );
-      // A part must not collapse onto itself: two of its own terminals on
-      // one grid point would merge its nodes.
-      if (!collides && (cur[0] !== here[0] || cur[1] !== here[1])) {
-        e.pins[pinDrag.k] = here;
+      // TWO TERMINALS ARE A PART; THREE ARE A SYMBOL.
+      //
+      // A resistor IS its two endpoints, so dragging one is how you draw it
+      // and `here` goes straight in. Anything the catalogue draws as an
+      // object — an op-amp triangle, a DIP, a transistor — has one canonical
+      // layout, and moving ONE of its terminals is not a smaller version of
+      // reshaping it, it is a different and meaningless thing. So the drag
+      // asks sim-core what the WHOLE part looks like now: swing and stretch
+      // it about its far end, or carry it by a leg that has no say in the
+      // axis. Neither branch can produce a shape the gate would refuse,
+      // which is why the throttled preview below can go out unchecked.
+      const rigid = pinCount(e.kind) > 2;
+      const next = rigid
+        ? reshapePins(e.kind, e.pins, pinDrag.k, here)
+        : e.pins.some((p, i) => i !== pinDrag!.k && p[0] === here[0] && p[1] === here[1])
+          ? // A two-pin part must not collapse onto itself: both terminals
+            // on one grid point would merge its nodes.
+            null
+          : e.pins.map((p, i) => (i === pinDrag!.k ? here : p));
+      if (next && next.some((p, i) => p[0] !== e.pins[i]![0] || p[1] !== e.pins[i]![1])) {
+        e.pins = next;
         space.update(e);
         pinDrag.moved = true;
       }
@@ -2526,6 +2600,14 @@ canvas.addEventListener('pointermove', (ev) => {
   const pz = z ? null : panelZoneAt(cam, panels, ev.clientX, ev.clientY);
   const over = z || pz ? undefined : elementAt(ev.clientX, ev.clientY);
   const onPin = !z && !pz && !!pinAt(ev.clientX, ev.clientY);
+  // What grabbing that terminal would DO. Three different gestures share one
+  // hit test, so the cursor has to distinguish them or a rigid part reads as
+  // "the drag stopped working": 'grab' for the terminals that swing the whole
+  // part round, 'move' for the legs that carry it and for the free endpoints
+  // of a two-pin part.
+  const pinOwner = onPin ? pinOwnerAt(ev.clientX, ev.clientY) : null;
+  const pinCur =
+    pinOwner && pinGesture(pinOwner.e.kind, pinOwner.k) === 'swing' ? 'grab' : 'move';
   // The machine is hit-tested last here too, so the cursor promises exactly
   // what pointerdown will do.
   const mz =
@@ -2552,7 +2634,7 @@ canvas.addEventListener('pointermove', (ev) => {
               ? 'pointer'
               : 'move'
           : onPin
-            ? 'move' // drag from a terminal carries that pin (reshape)
+            ? pinCur // reshape a free part, or swing/carry a rigid one
             : over?.kind.t === 'Switch' || over?.kind.t === 'Button'
               ? 'pointer'
               : over
@@ -3475,7 +3557,28 @@ function frame(now: number) {
   if (pinDrag && pinDrag.moved) {
     const e = elemById(pinDrag.id);
     const p = e?.pins[pinDrag.k];
-    if (p) {
+    if (e && p) {
+      // The pivot, for a part that swings as one body: the far end, which
+      // the gesture promises to hold still. Drawn with a spoke to the
+      // carried terminal, so what is happening to the WHOLE part is visible
+      // while it happens — without it a rigid swing reads as the drag
+      // refusing to follow the cursor.
+      const pivot = pinPivot(e.kind, e.pins, pinDrag.k);
+      if (pivot) {
+        const [hx, hy] = toPx(pivot);
+        const [px, py] = toPx(p);
+        ctx.strokeStyle = '#ffb24d';
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([4, 4]);
+        ctx.beginPath();
+        ctx.moveTo(hx, hy);
+        ctx.lineTo(px, py);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.beginPath();
+        ctx.arc(hx, hy, Math.max(3, cam.scale * 0.12), 0, Math.PI * 2);
+        ctx.stroke();
+      }
       const [bx, by] = toPx(p);
       const connects = pinExistsAt(p, pinDrag.id);
       ctx.strokeStyle = connects ? '#4bff6a' : '#8a8a98';

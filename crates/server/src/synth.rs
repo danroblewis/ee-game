@@ -62,57 +62,55 @@
 //!    cheap noise gates were really built.
 
 use sim_core::{ElementKind as K, ElementSpec, Point};
-use sim_golden::{dc, gnd, r, spec, spec3};
+use sim_golden::{dc, r};
 
+use crate::layout::{Sheet, DOWN, E, LEFT, N, RIGHT, S, UP, W};
 use crate::sequencer::{self, Seq};
 
 // ---------------------------------------------------------------- geometry
 //
-// The room is laid out so the part a player wants first is the part the
-// camera opens on. The client's home view frames x/y in -10..60, and the
-// SEQUENCER — every pitch knob, every beat toggle, the tempo knob — fills
-// the bottom two thirds of exactly that box. The voice runs right-to-left
-// along the top (the sequencer's CV comes out of its top right corner, so
-// the signal path starts there), and the two drum voices sit under it.
+// THE DRAWING. The room is one continuous signal path drawn as a
+// counter-clockwise loop, so a player can follow it with a finger:
+//
+//   the SEQUENCER fills the bottom two thirds, reading left to right —
+//   clock, threshold ladder, one lane per step, pitch knobs, beat toggles —
+//   and puts its CV and BEAT buses out on risers up its right-hand edge.
+//   The VOICE then reads RIGHT TO LEFT along the top: VCO, filter, mixer,
+//   speaker. The SNARE runs in its own band underneath the voice, fed from
+//   the BEAT riser on the right and dumping its current into the mixer's
+//   summing node on the left. The +9 V rail is a single line down the left
+//   margin and along the top; every ground is a local symbol on the pin
+//   that needs it.
+//
+// Every multi-pin part is placed through `sim_core::shape::place`, so it is
+// a rotation or mirror of its canonical symbol and nothing in the room is
+// skewed. Everything else is an orthogonal `Wire` run: a wire merges its
+// ends in `compile`'s union-find and stamps nothing, so routing is free in
+// the matrix and costs only an element visit.
 
-/// Where the sequencer's top-left corner sits.
-const SEQ_ORIGIN: Point = (-10, 12);
-/// First id the sequencer owns; it uses `SEQ_ID0 + 1 ..= SEQ_ID0 + 46`.
+/// Where the sequencer's rail-in corner sits.
+const SEQ_ORIGIN: Point = (-10, 14);
+/// First id the sequencer owns for its devices; routing comes from
+/// [`SEQ_ROUTE_ID0`].
 const SEQ_ID0: u32 = 400;
+/// Routing ids. The voice draws from [`VOICE_ROUTE_ID0`] and the sequencer
+/// from [`SEQ_ROUTE_ID0`]; devices keep the ids they have always had, which
+/// is what lets the netlist be diffed part by part across a re-layout.
+const VOICE_ROUTE_ID0: u32 = 100;
+const SEQ_ROUTE_ID0: u32 = 500;
 
-/// The single 9 V rail node, on the left margin between the two halves.
-const V9: Point = (-8, 16);
-/// Ground symbols. All three are node 0 — several symbols is how a
-/// schematic avoids one star of twenty-line-long wires, and `Ground` costs
-/// no branch unknown.
-const G: Point = (-8, 20); // sequencer side
-const G2: Point = (20, 0); // voice side
-const G3: Point = (20, 8); // drum side
+// -- the supply ------------------------------------------------------------
+/// The rail line: down the left margin from the sequencer, then along the
+/// top of the voice.
+const RAIL_Y: i32 = -10;
+const RAIL_X: i32 = -10;
 
 // -- mixer / output --------------------------------------------------------
-const SUM: Point = (24, -8); // virtual-ground current summing bus
-const OUT: Point = (20, -8); // op-amp output / speaker terminal
+const SUM: Point = (20, -5); // virtual-ground current summing bus
+const OUT: Point = (14, -4); // op-amp output / speaker terminal
 
 // -- VCO -------------------------------------------------------------------
-const SQ: Point = (44, -8); // comparator output: the square, ±5 V
-const TRI: Point = (48, -8); // the integrator: a 0.52 Vpp triangle
-const HYS: Point = (44, -4); // Schmitt divider tap
-const VBIAS: Point = (52, -4); // the exponential converter's output
-
-// -- filter ----------------------------------------------------------------
-const FA: Point = (36, -8); // attenuated input, ~10 mV
-const FY: Point = (32, -8); // filter output
-const FB: Point = (32, -4); // cutoff bias
-const FCV: Point = (36, -4); // cutoff control voltage
-
-// -- LFO (a buffered tap off the sequencer's own sawtooth) ------------------
-const LC: Point = (12, -8); // after the LFO's coupling cap
-
-// -- snare -----------------------------------------------------------------
-const NOUT: Point = (40, 4); // noise source output
-const SIN: Point = (48, 4); // MOSFET gate's signal side
-const SENV: Point = (48, 8); // envelope == MOSFET gate
-const STRIG: Point = (52, 8); // differentiated beat bus
+const SQ: Point = (44, -8); // comparator output: the square, +-5 V
 
 // ------------------------------------------------------------------ values
 //
@@ -152,8 +150,15 @@ pub fn seq_ids() -> sequencer::SeqIds {
     sequencer::seq_ids(&seq_config())
 }
 
+/// The VCO's square-wave node: what a test listens to when it wants the
+/// oscillator itself rather than the speaker.
+#[allow(dead_code)]
+pub fn vco_square() -> Point {
+    SQ
+}
+
 /// How many steps the bar has. THREE, not four, and the reason is the
-/// real-time budget: a step costs seven elements, and at four steps the live
+/// real-time budget: a step costs seven devices, and at four steps the live
 /// server measured 0.86x real time — a synthesizer running 0.86x plays two
 /// and a half semitones FLAT, which is not a performance problem, it is a
 /// broken instrument. See `SCOPE NOTES`.
@@ -173,8 +178,7 @@ pub fn seq_config() -> Seq {
     Seq {
         id0: SEQ_ID0,
         origin: SEQ_ORIGIN,
-        rail: V9,
-        gnd_pt: G,
+        route_id0: SEQ_ROUTE_ID0,
         // ~3.9 steps/s: slow enough that every step is a distinct note,
         // fast enough to be a groove.
         tempo: 0.34,
@@ -190,26 +194,29 @@ fn cap(farads: f64) -> K {
 fn pot(ohms: f64, wiper: f64) -> K {
     K::Potentiometer { ohms, wiper }
 }
-fn ota(id: u32, inp: Point, inm: Point, out: Point, bias: Point) -> ElementSpec {
-    ElementSpec {
-        id,
-        kind: K::Ota,
-        pins: vec![inp, inm, out, bias],
-        ..Default::default()
-    }
-}
 
 /// The synthesizer room.
 pub fn synth_room_circuit() -> Vec<ElementSpec> {
     let sq = seq_config();
-    let mut e: Vec<ElementSpec> = Vec::with_capacity(100);
+    let mut sh = Sheet::new(VOICE_ROUTE_ID0);
 
-    // ------------------------------------------------------- supply / mixer
-    e.push(spec(2, dc(SUPPLY_V), V9, G));
-    e.push(gnd(3, G));
-    e.push(gnd(4, G2));
-    e.push(gnd(5, G3));
+    // ------------------------------------------------------- supply
+    // One rail line: up the left margin out of the sequencer, then straight
+    // across the top of the voice. Every module drops a resistor onto it
+    // rather than reaching for a star point.
+    let rail_in = sq.rail_in();
+    sh.run(&[
+        rail_in,
+        (RAIL_X, RAIL_Y),
+        (-8, RAIL_Y),
+        (32, RAIL_Y),
+        (58, RAIL_Y),
+    ]);
+    sh.two(2, dc(SUPPLY_V), (-8, -8), (-8, -4));
+    sh.wire((-8, RAIL_Y), (-8, -8));
+    sh.ground((-8, -4), DOWN);
 
+    // ------------------------------------------------------- mixer + speaker
     // ONE op-amp is the whole output stage. Its inverting input is a
     // virtual-ground current bus: every voice dumps current into it and they
     // sum with zero crosstalk, at whatever impedance suits each one, and the
@@ -221,14 +228,26 @@ pub fn synth_room_circuit() -> Vec<ElementSpec> {
     // The speaker gets id 1: the server streams the four lowest-id Speakers,
     // so the instrument's output can never be crowded out by something a
     // player drops next to it.
-    e.push(ElementSpec {
-        id: 10,
-        kind: K::OpAmp { rail: SUPPLY_V, isc: sim_core::DEFAULT_OPAMP_ISC },
-        pins: vec![G2, SUM, OUT],
-        ..Default::default()
-    });
-    e.push(spec(11, r(6.8e6), OUT, SUM)); // Rf: transimpedance
-    e.push(spec(ID_SPEAKER, K::Speaker { ohms: 8.0 }, OUT, G2));
+    // pins [in+, in-, out]
+    let mix = sh.part(
+        10,
+        K::OpAmp { rail: SUPPLY_V, isc: sim_core::DEFAULT_OPAMP_ISC },
+        (20, -4),
+        W,
+        6,
+        false,
+    );
+    debug_assert_eq!(mix[1], SUM);
+    debug_assert_eq!(mix[2], OUT);
+    sh.ground(mix[0], DOWN);
+    // Rf, over the top of the amplifier: the transimpedance that turns the
+    // summing current into volts.
+    sh.run(&[OUT, (14, -1)]);
+    sh.two(11, r(6.8e6), (14, -1), (21, -1));
+    sh.run(&[(21, -1), (21, -5), SUM]);
+    sh.run(&[OUT, (12, -4)]);
+    sh.two(ID_SPEAKER, K::Speaker { ohms: 8.0 }, (12, -4), (8, -4));
+    sh.ground((8, -4), LEFT);
 
     // --------------------------------------------------------------- VCO
     // An OTA constant-current integrator inside an op-amp Schmitt loop:
@@ -236,23 +255,53 @@ pub fn synth_room_circuit() -> Vec<ElementSpec> {
     // the three-resistor divider below into a true exponential 1 V/octave
     // converter — an octave is 17.9 mV at the bias pin.
     //
-    // The triangle on the cap is the clean output, but the SQUARE is what
-    // feeds the filter: the triangle node is a bare integrator and any
-    // resistive load on it changes the pitch (the filter's 470 kΩ input
-    // would draw current comparable to Iabc itself). A filtered square is
-    // also the richer sound.
-    e.push(ota(20, SQ, G2, TRI, VBIAS));
-    e.push(spec(21, cap(C_VCO), TRI, G2));
-    e.push(spec3(22, K::OpAmp { rail: 5.0, isc: sim_core::DEFAULT_OPAMP_ISC }, HYS, TRI, SQ));
-    e.push(spec(23, r(R_HYST_TOP), SQ, HYS));
-    e.push(spec(24, r(R_HYST_BOT), HYS, G2));
-    // The exponential converter's Thevenin resistance at the bias pin is
-    // ~150 Ω, which is what lets the sequencer's BUFFERED CV set pitch to a
-    // couple of cents: driving R_SCALE from a bare pot wiper was measured at
-    // 844 cents of error.
-    e.push(spec(26, r(R_SCALE), sq.cv(), VBIAS));
-    e.push(spec(27, r(R_OFF), V9, VBIAS));
-    e.push(spec(28, r(R_GND), VBIAS, G2));
+    // Drawn as the loop it is: the comparator across the top, the integrator
+    // under it, the square running back down the left-hand edge into the
+    // integrator's own input and on out to the filter. The triangle is the
+    // clean output but the SQUARE is what feeds the filter: the triangle
+    // node is a bare integrator and any resistive load on it changes the
+    // pitch (the filter's 470 kΩ input would draw current comparable to
+    // Iabc itself). A filtered square is also the richer sound.
+    // pins [in+, in-, out, bias]
+    let ota = sh.part(20, K::Ota, (48, -4), E, 4, true);
+    let (sq_in, ota_gnd, tri, vbias) = (ota[0], ota[1], ota[2], ota[3]);
+    sh.two(21, cap(C_VCO), (54, -4), (54, -2));
+    // pins [in+, in-, out]
+    let cmp = sh.part(
+        22,
+        K::OpAmp { rail: 5.0, isc: sim_core::DEFAULT_OPAMP_ISC },
+        (50, -8),
+        W,
+        6,
+        false,
+    );
+    let (hys, tri_in, sq_out) = (cmp[0], cmp[1], cmp[2]);
+    debug_assert_eq!(sq_out, SQ);
+    // Schmitt divider.
+    sh.two(23, r(R_HYST_TOP), (44, -6), (50, -6));
+    sh.two(24, r(R_HYST_BOT), (52, -7), (54, -7));
+    // The exponential converter: three resistors on the bias pin. Its
+    // Thevenin resistance there is ~150 Ohm, which is what lets the
+    // sequencer's BUFFERED CV set pitch to a couple of cents — driving
+    // R_SCALE from a bare pot wiper was measured at 844 cents of error.
+    sh.two(26, r(R_SCALE), (46, -1), (50, -1));
+    sh.two(27, r(R_OFF), (58, RAIL_Y), (58, -1));
+    sh.two(28, r(R_GND), vbias, (47, -2));
+
+    // ...and the wiring.
+    sh.ground(ota_gnd, UP);
+    // The square: down the VCO's left edge, into the integrator and on out
+    // to the filter.
+    sh.run(&[sq_out, (44, -6), (44, -5), (44, -3), sq_in]);
+    // The triangle: round the outside of the comparator and back into it.
+    sh.run(&[tri, (54, -4), (56, -4), (56, -9), tri_in]);
+    sh.ground((54, -2), LEFT);
+    sh.run(&[(50, -6), hys, (52, -7)]);
+    sh.ground((54, -7), RIGHT);
+    sh.ground((47, -2), LEFT);
+    sh.run(&[sq.cv(), (46, -1)]);
+    sh.run(&[(58, -1), (51, -1), (50, -1)]);
+    sh.run(&[(51, -1), vbias]);
 
     // -------------------------------------------------------------- VCF
     // A one-pole gm-C low-pass: the OTA drives its own inverting input
@@ -262,25 +311,47 @@ pub fn synth_room_circuit() -> Vec<ElementSpec> {
     // 470 k : 1 k divides the 10 Vpp square to about ±10 mV, inside the
     // OTA's linear window. Everything inside the filter runs at millivolts
     // and the gain comes back at the mixer.
-    e.push(spec(30, r(470_000.0), SQ, FA));
-    e.push(spec(31, r(1_000.0), FA, G2));
-    e.push(ota(32, FA, FY, FY, FB));
-    e.push(spec(33, cap(22e-9), FY, G2));
-    e.push(spec(37, r(R_CUT_SCALE), FCV, FB));
-    // CUTOFF — the headline knob.
-    e.push(spec3(ID_CUTOFF, pot(10_000.0, 0.40), G2, FCV, V9));
+    //
+    // The gm-C strap — output back to the inverting input — used to be drawn
+    // by stacking those two pins on one point, which is not a shape an OTA
+    // has. It is a wire now, which is how a gm-C integrator is drawn anyway.
+    sh.two(30, r(470_000.0), (42, -5), (36, -5));
+    sh.two(31, r(1_000.0), (36, -5), (36, -2));
+    // pins [in+, in-, out, bias]
+    let f = sh.part(32, K::Ota, (34, -4), W, 4, true);
+    let (fa, fy_in, fy, fb) = (f[0], f[1], f[2], f[3]);
+    // The cutoff resistor and the LFO's injection land straight on the bias
+    // pin: no stub, because the symbol's own lead already points at them.
+    debug_assert_eq!(fb, (31, -6));
+    sh.two(33, cap(22e-9), (32, -2), (32, 0));
+    sh.two(37, r(R_CUT_SCALE), (29, -6), (31, -6));
+    // CUTOFF — the headline knob. pins [end a, wiper, end b]
+    let cut = sh.part(ID_CUTOFF, pot(10_000.0, 0.40), (26, -8), E, 6, true);
+    debug_assert_eq!(cut[1], (29, -6));
     // Out to the mixer, and deliberately a plain resistor rather than an OTA
-    // VCA. Two reasons, both measured. One: an 8 Ω speaker passes its 0.5 W
+    // VCA. Two reasons, both measured. One: an 8 Ohm speaker passes its 0.5 W
     // rating at 2 V rms and the op-amp's rail is 9 V, so a level control that
     // could be wound up would be a way to burn the speaker by turning
     // something clockwise — a demo is not a trap, and the damage test winds
     // every pot to 0.98. With the level fixed, nothing a player can touch
     // drives the output past ~1.3 V peak. Two: an OTA tracking an audio
     // signal costs the WHOLE room a third of a Newton iteration per substep
-    // (3 µs), because Newton is global. The filter's output impedance is
-    // 1/gm, so 220 kΩ is a light load when the filter is open and
+    // (3 us), because Newton is global. The filter's output impedance is
+    // 1/gm, so 220 kOhm is a light load when the filter is open and
     // deliberately fades the voice as the cutoff knob closes it.
-    e.push(spec(41, r(220_000.0), FY, SUM));
+    sh.two(41, r(220_000.0), (30, -5), (24, -5));
+
+    // ...and the wiring.
+    sh.run(&[fy, (30, -2), (32, -2), (34, -2), fy_in]);
+    sh.ground((32, 0), DOWN);
+    sh.run(&[(44, -5), (42, -5)]);
+    sh.run(&[(36, -5), fa]);
+    sh.ground((36, -2), DOWN);
+    sh.run(&[fy, (30, -5)]);
+    sh.run(&[(24, -5), (22, -5), (21, -5)]);
+    sh.ground(cut[0], LEFT);
+    sh.run(&[cut[2], (32, RAIL_Y)]);
+
 
     // ---------------------------------------------------------------- LFO
     // The sequencer's 555 already makes a 3-6 V sawtooth once per bar, so
@@ -293,44 +364,50 @@ pub fn synth_room_circuit() -> Vec<ElementSpec> {
     // 555's own timing capacitor, so it steals about a tenth of the charging
     // current and the tempo knob's calibration shifts with it. That is
     // measured and accounted for in the shipped `tempo` value, not ignored.
-    e.push(spec(51, cap(1e-6), sq.ramp(), LC));
-    e.push(spec(52, r(R_LFO_DEPTH), LC, FB));
+    //
+    // It gets a lane of its own along the top: up the sequencer's left-hand
+    // margin and straight across under the rail.
+    sh.run(&[sq.ramp(), (-4, -9)]);
+    sh.two(51, cap(1e-6), (-4, -9), (0, -9));
+    sh.two(52, r(R_LFO_DEPTH), (0, -9), (6, -9));
+    sh.run(&[(6, -9), (34, -9), (34, -6), (31, -6)]);
 
     // -------------------------------------------------------- noise + SNARE
-    e.push(spec(
+    // Its own band under the voice, reading right to left like the voice
+    // above it: hiss on the right, the VCA in the middle, and the mixer's
+    // summing node on the left. The trigger comes up out of the sequencer's
+    // BEAT riser at the right-hand end.
+    sh.two(
         ID_NOISE,
-        K::Noise {
-            volts: 1.0,
-            ohms: 1000.0,
-            seed: 0x00D1_5EA5,
-        },
-        NOUT,
-        G3,
-    ));
-    // An anti-alias pole made out of the noise source's OWN 1 kΩ output
+        K::Noise { volts: 1.0, ohms: 1000.0, seed: 0x00D1_5EA5 },
+        (40, 3),
+        (44, 3),
+    );
+    // An anti-alias pole made out of the noise source's OWN 1 kOhm output
     // resistance: fc = 4.8 kHz, one element. The raw source is flat to
     // 25 kHz and the audio tap decimates to 12.5 kHz, so without this most
     // of the snare's power folds back down and it stops sounding like a
     // snare at all.
-    e.push(spec(71, cap(33e-9), NOUT, G3));
-    e.push(spec(74, r(470_000.0), NOUT, SIN));
-    // SNARE TONE: the shunt leg of the input divider. Turning it down
-    // attenuates and brightens together.
-    e.push(spec3(ID_SNARE_TONE, pot(10_000.0, 0.47), SIN, G3, G3));
+    sh.two(71, cap(33e-9), (40, 3), (40, 5));
+    sh.two(74, r(470_000.0), (40, 3), (36, 3));
+    // SNARE TONE: the shunt leg of the input divider, a grounded rheostat.
+    // Turning it down attenuates and brightens together. Its wiper and its
+    // lower end are both on ground, which used to be drawn by stacking the
+    // two pins on the ground point; two ground symbols say the same thing
+    // and are a shape a potentiometer actually has.
+    // pins [end a, wiper, end b]
+    let tone = sh.part(ID_SNARE_TONE, pot(10_000.0, 0.47), (36, 3), S, 2, false);
     // THE VCA. A MOSFET in its ohmic region is a voltage-controlled
     // resistor between the noise and the mixer's virtual ground, so the
     // gain is `Rf/Rds` and the envelope on the gate opens and closes it:
-    // 100 MΩ of leak when shut, about 80 kΩ wide open, ~60 dB of range.
+    // 100 MOhm of leak when shut, about 80 kOhm wide open, ~60 dB of range.
     // See fact 4 in the module docs for why this is not an OTA.
-    e.push(ElementSpec {
-        id: 76,
-        kind: K::Nmos { vt: 1.0, k: NMOS_K },
-        pins: vec![SENV, SIN, SUM],
-        ..Default::default()
-    });
-    e.push(spec(77, K::Diode, STRIG, SENV));
-    e.push(spec(78, cap(15e-9), SENV, G3));
-    e.push(spec(79, r(3.3e6), SENV, G3)); // decay, tau = 50 ms
+    // pins [gate, drain, source]
+    let vca = sh.part(76, K::Nmos { vt: 1.0, k: NMOS_K }, (30, 7), N, 4, true);
+    let (senv, sin_d, ssum) = (vca[0], vca[1], vca[2]);
+    sh.two(77, K::Diode, (34, 7), senv);
+    sh.two(78, cap(15e-9), senv, (30, 9));
+    sh.two(79, r(3.3e6), senv, (26, 7)); // decay, tau = 50 ms
 
     // ------------------------------------------------------- trigger glue
     // The snare fires on whichever steps the player has toggled on.
@@ -340,13 +417,25 @@ pub fn synth_room_circuit() -> Vec<ElementSpec> {
     // sit there charged. The RC also keeps the envelope caps off an ideal
     // source: charging a cap inside one substep makes the trapezoidal
     // integrator ring (13.8 V was measured on a cap fed from a 7.8 V pulse).
-    e.push(spec(85, cap(47e-9), sq.beat(), STRIG));
-    e.push(spec(86, r(470_000.0), STRIG, G3));
+    sh.two(85, cap(47e-9), sq.beat(), (36, 8));
+    sh.two(86, r(470_000.0), (34, 8), (34, 10));
+
+    // ...and the snare's wiring.
+    sh.ground((44, 3), RIGHT);
+    sh.ground((40, 5), DOWN);
+    sh.ground(tone[1], RIGHT);
+    sh.ground(tone[2], DOWN);
+    sh.run(&[tone[0], sin_d]);
+    sh.run(&[ssum, (22, 3), (22, -5)]);
+    sh.ground((30, 9), DOWN);
+    sh.ground((26, 7), LEFT);
+    sh.run(&[(36, 8), (34, 8), (34, 7)]);
+    sh.ground((34, 10), DOWN);
 
     // ---------------------------------------------------------- SEQUENCER
-    e.extend(sequencer::sequencer(&sq));
-
-    e
+    let mut els = sh.finish();
+    els.extend(sequencer::sequencer(&sq));
+    els
 }
 
 /// A labelled region of the schematic. The client turns each one into a
@@ -363,80 +452,53 @@ pub struct PanelDef {
 /// The room's labels. Without them a player sees a hundred anonymous glyphs;
 /// with them they see the VCO, the filter, the snare and a row of numbered
 /// steps.
+///
+/// A panel is a WINDOW onto the parts inside it — the client only lists a
+/// part whose every pin is inside the rect — so these are drawn round whole
+/// modules now that the modules are actually contiguous.
 pub fn synth_panels() -> Vec<PanelDef> {
     let (ox, oy) = (SEQ_ORIGIN.0 as f64, SEQ_ORIGIN.1 as f64);
     let mut v = vec![
+        PanelDef { x0: 42.5, y0: -10.6, x1: 59.0, y1: 0.0, name: "VCO  1V/OCT" },
+        PanelDef { x0: 22.0, y0: -8.4, x1: 39.0, y1: 1.0, name: "FILTER  CUTOFF" },
+        PanelDef { x0: 7.0, y0: -6.0, x1: 22.0, y1: 0.0, name: "MIXER + SPEAKER" },
+        PanelDef { x0: -6.0, y0: -10.4, x1: 6.6, y1: -8.4, name: "LFO  BAR SWEEP" },
+        PanelDef { x0: 24.0, y0: 1.6, x1: 45.0, y1: 10.6, name: "SNARE  (TONE)" },
         PanelDef {
-            x0: 41.0,
-            y0: -10.0,
-            x1: 55.0,
-            y1: 2.0,
-            name: "VCO  1V/OCT",
-        },
-        PanelDef {
-            x0: 29.5,
-            y0: -10.0,
-            x1: 39.0,
-            y1: -2.0,
-            name: "FILTER  CUTOFF",
-        },
-        PanelDef {
-            x0: 17.0,
-            y0: -10.0,
-            x1: 25.0,
-            y1: -2.0,
-            name: "MIXER + SPEAKER",
-        },
-        PanelDef {
-            x0: 6.0,
-            y0: -10.0,
-            x1: 14.0,
-            y1: -6.0,
-            name: "LFO  BAR SWEEP",
-        },
-        PanelDef {
-            x0: 38.5,
-            y0: 2.0,
-            x1: 54.0,
-            y1: 10.0,
-            name: "SNARE  (TONE)",
-        },
-        PanelDef {
-            x0: ox + 4.0,
-            y0: oy + 3.0,
-            x1: ox + 17.0,
-            y1: oy + 15.0,
+            x0: ox - 0.6,
+            y0: oy - 1.0,
+            x1: ox + 16.0,
+            y1: oy + 13.5,
             name: "CLOCK  TEMPO",
         },
         PanelDef {
-            x0: ox + 19.0,
-            y0: oy + 19.0,
-            x1: ox + 36.0,
-            y1: oy + 45.0,
+            x0: ox + 20.5,
+            y0: oy + 2.0,
+            x1: ox + 33.0,
+            y1: oy + 40.0,
             name: "STEP DECODER",
         },
     ];
-    let pitch = [
-        "STEP 1 PITCH",
-        "STEP 2 PITCH",
-        "STEP 3 PITCH",
-        "STEP 4 PITCH",
-    ];
+    let pitch = ["STEP 1 PITCH", "STEP 2 PITCH", "STEP 3 PITCH", "STEP 4 PITCH"];
     let beat = ["BEAT 1", "BEAT 2", "BEAT 3", "BEAT 4"];
+    // One box per step, drawn round the knob and its steering diode, and one
+    // round the toggle and its own. A panel is a WINDOW onto the parts inside
+    // it — the client lists a part only when EVERY pin is in the rect — so
+    // these have to enclose whole devices, not just look like they do.
     for n in 0..SEQ_STEPS {
-        let y = oy + 10.0 * n as f64;
+        let y = oy + 8.0 + 12.0 * n as f64;
         v.push(PanelDef {
-            x0: ox + 42.0,
-            y0: y + 3.0,
-            x1: ox + 47.0,
-            y1: y + 9.0,
+            x0: ox + 37.0,
+            y0: y - 1.0,
+            x1: ox + 48.6,
+            y1: y + 3.0,
             name: pitch[n],
         });
         v.push(PanelDef {
             x0: ox + 37.0,
-            y0: y + 7.0,
-            x1: ox + 41.5,
-            y1: y + 12.0,
+            y0: y + 4.6,
+            x1: ox + 46.6,
+            y1: y + 7.4,
             name: beat[n],
         });
     }
@@ -449,24 +511,39 @@ pub fn synth_panels() -> Vec<PanelDef> {
 // several other agents building in parallel — load average 7.5, which is why
 // every figure below is quoted with its spread and against a control.
 //
-//   SHIPPED: 71 elements (75 in the live room, with the hoist fixture).
-//   Solver 13.60 / 13.64 / 13.66 / 13.71 / 13.73 / 13.73 µs per substep over
-//   two runs of three passes = 1.46–1.47x the 20 µs substep budget.
-//   LIVE SERVER, over a websocket, reporting its own `rt`, two runs:
-//   median 0.993 and 0.994, min 0.971, max 1.013.
+//   SHIPPED: 201 elements — 64 DEVICES plus 108 wires and 29 ground symbols
+//   of routing. The device count is the budget; the routing is very nearly
+//   free, and the two numbers must not be confused.
 //
-//   THE CONTROL, interleaved with those runs on the same machine: the
-//   SHIPPED showcase room (147 elements) reports rt median 0.985 and 0.987,
-//   min 0.940, and its solver costs 10.54–10.66 µs per substep. So this room
-//   reports a HIGHER realtime ratio than the room the game already ships,
-//   and a steadier one. The ~1 % both give up is the server's per-tick
-//   overhead (frame(), damage, the JSON broadcast, the machine
-//   co-simulation — about 11 ms here, 16 ms for the showcase) on a machine
-//   at load average 6–8, not the circuit.
+//   Solver, best of three passes of 30 000 substeps, interleaved against the
+//   same room drawn the OLD way (star of diagonals, 71 elements, the same 64
+//   devices) on the same machine:
 //
-// Cost in this engine is `newton_iterations × elements^1.64`, and BOTH
+//     71 el / 64 dev   10.79 / 11.42 / 11.95 µs per substep   1.67–1.85x
+//    201 el / 64 dev   12.21 / 13.44 / 13.36 µs per substep   1.49–1.64x
+//
+//   So drawing the room as a schematic costs about 1.4 µs per substep — 7 %
+//   of the 20 µs budget — for 137 more elements. `frame()`, where
+//   `solve_wire_currents` is quadratic in the wire count, goes 3.2 → 23.2 µs
+//   per tick; at the server's 30 Hz that is 0.1 → 0.7 ms per wall-clock
+//   second, which is noise.
+//
+//   LIVE SERVER, over a websocket, reporting its own `rt`, 900 samples over
+//   30 s, three runs: median 0.999 / 0.999 / 1.000, min 0.989, max 1.014,
+//   and ZERO samples below 0.97. The instrument holds real time and plays in
+//   tune.
+//
+//   WHY IT IS ALMOST FREE. A `Wire` merges its two ends in `compile`'s
+//   union-find and stamps NOTHING (`engine.rs`), so it adds no node, no
+//   branch unknown and no Newton work; a `Ground` pins its point to node 0
+//   and likewise stamps nothing. What is left is one element visit per
+//   substep each. The cost model below is written in elements because, when
+//   it was measured, every element was a device.
+//
+// Cost in this engine is `newton_iterations × devices^1.64`, and BOTH
 // factors had to be bought down. The ladder that got here, each rung
-// measured on the room as it stood:
+// measured on the room as it stood (element counts here are device counts —
+// the room carried almost no routing at the time):
 //
 //   106 el  2-pole OTA filter, OTA snare VCA, gm-C kick, 4 steps  35.5 µs  0.56x  NR 2.52
 //   102 el  1-pole filter,     OTA snare VCA, gm-C kick, 4 steps  26.1 µs  0.76x  NR 2.03

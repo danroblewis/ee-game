@@ -405,6 +405,10 @@ pub enum Reject {
     /// Solvable as placed, but singular once some switch/button closes —
     /// and any switch can close at any time (player or machine).
     UnsolvableWhenSwitched,
+    /// A part with more than two terminals was asked to hold a shape that is
+    /// not its symbol: an op-amp that is not a triangle, a DIP that is not a
+    /// rectangle. See [`crate::shape`].
+    SkewedPart { id: u32, part: &'static str },
 }
 
 impl Reject {
@@ -418,6 +422,7 @@ impl Reject {
             Reject::WillNotConverge { .. } => "will_not_converge",
             Reject::Unsolvable => "unsolvable",
             Reject::UnsolvableWhenSwitched => "unsolvable_switched",
+            Reject::SkewedPart { .. } => "skewed_part",
         }
     }
 
@@ -428,7 +433,8 @@ impl Reject {
         match self {
             Reject::BadValue { id, .. }
             | Reject::CollapsedPins { id }
-            | Reject::ShortedSource { id } => Some(*id),
+            | Reject::ShortedSource { id }
+            | Reject::SkewedPart { id, .. } => Some(*id),
             Reject::ConflictingSources { a, .. } => Some(*a),
             Reject::SourceLoop { ids } => ids.iter().next(),
             Reject::WillNotConverge { id } => *id,
@@ -442,7 +448,8 @@ impl Reject {
         match self {
             Reject::BadValue { id, .. }
             | Reject::CollapsedPins { id }
-            | Reject::ShortedSource { id } => SmallIds::of(&[*id]),
+            | Reject::ShortedSource { id }
+            | Reject::SkewedPart { id, .. } => SmallIds::of(&[*id]),
             Reject::ConflictingSources { a, b, .. } => SmallIds::of(&[*a, *b]),
             Reject::SourceLoop { ids } => *ids,
             Reject::WillNotConverge { id } => match id {
@@ -486,6 +493,12 @@ impl Reject {
             Reject::UnsolvableWhenSwitched => {
                 "that would short a source the moment a switch closes - reroute it".to_string()
             }
+            Reject::SkewedPart { part, .. } => format!(
+                "{} is one rigid symbol, not a handful of loose terminals - rotate it (Q), \
+                 mirror it (X/Y), or drag a terminal to swing the whole part round. \
+                 use a wire to reach the rest of the circuit",
+                part
+            ),
         }
     }
 }
@@ -706,6 +719,35 @@ fn check_kind(kind: &ElementKind) -> Result<(), &'static str> {
             }
             Ok(())
         }
+    }
+}
+
+/// The shape rule, said in one sentence, for a part with this document tag.
+///
+/// Exported so the client can use the SAME words when it straightens a
+/// legacy part on its own initiative as the gate uses when it refuses one.
+/// There is one rule; there should be one way of describing it.
+pub fn rigid_hint(tag: &str) -> String {
+    Reject::SkewedPart {
+        id: 0,
+        part: part_phrase(tag),
+    }
+    .hint()
+}
+
+/// "an op-amp", "a 555 timer" — the subject of a shape refusal, written the
+/// way a player would say it.
+fn part_phrase(tag: &str) -> &'static str {
+    match tag {
+        "OpAmp" => "an op-amp",
+        "Ota" => "an OTA",
+        "Timer555" => "a 555 timer",
+        "Npn" => "an NPN transistor",
+        "Pnp" => "a PNP transistor",
+        "Nmos" => "an N-channel MOSFET",
+        "Pmos" => "a P-channel MOSFET",
+        "Potentiometer" => "a potentiometer",
+        _ => "this part",
     }
 }
 
@@ -1379,6 +1421,89 @@ pub fn check_document(specs: &[ElementSpec], dt: f64) -> Result<(), Reject> {
         }
     }
     Ok(())
+}
+
+// ------------------------------------------------------------- shape rule
+//
+// The rule itself is [`crate::shape`]. What lives here is the POLICY: where
+// it is enforced, and what happens to documents that predate it.
+
+/// The shape half of the placement gate: no edit may put a multi-pin part
+/// into a shape that is not its symbol.
+///
+/// **Why this is a function of the change and not of the document.** Every
+/// other rule in this file is a property of one document, because "can the
+/// engine solve this?" is. "Is this part in formation?" is not, and treating
+/// it as one would have been a catastrophe: `check_document` runs on the
+/// CANDIDATE of every edit, interact, repair and machine move, so a whole
+/// document rule refuses every op in a room that contains a single skewed
+/// part — including the ops that would fix it. Measured on this tree at the
+/// time the rule landed, that was 100% of the synth template's 19 multi-pin
+/// parts, 3 of 9 in each of the two showcase templates, and 2 in the owner's
+/// own saved room. Those rooms would all have become uneditable, which is
+/// worse than either of the two options anyone had considered.
+///
+/// So the rule is monotone instead of absolute. A part's pins must be
+/// canonical **or** be the same rigid body they already were: skew can leave
+/// a document but never enter one. Concretely:
+///
+/// * a part added, pasted or reshaped into existence must be in formation;
+/// * a legacy skewed part may still be dragged, rotated, flipped and
+///   group-moved (all rigid motions preserve the body exactly), so nothing
+///   in an old room becomes untouchable;
+/// * the moment anyone takes hold of one of its terminals the client
+///   straightens it, and it can never go back.
+///
+/// Machine fixtures need no special case and get none. Their geometry is
+/// re-derived by the server from the machine's rect, never by a document op,
+/// so `before` and `after` always agree about them and `same_body` passes
+/// them through — including the hoist's deliberately collinear sensor pot,
+/// which is a package drawn by the machine renderer rather than a symbol.
+pub fn check_shapes(before: &[ElementSpec], after: &[ElementSpec]) -> Result<(), Reject> {
+    for s in after {
+        let shape = crate::shape::Shape::of(&s.kind);
+        if !shape.is_rigid_family() {
+            continue;
+        }
+        if crate::shape::is_rigid(&s.kind, &s.pins) {
+            continue;
+        }
+        // Grandfathered: the same part, in the same family, as the same rigid
+        // body it already was. The family has to match or `SetKind` becomes a
+        // way in: a canonical NPN's pins are not an op-amp's layout, and
+        // swapping the kind under them would mint a badly drawn op-amp out of
+        // a well drawn transistor. Changing a parameter (the only `SetKind`
+        // the editor actually offers) stays inside one family and is fine.
+        if before.iter().any(|b| {
+            b.id == s.id
+                && crate::shape::Shape::of(&b.kind) == shape
+                && crate::shape::same_body(&b.pins, &s.pins)
+        }) {
+            continue;
+        }
+        return Err(Reject::SkewedPart {
+            id: s.id,
+            part: part_phrase(s.kind.tag()),
+        });
+    }
+    Ok(())
+}
+
+/// The whole placement gate for an EDIT: the shape rule against the document
+/// being replaced, then [`check_document`] on the result.
+///
+/// Callers that have both halves of the change (the server's edit path, the
+/// client's pre-send check) should use this; callers judging a document on
+/// its own — a room being loaded, a repair, a machine move — still want
+/// `check_document`, which is unchanged and refuses nothing it did not
+/// refuse before.
+///
+/// Shape first: it is O(n) integer arithmetic in front of two O(n³)
+/// factorizations, and it gives the more specific sentence when both would
+/// fire.
+pub fn check_edit(before: &[ElementSpec], after: &[ElementSpec], dt: f64) -> Result<(), Reject> {
+    check_shapes(before, after)?;
+    check_document(after, dt)
 }
 
 /// Which of the four trial states a sweep is running, so a block can skip the
@@ -2741,5 +2866,89 @@ mod tests {
         let ids = SmallIds::of(&[1, 2, 3, 4, 5, 6]);
         assert_eq!(ids.len(), 6);
         assert_eq!(ids.iter().collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+    }
+
+    // ------------------------------------------------------- the shape rule
+
+    fn opamp_at(id: u32, pins: Vec<(i32, i32)>) -> ElementSpec {
+        ElementSpec {
+            id,
+            kind: ElementKind::OpAmp {
+                rail: 8.0,
+                isc: 0.025,
+            },
+            pins,
+            ..Default::default()
+        }
+    }
+
+    /// The whole point: a crafted `Move` cannot skew a part, however the
+    /// client behaves.
+    #[test]
+    fn a_crafted_move_cannot_skew_a_part() {
+        let before = vec![opamp_at(1, vec![(0, -1), (0, 1), (4, 0)])];
+        let after = vec![opamp_at(1, vec![(0, -1), (0, 1), (24, 9)])];
+        let r = check_shapes(&before, &after).unwrap_err();
+        assert_eq!(r.code(), "skewed_part");
+        assert_eq!(r.id(), Some(1));
+        assert!(r.hint().contains("op-amp"), "{}", r.hint());
+    }
+
+    /// ...nor add one that was born skewed.
+    #[test]
+    fn a_crafted_add_cannot_skew_a_part() {
+        let after = vec![opamp_at(7, vec![(0, -1), (0, 5), (4, 0)])];
+        assert!(check_shapes(&[], &after).is_err());
+    }
+
+    /// Two-pin parts are untouched: a resistor IS its endpoints, and
+    /// dragging one of them is how it gets drawn.
+    #[test]
+    fn two_pin_parts_are_not_constrained() {
+        let before = vec![ElementSpec::two(1, r(1e3), (0, 0), (4, 0))];
+        let after = vec![ElementSpec::two(1, r(1e3), (0, 0), (37, -19))];
+        assert!(check_shapes(&before, &after).is_ok());
+    }
+
+    /// A document that predates the rule stays editable, and every rigid
+    /// motion of its legacy parts is allowed. This is the grandfather
+    /// clause; without it the owner's saved rooms would have been bricked.
+    #[test]
+    fn legacy_skew_survives_every_rigid_motion() {
+        let skew = vec![(36, -8), (32, -8), (32, -4)];
+        let before = vec![opamp_at(1, skew.clone())];
+        // Untouched by an unrelated edit.
+        let mut after = before.clone();
+        after.push(ElementSpec::two(2, r(1e3), (0, 0), (4, 0)));
+        assert!(check_shapes(&before, &after).is_ok(), "unrelated edit");
+        // Translated (drag), rotated (Q), mirrored (X).
+        let motions: [fn((i32, i32)) -> (i32, i32); 3] =
+            [|p| (p.0 + 20, p.1 - 3), |p| (-p.1, p.0), |p| (-p.0, p.1)];
+        for f in motions {
+            let moved = vec![opamp_at(1, skew.iter().map(|&p| f(p)).collect())];
+            assert!(check_shapes(&before, &moved).is_ok(), "rigid motion");
+        }
+        // But not into a DIFFERENT skew.
+        let worse = vec![opamp_at(1, vec![(36, -8), (32, -8), (32, -9)])];
+        assert!(check_shapes(&before, &worse).is_err(), "re-skew");
+        // And straightening it is always allowed.
+        let fixed = vec![opamp_at(
+            1,
+            crate::shape::straighten(crate::shape::Shape::OpAmp, &skew),
+        )];
+        assert!(check_shapes(&before, &fixed).is_ok(), "straighten");
+    }
+
+    /// `check_document` is unchanged: it judges a document on its own and
+    /// still says yes to every room that was loadable before the rule. If
+    /// this ever fails, saved rooms stopped opening.
+    #[test]
+    fn check_document_still_ignores_shape() {
+        let skewed = vec![
+            opamp_at(1, vec![(36, -8), (32, -8), (32, -4)]),
+            ElementSpec::two(2, r(1e3), (32, -4), (32, -8)),
+            ElementSpec::ground(3, (32, -8)),
+        ];
+        assert!(check_document(&skewed, DT).is_ok());
     }
 }

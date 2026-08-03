@@ -4,6 +4,15 @@
 
 import { DEFAULT_OPAMP_ISC } from './circuit';
 import type { ElementKind, Point } from './circuit';
+import {
+  partHandle,
+  partIsRigid,
+  partPins,
+  partPivot,
+  partReshape,
+  partRigidHint,
+  partStraighten,
+} from './wasm/sim_wasm';
 
 /** Menu categories, in the order the right-click submenu lists them. */
 export const CATEGORIES = [
@@ -275,65 +284,95 @@ export function pinCount(kind: ElementKind): number {
   }
 }
 
-/** Pin layout for a part dragged from grid point A to B. */
+/** Pin layout for a part dragged from grid point A to B.
+ *
+ * This used to be a hand-written table of offsets, and it was one of the two
+ * places skew came from: it snapped the part's PERPENDICULAR offsets to an
+ * axis but left the far pin wherever the cursor was, so a diagonal drag put
+ * an op-amp down as a skewed triangle before anyone touched a terminal.
+ *
+ * It is now `sim_core::shape::canonical_pins`, reached through wasm. Same
+ * layouts, with the far end projected onto the snapped axis — and, more to
+ * the point, the SAME code the placement gate judges the result with. A
+ * second copy in TypeScript would be a second set of rounding rules, and the
+ * first thing the two disagreed about was where an odd-length
+ * potentiometer's wiper goes: the old client rounded the midpoint in world
+ * coordinates, so it landed on a different grid unit depending on which way
+ * the drag went. */
 export function makePins(kind: ElementKind, a: Point, b: Point): Point[] {
-  if (pinCount(kind) === 1) return [a];
-  if (a[0] === b[0] && a[1] === b[1]) b = [a[0] + 3, a[1]];
-  if (pinCount(kind) === 2) return [a, b];
-  if (kind.t === 'Timer555') {
-    // A 4×4 DIP footprint anchored at A, oriented along the drag: VCC at
-    // the anchor (top-left), GND bottom-left, TRG/THR down the left edge,
-    // DIS/OUT on the right edge. [vcc, gnd, trig, thr, out, dis]
-    const dx = b[0] - a[0];
-    const dy = b[1] - a[1];
-    const horiz = Math.abs(dx) >= Math.abs(dy);
-    const ux: Point = horiz ? [Math.sign(dx) || 1, 0] : [0, Math.sign(dy) || 1];
-    const uy: Point = [-ux[1], ux[0]];
-    const at = (x: number, y: number): Point => [
-      a[0] + ux[0] * x + uy[0] * y,
-      a[1] + ux[1] * x + uy[1] * y,
-    ];
-    return [at(0, 0), at(0, 4), at(0, 1), at(0, 3), at(4, 3), at(4, 1)];
-  }
-  if (kind.t === 'Ota') {
-    // [in+, in-, out, bias]: inputs split at A, out at B. The bias pin sits
-    // square to the body one step back from the output — that is where the
-    // transconductance balls are drawn, so its lead is a straight run out of
-    // them (up for a left-to-right part) instead of a diagonal.
-    const dx = b[0] - a[0];
-    const dy = b[1] - a[1];
-    const horiz = Math.abs(dx) >= Math.abs(dy);
-    const p: Point = horiz ? [0, 1] : [Math.sign(dy) >= 0 ? -1 : 1, 0];
-    const ux: Point = horiz ? [Math.sign(dx) || 1, 0] : [0, Math.sign(dy) || 1];
-    const tip: Point = [b[0] - ux[0], b[1] - ux[1]];
-    return [
-      [a[0] - p[0], a[1] - p[1]],
-      [a[0] + p[0], a[1] + p[1]],
-      b,
-      [tip[0] - p[0] * 2, tip[1] - p[1] * 2],
-    ];
-  }
-  // 3-pin: split the far end (or inputs) perpendicular to the drag axis.
-  const dx = b[0] - a[0];
-  const dy = b[1] - a[1];
-  const horiz = Math.abs(dx) >= Math.abs(dy);
-  const p: Point = horiz ? [0, 1] : [Math.sign(dy) >= 0 ? -1 : 1, 0];
-  const off = (pt: Point, k: number): Point => [pt[0] + p[0] * k, pt[1] + p[1] * k];
-  switch (kind.t) {
-    case 'Npn':
-    case 'Pnp':
-    case 'Nmos':
-    case 'Pmos':
-      // [base/gate at A], [collector/drain], [emitter/source]
-      return [a, off(b, -2), off(b, 2)];
-    case 'OpAmp':
-      // [in+], [in-] on the near side, [out] at B
-      return [off(a, -1), off(a, 1), b];
-    case 'Potentiometer': {
-      const mid: Point = [Math.round((a[0] + b[0]) / 2), Math.round((a[1] + b[1]) / 2)];
-      return [a, off(mid, -2), b];
-    }
-    default:
-      return [a, b];
-  }
+  return unflatten(partPins(kind.t, a[0], a[1], b[0], b[1]));
 }
+
+/** Is this pin list a legal placement — the part's canonical layout under a
+ *  rotation and an optional mirror? Always true for one- and two-pin parts,
+ *  whose geometry is not a symbol. The same predicate the server enforces. */
+export function isRigidPlacement(kind: ElementKind, pins: Point[]): boolean {
+  return partIsRigid(kind.t, flatten(pins));
+}
+
+/** Snap a part that predates the shape rule back into formation, keeping its
+ *  orientation, handedness and rough size. The identity on a part that is
+ *  already in formation. */
+export function straightenPins(kind: ElementKind, pins: Point[]): Point[] {
+  return unflatten(partStraighten(kind.t, flatten(pins)));
+}
+
+/** Drag terminal `k` to `cursor` and get back the WHOLE part: the reshape
+ *  gesture for rigid parts. `null` when nothing would change.
+ *
+ *  This is the only way this client can author a multi-pin placement, which
+ *  is what makes "it cannot draw a skewed part" structural rather than a
+ *  convention someone has to remember. */
+export function reshapePins(
+  kind: ElementKind,
+  pins: Point[],
+  k: number,
+  cursor: Point,
+): Point[] | null {
+  const out = partReshape(kind.t, flatten(pins), k, cursor[0], cursor[1]);
+  return out.length ? unflatten(out) : null;
+}
+
+/** The grid point a reshape of terminal `k` turns about — the far end of the
+ *  part, which stays exactly where it is while the rest swings. `null` for a
+ *  terminal that carries the part rather than reorienting it.
+ *
+ *  Worth having as its own answer: a rigid swing moves EVERY pin, because the
+ *  perpendicular offsets turn with the axis. "Which pins did not move" is
+ *  therefore not the pivot; this is. */
+export function pinPivot(kind: ElementKind, pins: Point[], k: number): Point | null {
+  const p = partPivot(kind.t, flatten(pins), k);
+  return p.length === 2 ? [p[0]!, p[1]!] : null;
+}
+
+/** The shape rule in one sentence, as the placement gate itself would say it
+ *  — so the editor uses the same words when it straightens a part on its own
+ *  initiative as the server uses when it refuses one. */
+export function rigidHint(kind: ElementKind): string {
+  return partRigidHint(kind.t);
+}
+
+/** What dragging terminal `k` does: 'free' (an endpoint of a two-pin part —
+ *  drag it where you like, that is how a resistor gets drawn), 'swing'
+ *  (reorient and resize the whole part about its far end) or 'carry' (a leg
+ *  with no say in the axis — a DIP pin, an OTA's bias, a wiper — which
+ *  carries the whole part). */
+export type PinGesture = 'free' | 'swing' | 'carry';
+export function pinGesture(kind: ElementKind, k: number): PinGesture {
+  return (['free', 'swing', 'carry'] as const)[partHandle(kind.t, k)] ?? 'free';
+}
+
+const flatten = (pins: Point[]): Int32Array => {
+  const a = new Int32Array(pins.length * 2);
+  for (let i = 0; i < pins.length; i++) {
+    a[i * 2] = pins[i]![0];
+    a[i * 2 + 1] = pins[i]![1];
+  }
+  return a;
+};
+
+const unflatten = (flat: Int32Array): Point[] => {
+  const pins: Point[] = [];
+  for (let i = 0; i < flat.length; i += 2) pins.push([flat[i]!, flat[i + 1]!]);
+  return pins;
+};
