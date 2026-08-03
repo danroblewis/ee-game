@@ -8116,9 +8116,19 @@ mod tests {
         // How much of the bar each envelope spends over its threshold is the
         // decay resistors talking: 10 M for the bass against 3.3 M for the
         // snare, into the same 15 nF.
+        //
+        // THE RATIO IS 1.456, NOT 3. The resistors predict roughly 3x and the
+        // circuit does not deliver it, because the trigger diode's 171 nA
+        // reverse leakage bleeds the storage cap by an amount comparable to
+        // what the pot draws — see `POT_BASS_DECAY` for the measurement. The
+        // threshold sat at 1.4, which is 4% of headroom under a deterministic
+        // value: not flaky, but one component tweak from red for a reason
+        // that would look like a regression and would not be one. 1.25 still
+        // fails if the two envelopes become the same shape, which is the only
+        // thing this assertion can honestly claim to catch.
         let open = |v: &[f64]| v.iter().filter(|x| **x > 1.0).count() as f64 / n as f64;
         assert!(
-            open(&be) > open(&se) * 1.4,
+            open(&be) > open(&se) * 1.25,
             "bass open {:.3} of the run against the snare's {:.3} — the two \
              envelopes have the same shape, so the decay resistors are not \
              doing anything",
@@ -8325,11 +8335,22 @@ mod tests {
     #[test]
     fn the_synth_block_headings_are_label_boxes_and_cost_no_windows() {
         let boxes = synth::synth_label_boxes();
-        assert_eq!(
-            boxes.len(),
-            13,
-            "seven modules plus two per sequencer step = the thirteen headings"
+        // At least one heading per module, checked by NAME below rather than
+        // by a magic count: the count was 13 and went red the moment the synth
+        // grew VCAs and envelopes, which told us nothing except that the
+        // instrument had changed.
+        assert!(
+            boxes.len() >= 13,
+            "every module wants a heading; found {}",
+            boxes.len()
         );
+        // No two headings may share a name, or the sheet has two boxes saying
+        // the same word and one of them is lying about which parts it covers.
+        let mut names: Vec<&str> = boxes.iter().map(|b| b.name).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(before, names.len(), "two label boxes share a name");
         // Every one of them has to be a LEGAL label box, or the template
         // fails on load rather than here.
         for b in &boxes {
@@ -8362,17 +8383,19 @@ mod tests {
             );
         }
 
-        // AND THE POINT OF THE WHOLE FEATURE: the room the template builds
-        // has thirteen headings and exactly ONE control panel. Thirteen more
-        // windows is the regression this exists to undo.
+        // AND THE POINT OF THE WHOLE FEATURE: the room the template builds is
+        // labelled all over and still has exactly ONE control panel. The
+        // regression this exists to undo is a window per heading, so the
+        // number that must not drift is the PANEL count -- the heading count
+        // is free to grow every time the instrument does, and did.
         let setup = templates::resolve(std::path::Path::new("/nonexistent"), "synth").unwrap();
-        assert_eq!(setup.label_boxes.len(), 13);
-        assert_eq!(setup.panels.len(), 1, "one window, not fourteen");
+        assert_eq!(setup.label_boxes.len(), boxes.len());
+        assert_eq!(setup.panels.len(), 1, "one window, however many headings");
         assert_eq!(setup.panels[0].name, "SYNTHESIZER");
         // Ids are distinct and the allocator is clear of all of them.
         let ids: std::collections::HashSet<u32> =
             setup.label_boxes.iter().map(|b| b.blid).collect();
-        assert_eq!(ids.len(), 13);
+        assert_eq!(ids.len(), boxes.len(), "two headings share a blid");
         assert!(setup.next_blid > *ids.iter().max().unwrap());
 
         // The FILTER heading is sized for READING, not for membership. Its

@@ -180,17 +180,33 @@ const NMOS_K: f64 = 5e-5;
 /// both envelopes at 1.4 V, barely over the MOSFETs' 1.0 V threshold.
 const C_TRIG: f64 = 100e-9;
 /// DECAY, one knob per envelope generator, wired as a rheostat across the
-/// storage cap: `tau = ohms*wiper*C` into 15 nF. The shipped positions are a
-/// 50 ms snare (a hit) and a 150 ms bass (a plucked note), and the whole
-/// travel is about 1 ms to 100 / 300 ms. This is what makes each of them an
+/// storage cap.
+///
+/// `tau = ohms*wiper*C` is the SCHOOLBOOK answer and it is not what this
+/// circuit does. MEASURED: the shipped positions give 52.6 ms (snare) and
+/// 60.5 ms (bass) against 49.5 and 150 predicted, and the knobs saturate --
+/// the snare's whole upper half moves tau by 5%. The cause is the trigger
+/// diode: `DIODE_IS` is 171 nA, and at 10 MOhm the pot itself only draws
+/// ~300 nA at 3 V, so a constant-current bleed comparable to the signal sits
+/// across the storage cap. Solving `C dV/dt = -(V/R + Is)` predicts 57.1 ms
+/// against 57.9 measured, and the decay SHAPE confirms it independently:
+/// the (50->25%)/(peak->50%) ratio runs 0.95 at the small-resistor end
+/// (pure RC = 1.00) down to 0.58 at full travel (pure ramp = 0.50).
+///
+/// So the two envelopes differ by 15%, not 3x, and the real travel is
+/// 62->141 ms (bass) and 32->128 ms (snare), peak to 10%. They are still AD
+/// contours and they still shape the sound -- see the mixer op-amp's
+/// dynamic range going 3.4 -> 11.2 dB -- but a bigger cap, or a decade less
+/// pot, is what would make the knob mean what the formula says. This is what
+/// makes each of them an
 /// envelope GENERATOR rather than a fixed RC. Attack stays fixed: these two
 /// cost nothing in DEVICES (each replaced a resistor) but +0.40 µs for their
 /// two wiper nodes, and an attack knob would be two more devices on top. The
 /// margin is 1.11x, not 1.5x.
 const POT_SNARE_DECAY: f64 = 6.8e6;
-const W_SNARE_DECAY: f64 = 0.485; // 3.3 MOhm, tau = 50 ms
+const W_SNARE_DECAY: f64 = 0.485; // 3.3 MOhm; tau MEASURED 52.6 ms
 const POT_BASS_DECAY: f64 = 20e6;
-const W_BASS_DECAY: f64 = 0.50; // 10 MOhm, tau = 150 ms
+const W_BASS_DECAY: f64 = 0.50; // 10 MOhm; tau MEASURED 60.5 ms, not the 150 the RC predicts
 /// CUTOFF knob to filter bias current: `Iabc = (V_cv - 0.45 V) / R`, and
 /// `fc = Iabc / (2 * 2*VT * pi * C)`. Sized so the knob's whole travel lands
 /// on the bass's own harmonics rather than far above them.
@@ -606,9 +622,12 @@ pub fn synth_room_circuit() -> Vec<ElementSpec> {
     // ------------------------------------------------- BASS AD ENVELOPE
     // ENVELOPE GENERATOR 2 — bass, in its own bay under the mixer where the
     // VCA it drives already is. Same three parts as the snare's, same shape
-    // on the sheet, a longer decay: this one has to sound like a plucked note
-    // rather than a hit, so 15 nF into 10 MOhm is 150 ms against the snare's
-    // 50. The envelope BUS is a run along one row with the storage cap and
+    // on the sheet, a longer decay: this one is meant to sound like a plucked
+    // note rather than a hit. 15 nF into 10 MOhm predicts 150 ms against the
+    // snare's 50; MEASURED it is 60.5 against 52.6, because the trigger
+    // diode's reverse leakage bleeds the cap -- see `POT_BASS_DECAY`. The
+    // contrast is audible but it is 15%, not 3x.
+    // The envelope BUS is a run along one row with the storage cap and
     // the decay resistor standing up off it, because a node with three things
     // on it is a bus, and the gate rail then drops straight onto the VCA.
     sh.two(87, K::Diode, (34, 2), BASS_ENV);

@@ -26,7 +26,16 @@ fn av_annotation_cannot_move_the_state_hash() {
         .unwrap()
         .build;
     let ann = build().normalize().unwrap();
-    assert_eq!(ann.label_boxes.len(), 13, "the synth ships 13 headings");
+    // A COUNT, not a number. This asserted 13 and went red the moment the
+    // synth grew its VCA and envelope modules, which is a test measuring the
+    // wrong thing: what matters here is that the room HAS headings and that
+    // annotating it moves nothing, not how many modules the instrument has
+    // this month.
+    assert!(
+        ann.label_boxes.len() >= 13,
+        "the synth ships block headings; found {}",
+        ann.label_boxes.len()
+    );
 
     let mut plain = build().normalize().unwrap();
     plain.label_boxes.clear();
