@@ -3895,6 +3895,10 @@ async fn main() {
 }
 
 #[cfg(test)]
+#[path = "annotation_hash_tests.rs"]
+mod annotation_hash_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use sim_core::ElementKind as K;
