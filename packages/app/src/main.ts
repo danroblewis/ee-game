@@ -66,6 +66,24 @@
 //                         (its floating instrument window follows) — a scope
 //                         parked inside a region becomes a widget in that
 //                         panel's window; drag it out to detach it again
+//   ⇧J                    a LABEL BOX: the same drag, and only words. A box
+//                         with a title that says what the parts inside it
+//                         are. No window, no widget list, no membership —
+//                         drawing one round a part changes nothing about
+//                         that part. Double-click the title to rename, ×
+//                         (or Del with the pointer on it) deletes, the grips
+//                         resize. Shared and saved.
+//   ⇧W                    NAME A NET: click a point on it. The name is drawn
+//                         on the wire and shown wherever that net is
+//                         reported (probe rows, scope chips, dock chips).
+//                         It is a LABEL and nothing else — the same name on
+//                         two separate nets joins them by exactly nothing.
+//                         The anchor is a grid POINT, so no edit can destroy
+//                         it: delete everything under it and it goes dimmed
+//                         and dashed, still saying what you wrote, until
+//                         something is connected there again. Shift+click
+//                         deletes (so does Del), drag re-anchors,
+//                         double-click renames.
 //   H / shift+H           frame the home district / the whole document
 //   ⇧R                    the room browser: which room you are in, every
 //                         other room on the server (join / rename / delete),
@@ -113,6 +131,28 @@ import {
   type PartDef,
   type PinGesture,
 } from './catalog';
+import {
+  applyLabelBoxOp,
+  applyNetLabelOp,
+  drawLabelBoxes,
+  drawLabelBoxGhost,
+  drawNetLabels,
+  emptyNetMap,
+  labelBoxHotAt,
+  labelBoxTitleAnchor,
+  labelBoxZoneAt,
+  MAX_LABEL_BOX_NAME,
+  MAX_NET_LABEL_NAME,
+  netLabelAt,
+  netLabelRect,
+  netNameForProbe,
+  normLabelBoxRect,
+  type LabelBox,
+  type LabelBoxOp,
+  type NetLabel,
+  type NetLabelOp,
+  type NetMap,
+} from './annotate';
 import { History, isTypingTarget } from './history';
 import { createHoist, type MachineRect } from './hoist';
 import { connect, type RoomHello } from './net';
@@ -285,6 +325,45 @@ let damageSeen = false;
 let probes: Probe[] = [];
 /** Shared control-panel regions (room-scoped, like probes). */
 let panels: Panel[] = [];
+
+// ---- ANNOTATION. Two primitives, both room state, both pure LABELS: a box
+// with a title drawn round some parts, and a name pinned to a grid point.
+// Neither reaches the solver, neither groups anything, and neither opens a
+// window. See annotate.ts.
+let labelBoxes: LabelBox[] = [];
+let netLabels: NetLabel[] = [];
+/** WHICH net is named what, derived by the server (see `onNetMap`). */
+let netMap: NetMap = emptyNetMap();
+let localBlidCounter = 1;
+let localNlidCounter = 1;
+/** probe pid -> net name, rebuilt only when the inputs change. Every readout
+ * that shows a channel takes its string from HERE, so the scope chip, the
+ * dock chip and the panel meter row can never disagree about what a net is
+ * called. Empty (undefined) when nothing is named, so a room with no net
+ * labels pays nothing and every label reads exactly as it did before. */
+let netNamesCache: Map<number, string> | undefined;
+let netNamesKey = '';
+function netNames(): Map<number, string> | undefined {
+  // A room with no net labels pays one length check per frame and nothing
+  // else — not even the cache key, which is the only allocation here.
+  if (netLabels.length === 0 || netMap.probe.size === 0) {
+    netNamesKey = '';
+    netNamesCache = undefined;
+    return undefined;
+  }
+  const key = `${netMap.probe.size}:${[...netMap.probe].join(',')}:${netLabels
+    .map((l) => `${l.nlid}=${l.name}`)
+    .join(',')}`;
+  if (key === netNamesKey) return netNamesCache;
+  netNamesKey = key;
+  const m = new Map<number, string>();
+  for (const p of probes) {
+    const n = netNameForProbe(p.pid, netLabels, netMap);
+    if (n) m.set(p.pid, n);
+  }
+  netNamesCache = m.size > 0 ? m : undefined;
+  return netNamesCache;
+}
 
 // ---- EXTERNAL INPUTS. `layers` and `claims` are ROOM state (the server's
 // broadcast is the truth); the camera behind a layer is this browser's alone
@@ -546,9 +625,7 @@ function resetForRoom(room: RoomHello | null) {
   clipboard = [];
   pasting = null;
   placing = null;
-  panelTool = false;
-  layerTool = false;
-  repairing = false;
+  disarmTools();
   canvas.style.cursor = 'default';
   // Leaving a room STOPS the camera. A capture must never outlive the place
   // it was pointed at; the next room's `hello` brings its own layers.
@@ -556,6 +633,16 @@ function resetForRoom(room: RoomHello | null) {
   layers = [];
   claims = new Map();
   localLidCounter = 1;
+  // Annotation is room state, so it leaves with the room. The next hello
+  // brings the new room's own.
+  labelBoxes = [];
+  netLabels = [];
+  netMap = emptyNetMap();
+  localBlidCounter = 1;
+  localNlidCounter = 1;
+  pendingBoxName = null;
+  pendingNetName = null;
+  closeNameEditor();
   listenWanted = null;
   audio.stop();
   damage = new Map();
@@ -637,7 +724,7 @@ const roomFromUrl = (): string | null => {
 };
 
 const net = connect({
-  onHello(you, serverElements, serverProbes, serverPanels, room) {
+  onHello(you, serverElements, serverProbes, serverPanels, serverBoxes, serverNets, room) {
     online = true;
     myId = you;
     elements = serverElements;
@@ -662,6 +749,17 @@ const net = connect({
       roomKey = key;
       resetForRoom(room);
     }
+    // AFTER `resetForRoom`, not before: leaving a room drops its annotation
+    // (see `resetForRoom`), and assigning the new room's boxes above that
+    // call would have them wiped by the very reset that is meant to clear the
+    // OLD room's. That is exactly what happened — the labels arrived, were
+    // deleted a line later, and every net went nameless.
+    labelBoxes = serverBoxes;
+    netLabels = serverNets;
+    // Derived state: the server re-sends `netmap` on the tick after a join,
+    // so start from "nothing is attached" rather than from the last room's
+    // answer.
+    netMap = emptyNetMap();
     roomsUI.onHello(room);
   },
   onFrame(f) {
@@ -706,6 +804,17 @@ const net = connect({
   },
   onPanels(list) {
     panels = list;
+  },
+  onLabelBoxes(list) {
+    labelBoxes = list;
+    resolvePendingNames();
+  },
+  onNetLabels(list) {
+    netLabels = list;
+    resolvePendingNames();
+  },
+  onNetMap(liveNlids, probePairs) {
+    netMap = { live: new Set(liveNlids), probe: new Map(probePairs) };
   },
   onLayers(list, cl) {
     layers = list;
@@ -995,10 +1104,10 @@ function repair(id: number) {
 }
 
 function armRepair() {
+  disarmTools();
   repairing = true;
   placing = null;
   pasting = null;
-  panelTool = false;
   canvas.style.cursor = REPAIR_CURSOR;
   // Offline there is no damage model at all, so there is never anything to
   // repair — say so rather than leaving the wrench clicking on nothing.
@@ -1110,6 +1219,95 @@ function panelOp(op: PanelOp) {
     for (const p of panels) localPlidCounter = Math.max(localPlidCounter, p.plid + 1);
     return localPlidCounter++;
   });
+}
+
+// A NEW ANNOTATION NAMES ITSELF. Both primitives exist to carry a word, so
+// creating one that says "LABEL 3" and leaving the player to find the rename
+// gesture would be creating nothing. The rename box therefore opens the moment
+// the object appears — but the object appears when the SERVER says so, and the
+// server owns the id, so what is remembered here is the only thing this client
+// knows about it: where it was put. `deadline` means a dropped op (budget
+// full, a rect the server refused) expires instead of ambushing the next
+// label that happens to land on that spot.
+let pendingBoxName: { x0: number; y0: number; deadline: number } | null = null;
+let pendingNetName: { x: number; y: number; deadline: number } | null = null;
+const PENDING_NAME_MS = 3000;
+
+/** Open the rename box over an annotation this client just created. Called
+ * from the server broadcast handlers AND from the offline apply, so the
+ * gesture feels identical with or without a server. */
+function resolvePendingNames() {
+  const now = performance.now();
+  if (pendingBoxName) {
+    const want = pendingBoxName;
+    const b = labelBoxes.find((q) => q.x0 === want.x0 && q.y0 === want.y0);
+    if (b) {
+      pendingBoxName = null;
+      renameLabelBox(b);
+    } else if (now > want.deadline) {
+      pendingBoxName = null;
+    }
+  }
+  if (pendingNetName) {
+    const want = pendingNetName;
+    const l = netLabels.find((q) => q.x === want.x && q.y === want.y);
+    if (l) {
+      pendingNetName = null;
+      renameNetLabel(l);
+    } else if (now > want.deadline) {
+      pendingNetName = null;
+    }
+  }
+}
+
+/** Rename a label box in place: the field lands over its own title plate. */
+function renameLabelBox(b: LabelBox) {
+  const [x, y] = labelBoxTitleAnchor(cam, b);
+  const w = Math.max(90, (b.x1 - b.x0) * cam.scale - 6);
+  openNameEditor(x, y, w, b.name, MAX_LABEL_BOX_NAME, (name) => {
+    if (name !== b.name) labelBoxOp({ t: 'rename', blid: b.blid, name });
+  });
+}
+
+/** Rename a net label in place: the field lands over its own plate. */
+function renameNetLabel(l: NetLabel) {
+  const [x, y, w] = netLabelRect(cam, l);
+  openNameEditor(x, y, Math.max(90, w), l.name, MAX_NET_LABEL_NAME, (name) => {
+    if (name !== l.name) netLabelOp({ t: 'rename', nlid: l.nlid, name });
+  });
+}
+
+/** Label boxes are room state, exactly like panels: online the server owns
+ * the list (its broadcast is the truth), offline the same rules run locally.
+ *
+ * NOTHING ELSE happens here. There is no window to open, no membership to
+ * recompute and no widget list to touch — the entire feature is "the box now
+ * says this, and everybody can see it". */
+function labelBoxOp(op: LabelBoxOp) {
+  if (online) {
+    net.sendLabelBox(op);
+    return;
+  }
+  labelBoxes = applyLabelBoxOp(labelBoxes, op, () => {
+    for (const b of labelBoxes) localBlidCounter = Math.max(localBlidCounter, b.blid + 1);
+    return localBlidCounter++;
+  });
+  resolvePendingNames();
+}
+
+/** Net labels, same rule. Offline there is no `netmap` broadcast (nothing is
+ * deriving one), so every label reads detached until a server answers —
+ * which is honest: this client genuinely does not know which net it is on. */
+function netLabelOp(op: NetLabelOp) {
+  if (online) {
+    net.sendNetLabel(op);
+    return;
+  }
+  netLabels = applyNetLabelOp(netLabels, op, () => {
+    for (const l of netLabels) localNlidCounter = Math.max(localNlidCounter, l.nlid + 1);
+    return localNlidCounter++;
+  });
+  resolvePendingNames();
 }
 
 // ------------------------------------------------------- external inputs
@@ -1309,6 +1507,7 @@ const panelHost = new PanelHost({
   probes: () => probes,
   traces: () => traces,
   scopes: () => floatScopes,
+  netNames,
   removeScope: (sid) => {
     floatScopes = floatScopes.filter((s) => s.sid !== sid);
   },
@@ -1571,13 +1770,95 @@ function placePins(kind: ElementKind, a: Point, b: Point): Point[] {
   return pins;
 }
 
+/** Drop every armed tool. ARMING IS EXCLUSIVE: the region tools are hit
+ * before `placing` in pointerdown, so a tool left armed from a minute ago
+ * would silently eat the next part a player tried to place. */
+function disarmTools() {
+  panelTool = false;
+  panelDrag = null;
+  labelBoxTool = false;
+  labelBoxDrag = null;
+  netLabelTool = false;
+  layerTool = false;
+  layerDrag = null;
+  repairing = false;
+}
+
 function choosePart(p: PartDef) {
+  disarmTools();
   placing = p;
   pasting = null;
-  repairing = false;
   closeCtxMenu();
   canvas.style.cursor = 'crosshair';
 }
+
+// ------------------------------------------------------ on-canvas rename
+//
+// The one genuinely new bit of UI the annotation primitives needed. A panel
+// renames through its window header; a label box and a net label have no
+// window, so the field comes to the plate instead: double-click a title and a
+// text box appears exactly over it, sized like it, committing on Enter or
+// blur and abandoning on Escape.
+//
+// It is length-capped CLIENT-SIDE as well as on the server. The server
+// truncates whatever arrives, but a field that silently eats the end of what
+// you typed is a field that lied to you — which is exactly the gap the panel
+// title input still has.
+
+const nameEdit = document.getElementById('nameedit') as HTMLInputElement;
+/** What the open editor will do with the text. Null = nothing is open. */
+let nameEditCommit: ((name: string) => void) | null = null;
+
+function closeNameEditor() {
+  if (!nameEditCommit) return;
+  nameEditCommit = null;
+  nameEdit.style.display = 'none';
+  nameEdit.value = '';
+  nameEdit.blur();
+}
+
+/** Open the rename box at `[x, y]` screen px, `w` wide, over `current`.
+ * `commit` is called with the trimmed text only when it actually changed. */
+function openNameEditor(
+  x: number,
+  y: number,
+  w: number,
+  current: string,
+  maxLen: number,
+  commit: (name: string) => void,
+) {
+  closeNameEditor();
+  nameEditCommit = commit;
+  nameEdit.maxLength = maxLen;
+  nameEdit.value = current;
+  nameEdit.style.display = 'block';
+  nameEdit.style.width = `${Math.max(70, Math.round(w))}px`;
+  // Kept inside the viewport: a box drawn at the edge of the world must not
+  // put its own rename field off-screen.
+  const r = nameEdit.getBoundingClientRect();
+  nameEdit.style.left = `${Math.round(Math.min(Math.max(4, x), Math.max(4, window.innerWidth - r.width - 4)))}px`;
+  nameEdit.style.top = `${Math.round(Math.min(Math.max(4, y), Math.max(4, window.innerHeight - r.height - 4)))}px`;
+  nameEdit.focus();
+  nameEdit.select();
+}
+
+nameEdit.addEventListener('keydown', (ev) => {
+  ev.stopPropagation(); // never let a part hotkey fire while typing a name
+  if (ev.key === 'Enter') {
+    ev.preventDefault();
+    nameEdit.blur(); // blur commits
+  } else if (ev.key === 'Escape') {
+    ev.preventDefault();
+    closeNameEditor(); // clears the callback first, so the blur does nothing
+  }
+});
+nameEdit.addEventListener('blur', () => {
+  const commit = nameEditCommit;
+  if (!commit) return;
+  const name = nameEdit.value.trim();
+  closeNameEditor();
+  if (name) commit(name);
+});
 
 // ---------------------------------------------------------------- props
 const propsDiv = document.getElementById('props') as HTMLDivElement;
@@ -2611,6 +2892,8 @@ function canvasMenu(x: number, y: number): MenuItem[] {
     { sep: true },
     { label: 'Oscilloscope here', hint: 'O', run: () => addFloatScope(snap(x, y)) },
     { label: 'Control panel here', hint: 'J', run: () => (panelTool = true) },
+    { label: 'Label box here', hint: '⇧J', run: () => (labelBoxTool = true) },
+    { label: 'Name this net', hint: '⇧W', run: () => (netLabelTool = true) },
     {
       label: 'Camera layer here',
       hint: '⇧Y',
@@ -2711,6 +2994,46 @@ let panelResize: {
   base: PanelRect;
   lastSent: number;
 } | null = null;
+
+// ---- ANNOTATION GESTURES. Deliberately the same shape as the panel ones —
+// drag out a rect, drag the title to move, drag a grip to resize, 60 ms
+// throttle with a final absolute op on release — because a player who has
+// drawn a control panel already knows how to draw a label box.
+/** ⇧J: drag out a new label box. */
+let labelBoxTool = false;
+let labelBoxDrag: { a: Point; b: Point } | null = null;
+let labelBoxMove: {
+  blid: number;
+  dx: number;
+  dy: number;
+  w: number;
+  h: number;
+  lastSent: number;
+} | null = null;
+let labelBoxResize: {
+  blid: number;
+  handle: PanelHandle;
+  base: PanelRect;
+  lastSent: number;
+} | null = null;
+/** ⇧W: the next click names the net at that grid point. */
+let netLabelTool = false;
+/** Dragging a net label onto a different point — which changes WHICH net it
+ * names, because the anchor is the whole of its identity.
+ *
+ * `dx`/`dy` are the grab offset in grid units. Without them the label would
+ * jump to the point under the cursor the instant it was touched, and the
+ * plate floats a dozen pixels ABOVE its anchor — so merely picking one up
+ * would silently re-anchor it a grid unit or two north, onto another net. */
+let netLabelMove: {
+  nlid: number;
+  lastSent: number;
+  x: number;
+  y: number;
+  dx: number;
+  dy: number;
+} | null = null;
+
 let spaceHeld = false;
 let lastCursorSent = 0;
 /** The control-hint block. Collapsed by default: it is wide enough to sit in
@@ -2913,6 +3236,31 @@ canvas.addEventListener('pointerdown', (ev) => {
     panelDrag = { a: p, b: p };
     return;
   }
+  if (labelBoxTool) {
+    const p = snap(ev.clientX, ev.clientY);
+    labelBoxDrag = { a: p, b: p };
+    return;
+  }
+  if (netLabelTool) {
+    // ONE CLICK, ONE LABEL, on the grid point under the pointer. The point is
+    // the anchor and the anchor is the whole of the label's identity — see
+    // `NetLabel` in crates/server/src/main.rs for why it is a point and not a
+    // wire or a pin, and for what happens to it when things get deleted.
+    const [gx, gy] = snap(ev.clientX, ev.clientY);
+    netLabelTool = false;
+    canvas.style.cursor = 'default';
+    if (netLabels.some((l) => l.x === gx && l.y === gy)) {
+      toast('there is already a net label on that point');
+      return;
+    }
+    netLabelOp({ t: 'add', x: gx, y: gy });
+    // Name it straight away: a label called "NET 4" is not a label. The
+    // rename box opens over where the plate will land, and the op it commits
+    // names whichever label just appeared on that point — resolved at commit
+    // time, because online the nlid is the server's to allocate.
+    pendingNetName = { x: gx, y: gy, deadline: performance.now() + PENDING_NAME_MS };
+    return;
+  }
   if (pasting) {
     commitPaste(snap(ev.clientX, ev.clientY));
     return;
@@ -2937,6 +3285,34 @@ canvas.addEventListener('pointerdown', (ev) => {
       scopeDrag = { s: z.s, dx: gx - z.s.x, dy: gy - z.s.y };
     } else if (z.zone === 'resize') {
       scopeResize = { s: z.s };
+    }
+    return;
+  }
+  // LABEL BOX titles: × deletes it, the title drags it, the eight grips on
+  // its border resize it. Identical to the panel gesture below on purpose —
+  // and the ONLY thing that happens is that a rectangle and a word move.
+  const bz = labelBoxZoneAt(cam, labelBoxes, ev.clientX, ev.clientY);
+  if (bz) {
+    if (bz.zone === 'close') {
+      labelBoxOp({ t: 'remove', blid: bz.box.blid });
+    } else if (bz.zone === 'resize') {
+      const { x0, y0, x1, y1 } = bz.box;
+      labelBoxResize = {
+        blid: bz.box.blid,
+        handle: bz.handle,
+        base: { x0, y0, x1, y1 },
+        lastSent: 0,
+      };
+    } else {
+      const [gx, gy] = toGrid(ev.clientX, ev.clientY);
+      labelBoxMove = {
+        blid: bz.box.blid,
+        dx: gx - bz.box.x0,
+        dy: gy - bz.box.y0,
+        w: bz.box.x1 - bz.box.x0,
+        h: bz.box.y1 - bz.box.y0,
+        lastSent: 0,
+      };
     }
     return;
   }
@@ -2968,6 +3344,33 @@ canvas.addEventListener('pointerdown', (ev) => {
     selectedIds.clear();
     selectedMachine = false;
     return;
+  }
+  // NET LABEL PLATES, AFTER the probe flags. A net label is drawn on the very
+  // wire a probe is clipped to, so the two overlap — and an INSTRUMENT beats an
+  // annotation for a click every time. Everything else the plate sits over is
+  // a part body, which it does win against: the plate floats clear above the
+  // conductor, so a pixel inside it was never a pixel of the schematic.
+  //
+  // Shift+click deletes; a plain drag re-anchors it to another point (which is
+  // how you move it to a different net — the anchor IS which net it names).
+  {
+    const l = netLabelAt(cam, netLabels, ev.clientX, ev.clientY);
+    if (l) {
+      if (ev.shiftKey) {
+        netLabelOp({ t: 'remove', nlid: l.nlid });
+      } else {
+        const [gx, gy] = toGrid(ev.clientX, ev.clientY);
+        netLabelMove = {
+          nlid: l.nlid,
+          lastSent: 0,
+          x: l.x,
+          y: l.y,
+          dx: gx - l.x,
+          dy: gy - l.y,
+        };
+      }
+      return;
+    }
   }
   // Pins take priority: dragging a terminal reshapes ITS part — stretch,
   // shrink, reorient. Wires are placed with W (or the right-click menu),
@@ -3064,6 +3467,25 @@ canvas.addEventListener('pointerdown', (ev) => {
 
 // Double-click a part: floating property editor, parked next to it.
 
+// DOUBLE-CLICK RENAMES AN ANNOTATION. A panel renames through its window
+// header; these two have no window, so the title itself is the control. The
+// preceding pointerdowns will have opened (and closed) a move drag, which is
+// harmless: a drag that ends where it started re-sends the rect it already
+// had.
+canvas.addEventListener('dblclick', (ev) => {
+  const l = netLabelAt(cam, netLabels, ev.clientX, ev.clientY);
+  if (l) {
+    ev.preventDefault();
+    renameNetLabel(l);
+    return;
+  }
+  const bz = labelBoxZoneAt(cam, labelBoxes, ev.clientX, ev.clientY);
+  if (bz && bz.zone === 'title') {
+    ev.preventDefault();
+    renameLabelBox(bz.box);
+  }
+});
+
 canvas.addEventListener('pointermove', (ev) => {
   mouse = { x: ev.clientX, y: ev.clientY };
   const now = performance.now();
@@ -3118,6 +3540,55 @@ canvas.addEventListener('pointermove', (ev) => {
     if (now - panelResize.lastSent > 60) {
       panelResize.lastSent = now;
       panelOp({ t: 'rect', plid: panelResize.plid, ...rect });
+    }
+    return;
+  }
+  if (labelBoxDrag) {
+    labelBoxDrag.b = snap(ev.clientX, ev.clientY);
+    return;
+  }
+  if (labelBoxMove) {
+    const [gx, gy] = toGrid(ev.clientX, ev.clientY);
+    const x0 = Math.round(gx - labelBoxMove.dx);
+    const y0 = Math.round(gy - labelBoxMove.dy);
+    const rect = { x0, y0, x1: x0 + labelBoxMove.w, y1: y0 + labelBoxMove.h };
+    const b = labelBoxes.find((q) => q.blid === labelBoxMove!.blid);
+    if (b) Object.assign(b, rect); // optimistic; the broadcast confirms
+    if (now - labelBoxMove.lastSent > 60) {
+      labelBoxMove.lastSent = now;
+      labelBoxOp({ t: 'rect', blid: labelBoxMove.blid, ...rect });
+    }
+    return;
+  }
+  if (labelBoxResize) {
+    const [gx, gy] = toGrid(ev.clientX, ev.clientY);
+    // The panel's resize maths, unchanged: a rectangle is a rectangle, and
+    // both have the same one-grid-unit minimum span.
+    const rect = resizePanelRect(labelBoxResize.base, labelBoxResize.handle, gx, gy);
+    const b = labelBoxes.find((q) => q.blid === labelBoxResize!.blid);
+    if (b) Object.assign(b, rect);
+    if (now - labelBoxResize.lastSent > 60) {
+      labelBoxResize.lastSent = now;
+      labelBoxOp({ t: 'rect', blid: labelBoxResize.blid, ...rect });
+    }
+    return;
+  }
+  if (netLabelMove) {
+    const [px, py] = toGrid(ev.clientX, ev.clientY);
+    const gx = Math.round(px - netLabelMove.dx);
+    const gy = Math.round(py - netLabelMove.dy);
+    if (gx !== netLabelMove.x || gy !== netLabelMove.y) {
+      netLabelMove.x = gx;
+      netLabelMove.y = gy;
+      const l = netLabels.find((q) => q.nlid === netLabelMove!.nlid);
+      if (l) {
+        l.x = gx;
+        l.y = gy;
+      }
+      if (now - netLabelMove.lastSent > 60) {
+        netLabelMove.lastSent = now;
+        netLabelOp({ t: 'move', nlid: netLabelMove.nlid, x: gx, y: gy });
+      }
     }
     return;
   }
@@ -3226,9 +3697,15 @@ canvas.addEventListener('pointermove', (ev) => {
   const mz =
     z || pz || over || onPin ? null : hoist.zoneAt(cam, ev.clientX, ev.clientY);
   hoist.setHot(mz === 'body' || !!machineDrag);
+  // The annotation chrome, in the order pointerdown hit-tests it: the label
+  // box's title/grips sit with the panel tabs, and the net-label plate comes
+  // after them. The cursor has to agree with that order or it promises
+  // something the click will not do.
+  const bz2 = z || pz ? null : labelBoxZoneAt(cam, labelBoxes, ev.clientX, ev.clientY);
+  const nl2 = z || pz || bz2 ? null : netLabelAt(cam, netLabels, ev.clientX, ev.clientY);
   canvas.style.cursor = repairing
     ? REPAIR_CURSOR
-    : placing || pasting || panelTool
+    : placing || pasting || panelTool || labelBoxTool || netLabelTool
     ? 'crosshair'
     : spaceHeld
       ? 'grab'
@@ -3240,7 +3717,15 @@ canvas.addEventListener('pointermove', (ev) => {
             : z.zone === 'ctrl' || z.zone === 'chan' || z.zone === 'close'
               ? 'pointer'
               : 'default'
-        : pz
+        : bz2
+          ? bz2.zone === 'resize'
+            ? PANEL_HANDLE_CURSOR[bz2.handle]
+            : bz2.zone === 'close'
+              ? 'pointer'
+              : 'move'
+          : nl2
+            ? 'move'
+          : pz
           ? pz.zone === 'resize'
             ? PANEL_HANDLE_CURSOR[pz.handle]
             : pz.zone === 'close'
@@ -3303,6 +3788,36 @@ canvas.addEventListener('pointerup', (ev) => {
     if (p) panelOp({ t: 'rect', plid: p.plid, x0: p.x0, y0: p.y0, x1: p.x1, y1: p.y1 });
     panelMove = null;
     panelResize = null;
+    return;
+  }
+  if (labelBoxDrag) {
+    const r = normLabelBoxRect(labelBoxDrag.a, labelBoxDrag.b);
+    labelBoxDrag = null;
+    if (r) {
+      // One box per arming; a stray click leaves the tool armed.
+      labelBoxTool = false;
+      canvas.style.cursor = 'default';
+      labelBoxOp({ t: 'add', x0: r[0], y0: r[1], x1: r[2], y1: r[3] });
+      // Name it immediately: a box called "LABEL 3" is not a label. Resolved
+      // at commit time by rect, because online the blid is the server's.
+      pendingBoxName = { x0: r[0], y0: r[1], deadline: performance.now() + PENDING_NAME_MS };
+    }
+    return;
+  }
+  // The final op is ABSOLUTE, so it says the same thing as all the throttled
+  // increments put together — nothing can be left half-applied.
+  if (labelBoxMove || labelBoxResize) {
+    const blid = labelBoxMove?.blid ?? labelBoxResize!.blid;
+    const b = labelBoxes.find((q) => q.blid === blid);
+    if (b) labelBoxOp({ t: 'rect', blid: b.blid, x0: b.x0, y0: b.y0, x1: b.x1, y1: b.y1 });
+    labelBoxMove = null;
+    labelBoxResize = null;
+    return;
+  }
+  if (netLabelMove) {
+    const l = netLabels.find((q) => q.nlid === netLabelMove!.nlid);
+    if (l) netLabelOp({ t: 'move', nlid: l.nlid, x: l.x, y: l.y });
+    netLabelMove = null;
     return;
   }
   if (machineDrag) {
@@ -3478,11 +3993,9 @@ window.addEventListener('keydown', (ev) => {
     }
     placing = null;
     pasting = null;
-    panelTool = false;
-    panelDrag = null;
-    layerTool = false;
-    layerDrag = null;
-    repairing = false;
+    disarmTools();
+    pendingBoxName = null;
+    pendingNetName = null;
     selectedIds.clear();
     selectedProbe = null;
     selectedMachine = false;
@@ -3514,23 +4027,49 @@ window.addEventListener('keydown', (ev) => {
     // ⇧Y: the camera layer, next to Y (the photocell) because they are two
     // halves of one gesture — draw the hole in the world, then put a part
     // over it.
+    disarmTools();
     layerTool = true;
     placing = null;
     pasting = null;
-    panelTool = false;
-    repairing = false;
     canvas.style.cursor = 'crosshair';
     toast('drag out a camera layer, then click its plate to point a camera at it');
     return;
   }
-  if (ev.key === 'j' || ev.key === 'J') {
+  if (ev.key === 'j') {
     // Arm the panel tool: drag a region around the parts you want on a
     // control panel. Its window appears as soon as the region exists.
+    disarmTools();
     panelTool = true;
     placing = null;
     pasting = null;
-    repairing = false;
     canvas.style.cursor = 'crosshair';
+    return;
+  }
+  if (ev.key === 'J') {
+    // ⇧J: a LABEL BOX. Next to J because it is the same gesture — drag out a
+    // rectangle round some parts — and shifted because the difference is
+    // exactly that this one is only words: no window, no membership, nothing
+    // about the parts inside it changes.
+    disarmTools();
+    labelBoxTool = true;
+    placing = null;
+    pasting = null;
+    canvas.style.cursor = 'crosshair';
+    toast('drag out a label box, then type what it is');
+    return;
+  }
+  if (ev.key === 'W') {
+    // ⇧W: NAME A NET. Next to W (the wire) because a net is what wires make.
+    // The click lands the name on a grid POINT — see `NetLabel` in
+    // crates/server/src/main.rs for why the anchor is a point, what happens
+    // when the thing under it is deleted, and why two nets may share a name
+    // without being joined by it.
+    disarmTools();
+    netLabelTool = true;
+    placing = null;
+    pasting = null;
+    canvas.style.cursor = 'crosshair';
+    toast('click a point on the net to name it — a name joins nothing');
     return;
   }
   if (ev.key === 'Delete' || ev.key === 'Backspace') {
@@ -3542,6 +4081,28 @@ window.addEventListener('keydown', (ev) => {
     if (pr) {
       deleteProbe(pr);
       return;
+    }
+    // ANNOTATION UNDER THE POINTER, before the selection, for the same reason
+    // probes come first: pointing at a thing and pressing Delete must delete
+    // that thing, not the parts you selected somewhere else.
+    //
+    // It is also the guaranteed way out. Both primitives are deleted by their
+    // own chrome (the box's ×, shift+click on a net plate), but a box small
+    // enough — or a zoom low enough — that its title plate is not drawn has no
+    // chrome to click, and a shape a player can make and cannot unmake is a
+    // trap. `netLabelAt` and `labelBoxHotAt` are both edge-or-plate hits, so
+    // neither can shadow a part inside the box.
+    if (mouse) {
+      const nl = netLabelAt(cam, netLabels, mouse.x, mouse.y);
+      if (nl) {
+        netLabelOp({ t: 'remove', nlid: nl.nlid });
+        return;
+      }
+      const lb = labelBoxHotAt(cam, labelBoxes, mouse.x, mouse.y);
+      if (lb) {
+        labelBoxOp({ t: 'remove', blid: lb.blid });
+        return;
+      }
     }
     const e = mouse ? elementAt(mouse.x, mouse.y) : undefined;
     if (selectedIds.size > 0) deleteIds([...selectedIds]);
@@ -3972,7 +4533,7 @@ function drawFloatScopes() {
     ctx.stroke();
     if (H - SCOPE_TITLE_PX > 20) {
       const [bx, by, bw, bh] = scopeBodyPx(s);
-      renderScopeInto(ctx, bx, by, bw, bh, traces, active, s.set.timebase, s.set);
+      renderScopeInto(ctx, bx, by, bw, bh, traces, active, s.set.timebase, s.set, netNames());
     }
   }
 }
@@ -4104,6 +4665,17 @@ function frame(now: number) {
   );
   if (panelDrag) drawPanelGhost(ctx, cam, panelDrag.a, panelDrag.b);
 
+  // Label boxes sit beside the panel regions and under the schematic, for the
+  // same reason: they frame parts, they never hide them.
+  const hotBox = mouse ? labelBoxHotAt(cam, labelBoxes, mouse.x, mouse.y) : null;
+  drawLabelBoxes(
+    ctx,
+    cam,
+    labelBoxes,
+    labelBoxResize?.blid ?? labelBoxMove?.blid ?? hotBox?.blid ?? null,
+  );
+  if (labelBoxDrag) drawLabelBoxGhost(ctx, cam, labelBoxDrag.a, labelBoxDrag.b);
+
   // Cull to the viewport through the spatial index: a 20k-element world
   // costs what is on screen, not what exists.
   const view = viewRect();
@@ -4159,7 +4731,7 @@ function frame(now: number) {
   const md = moveDrag;
   const hover = md
     ? elemById(md.clickTarget)
-    : mouse && !placing && !pasting && !panelTool && !layerTool && !zHover
+    : mouse && !placing && !pasting && !panelTool && !labelBoxTool && !netLabelTool && !layerTool && !zHover
       ? elementAt(mouse.x, mouse.y)
       : undefined;
   if (hover) drawHighlight(hover, true);
@@ -4170,6 +4742,19 @@ function frame(now: number) {
   }
   // ...and whatever a control panel is pointing at (row hover / keyboard).
   if (panelHover) drawPanelHoverHighlight(panelHover, view);
+
+  // NET LABELS, on top of the wires they name — a net name belongs ON the
+  // conductor, the way it is drawn on paper. Detached ones (the anchor has
+  // nothing connected to it) draw dimmed and dashed rather than vanishing:
+  // the player wrote that word deliberately, and the label is still exactly
+  // where they put it.
+  drawNetLabels(
+    ctx,
+    cam,
+    netLabels,
+    netMap,
+    netLabelMove?.nlid ?? (mouse ? (netLabelAt(cam, netLabels, mouse.x, mouse.y)?.nlid ?? null) : null),
+  );
 
   // Ghost previews for in-progress edits.
   ctx.globalAlpha = 0.45;
@@ -4266,7 +4851,7 @@ function frame(now: number) {
   // whichever panel owns it read hot. Self-guarded on an unchanged id.
   panelHost.setCanvasHover(hover?.id ?? null);
 
-  dock.update(now, probes, traces, dockScope);
+  dock.update(now, probes, traces, dockScope, netNames());
 
   // Deliberately NO hover readout: voltages, currents and power are only
   // visible through probes, scopes and panel meters — placing an instrument
@@ -4277,6 +4862,10 @@ function frame(now: number) {
     ? 'repair tool: click a charred part to put it back into service (Esc exits)'
     : panelTool
     ? 'control panel: drag a region around the parts you want on it (Esc cancels)'
+    : labelBoxTool
+    ? 'label box: drag a box round some parts and say what they are — no window, no grouping (Esc cancels)'
+    : netLabelTool
+    ? 'name a net: click a point on it. The name is a LABEL — the same name on two nets joins nothing (Esc cancels)'
     : pasting
       ? `pasting ${pasting.length} parts (Q rotates, X/Y flips, click places, Esc cancels)`
       : placing
@@ -4313,7 +4902,7 @@ function frame(now: number) {
       : '';
   const hints = hintsOpen
     ? `\nparts: R C L W G V D N P M A U 5 S B T Z E F I · ⇧V rail · drag part = move · drag the hoist chip = move the machine · dbl-click = edit values · right-click = menu` +
-      `\ndrag pin = reshape part · W then drag = wire · drag empty = select · Q rotate · X/Y flip · ⌘Z undo · ⌘C/⌘V copy/paste · 1/2 probe · 3 listen · 0 ref · O scope · \` dock · J panel · [ ] sidebars · K repair · Del delete` +
+      `\ndrag pin = reshape part · W then drag = wire · drag empty = select · Q rotate · X/Y flip · ⌘Z undo · ⌘C/⌘V copy/paste · 1/2 probe · 3 listen · 0 ref · O scope · \` dock · J panel · ⇧J label box · ⇧W name a net · [ ] sidebars · K repair · Del delete` +
       `\nH home district · shift+H fit everything · ⇧R rooms · wheel = zoom (0.4–200 px/unit) · pan: middle / ctrl+drag / space+drag · ? hides this`
     : `\n? controls`;
   // Which room, first thing on the status line — the clickable version of

@@ -133,6 +133,21 @@ export interface FloatScope {
   pids: number[] | null;
 }
 
+/** probe pid -> the name of the net that probe sits on, when it is on a
+ * NAMED net. Built by main.ts from the server's `netmap`; the scope never
+ * computes connectivity and must not start. */
+export type NetNames = Map<number, string> | undefined;
+
+/** What a channel is CALLED. `V3` is an index into a list nobody keeps; `V3
+ * CUTOFF` is the wire you meant. The pid stays because it is what the colour
+ * dots and the channel toggles are keyed on — dropping it would leave the
+ * legend and the controls speaking different languages. */
+export function channelName(p: Probe, netNames?: NetNames): string {
+  const base = `${p.kind.toUpperCase()}${p.pid}`;
+  const net = netNames?.get(p.pid);
+  return net ? `${base} ${net}` : base;
+}
+
 /** The channels a scope displays, in probe order. */
 export const scopeChannels = (s: FloatScope, probes: Probe[]): Probe[] =>
   s.pids === null ? probes : probes.filter((p) => s.pids!.includes(p.pid));
@@ -539,6 +554,7 @@ export function renderScope(
   probes: Probe[],
   timebase: number,
   settings?: ScopeSettings,
+  netNames?: NetNames,
 ) {
   const ctx = canvas.getContext('2d');
   if (!ctx) return;
@@ -558,7 +574,7 @@ export function renderScope(
   // Scale from the *actual* backing size so geometry matches the CSS box.
   ctx.setTransform(bw / W, 0, 0, bh / H, 0, 0);
   ctx.clearRect(0, 0, W, H);
-  renderScopeInto(ctx, 0, 0, W, H, store, probes, timebase, settings);
+  renderScopeInto(ctx, 0, 0, W, H, store, probes, timebase, settings, netNames);
 }
 
 /** Render traces into an arbitrary rect of an existing context (used by
@@ -573,6 +589,7 @@ export function renderScopeInto(
   probes: Probe[],
   timebase: number,
   settings?: ScopeSettings,
+  netNames?: NetNames,
 ) {
   ctx.save();
   ctx.beginPath();
@@ -655,12 +672,16 @@ export function renderScopeInto(
     const color = probeColor(p.pid);
     const unit = p.kind === 'v' ? 'V' : 'A';
     if (!stats) {
-      const dash = `${p.kind.toUpperCase()}${p.pid} —`;
-      if (labelX + ctx.measureText(dash).width <= chipRight) {
+      const dash = `${channelName(p, netNames)} —`;
+      // Measured, not a fixed 60: a channel that carries its net's name is as
+      // long as the name, and a hardcoded step would stack the next chip on
+      // top of it.
+      const dw = ctx.measureText(dash).width;
+      if (labelX + dw <= chipRight) {
         ctx.fillStyle = color;
         ctx.fillText(dash, labelX, 12);
       }
-      labelX += 60;
+      labelX += Math.max(60, dw + 18);
       return;
     }
 
@@ -794,7 +815,7 @@ export function renderScopeInto(
     }
 
     // ---------------------------------------------- measurement chips
-    const name = `${p.kind.toUpperCase()}${p.pid}${p.r ? 'Δ' : ''}`;
+    const name = `${channelName(p, netNames)}${p.r ? 'Δ' : ''}`;
     const label = terse
       ? `${name} ${fmtEng(stats.last, unit)}`
       : `${name} ${fmtEng(stats.last, unit)}  pp ${fmtEng(stats.max - stats.min, unit)}` +

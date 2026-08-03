@@ -23,8 +23,10 @@
 //! template *should* ship with the binary it is one entry in `BUILTINS`.
 
 use crate::{
-    demo_room_circuit, hoist_fixture_at, sane_rect, Layer, Panel, ProbeKind, SaveFile, SavedProbe,
-    HOIST_RECT, MAX_ELEMENTS, MAX_LAYERS, MAX_PANELS, MAX_PROBES,
+    clean_name, demo_room_circuit, hoist_fixture_at, norm_label_box_rect, norm_net_label_point,
+    sane_rect, LabelBox, Layer, NetLabel, Panel, ProbeKind, SaveFile, SavedProbe, HOIST_RECT,
+    MAX_ELEMENTS, MAX_LABEL_BOXES, MAX_LABEL_BOX_NAME, MAX_LAYERS, MAX_LAYER_NAME,
+    MAX_NET_LABELS, MAX_NET_LABEL_NAME, MAX_PANELS, MAX_PANEL_NAME, MAX_PROBES,
 };
 use damage::DamageModel;
 use machine::Hoist;
@@ -134,6 +136,13 @@ pub struct RoomSetup {
     pub next_pid: u32,
     pub panels: Vec<Panel>,
     pub next_plid: u32,
+    /// The room's annotation: boxes with titles drawn round groups of parts,
+    /// and names pinned to grid points. Neither carries electrical or grouping
+    /// meaning — see `LabelBox` and `NetLabel` in main.rs.
+    pub label_boxes: Vec<LabelBox>,
+    pub next_blid: u32,
+    pub net_labels: Vec<NetLabel>,
+    pub next_nlid: u32,
     /// Sensor layers. Their RECTANGLES are room state and persist; who is
     /// driving one never does.
     pub layers: Vec<Layer>,
@@ -152,6 +161,10 @@ impl Default for RoomSetup {
             next_pid: 1,
             panels: Vec::new(),
             next_plid: 1,
+            label_boxes: Vec::new(),
+            next_blid: 1,
+            net_labels: Vec::new(),
+            next_nlid: 1,
             layers: Vec::new(),
             next_lid: 1,
             machine: MachineSpec::None,
@@ -199,7 +212,57 @@ impl RoomSetup {
             .next_plid
             .max(self.panels.iter().map(|p| p.plid + 1).max().unwrap_or(1))
             .max(1);
+        // ANNOTATION ARRIVING FROM A FILE GETS THE SAME BOUNDS A PLAYER'S OP
+        // GETS. A save is a hand-editable file, so budgets and name rules
+        // enforced only in the op handler are enforced only against honest
+        // clients — the load path is the other half of every bound, and it was
+        // missing for panels and layers (their names were capped on the way in
+        // and unbounded on the way back). Closed here for all four.
+        for p in self.panels.iter_mut() {
+            p.name = clean_name(&p.name, MAX_PANEL_NAME);
+        }
+        // Normalized in place; a rect the op path would have refused (zero
+        // width, non-finite) is DROPPED rather than repaired into something
+        // nobody drew. One pass, and no `expect` — a restored room must never
+        // be able to panic the server that is restoring it.
+        self.label_boxes
+            .retain_mut(|b| match norm_label_box_rect(b.x0, b.y0, b.x1, b.y1) {
+                Some(r) => {
+                    (b.x0, b.y0, b.x1, b.y1) = r;
+                    b.name = clean_name(&b.name, MAX_LABEL_BOX_NAME);
+                    true
+                }
+                None => false,
+            });
+        self.label_boxes.truncate(MAX_LABEL_BOXES);
+        self.next_blid = self
+            .next_blid
+            .max(
+                self.label_boxes
+                    .iter()
+                    .map(|b| b.blid + 1)
+                    .max()
+                    .unwrap_or(1),
+            )
+            .max(1);
+        // Two labels on one point cannot both be picked up again, so the load
+        // path enforces what `apply_net_label_op` enforces: first one wins.
+        self.net_labels
+            .retain(|l| norm_net_label_point(l.x, l.y).is_some());
+        let mut seen_pts: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
+        self.net_labels.retain(|l| seen_pts.insert((l.x, l.y)));
+        self.net_labels.truncate(MAX_NET_LABELS);
+        for l in self.net_labels.iter_mut() {
+            l.name = clean_name(&l.name, MAX_NET_LABEL_NAME);
+        }
+        self.next_nlid = self
+            .next_nlid
+            .max(self.net_labels.iter().map(|l| l.nlid + 1).max().unwrap_or(1))
+            .max(1);
         self.layers.truncate(MAX_LAYERS);
+        for l in self.layers.iter_mut() {
+            l.name = clean_name(&l.name, MAX_LAYER_NAME);
+        }
         self.next_lid = self
             .next_lid
             .max(self.layers.iter().map(|l| l.lid + 1).max().unwrap_or(1))
@@ -331,10 +394,28 @@ fn synth_setup() -> RoomSetup {
         })
         .collect();
     let next_plid = panels.len() as u32 + 1;
+    // The BLOCK HEADINGS. One control panel plus thirteen label boxes: the
+    // sheet reads as VCO / FILTER / MIXER / sequencer again, and the sidebar
+    // still holds exactly one window. See `synth_label_boxes`.
+    let label_boxes: Vec<LabelBox> = crate::synth::synth_label_boxes()
+        .into_iter()
+        .enumerate()
+        .map(|(i, b)| LabelBox {
+            blid: i as u32 + 1,
+            x0: b.x0,
+            y0: b.y0,
+            x1: b.x1,
+            y1: b.y1,
+            name: b.name.to_string(),
+        })
+        .collect();
+    let next_blid = label_boxes.len() as u32 + 1;
     RoomSetup {
         elements: crate::synth::synth_room_circuit(),
         panels,
         next_plid,
+        label_boxes,
+        next_blid,
         // No machine: the synth's goal is that it makes a noise.
         machine: MachineSpec::None,
         view: View {

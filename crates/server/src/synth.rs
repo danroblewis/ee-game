@@ -512,6 +512,76 @@ pub fn synth_panels() -> Vec<PanelDef> {
     }]
 }
 
+/// THE BLOCK HEADINGS — the thirteen words this sheet lost, back on it.
+///
+/// The history in three steps. Every one of these was a `PanelDef` once,
+/// because a panel was the only way to put words in the world. Then parts got
+/// names, the thirteen windows collapsed into one `SYNTHESIZER` region — and
+/// the schematic lost its headings, because the headings WERE the panels. A
+/// player looking at the sheet could read every knob and could no longer see
+/// where the VCO ended and the filter began.
+///
+/// So they come back as LABEL BOXES: the same rectangles, the same words, and
+/// none of the consequences. Thirteen label boxes open no windows, list no
+/// parts, capture no scopes and add nothing to the sidebar. The one control
+/// panel is still the one control panel.
+///
+/// The rects are the originals with one difference, and it is the point of
+/// the whole feature. The old FILTER rect was stretched to `x1 = 42.2` purely
+/// so a divider's input pin at `(42, -5)` fell inside it — a panel lists a
+/// part only when EVERY pin is in the rect, so a heading had to swallow whole
+/// devices to keep them on its window. A label box has no membership at all,
+/// so this one is sized for READING: it stops at 39, clear of the VCO, and
+/// nothing anywhere notices.
+pub fn synth_label_boxes() -> Vec<PanelDef> {
+    let (ox, oy) = (SEQ_ORIGIN.0 as f64, SEQ_ORIGIN.1 as f64);
+    let mut v = vec![
+        PanelDef { x0: 42.5, y0: -10.6, x1: 59.0, y1: 0.0, name: "VCO  1V/OCT" },
+        // 39.0, not the old 42.2: see above. The heading is drawn where it
+        // reads, not where a membership rule needed it to end.
+        PanelDef { x0: 22.0, y0: -8.4, x1: 39.0, y1: 1.0, name: "FILTER  CUTOFF" },
+        PanelDef { x0: 7.0, y0: -6.0, x1: 22.0, y1: 0.0, name: "MIXER + SPEAKER" },
+        PanelDef { x0: -6.0, y0: -10.4, x1: 6.6, y1: -8.4, name: "LFO  BAR SWEEP" },
+        PanelDef { x0: 24.0, y0: 1.6, x1: 45.0, y1: 10.6, name: "SNARE  (TONE)" },
+        PanelDef {
+            x0: ox - 0.6,
+            y0: oy - 1.0,
+            x1: ox + 16.0,
+            y1: oy + 13.5,
+            name: "CLOCK  TEMPO",
+        },
+        PanelDef {
+            x0: ox + 20.5,
+            y0: oy + 2.0,
+            x1: ox + 33.0,
+            y1: oy + 40.0,
+            name: "STEP DECODER",
+        },
+    ];
+    // One box per step, round the knob and its steering diode, and one round
+    // the toggle and its own. Two per step, `SEQ_STEPS` steps.
+    let pitch = ["STEP 1 PITCH", "STEP 2 PITCH", "STEP 3 PITCH", "STEP 4 PITCH"];
+    let beat = ["BEAT 1", "BEAT 2", "BEAT 3", "BEAT 4"];
+    for n in 0..SEQ_STEPS {
+        let y = oy + 8.0 + 12.0 * n as f64;
+        v.push(PanelDef {
+            x0: ox + 37.0,
+            y0: y - 1.0,
+            x1: ox + 48.6,
+            y1: y + 3.0,
+            name: pitch[n],
+        });
+        v.push(PanelDef {
+            x0: ox + 37.0,
+            y0: y + 4.6,
+            x1: ox + 46.6,
+            y1: y + 7.4,
+            name: beat[n],
+        });
+    }
+    v
+}
+
 // ------------------------------------------------------------ SCOPE NOTES
 //
 // All numbers measured on an Apple M4 (release, pinned cargo 1.95.0), with

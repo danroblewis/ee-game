@@ -18,7 +18,15 @@
 
 import type { AudioBufferHealth, AudioControls } from './audio';
 import { lsGet as read, lsSet as write } from './store';
-import { probeColor, renderScope, type Probe, type TraceStore, type ScopeSettings } from './scope';
+import {
+  channelName,
+  probeColor,
+  renderScope,
+  type NetNames,
+  type Probe,
+  type TraceStore,
+  type ScopeSettings,
+} from './scope';
 import { fmtEng } from './units';
 
 const BAR_PX = 24;
@@ -57,8 +65,18 @@ export interface Dock {
   setOpen(v: boolean): void;
   toggle(): void;
   /** Per-frame: the strip is ALWAYS visible (it carries room telemetry, not
-   * just waveforms); draws waveforms only if open and something is probed. */
-  update(now: number, probes: Probe[], traces: TraceStore, set: ScopeSettings): void;
+   * just waveforms); draws waveforms only if open and something is probed.
+   *
+   * `netNames` maps a probe pid to the name of the net it sits on, when that
+   * net has one. Derived server-side (see the `netmap` message) — the dock
+   * never works out connectivity for itself. */
+  update(
+    now: number,
+    probes: Probe[],
+    traces: TraceStore,
+    set: ScopeSettings,
+    netNames?: NetNames,
+  ): void;
   /** The server's sim-vs-wall dilation ratio from the frame stream, so the
    * "sim 0.5x" warning does not need a speaker in the room to exist. */
   onRt(ratio: number | null): void;
@@ -262,7 +280,7 @@ export function createDock(root: HTMLElement, cv: HTMLCanvasElement, audio: Audi
   bar.addEventListener('pointercancel', () => (drag = null));
 
   /** Probe count plus each channel's latest value in its probe colour. */
-  function updateSummary(probes: Probe[], traces: TraceStore) {
+  function updateSummary(probes: Probe[], traces: TraceStore, netNames?: NetNames) {
     if (probes.length === 0) {
       // Not blank: say how to get a trace, or the empty strip reads as junk.
       if (sumKey !== 'noprobes') {
@@ -273,7 +291,7 @@ export function createDock(root: HTMLElement, cv: HTMLCanvasElement, audio: Audi
     }
     const labels = probes.map((p) => {
       const v = latest(traces, p.pid);
-      const name = `${p.kind.toUpperCase()}${p.pid}${p.r ? 'Δ' : ''}`;
+      const name = `${channelName(p, netNames)}${p.r ? 'Δ' : ''}`;
       return `${name} ${v === null ? '—' : fmtEng(v, p.kind === 'v' ? 'V' : 'A')}`;
     });
     const key = labels.join('|');
@@ -291,7 +309,13 @@ export function createDock(root: HTMLElement, cv: HTMLCanvasElement, audio: Audi
     });
   }
 
-  function update(now: number, probes: Probe[], traces: TraceStore, set: ScopeSettings) {
+  function update(
+    now: number,
+    probes: Probe[],
+    traces: TraceStore,
+    set: ScopeSettings,
+    netNames?: NetNames,
+  ) {
     // Audio state is cheap to read but not free to reflect into the DOM, so
     // it rides the same ~10 Hz budget as the channel summary.
     if (now - lastSumT >= SUMMARY_MS) syncAudio();
@@ -302,10 +326,10 @@ export function createDock(root: HTMLElement, cv: HTMLCanvasElement, audio: Audi
     // The strip never hides: it is the room's status line (sim speed, audio
     // buffer, probe readouts) and the way the scope dock stays discoverable.
     root.style.display = 'block';
-    if (open && hasProbes) renderScope(cv, traces, probes, set.timebase, set);
+    if (open && hasProbes) renderScope(cv, traces, probes, set.timebase, set, netNames);
     if (now - lastSumT >= SUMMARY_MS) {
       lastSumT = now;
-      updateSummary(probes, traces);
+      updateSummary(probes, traces, netNames);
     }
   }
 

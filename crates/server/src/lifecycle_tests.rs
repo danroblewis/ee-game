@@ -593,8 +593,30 @@ async fn joining_resumes_a_parked_room_and_parking_preserves_everything() {
             op: DocOp::Add { spec: e },
         });
     }
+    // ...and they write on the sheet. ANNOTATION IS ROOM STATE: a box with a
+    // title and a name pinned to a grid point both go through the tick, both
+    // get checkpointed, and both have to come back off disk saying exactly
+    // what they said.
+    let _ = h.room.cmds.send(crate::Cmd::LabelBox {
+        op: crate::LabelBoxOp::Add {
+            x0: 2.0,
+            y0: 2.0,
+            x1: 14.0,
+            y1: 9.0,
+            name: Some("POWER STAGE".into()),
+        },
+    });
+    let _ = h.room.cmds.send(crate::Cmd::NetLabel {
+        op: crate::NetLabelOp::Add {
+            x: 3,
+            y: 4,
+            name: Some("5V RAIL".into()),
+        },
+    });
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     assert_eq!(h.room.elements.lock().unwrap().len(), 8);
+    assert_eq!(h.room.label_boxes.lock().unwrap().len(), 1);
+    assert_eq!(h.room.net_labels.lock().unwrap().len(), 1);
 
     // They leave and the room parks. `Stop` is the same handover the 30 s
     // empty-room timer takes, without making the test wait 30 s for it.
@@ -618,6 +640,18 @@ async fn joining_resumes_a_parked_room_and_parking_preserves_everything() {
     assert_eq!(back.room.elements.lock().unwrap().len(), 8);
     assert_eq!(back.room.probes.lock().unwrap().len(), 2);
     assert_eq!(back.room.panels.lock().unwrap()[0].name, "DRIVE");
+    // The words survive the round trip through the file, in both primitives.
+    let boxes = back.room.label_boxes.lock().unwrap().clone();
+    assert_eq!(boxes.len(), 1);
+    assert_eq!(boxes[0].name, "POWER STAGE");
+    assert_eq!((boxes[0].x0, boxes[0].y1), (2.0, 9.0));
+    let nets = back.room.net_labels.lock().unwrap().clone();
+    assert_eq!(nets.len(), 1);
+    assert_eq!(nets[0].name, "5V RAIL");
+    assert_eq!((nets[0].x, nets[0].y), (3, 4), "the anchor is a grid point");
+    // A restored room must not hand the next label an id somebody already has.
+    assert!(back.room.next_blid.load(Ordering::Relaxed) > boxes[0].blid);
+    assert!(back.room.next_nlid.load(Ordering::Relaxed) > nets[0].nlid);
     assert!(back.has_machine);
 
     // And it resumes again.

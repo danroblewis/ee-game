@@ -37,11 +37,13 @@ import type { ElemLive, ElementSpec, InteractOp, Point } from './circuit';
 import { LED_COLORS, LOD_FULL, type Camera } from './render';
 import {
   applyScopeControl,
+  channelName,
   probeColor,
   renderScope,
   scopeChannels,
   scopeControlAt,
   type FloatScope,
+  type NetNames,
   type Probe,
   type ScopeControlId,
   type TraceStore,
@@ -792,6 +794,8 @@ export interface PanelHostDeps {
   /** Every client-local floating scope. main.ts owns the array; panels only
    * borrow the ones their region contains. */
   scopes(): FloatScope[];
+  /** probe pid -> net name, from the server's `netmap`. */
+  netNames(): NetNames;
   /** Delete a floating scope (a panel-owned scope has no canvas chrome). */
   removeScope(sid: number): void;
   /** Same interact path the canvas uses (optimistic + server echo). */
@@ -831,6 +835,10 @@ interface TickCtx {
   panels: Panel[];
   scopes: FloatScope[];
   traces: TraceStore;
+  /** probe pid -> the name of the net that probe sits on, when it has one.
+   * Derived by the server (`netmap`); the panel never works out which parts
+   * are on which net for itself. */
+  netNames: NetNames;
 }
 
 interface Widget {
@@ -1158,7 +1166,10 @@ function probeWidget(pid: number): Widget {
         return;
       }
       const unit = p.kind === 'v' ? 'V' : 'A';
-      lab.textContent = `${p.kind === 'v' ? 'VOLT' : 'AMP'} ${pid}`;
+      // A meter on a NAMED net says which net. `VOLT 3` is an index into a
+      // list nobody keeps; `VOLT 3 · CUTOFF` is the wire you meant.
+      const net = ctx.netNames?.get(pid);
+      lab.textContent = `${p.kind === 'v' ? 'VOLT' : 'AMP'} ${pid}${net ? ` · ${net}` : ''}`;
       const l = ctx.live.get(p.elem);
       if (!l) {
         seg.textContent = `–.–– ${unit}`;
@@ -1251,9 +1262,13 @@ function scopeWidget(sid: number, deps: PanelHostDeps): Widget {
   // The canvas scope's channel dots live in its title bar, which a panel-owned
   // scope does not have: rebuild them here whenever the selection changes.
   let chanSig = '';
-  const syncChans = () => {
+  const syncChans = (netNames: NetNames) => {
     const on = new Set(active().map((p) => p.pid));
-    const sig = `${probes.map((p) => `${p.pid}${p.kind}`).join(',')}|${[...on].join(',')}`;
+    // The net name is part of the signature: renaming a net has to re-title
+    // the dots, or the tooltip keeps saying what the wire used to be called.
+    const sig =
+      `${probes.map((p) => `${p.pid}${p.kind}:${netNames?.get(p.pid) ?? ''}`).join(',')}` +
+      `|${[...on].join(',')}`;
     if (sig === chanSig) return;
     chanSig = sig;
     chans.replaceChildren(
@@ -1261,7 +1276,7 @@ function scopeWidget(sid: number, deps: PanelHostDeps): Widget {
         const b = document.createElement('button');
         b.className = on.has(p.pid) ? 'pchan on' : 'pchan';
         b.style.color = probeColor(p.pid);
-        b.title = `${p.kind === 'v' ? 'V' : 'I'}${p.pid}`;
+        b.title = channelName(p, netNames);
         b.onclick = () => toggle(p.pid);
         return b;
       }),
@@ -1276,9 +1291,9 @@ function scopeWidget(sid: number, deps: PanelHostDeps): Widget {
       probes = ctx.probes;
       if (!scope) return;
       lab.textContent = `SCOPE ${sid}`;
-      syncChans();
+      syncChans(ctx.netNames);
       val.textContent = `${fmtEng(scope.set.timebase / 10, 's', { trim: true })}/div`;
-      renderScope(cv, ctx.traces, active(), scope.set.timebase, scope.set);
+      renderScope(cv, ctx.traces, active(), scope.set.timebase, scope.set, ctx.netNames);
     },
   };
 }
@@ -2295,6 +2310,7 @@ export class PanelHost implements WinHost {
       panels,
       scopes: this.deps.scopes(),
       traces: this.deps.traces(),
+      netNames: this.deps.netNames(),
     };
     for (const p of panels) {
       let w = this.wins.get(p.plid);

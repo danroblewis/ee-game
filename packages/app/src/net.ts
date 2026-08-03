@@ -4,6 +4,7 @@
 import type { DocOp, ElementSpec, InteractOp } from './circuit';
 import type { MachineMsg } from './hoist';
 import type { Panel, PanelOp } from './panel';
+import type { LabelBox, LabelBoxOp, NetLabel, NetLabelOp } from './annotate';
 import type { Layer, LayerOp } from './layer';
 import type { Probe, SeedScope } from './scope';
 
@@ -86,6 +87,11 @@ export interface ParsedHello {
   elements: ElementSpec[];
   probes: Probe[];
   panels: Panel[];
+  /** The two ANNOTATION primitives: boxes with titles, and names pinned to
+   * grid points. Both are room state and both ride the hello beside the
+   * panels; neither means anything electrically. */
+  labelBoxes: LabelBox[];
+  netLabels: NetLabel[];
   room: RoomHello | null;
   drift: WireDrift[];
 }
@@ -109,7 +115,16 @@ export function parseHello(raw: unknown): ParsedHello {
 
   if (!isRecord(raw)) {
     note('hello', 'object', raw);
-    return { you: 0, elements: [], probes: [], panels: [], room: null, drift };
+    return {
+      you: 0,
+      elements: [],
+      probes: [],
+      panels: [],
+      labelBoxes: [],
+      netLabels: [],
+      room: null,
+      drift,
+    };
   }
   const m = raw;
 
@@ -127,6 +142,8 @@ export function parseHello(raw: unknown): ParsedHello {
   const elements = list<ElementSpec>(m.elements, 'hello.elements');
   const probes = list<Probe>(m.probes, 'hello.probes');
   const panels = list<Panel>(m.panels, 'hello.panels');
+  const labelBoxes = list<LabelBox>(m.labelboxes, 'hello.labelboxes');
+  const netLabels = list<NetLabel>(m.netlabels, 'hello.netlabels');
 
   // No `room` key at all = a server from before rooms existed. That is a
   // supported server, not drift: the chip says "this server has no room list"
@@ -208,7 +225,7 @@ export function parseHello(raw: unknown): ParsedHello {
     }
   }
 
-  return { you, elements, probes, panels, room, drift };
+  return { you, elements, probes, panels, labelBoxes, netLabels, room, drift };
 }
 
 /** One line per drifted field, for a console or a toast. */
@@ -246,6 +263,8 @@ export interface NetHandlers {
     elements: ElementSpec[],
     probes: Probe[],
     panels: Panel[],
+    labelBoxes: LabelBox[],
+    netLabels: NetLabel[],
     room: RoomHello | null,
   ): void;
   /** The room was renamed by somebody (possibly us): every open chip, tab
@@ -260,6 +279,20 @@ export interface NetHandlers {
   onDoc(op: DocOp): void;
   onProbes(list: Probe[]): void;
   onPanels(list: Panel[]): void;
+  /** Label boxes: words on the sheet. Whole list, never a delta — a lagging
+   * subscriber SKIPS messages, and a skipped delta desyncs forever. */
+  onLabelBoxes(list: LabelBox[]): void;
+  /** Net labels: names pinned to grid points. Same whole-list rule. */
+  onNetLabels(list: NetLabel[]): void;
+  /** WHICH net is named what, DERIVED by the server from the compiled
+   * document. `live` is the nlids whose anchor is a real junction (everything
+   * else is detached); `probe` is `[pid, nlid]` for probes on named nets.
+   *
+   * Derived, so it is never persisted and never sent by the client. It has to
+   * come from the server because the client has no netlist: node membership is
+   * an equivalence class the solver computes, and a second implementation of
+   * it here would be a second answer to disagree with. */
+  onNetMap(live: number[], probe: [number, number][]): void;
   /** Sensor layers plus who is driving each, `[[lid, who], ...]`. Rectangles
    * and claims only — there is no field on this message for a device, and
    * there must never be one. */
@@ -309,6 +342,11 @@ export interface Net {
   sendProbe(elem: number, pin: number, kind: 'v' | 'i'): void;
   sendProbeRef(pid: number, elem: number, pin: number): void;
   sendPanel(op: PanelOp): void;
+  /** Draw/move/rename/delete a label box. Pure annotation: this op can never
+   * change what the solver solves. */
+  sendLabelBox(op: LabelBoxOp): void;
+  /** Name a net (annotation only — the same name on two nets joins nothing). */
+  sendNetLabel(op: NetLabelOp): void;
   sendLayer(op: LayerOp): void;
   /** Take or drop the right to drive a layer with your own device. */
   sendLayerClaim(lid: number, claim: boolean): void;
@@ -413,7 +451,15 @@ export function connect(h: NetHandlers, room: string | null = null): Net {
           console.error(`hello: wire drift — ${describeDrift(p.drift)}`);
           h.onWireDrift?.(p.drift);
         }
-        h.onHello(p.you, p.elements, p.probes, p.panels, p.room);
+        h.onHello(
+          p.you,
+          p.elements,
+          p.probes,
+          p.panels,
+          p.labelBoxes,
+          p.netLabels,
+          p.room,
+        );
         // Sensor layers ride the hello beside `panels`. Deliberately routed
         // through the SAME handler the live broadcast uses, so a late joiner
         // and a running client can never disagree about what a layer is.
@@ -444,6 +490,18 @@ export function connect(h: NetHandlers, room: string | null = null): Net {
         break;
       case 'panels':
         h.onPanels(m.list ?? []);
+        break;
+      case 'labelboxes':
+        h.onLabelBoxes(m.list ?? []);
+        break;
+      case 'netlabels':
+        h.onNetLabels(m.list ?? []);
+        break;
+      case 'netmap':
+        h.onNetMap(
+          Array.isArray(m.live) ? m.live : [],
+          Array.isArray(m.probes) ? m.probes : [],
+        );
         break;
       case 'layers':
         h.onLayers(m.list ?? [], m.claims ?? []);
@@ -495,6 +553,18 @@ export function connect(h: NetHandlers, room: string | null = null): Net {
     sendProbe: (elem, pin, kind) => send({ t: 'probe', elem, pin, kind }),
     sendProbeRef: (pid, elem, pin) => send({ t: 'proberef', pid, elem, pin }),
     sendPanel: (op) => send({ t: 'panel', op }),
+    sendLabelBox: (op) => send({ t: 'labelbox', op }),
+    // Integers only, enforced HERE: the anchor is a grid POINT and the server
+    // deserializes it into an i32 pair, so a fractional coordinate would be a
+    // dropped message rather than a label.
+    sendNetLabel: (op) =>
+      send({
+        t: 'netlabel',
+        op:
+          op.t === 'add' || op.t === 'move'
+            ? { ...op, x: Math.round(op.x), y: Math.round(op.y) }
+            : op,
+      }),
     sendLayer: (op) => send({ t: 'layer', op }),
     sendLayerClaim: (lid, claim) => send({ t: 'layerclaim', lid, claim }),
     // Integers, enforced HERE and not merely expected: the one message a
