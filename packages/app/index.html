@@ -84,6 +84,32 @@
         width: 110px; background: #0f0f14; color: #e8e8ef; border: 1px solid #3a3a48;
         border-radius: 4px; padding: 2px 6px; font: inherit; outline: none;
       }
+      /* Value entry is text now, so prefixes can be typed ("4k7", "100n").
+         `.bad` marks a value this field's own range refuses. */
+      #props input.bad, #propsdlg input.bad { border-color: #ff8f8f; color: #ff8f8f; }
+      /* The note under a field: the rejection reason, or — only when the
+         player has opted into standard values — the nearest stock part. */
+      #props .pnote, #propsdlg .pnote {
+        font-size: 11px; line-height: 1.45; color: #7a7a88;
+        margin: -3px 0 3px; text-align: right; min-height: 0;
+      }
+      #props .pnote:empty, #propsdlg .pnote:empty { display: none; }
+      #props .pnote.err, #propsdlg .pnote.err { color: #ff8f8f; text-align: left; }
+      #props .pnote.good, #propsdlg .pnote.good { color: #7dffb0; }
+      #props .pnote .snap, #propsdlg .pnote .snap {
+        color: #7dffb0; border-bottom: 1px dotted #7dffb0; cursor: pointer;
+      }
+      #props .pnote .why, #propsdlg .pnote .why { cursor: pointer; color: #8a8a98; }
+      #props .pnote .why:hover, #propsdlg .pnote .why:hover { color: #fff; }
+      #props .pnote .explain, #propsdlg .pnote .explain {
+        text-align: left; margin-top: 6px; padding: 6px 8px; color: #c9c9d4;
+        background: #0f0f14; border: 1px solid #33333f; border-radius: 4px;
+      }
+      #props .pnote .explain p, #propsdlg .pnote .explain p { margin: 0 0 6px; }
+      #props .pnote .explain p:first-child, #propsdlg .pnote .explain p:first-child {
+        color: #fff; font-weight: 600;
+      }
+      #props .pnote .explain p:last-child, #propsdlg .pnote .explain p:last-child { margin: 0; }
       #props .row, #propsdlg .row { display: flex; gap: 6px; margin-top: 8px; }
       #props button, #propsdlg button {
         flex: 1; background: #22222c; color: #c9c9d4; border: 1px solid #3a3a48;
@@ -258,11 +284,16 @@
         font-variant-numeric: tabular-nums;
       }
       .pslider { flex: 1 1 auto; min-width: 60px; accent-color: #4ad4ff; }
+      /* Holds a unit now ("−4.5 V", "250 mV") rather than a bare number, so it
+         is a little wider and right-aligned; red while it holds a value the
+         field's own range refuses. */
       .pnum {
-        width: 62px; background: #0f1419; color: #e8f2f8; border: 1px solid #3c4653;
+        width: 74px; background: #0f1419; color: #e8f2f8; border: 1px solid #3c4653;
         border-radius: 3px; padding: 1px 4px; font: inherit; outline: none;
+        text-align: right;
       }
       .pnum:focus { border-color: #4ad4ff; }
+      .pnum.bad { border-color: #ff8f8f; color: #ff8f8f; }
       .ptog {
         background: #262e37; color: #93a6b3; border: 1px solid #3c4653; border-radius: 3px;
         font: 10px ui-monospace, monospace; padding: 2px 5px; cursor: pointer; white-space: nowrap;

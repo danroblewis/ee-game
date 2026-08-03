@@ -32,6 +32,7 @@
 import type { ChipFrame, ChipSpec, PinoutRow } from '../chip';
 import { atLeast } from '../chip';
 import type { MachineAnim, MachineDef, MachineFrame, MachineMsg } from './seam';
+import { fmtEng } from '../units';
 
 /** The conveyor's live state: the server's message plus the two phases the
  * client integrates from its `vel`. No dust, no landing clock, no win flash —
@@ -424,13 +425,16 @@ export const CONVEYOR_CHIP: ChipSpec<ConveyorState> = {
 
   pinout(st, meas) {
     const { m } = st;
+    // A datasheet that says `0 mA` while the winding is holding 400 uA is
+    // lying about a measured quantity, which is the one thing this table
+    // promised not to do. Both go through the shared formatter now.
     const volts = (k: number) => {
       const v = meas.v(k);
-      return v === null ? '—' : `${v.toFixed(2)} V`;
+      return v === null ? '—' : fmtEng(v, 'V');
     };
     const rows: PinoutRow[] = [
       ['M+', 'drive +, turns the belt', `${ratedA(m)} max · stall = V/R`],
-      ['M−', 'drive −', `now ${(m.i * 1000).toFixed(0)} mA`],
+      ['M−', 'drive −', `now ${fmtEng(m.i, 'A')}`],
       ['FAR A', 'far end stop', `closes at ${((m.lim?.[1] ?? m.h) * 1000).toFixed(0)} mm`],
       ['FAR B', 'far end stop', m.limt ? 'CLOSED' : 'open'],
       ['SNS A', 'track far end — wire to the supply', `now ${volts(4)}`],

@@ -13,6 +13,8 @@
 // One layout function feeds both the renderer and the hit test, so they can
 // never disagree.
 
+import { fmtEng, fmtTight } from './units';
+
 export interface Probe {
   pid: number;
   elem: number;
@@ -203,17 +205,10 @@ export function scopeToSeed(s: FloatScope): SeedScope {
 /** Auto-scale state used when a caller renders without a settings object. */
 const legacyAuto = new Map<number, AutoState>();
 
-const fmtSI = (v: number, unit: string) => {
-  const a = Math.abs(v);
-  if (a >= 1000) return `${(v / 1000).toFixed(1)} k${unit}`;
-  if (a >= 1) return `${v.toFixed(2)} ${unit}`;
-  if (a >= 1e-3) return `${(v * 1e3).toFixed(1)} m${unit}`;
-  if (a >= 1e-6) return `${(v * 1e6).toFixed(1)} µ${unit}`;
-  return `0 ${unit}`;
-};
-
-/** Compact form for control-row readouts: 2 significant-ish digits, no space. */
-const fmtTight = (v: number, unit: string) => fmtSI(v, unit).replace(' ', '');
+// Formatting comes from units.ts. It used to be a local ladder that stopped
+// at kilo and at micro, which mattered here more than anywhere: `nice125`
+// below sets divisions down to MIN_STEP = 1e-12, so the scope could set a
+// y-scale it had no way to name and print `0A/div` underneath a live trace.
 
 // --------------------------------------------------------- 1-2-5 ladder
 
@@ -643,7 +638,7 @@ export function renderScopeInto(
   let chipRight = W - 8;
   if (!compact) {
     ctx.fillStyle = '#6a6a78';
-    const info = `${fmtSI(tb / DIVS_X, 's')}/div`;
+    const info = `${fmtEng(tb / DIVS_X, 's', { trim: true })}/div`;
     const iw = ctx.measureText(info).width;
     ctx.fillText(info, W - 6 - iw, top - 5);
     chipRight = W - 14 - iw;
@@ -801,9 +796,9 @@ export function renderScopeInto(
     // ---------------------------------------------- measurement chips
     const name = `${p.kind.toUpperCase()}${p.pid}${p.r ? 'Δ' : ''}`;
     const label = terse
-      ? `${name} ${fmtSI(stats.last, unit)}`
-      : `${name} ${fmtSI(stats.last, unit)}  pp ${fmtSI(stats.max - stats.min, unit)}` +
-        (stats.freq > 0.05 ? `  ${stats.freq.toFixed(stats.freq < 10 ? 2 : 0)} Hz` : '');
+      ? `${name} ${fmtEng(stats.last, unit)}`
+      : `${name} ${fmtEng(stats.last, unit)}  pp ${fmtEng(stats.max - stats.min, unit)}` +
+        (stats.freq > 0.05 ? `  ${fmtEng(stats.freq, 'Hz')}` : '');
     const lw = ctx.measureText(label).width;
     if (labelX + lw <= chipRight) {
       ctx.fillStyle = color;

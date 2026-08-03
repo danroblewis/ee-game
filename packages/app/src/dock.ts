@@ -19,6 +19,7 @@
 import type { AudioBufferHealth, AudioControls } from './audio';
 import { lsGet as read, lsSet as write } from './store';
 import { probeColor, renderScope, type Probe, type TraceStore, type ScopeSettings } from './scope';
+import { fmtEng } from './units';
 
 const BAR_PX = 24;
 const MIN_H = 120;
@@ -44,16 +45,6 @@ const SLOW_RATIO = 0.97;
 const SLOW_HOLD_MS = 500;
 
 const clampH = (h: number) => Math.min(MAX_H, Math.max(MIN_H, h));
-
-const fmtSI = (v: number, unit: string) => {
-  const a = Math.abs(v);
-  if (a >= 1000) return `${(v / 1000).toFixed(2)} k${unit}`;
-  if (a >= 1) return `${v.toFixed(2)} ${unit}`;
-  if (a >= 1e-3) return `${(v * 1e3).toFixed(1)} m${unit}`;
-  if (a >= 1e-6) return `${(v * 1e6).toFixed(1)} µ${unit}`;
-  if (a >= 1e-9) return `${(v * 1e9).toFixed(1)} n${unit}`;
-  return `0 ${unit}`;
-};
 
 /** Latest sample of a probe, or null when the store has nothing yet. */
 function latest(traces: TraceStore, pid: number): number | null {
@@ -283,7 +274,7 @@ export function createDock(root: HTMLElement, cv: HTMLCanvasElement, audio: Audi
     const labels = probes.map((p) => {
       const v = latest(traces, p.pid);
       const name = `${p.kind.toUpperCase()}${p.pid}${p.r ? 'Δ' : ''}`;
-      return `${name} ${v === null ? '—' : fmtSI(v, p.kind === 'v' ? 'V' : 'A')}`;
+      return `${name} ${v === null ? '—' : fmtEng(v, p.kind === 'v' ? 'V' : 'A')}`;
     });
     const key = labels.join('|');
     if (key === sumKey) return;

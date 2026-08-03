@@ -34,6 +34,7 @@
 import type { ChipFrame, ChipMeas, ChipSpec, PinoutRow } from '../chip';
 import { atLeast } from '../chip';
 import type { MachineAnim, MachineDef, MachineFrame, MachineMsg } from './seam';
+import { fmtEng } from '../units';
 
 export type { MachineMsg } from './seam';
 
@@ -581,13 +582,16 @@ export const HOIST_CHIP: ChipSpec<HoistState> = {
    */
   pinout(st, meas) {
     const { m } = st;
+    // A datasheet that says `0 mA` while the winding is holding 400 uA is
+    // lying about a measured quantity, which is the one thing this table
+    // promised not to do. Both go through the shared formatter now.
     const volts = (k: number) => {
       const v = meas.v(k);
-      return v === null ? '—' : `${v.toFixed(2)} V`;
+      return v === null ? '—' : fmtEng(v, 'V');
     };
     const rows: PinoutRow[] = [
       ['M+', 'armature +, drives the drum', `${ratedA(m)} max · stall = V/R`],
-      ['M−', 'armature −', `now ${(m.i * 1000).toFixed(0)} mA`],
+      ['M−', 'armature −', `now ${fmtEng(m.i, 'A')}`],
       ['TOP A', 'head-stop switch', `closes at ${((m.lim?.[1] ?? m.h) * 1000).toFixed(0)} mm`],
       ['TOP B', 'head-stop switch', m.limt ? 'CLOSED' : 'open'],
       ['SNS A', 'track top — wire to the supply', `now ${volts(4)}`],
