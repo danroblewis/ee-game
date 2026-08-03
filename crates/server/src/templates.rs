@@ -24,7 +24,7 @@
 
 use crate::{
     demo_room_circuit, hoist_fixture_at, sane_rect, Layer, Panel, ProbeKind, SaveFile, SavedProbe,
-    HOIST_RECT, MAX_ELEMENTS, MAX_LAYERS, MAX_PANELS, MAX_PROBES,
+    Scope, HOIST_RECT, MAX_ELEMENTS, MAX_LAYERS, MAX_PANELS, MAX_PROBES, MAX_SCOPES,
 };
 use damage::DamageModel;
 use machine::Hoist;
@@ -134,6 +134,12 @@ pub struct RoomSetup {
     pub next_pid: u32,
     pub panels: Vec<Panel>,
     pub next_plid: u32,
+    /// In-place oscilloscopes. `None` means "this setup predates scopes being
+    /// room state, so seed them from `view.scopes`"; `Some(vec![])` means "a
+    /// room with no instruments, and it means it" (see `SaveFile::scopes`).
+    /// `normalize` resolves the two into a concrete list.
+    pub scopes: Option<Vec<Scope>>,
+    pub next_sid: u32,
     /// Sensor layers. Their RECTANGLES are room state and persist; who is
     /// driving one never does.
     pub layers: Vec<Layer>,
@@ -152,6 +158,8 @@ impl Default for RoomSetup {
             next_pid: 1,
             panels: Vec::new(),
             next_plid: 1,
+            scopes: None,
+            next_sid: 1,
             layers: Vec::new(),
             next_lid: 1,
             machine: MachineSpec::None,
@@ -199,6 +207,35 @@ impl RoomSetup {
             .next_plid
             .max(self.panels.iter().map(|p| p.plid + 1).max().unwrap_or(1))
             .max(1);
+        // THE SEED, RESOLVED — once, here, and never again.
+        //
+        // `None` is "nobody has ever told this room what its instruments
+        // are", which is true of a brand-new room from a template and of
+        // every checkpoint written before scopes were room state; both want
+        // the template's `view.scopes`. `Some(list)` is the room's own
+        // answer and is honoured verbatim, INCLUDING the empty list — a room
+        // whose players closed every scope must not have them handed back
+        // every restart. (The client's per-browser bench kept exactly this
+        // distinction in `localStorage`; it belongs on the room.)
+        let mut scopes = self.scopes.take().unwrap_or_else(|| {
+            self.view
+                .scopes
+                .iter()
+                .enumerate()
+                .map(|(i, seed)| Scope::from_seed(seed, i as u32 + 1))
+                .collect()
+        });
+        scopes.truncate(MAX_SCOPES);
+        // Two instruments with one sid would be one instrument to every op
+        // that names it, so a hand-edited file gets renumbered rather than
+        // trusted.
+        let mut seen_sid: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        scopes.retain(|s| seen_sid.insert(s.sid));
+        self.next_sid = self
+            .next_sid
+            .max(scopes.iter().map(|s| s.sid + 1).max().unwrap_or(1))
+            .max(1);
+        self.scopes = Some(scopes.into_iter().map(Scope::sane).collect());
         self.layers.truncate(MAX_LAYERS);
         self.next_lid = self
             .next_lid

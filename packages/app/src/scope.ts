@@ -117,9 +117,18 @@ export interface ScopeSettings {
 }
 
 /** A world-anchored scope instrument: a rect in GRID units plus the settings
- * and channel selection it carries. Client-local state (main.ts owns the
- * array), but panel.ts needs the shape too — a scope whose rect sits inside a
- * control-panel region is rendered as a widget in that panel's window. */
+ * and channel selection it carries.
+ *
+ * ROOM STATE, like panels and probes: the server owns the list, its `scopes`
+ * broadcast is the truth, and main.ts holds the mirror. It used to be
+ * per-browser state in `localStorage`, which looked like replication only
+ * because two tabs of one browser share the store — two actual players never
+ * saw each other's instruments move.
+ *
+ * `set` still carries two fields that are NOT replicated (`auto`, the
+ * autoscale hysteresis, and `lastTrigger`): they are per-frame render state,
+ * they legitimately differ between clients, and `applyWireScope` preserves
+ * this client's copy of them across every broadcast. */
 export interface FloatScope {
   sid: number;
   x: number;
@@ -153,6 +162,218 @@ export function defaultScopeSettings(timebase = 5): ScopeSettings {
   };
 }
 
+/** A finite number inside `[lo, hi]`, or `dflt` when it is neither. Every
+ * geometry field off the wire or out of a template goes through this: both
+ * are hand-editable, and neither gets to place an unusable instrument. */
+const clampNum = (v: unknown, lo: number, hi: number, dflt: number): number =>
+  typeof v === 'number' && Number.isFinite(v) ? Math.max(lo, Math.min(hi, v)) : dflt;
+
+// ------------------------------------------------------- the shared bench
+//
+// Scopes travel exactly the way panels do, and they were made to travel that
+// way rather than getting a mechanism of their own:
+//
+//   1. the client sends an op            (`sendScope`, below / net.ts)
+//   2. the server applies it to the room (`apply_scope_op`)
+//   3. the server BROADCASTS the list    (`{"t":"scopes","list":[...]}`)
+//   4. every client applies the list     (`applyWireScopes`)
+//
+// Step 1 was the missing one: nothing about a scope had ever left the
+// browser, so there was no step 2 to broadcast from.
+//
+// The ECHO — the originator receiving its own change back — is handled the
+// way the machine drag already handles it: whoever is holding the pointer
+// owns the geometry until they let go, so a 60 ms-old rect from the server
+// cannot snap the instrument backwards under the cursor. See `holdRect` in
+// `applyWireScopes`.
+
+/** The replicated half of `ScopeSettings`: everything but the two live
+ * render fields. Exactly the server's `ScopeSet`. */
+export type WireScopeSet = Omit<ScopeSettings, 'lastTrigger' | 'auto'>;
+
+/** A scope as the server stores and broadcasts it. */
+export interface WireScope {
+  sid: number;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  set: WireScopeSet;
+  pids: number[] | null;
+}
+
+/** The four things a player can do to an instrument. `rect` and `set` are
+ * absolute writes, so a drag may throttle its stream and send only the
+ * latest. */
+export type ScopeOp =
+  | { t: 'add'; x: number; y: number; w: number; h: number; set: WireScopeSet; pids: number[] | null }
+  | { t: 'remove'; sid: number }
+  | { t: 'rect'; sid: number; x: number; y: number; w: number; h: number }
+  | { t: 'set'; sid: number; set: WireScopeSet; pids: number[] | null };
+
+/** The settings that replicate, without the two that do not. */
+export function wireScopeSet(s: ScopeSettings): WireScopeSet {
+  return {
+    timebase: s.timebase,
+    yMode: s.yMode,
+    yStep: s.yStep,
+    yOffset: s.yOffset,
+    trigMode: s.trigMode,
+    trigSlope: s.trigSlope,
+    trigLevel: s.trigLevel,
+    trigAutoLevel: s.trigAutoLevel,
+    trigSource: s.trigSource,
+  };
+}
+
+/** "Retune this instrument to what it looks like right now." The op a caller
+ * sends after mutating a scope's settings or channels in place. */
+export const scopeSetOp = (s: FloatScope): ScopeOp => ({
+  t: 'set',
+  sid: s.sid,
+  set: wireScopeSet(s.set),
+  pids: s.pids,
+});
+
+export const scopeRectOp = (s: FloatScope): ScopeOp => ({
+  t: 'rect',
+  sid: s.sid,
+  x: s.x,
+  y: s.y,
+  w: s.w,
+  h: s.h,
+});
+
+/** Write the replicated settings into a live settings object, leaving this
+ * client's autoscale hysteresis and trigger latch alone. */
+function applyWireSet(dst: ScopeSettings, src: Partial<WireScopeSet> | undefined) {
+  const w = src ?? {};
+  const num = (v: unknown, d: number) => (typeof v === 'number' && Number.isFinite(v) ? v : d);
+  dst.timebase = clampNum(w.timebase, 0.001, 60, dst.timebase);
+  dst.yMode = w.yMode === 'manual' ? 'manual' : 'auto';
+  dst.yStep = num(w.yStep, dst.yStep);
+  dst.yOffset = num(w.yOffset, dst.yOffset);
+  dst.trigMode =
+    w.trigMode === 'auto' || w.trigMode === 'normal' || w.trigMode === 'off' ? w.trigMode : 'off';
+  dst.trigSlope = w.trigSlope === 'falling' ? 'falling' : 'rising';
+  dst.trigLevel = num(w.trigLevel, dst.trigLevel);
+  dst.trigAutoLevel = w.trigAutoLevel !== false;
+  dst.trigSource = Math.max(0, Math.round(num(w.trigSource, dst.trigSource)));
+}
+
+const wirePids = (p: unknown): number[] | null =>
+  Array.isArray(p) ? p.filter((x): x is number => typeof x === 'number' && Number.isFinite(x)) : null;
+
+/** A broadcast scope this client has never seen: a fresh instrument, with a
+ * FRESH settings object (the live Maps must never be shared between two). */
+function wireToScope(w: WireScope): FloatScope {
+  const set = defaultScopeSettings();
+  applyWireSet(set, w.set);
+  return {
+    sid: w.sid,
+    x: clampNum(w.x, -1e6, 1e6, 0),
+    y: clampNum(w.y, -1e6, 1e6, 0),
+    w: clampNum(w.w, 2, 400, 12),
+    h: clampNum(w.h, 2, 400, 6),
+    set,
+    pids: wirePids(w.pids),
+  };
+}
+
+/**
+ * Fold the server's scope list into the client's, IN PLACE where an
+ * instrument already exists: object identity survives, so a live drag, a
+ * panel widget and this client's autoscale state all keep pointing at the
+ * same scope they did before the message arrived.
+ *
+ * `held` is the echo guard, and it is the whole reason this is a merge rather
+ * than an assignment. A drag sends one op per 60 ms and gets every one of
+ * them back; applying our own confirmation of where the pointer WAS fights
+ * the pointer where it IS, and the instrument stutters backwards under the
+ * cursor. So whoever is holding a scope owns that half of its state until
+ * they let go, and the trailing op they send on release is what reconciles
+ * the two. Same bargain `onDoc` strikes for a machine drag.
+ *
+ * Split in two because the two halves are held by different gestures:
+ * `'rect'` by a pointer that is down, `'set'` by a wheel or a control click
+ * that has no pointer-up to wait for.
+ */
+export function applyWireScopes(
+  current: FloatScope[],
+  list: WireScope[],
+  held: (sid: number, what: 'rect' | 'set') => boolean,
+): FloatScope[] {
+  const byId = new Map(current.map((s) => [s.sid, s]));
+  return list
+    .filter((w) => w && typeof w.sid === 'number')
+    .map((w) => {
+      const cur = byId.get(w.sid);
+      if (!cur) return wireToScope(w);
+      if (!held(w.sid, 'rect')) {
+        cur.x = clampNum(w.x, -1e6, 1e6, cur.x);
+        cur.y = clampNum(w.y, -1e6, 1e6, cur.y);
+        cur.w = clampNum(w.w, 2, 400, cur.w);
+        cur.h = clampNum(w.h, 2, 400, cur.h);
+      }
+      if (!held(w.sid, 'set')) {
+        applyWireSet(cur.set, w.set);
+        cur.pids = wirePids(w.pids);
+      }
+      return cur;
+    });
+}
+
+/**
+ * The server's `apply_scope_op`, in TypeScript, for the OFFLINE client — the
+ * same deal `applyPanelOp` and `applyLayerOp` strike. One set of rules, run
+ * on the server when there is one and locally when there is not.
+ */
+export function applyScopeOp(
+  scopes: FloatScope[],
+  op: ScopeOp,
+  mintSid: () => number,
+): FloatScope[] {
+  switch (op.t) {
+    case 'add': {
+      if (scopes.length >= 32) return scopes;
+      const set = defaultScopeSettings();
+      applyWireSet(set, op.set);
+      return [
+        ...scopes,
+        {
+          sid: mintSid(),
+          x: clampNum(op.x, -1e6, 1e6, 0),
+          y: clampNum(op.y, -1e6, 1e6, 0),
+          w: clampNum(op.w, 2, 400, 12),
+          h: clampNum(op.h, 2, 400, 6),
+          set,
+          pids: op.pids ? [...op.pids] : null,
+        },
+      ];
+    }
+    case 'remove':
+      return scopes.filter((s) => s.sid !== op.sid);
+    case 'rect': {
+      const s = scopes.find((x) => x.sid === op.sid);
+      if (s) {
+        s.x = clampNum(op.x, -1e6, 1e6, s.x);
+        s.y = clampNum(op.y, -1e6, 1e6, s.y);
+        s.w = clampNum(op.w, 2, 400, s.w);
+        s.h = clampNum(op.h, 2, 400, s.h);
+      }
+      return scopes;
+    }
+    case 'set': {
+      const s = scopes.find((x) => x.sid === op.sid);
+      if (s) {
+        applyWireSet(s.set, op.set);
+        s.pids = op.pids ? [...op.pids] : null;
+      }
+      return scopes;
+    }
+  }
+}
+
 // ------------------------------------------------------------ seed scopes
 //
 // A room template ships the instruments it wants on screen. In-place scopes
@@ -172,9 +393,6 @@ export interface SeedScope {
   pids?: number[] | null;
   timebase?: number;
 }
-
-const clampNum = (v: unknown, lo: number, hi: number, dflt: number): number =>
-  typeof v === 'number' && Number.isFinite(v) ? Math.max(lo, Math.min(hi, v)) : dflt;
 
 /** A seed → a real instrument. A template file is hand-editable, so treat
  * every field as untrusted: clamp the geometry and build a FRESH settings

@@ -2,10 +2,12 @@
   "$comment": [
     "THE `hello` CONTRACT, asserted from both ends.",
     "",
-    "`hello` is the only message that carries a whole room, and four of the",
+    "`hello` is the only message that carries a whole room, and five of the",
     "things a template promises ride on it: the parts, the panels, the camera",
-    "(view.home) and the instruments (view.scopes) — plus whether the room has",
-    "a goal at all (machine). Two of those once went missing for a release,",
+    "(view.home), the instruments the room was SEEDED with (view.scopes) and",
+    "the instruments it actually HAS (scopes, room state like panels) — plus",
+    "whether the room has a goal at all (machine). Two of those once went",
+    "missing for a release,",
     "because the server wrote `view` and `machine` beside `room` while the",
     "client forwarded `room` alone as its RoomHello. Both halves compiled. The",
     "TypeScript interface declared the fields it never received.",
@@ -38,6 +40,7 @@
     "elements": "array",
     "probes": "array",
     "panels": "array",
+    "scopes": "array",
     "room": "object",
     "room.id": "string",
     "room.name": "string",
@@ -91,6 +94,27 @@
       { "pid": 2, "elem": 901, "pin": 1, "kind": "v", "r": null }
     ],
     "panels": [{ "plid": 1, "name": "DRIVE", "x0": 26, "y0": 4, "x1": 44, "y1": 20 }],
+    "scopes": [
+      {
+        "sid": 1,
+        "x": 26,
+        "y": 22,
+        "w": 18,
+        "h": 9,
+        "set": {
+          "timebase": 0.5,
+          "yMode": "auto",
+          "yStep": 1.0,
+          "yOffset": 0.0,
+          "trigMode": "off",
+          "trigSlope": "rising",
+          "trigLevel": 0.0,
+          "trigAutoLevel": true,
+          "trigSource": 0
+        },
+        "pids": [1, 2]
+      }
+    ],
     "room": {
       "id": "7AWF4N",
       "name": "Hoist practice",
