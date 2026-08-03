@@ -384,32 +384,46 @@ function scopeOp(op: ScopeOp) {
 // replicate. Two of those ways are STREAMS, not clicks — the timebase wheel
 // and a dragged trigger level — which is why this looks like the drag path
 // rather than like a plain send.
-let retuneAt = 0;
-let retunePending: FloatScope | null = null;
-let retuneTimer = 0;
+/** Per-scope throttle state. KEYED BY SID, and that is the whole point: one
+ * shared slot meant that retuning scope 1 and then touching scope 2 inside
+ * the same 80 ms window overwrote scope 1's pending op with scope 2's, and
+ * scope 1's last notch was silently dropped. It converged — the broadcast is
+ * the whole list, so the very op that caused the loss re-synced the scope it
+ * lost — but "one notch of a fast two-scope flick doesn't take" is still a
+ * lie told to the player's fingers. A stream per instrument needs a slot per
+ * instrument. */
+type Retune = { at: number; pending: FloatScope | null; timer: number };
+const retune = new Map<number, Retune>();
 /** The scope whose SETTINGS this client is currently in the middle of
  * changing, and until when. A wheel gesture has no pointer-up to end it, so
  * the hold is a short window past the last change rather than a flag. */
 let retuneHeld: { sid: number; until: number } | null = null;
 
 /** Send this scope's settings and channel list as they stand now: at most one
- * op per 60 ms, and always one more after the last change, because the value
- * the player meant is the one they stopped on. */
+ * op per 60 ms PER SCOPE, and always one more after the last change, because
+ * the value the player meant is the one they stopped on. */
 function scopeRetuned(s: FloatScope) {
   const now = performance.now();
   retuneHeld = { sid: s.sid, until: now + 250 };
-  if (now - retuneAt > 60) {
-    retuneAt = now;
+  let r = retune.get(s.sid);
+  if (!r) {
+    r = { at: 0, pending: null, timer: 0 };
+    retune.set(s.sid, r);
+  }
+  if (now - r.at > 60) {
+    r.at = now;
     scopeOp(scopeSetOp(s));
     return;
   }
-  retunePending = s;
-  if (!retuneTimer) {
-    retuneTimer = window.setTimeout(() => {
-      retuneTimer = 0;
-      retuneAt = performance.now();
-      if (retunePending) scopeOp(scopeSetOp(retunePending));
-      retunePending = null;
+  r.pending = s;
+  if (!r.timer) {
+    r.timer = window.setTimeout(() => {
+      const cur = retune.get(s.sid);
+      if (!cur) return;
+      cur.timer = 0;
+      cur.at = performance.now();
+      if (cur.pending) scopeOp(scopeSetOp(cur.pending));
+      cur.pending = null;
     }, 80);
   }
 }
@@ -1359,7 +1373,14 @@ const panelHost = new PanelHost({
   probes: () => probes,
   traces: () => traces,
   scopes: () => floatScopes,
-  removeScope: (sid) => scopeOp({ t: 'remove', sid }),
+  removeScope: (sid) => {
+    // Drop the throttle slot with the scope, or a closed instrument leaves a
+    // pending timer that fires an op for a sid the room no longer has.
+    const r = retune.get(sid);
+    if (r?.timer) window.clearTimeout(r.timer);
+    retune.delete(sid);
+    scopeOp({ t: 'remove', sid });
+  },
   // A widget retuned an instrument (control row, timebase wheel, channel
   // button). Same op the canvas sends, so the two surfaces cannot drift.
   scopeChanged: scopeRetuned,
