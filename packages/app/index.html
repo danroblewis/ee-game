@@ -201,8 +201,8 @@
       }
       .pwin-dock:hover { color: #8ee7ff; }
       .pwin-shut ~ .pwin-x { margin-left: 0; }
-      .pwin.shut .pwin-body, .pwin.shut .pwin-hint { display: none; }
-      .pwin.shut .pwin-hd { border-bottom: none; border-radius: 7px; }
+      .pwin.shut .pwin-body, .pwin.empty .pwin-body { display: none; }
+      .pwin.shut .pwin-hd, .pwin.empty .pwin-hd { border-bottom: none; border-radius: 7px; }
       .pwin {
         position: absolute; pointer-events: auto; width: 300px; color: #c9d6de;
         font: 12px/1.5 ui-monospace, monospace;
@@ -211,7 +211,7 @@
         box-shadow: 0 10px 28px #000a, inset 0 1px 0 #ffffff14;
       }
       .pwin-hd {
-        display: flex; align-items: center; gap: 6px; padding: 5px 6px 5px 8px;
+        display: flex; align-items: center; gap: 6px; padding: 1px 6px 1px 8px;
         cursor: move; border-bottom: 1px solid #2c343d;
         background: linear-gradient(#2b323c, #212730);
         border-radius: 7px 7px 0 0; position: relative;
@@ -220,7 +220,7 @@
       /* The name field is sized to its text by panel.ts (never flex: 1), so
          the header space to its right is real, grabbable title bar. */
       .pwin-title, .pwin-mez {
-        font: 600 12px ui-monospace, monospace; letter-spacing: 0.08em;
+        font: 600 11px ui-monospace, monospace; letter-spacing: 0.08em;
         text-transform: uppercase;
       }
       .pwin-title {
@@ -243,7 +243,6 @@
       }
       .pwin-x:hover { color: #ff8f8f; }
       .pwin-body { padding: 4px 0; }
-      .pwin-hint { display: none; padding: 6px 10px 9px; color: #6d7d89; font-size: 11px; }
       .prow {
         display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
         padding: 4px 8px 4px 4px; border-bottom: 1px solid #232a32;

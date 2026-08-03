@@ -430,7 +430,20 @@ let LS = 'eepanel';
 
 /** Point the panel prefs at a room. Called from `resetForRoom`. */
 export function setPanelRoom(code: string | null) {
-  LS = code ? `eepanel:${code}` : 'eepanel';
+  const next = code ? `eepanel:${code}` : 'eepanel';
+  if (next === LS) return;
+  LS = next;
+  // Drop the cached rails so the next `ensureRails()` reads THIS room's saved
+  // layout. They were built from whichever prefix was current when the first
+  // panel arrived — and `hello` lands after boot, so that is the un-scoped
+  // one. Without this the rails keep an empty default, every write goes to
+  // the room-scoped key, and a docked layout is saved correctly and then
+  // never read back: panels float again on every reload.
+  //
+  // `buildRail` is idempotent (it reuses `#rail-<side>` and its children by
+  // id), so this re-reads prefs without orphaning DOM or the windows already
+  // parented into a rail list.
+  rails = null;
 }
 
 const lsGet = (key: string): string | null => {
@@ -1298,7 +1311,6 @@ class PanelWindow {
   readonly el: HTMLDivElement;
   private title: HTMLInputElement;
   private body: HTMLDivElement;
-  private hint: HTMLDivElement;
   private hd: HTMLDivElement;
   private grab: HTMLSpanElement;
   private close: HTMLButtonElement;
@@ -1382,12 +1394,7 @@ class PanelWindow {
 
     this.body = document.createElement('div');
     this.body.className = 'pwin-body';
-    this.hint = document.createElement('div');
-    this.hint.className = 'pwin-hint';
-    this.hint.textContent =
-      'no controls in this region — enclose a pot, switch, lamp, LED, DC source, ' +
-      'probe or oscilloscope';
-    this.el.append(hd, this.body, this.hint);
+    this.el.append(hd, this.body);
     host.root.appendChild(this.el);
 
     const pos = readPos(plid);
@@ -1755,7 +1762,10 @@ class PanelWindow {
       this.rebuild(specs);
     }
     for (const w of this.widgets.values()) w.update(ctx);
-    this.hint.style.display = this.widgets.size === 0 ? 'block' : 'none';
+    // Nothing to control: show the title bar and nothing else. This is
+    // rendering state, NOT the player's own shut/open choice (`:shut`), so a
+    // panel they left open springs back the moment a part lands inside it.
+    this.el.classList.toggle('empty', this.widgets.size === 0);
   }
 
   /** Member set changed: re-lay the rows, honoring the saved drag order and
@@ -2258,6 +2268,26 @@ export class PanelHost implements WinHost {
     for (const p of panels) {
       let w = this.wins.get(p.plid);
       if (!w) {
+        // A region this browser has never met opens DOCKED, in the left rail:
+        // a panel you just drew should land somewhere you can see it, not as
+        // one more floating window over the schematic.
+        //
+        // `:seen` records only that we have met the panel — the two `order`
+        // arrays stay the single truth about WHERE its window lives. Without
+        // it, a panel deliberately undocked to float (which removes it from
+        // both arrays) would read as new again on the next reload and get
+        // re-docked under the player.
+        if (lsGet(`${p.plid}:seen`) !== '1') {
+          lsSet(`${p.plid}:seen`, '1');
+          const R = ensureRails();
+          if (!R.left.order.includes(p.plid) && !R.right.order.includes(p.plid)) {
+            R.left.order.push(p.plid);
+            // Docking into a rail the player has shut would file the new
+            // panel out of sight, which reads as "nothing happened".
+            R.left.open = true;
+            writeRailPrefs(R.left);
+          }
+        }
         w = new PanelWindow(p.plid, this.deps, this);
         this.wins.set(p.plid, w);
         churn = true;
