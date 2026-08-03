@@ -2734,14 +2734,29 @@ mod tests {
 
     impl HoistRun {
         fn new(player_circuit: Vec<ElementSpec>) -> Self {
-            let mut elems = hoist_fixture();
+            let fixture = hoist_fixture();
+            let mut elems = fixture.clone();
             elems.extend(player_circuit);
             // Every hoist run is a document a player could have placed, so
             // it has to pass the same gate a placement does. This is what
             // keeps the placement gate honest about the ONE circuit the game
             // is built to teach: tighten the gate and break the intended
             // solution, and this fails before the win test even runs.
-            assert_eq!(check_room_doc(&elems), Ok(()), "the run must be placeable");
+            // The EDIT gate, not just the document gate -- `check_room_edit`
+            // is what a placement actually runs, and it is the one that
+            // enforces rigid geometry. The fixture is passed as `before` so
+            // the machine's own collinear sensor pot (#901, drawn by the
+            // package renderer rather than placed) stays grandfathered.
+            //
+            // This assertion was previously `check_room_doc`, which does NOT
+            // check geometry -- so when rigid parts landed, the intended
+            // solution silently stopped being placeable and this guard, whose
+            // whole purpose is to catch exactly that, did not fire.
+            assert_eq!(
+                check_room_edit(&fixture, &elems),
+                Ok(()),
+                "the run must be placeable by a player"
+            );
             let sources = source_ids(&elems);
             let mut eng = Engine::new(DT);
             eng.set_elements(&elems);
@@ -2974,9 +2989,25 @@ mod tests {
         let (sa, sw, sb) = (sensor.pins[0], sensor.pins[1], sensor.pins[2]);
         let (sup_p, sup_n) = ((sa.0 - 17, sa.1), (sb.0 - 17, sb.1));
         let (ref_p, ref_n) = ((sa.0 - 17, sa.1 + 8), (sa.0 - 17, sa.1 + 12));
+        // The comparator's two NET points -- where the setpoint and the wiper
+        // arrive -- and, separately, the op-amp's own terminals.
+        //
+        // These used to be the same points, which put the op-amp's inputs SIX
+        // units apart. That was a skewed symbol, and once multi-pin parts
+        // became rigid it stopped being placeable: the one circuit this goal
+        // exists to teach was no longer drawable by a player. The symbol is
+        // canonical now (inputs 2 apart, output at the tip) and two short
+        // wires reach out to the original nodes -- which is exactly what a
+        // player would have to do, so the test drives the real gesture.
+        //
+        // Mirrored on purpose: `+` sits BELOW `-` here because the setpoint
+        // enters from below. The reach wires then occupy disjoint spans of
+        // the same column (y+6..y+8 and y+2..y+4) instead of overlapping,
+        // which would have shorted the two inputs together.
+        let (net_p, net_m) = ((sa.0 - 9, sa.1 + 8), (sa.0 - 9, sa.1 + 2));
         let (in_p, in_m, out) = (
-            (sa.0 - 9, sa.1 + 8),
-            (sa.0 - 9, sa.1 + 2),
+            (sa.0 - 9, sa.1 + 6),
+            (sa.0 - 9, sa.1 + 4),
             (sa.0 - 5, sa.1 + 5),
         );
         // Power stage, to the right of the terminal column.
@@ -2997,7 +3028,8 @@ mod tests {
             // Setpoint: 3.2 V = 4 V · (0.32 / 0.40).
             spec(5, dc(3.2), ref_p, ref_n),
             gnd(6, ref_n),
-            spec(7, K::Wire, ref_p, in_p),
+            spec(7, K::Wire, ref_p, net_p),
+            spec(22, K::Wire, net_p, in_p),
             // Comparator: in+ = setpoint, in- = wiper. Its output goes to a
             // GATE, not to the motor: 25 mA cannot lift a crate, and the
             // gate of a MOSFET draws exactly none.
@@ -3011,7 +3043,8 @@ mod tests {
                 in_m,
                 out,
             ),
-            spec(9, K::Wire, in_m, sw),
+            spec(9, K::Wire, net_m, sw),
+            spec(23, K::Wire, net_m, in_m),
             spec(10, K::Wire, out, corner),
             spec(11, K::Wire, corner, gate),
             // ---- muscle: 12 V through the motor, low-side switched by a
@@ -4557,9 +4590,13 @@ mod tests {
         let (sa, sw, sb) = (sensor.pins[0], sensor.pins[1], sensor.pins[2]);
         let (sup_p, sup_n) = ((sa.0 - 17, sa.1), (sb.0 - 17, sb.1));
         let (ref_p, ref_n) = ((sa.0 - 17, sa.1 + 8), (sa.0 - 17, sa.1 + 12));
+        // Canonical symbol + two reach wires, for the same reason as
+        // `comparator_feedback_circuit` -- a player has to be able to draw
+        // the circuit a test claims they can draw.
+        let (net_p, net_m) = ((sa.0 - 9, sa.1 + 8), (sa.0 - 9, sa.1 + 2));
         let (in_p, in_m, out) = (
-            (sa.0 - 9, sa.1 + 8),
-            (sa.0 - 9, sa.1 + 2),
+            (sa.0 - 9, sa.1 + 6),
+            (sa.0 - 9, sa.1 + 4),
             (sa.0 - 5, sa.1 + 5),
         );
         let mut run = HoistRun::new(vec![
@@ -4569,7 +4606,9 @@ mod tests {
             spec(4, K::Wire, sup_n, sb),
             spec(5, dc(3.2), ref_p, ref_n),
             gnd(6, ref_n),
-            spec(7, K::Wire, ref_p, in_p),
+            spec(7, K::Wire, ref_p, net_p),
+            spec(13, K::Wire, net_p, in_p),
+            spec(14, K::Wire, net_m, in_m),
             spec3(
                 8,
                 K::OpAmp {
@@ -4580,7 +4619,7 @@ mod tests {
                 in_m,
                 out,
             ),
-            spec(9, K::Wire, in_m, sw),
+            spec(9, K::Wire, net_m, sw),
             spec(10, K::Wire, out, mp), // straight into the motor
             spec(11, K::Wire, mm, (mm.0 - 5, mm.1)),
             gnd(12, (mm.0 - 5, mm.1)),

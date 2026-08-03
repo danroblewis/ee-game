@@ -53,6 +53,27 @@ use crate::netlist::{ElementKind, Point};
 /// started still gets [`DEFAULT_LEN`].
 pub const MIN_LEN: i32 = 1;
 
+/// Farthest from the origin a pin may sit and still be considered as a rigid
+/// body at all. Nothing to do with how big a world may be — it is a guard on
+/// the ARITHMETIC. `apply` negates a coordinate to undo a D4 transform, and
+/// `-i32::MIN` overflows; the subtractions in `decompose` overflow long before
+/// that. A billion grid units is ~10^7 screens wide at full zoom, so no
+/// reachable placement is anywhere near it, and a pin beyond it is not a
+/// canonical part under any reading. Bounding here keeps every downstream
+/// difference and negation in range without threading `Option` through the
+/// whole module.
+pub const MAX_ABS_COORD: i32 = 1_000_000_000;
+
+/// Is every coordinate inside [`MAX_ABS_COORD`]?
+///
+/// Range-compared rather than `abs()`-compared, because `i32::MIN.abs()`
+/// panics — the exact class of bug this guard exists to prevent, and it was
+/// written that way first.
+fn coords_sane(pins: &[Point]) -> bool {
+    let ok = |v: i32| (-MAX_ABS_COORD..=MAX_ABS_COORD).contains(&v);
+    pins.iter().all(|p| ok(p.0) && ok(p.1))
+}
+
 /// Axial length a degenerate (zero-length) placement drag lands on, so that
 /// clicking once still puts a readable symbol down.
 pub const DEFAULT_LEN: i32 = 3;
@@ -367,28 +388,45 @@ impl Placement {
 /// once per changed element per edit; there is nothing here worth being
 /// clever about.
 pub fn decompose(shape: Shape, pins: &[Point]) -> Option<Placement> {
-    if !shape.is_rigid_family() || pins.len() != shape.pins() {
+    if !shape.is_rigid_family() || pins.len() != shape.pins() || !coords_sane(pins) {
         return None;
     }
     for (ti, m) in D4.iter().enumerate() {
         // Undo the transform, then read the layout's own free parameter
         // straight off the part frame.
         let q: Vec<Point> = pins.iter().map(|&p| apply_inv(m, p)).collect();
+        // CHECKED, because these are player-supplied coordinates arriving from
+        // the wire and `sim-core` must never panic on hostile input. An op
+        // crafted with pins near the i32 extremes used to panic a debug server
+        // — killing the room's tick worker, so the room silently stopped
+        // applying edits with the socket still open — and in release it
+        // wrapped, which is worse: the wrapped difference could pass for a
+        // legal length and mint a distorted part. Overflow simply means "not
+        // this transform": a part spanning two billion grid units is not a
+        // canonical placement under any reading.
         let len = if shape.sized() {
             let l = match shape {
-                Shape::Transistor => q[1].0 - q[0].0,
-                _ => q[2].0 - q[0].0,
+                Shape::Transistor => q[1].0.checked_sub(q[0].0),
+                _ => q[2].0.checked_sub(q[0].0),
             };
-            if l < MIN_LEN {
-                continue;
+            match l {
+                Some(l) if l >= MIN_LEN => l,
+                _ => continue,
             }
-            l
         } else {
             0
         };
         let b = base(shape, len);
-        let off = (q[0].0 - b[0].0, q[0].1 - b[0].1);
-        if (0..shape.pins()).all(|i| q[i] == (b[i].0 + off.0, b[i].1 + off.1)) {
+        let Some(off) = q[0].0.checked_sub(b[0].0).zip(q[0].1.checked_sub(b[0].1)) else {
+            continue;
+        };
+        if (0..shape.pins()).all(|i| {
+            b[i]
+                .0
+                .checked_add(off.0)
+                .zip(b[i].1.checked_add(off.1))
+                .is_some_and(|e| q[i] == e)
+        }) {
             return Some(Placement {
                 transform: ti,
                 len,
@@ -423,12 +461,23 @@ pub fn same_body(a: &[Point], b: &[Point]) -> bool {
     if a.len() != b.len() || a.is_empty() {
         return a.len() == b.len();
     }
+    if !coords_sane(a) || !coords_sane(b) {
+        return false;
+    }
+    // Checked for the same reason as `decompose`: `a` and `b` are pin lists
+    // off the wire. Overflow means the two bodies are not a rigid motion apart
+    // — which is the honest answer, and never a panic.
     D4.iter().any(|m| {
         let r0 = apply(m, a[0]);
-        let t = (b[0].0 - r0.0, b[0].1 - r0.1);
+        let Some(t) = b[0].0.checked_sub(r0.0).zip(b[0].1.checked_sub(r0.1)) else {
+            return false;
+        };
         a.iter().zip(b.iter()).all(|(&p, &q)| {
             let r = apply(m, p);
-            (r.0 + t.0, r.1 + t.1) == q
+            r.0
+                .checked_add(t.0)
+                .zip(r.1.checked_add(t.1))
+                .is_some_and(|e| e == q)
         })
     })
 }
@@ -903,5 +952,50 @@ mod tests {
         let mut s = a.clone();
         s[2] = (8, 3);
         assert!(!same_body(&a, &s), "a different skew is a different body");
+    }
+}
+
+#[cfg(test)]
+mod hostile_coords {
+    use super::*;
+
+    /// `sim-core` must never panic on input off the wire. These pin lists are
+    /// what a crafted op can send; before the checked arithmetic they panicked
+    /// a debug build (killing the room's tick worker, so the room silently
+    /// stopped applying edits with its socket still open) and wrapped in a
+    /// release build, where a wrapped difference could pass for a legal length.
+    #[test]
+    fn extreme_coordinates_are_refused_not_panicked() {
+        let hostile: &[&[Point]] = &[
+            &[(0, -1), (0, 1), (i32::MAX, 0)],
+            &[(i32::MIN, -1), (i32::MIN, 1), (i32::MAX, 0)],
+            &[(i32::MIN, i32::MIN), (i32::MAX, i32::MAX), (0, 0)],
+            &[(i32::MAX, i32::MAX), (i32::MAX, i32::MIN), (i32::MIN, 0)],
+            &[(0, 0), (i32::MIN, -2), (i32::MIN, 2)],
+        ];
+        for pins in hostile {
+            for shape in [Shape::OpAmp, Shape::Transistor, Shape::Pot] {
+                // The only requirement is that it RETURNS.
+                let _ = decompose(shape, pins);
+            }
+            assert!(
+                !same_body(pins, pins) || pins.iter().all(|p| p.0.abs() <= MAX_ABS_COORD),
+                "an out-of-range body must not claim to be a rigid motion"
+            );
+        }
+    }
+
+    /// The guard must not touch anything a player can actually draw.
+    #[test]
+    fn ordinary_placements_are_untouched_by_the_bound() {
+        for shape in [Shape::OpAmp, Shape::Transistor, Shape::Pot, Shape::Ota] {
+            let pins = canonical_pins(shape, (0, 0), (4, 0));
+            assert!(decompose(shape, &pins).is_some(), "{shape:?} canonical must stay legal");
+            let far: Vec<Point> = pins.iter().map(|p| (p.0 + 900_000, p.1 - 750_000)).collect();
+            assert!(
+                decompose(shape, &far).is_some(),
+                "{shape:?} far from origin must stay legal"
+            );
+        }
     }
 }
