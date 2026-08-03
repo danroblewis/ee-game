@@ -35,6 +35,9 @@
 // signal with 15 Hz of bandwidth, whatever the hardware does. You can make
 // loudness dim a lamp; you cannot whistle a tone into a circuit. The UI says
 // so rather than letting players discover it.
+//
+// The microphone and gamepad providers are designed and measured but not
+// built: `docs/design_external-inputs.md`.
 
 import type { ElementSpec, Point } from './circuit';
 import type { Camera } from './render';
@@ -158,15 +161,27 @@ export interface Aperture {
 }
 
 /** Every photocell sitting on `layer`, as apertures. Pure geometry, computed
- *  from the live document: no stored binding exists to go stale. */
-export function aperturesOn(layer: Layer, elements: ElementSpec[], out: Aperture[]): Aperture[] {
+ *  from the live document: no stored binding exists to go stale.
+ *
+ *  `all` is the WHOLE layer list, not a courtesy: the server decides which
+ *  layer owns a part with `layer_under` over every layer in the room, and
+ *  drops a reading whose layer is not the one the sender claimed. Testing
+ *  membership against `layer` alone made the client disagree the moment two
+ *  layers overlapped — it sampled and sent, the server discarded every
+ *  frame, and nothing anywhere said so. Same rule, same answer. */
+export function aperturesOn(
+  layer: Layer,
+  all: Layer[],
+  elements: ElementSpec[],
+  out: Aperture[],
+): Aperture[] {
   out.length = 0;
   const w = layer.x1 - layer.x0;
   const h = layer.y1 - layer.y0;
   if (w <= 0 || h <= 0) return out;
   for (const e of elements) {
     if (e.kind.t !== 'Photocell') continue;
-    if (layerUnder([layer], e) === null) continue;
+    if (layerUnder(all, e)?.lid !== layer.lid) continue;
     const [ax0, ay0, ax1, ay1] = apertureOf(e);
     out.push({
       id: e.id,
@@ -183,6 +198,48 @@ export function aperturesOn(layer: Layer, elements: ElementSpec[], out: Aperture
 
 const LABEL_FONT = '12px ui-monospace, SFMono-Regular, monospace';
 
+/** The name plate's geometry, in screen pixels. */
+const PLATE_PAD = 6;
+const PLATE_H = 20;
+const PLATE_MAX_W = 260;
+
+/**
+ * THE PLATE, computed ONCE for both the drawing and the hit test.
+ *
+ * It used to be pinned to the layer's own top-left corner, which meant that
+ * zooming in far enough to aim a camera scrolled the only clickable thing in
+ * the feature off the top of the screen: the layer filled the viewport, the
+ * player clicked it, and nothing happened, forever. So the plate is STICKY —
+ * it rides the visible part of the rectangle, the way a table header does, and
+ * is reachable whenever any of the layer is.
+ *
+ * Returns null when the visible sliver is too small to hold a legible plate;
+ * callers must then say something rather than leave a dead target.
+ */
+export function layerPlateRect(
+  cam: Camera,
+  l: Layer,
+  viewW: number,
+  viewH: number,
+  viewTop = 0,
+): [number, number, number, number] | null {
+  const X = cam.ox + l.x0 * cam.scale;
+  const Y = cam.oy + l.y0 * cam.scale;
+  const X1 = cam.ox + l.x1 * cam.scale;
+  const Y1 = cam.oy + l.y1 * cam.scale;
+  // The layer's box clipped to the screen: what the player can actually see.
+  // `viewTop` keeps it out from under the HUD rail — a button hidden behind
+  // an overlay is the same dead button as one scrolled off the top.
+  const vx0 = Math.max(X, 0);
+  const vy0 = Math.max(Y, viewTop);
+  const vx1 = Math.min(X1, viewW);
+  const vy1 = Math.min(Y1, viewH);
+  if (vx1 - vx0 < 48 || vy1 - vy0 < PLATE_H + PLATE_PAD) return null;
+  const w = Math.min(PLATE_MAX_W, vx1 - vx0 - 2 * PLATE_PAD);
+  if (w < 40) return null;
+  return [vx0 + PLATE_PAD, vy0 + PLATE_PAD, w, PLATE_H];
+}
+
 /** Draw the sensor layers under the schematic: a dashed frame, the video (if
  *  this client is the one driving it) letterboxed inside, and a name plate
  *  that always says who is behind it. `preview` is the driving client's own
@@ -195,6 +252,14 @@ export function drawSensorLayers(
   me: number,
   preview: HTMLVideoElement | null,
   hotLid: number | null,
+  viewW: number,
+  viewH: number,
+  viewTop = 0,
+  /** MY camera is up but no frame has arrived for a while. A track can sit
+   *  at `readyState: "live"` forever and send nothing, and a plate reading
+   *  "● LIVE" over a black rectangle is a false statement, not a missing
+   *  one. Only ever true for the layer this client drives. */
+  stalled = false,
 ) {
   if (layers.length === 0) return;
   ctx.save();
@@ -235,21 +300,30 @@ export function drawSensorLayers(
     ctx.stroke();
     ctx.setLineDash([]);
 
-    if (H > 26 && W > 90) {
+    // The plate is the button. It is drawn from the SAME rectangle the hit
+    // test uses, so "I clicked it and nothing happened" cannot come back.
+    const plate = layerPlateRect(cam, l, viewW, viewH, viewTop);
+    if (plate) {
+      const [px, py, pw, ph] = plate;
       const label = live
-        ? `● LIVE — ${l.name}`
-        : driver !== undefined
+        ? stalled
+          ? `● NO FRAMES — ${l.name} — click to stop`
+          : `● LIVE — ${l.name} — click to stop`
+        : driver !== undefined && !mine
           ? `${l.name} — driven by player ${driver}`
-          : `${l.name} — UNCLAIMED`;
-      const tw = ctx.measureText(label).width + 14;
-      ctx.fillStyle = live ? '#3a1216' : '#12222a';
-      roundRectPath(ctx, X + 6, Y + 6, Math.min(tw, W - 12), 20, 5);
+          : `▶ ${l.name} — click for camera`;
+      const hot = l.lid === hotLid;
+      ctx.fillStyle = live ? '#3a1216' : hot ? '#1d3d4a' : '#12222a';
+      roundRectPath(ctx, px, py, pw, ph, 5);
       ctx.fill();
+      ctx.strokeStyle = live ? '#ff5a5a' : hot ? '#8ee7ff' : '#3d6a7c';
+      ctx.lineWidth = 1;
+      ctx.stroke();
       ctx.fillStyle = live ? '#ff9c9c' : '#9fc4d4';
       ctx.save();
-      roundRectPath(ctx, X + 6, Y + 6, Math.min(tw, W - 12), 20, 5);
+      roundRectPath(ctx, px, py, pw, ph, 5);
       ctx.clip();
-      ctx.fillText(label, X + 13, Y + 17);
+      ctx.fillText(label, px + 7, py + ph / 2 + 1);
       ctx.restore();
     }
     // Said out loud, on the layer, because a player placing a camera-driven
@@ -285,19 +359,37 @@ export function drawLayerGhost(
   ctx.restore();
 }
 
-/** Hit-test a layer's name plate (the grab handle for move/close). */
+/** Hit-test a layer's name plate — the one control the feature has. Shares
+ *  `layerPlateRect` with the draw, so the button is exactly where it looks. */
 export function layerPlateAt(
   cam: Camera,
   layers: Layer[],
   x: number,
   y: number,
+  viewW: number,
+  viewH: number,
+  viewTop = 0,
 ): Layer | null {
+  for (let k = layers.length - 1; k >= 0; k--) {
+    const l = layers[k]!;
+    const p = layerPlateRect(cam, l, viewW, viewH, viewTop);
+    if (!p) continue;
+    if (x >= p[0] && x <= p[0] + p[2] && y >= p[1] && y <= p[1] + p[3]) return l;
+  }
+  return null;
+}
+
+/** Hit-test a layer's BODY. Used only to answer a click that would otherwise
+ *  have done nothing at all: a player who clicks the rectangle is asking
+ *  about the camera and has to be told something. */
+export function layerAt(cam: Camera, layers: Layer[], x: number, y: number): Layer | null {
   for (let k = layers.length - 1; k >= 0; k--) {
     const l = layers[k]!;
     const X = cam.ox + l.x0 * cam.scale;
     const Y = cam.oy + l.y0 * cam.scale;
-    const W = (l.x1 - l.x0) * cam.scale;
-    if (x >= X + 6 && x <= X + Math.min(260, W - 12) && y >= Y + 6 && y <= Y + 26) return l;
+    const X1 = cam.ox + l.x1 * cam.scale;
+    const Y1 = cam.oy + l.y1 * cam.scale;
+    if (x >= X && x <= X1 && y >= Y && y <= Y1) return l;
   }
   return null;
 }

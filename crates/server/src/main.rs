@@ -945,7 +945,9 @@ struct Panel {
 
 /// A SENSOR LAYER: a rectangle of the world that a player's browser points a
 /// real-world source at (a camera today; a microphone spectrum strip and a
-/// gamepad diagram are the same rectangle with a different provider).
+/// gamepad diagram are the same rectangle with a different provider — that
+/// design is measured and written down in `docs/design_external-inputs.md`,
+/// which is where the unbuilt half of this feature lives).
 ///
 /// Room state, exactly like `Panel`, and for the same reason: everybody has
 /// to see where the light is. Only the rectangle and the name are stored —

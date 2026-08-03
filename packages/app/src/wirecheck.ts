@@ -637,9 +637,24 @@ console.log('privacy — the client has no way to transmit media, and cannot gro
   }
   const calls = (sensorSrc.match(/getUserMedia\(/g) ?? []).length;
   check('exactly one getUserMedia call site', calls === 1, String(calls));
+  // A GUARD THAT CANNOT FAIL IS NOT A GUARD. This used to read
+  // `indexOf('async start(') < indexOf('getUserMedia(')`, and the day
+  // `async start()` became `start()` + `private async begin()` the left side
+  // turned into -1 — which is less than every index there is, so the
+  // assertion passed no matter where the call had moved, including module
+  // scope. Anchor on something that must exist, and PROVE it must exist.
+  const opener = /\n  (?:private )?(?:async )?(start|begin)\(/.exec(sensorSrc);
+  check('the camera opener is a method, and findable', opener !== null, String(opener?.[1]));
+  const openerAt = opener ? opener.index : -1;
   check(
-    'and it is inside start(), not at module scope',
-    sensorSrc.indexOf('async start(') < sensorSrc.indexOf('getUserMedia('),
+    'and getUserMedia is inside it, not at module scope',
+    openerAt >= 0 && openerAt < sensorSrc.indexOf('getUserMedia('),
+  );
+  // The call is reached only from a method, never from the top level: no
+  // line that calls it may start at column zero.
+  check(
+    'no getUserMedia call at top-level indentation',
+    !/^getUserMedia\(|^\s{0,3}(?:await )?navigator\.mediaDevices/m.test(sensorSrc),
   );
   // Comment-aware, like the scan above: sensor.ts's own prose says "never
   // `enabled = false`", and a mention is not a call site.

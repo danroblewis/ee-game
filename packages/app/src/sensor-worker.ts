@@ -127,7 +127,12 @@ function emit(w: number, h: number, stride: number, offset: number, t0: number) 
     outIds.push(a.id);
     outVs.push(meanLuma(a, w, h, stride, offset, layerAspect));
   }
-  if (outIds.length === 0) return;
+  // POSTED EVEN WHEN THERE IS NOTHING TO REPORT. It used to return here, so
+  // a camera with no photocell under it yet was indistinguishable — from the
+  // main thread — from a track delivering no frames at all. The main thread
+  // needs that difference to tell the player the truth about a dead device,
+  // and two empty arrays at 30 Hz cost nothing: no aperture was sampled, so
+  // `meanLuma` never ran.
   wk.postMessage({ t: 's', ids: outIds, vs: outVs, ms: performance.now() - t0 });
 }
 
