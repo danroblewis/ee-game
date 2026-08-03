@@ -5,11 +5,15 @@ import type { DocOp, ElementSpec, InteractOp } from './circuit';
 import type { MachineMsg } from './hoist';
 import type { Panel, PanelOp } from './panel';
 import type { Layer, LayerOp } from './layer';
-import type { Probe, SeedScope } from './scope';
+import type { Probe, ScopeOp, SeedScope, WireScope } from './scope';
 
-/** Where a room wants the camera, and which in-place scopes it ships with.
- * Both are client-local concerns, which is why they ride the hello rather
- * than being replicated room state. */
+/** Where a room wants the camera, and which in-place scopes it SEEDED with.
+ *
+ * `home` is a client-local concern (where to point the camera on arrival).
+ * `scopes` is an opening offer, not live state: the server materializes it
+ * into the room's real scope list once, when the room is created, and from
+ * then on `hello.scopes` and the `scopes` broadcast are the truth. It stays
+ * on the view because "save this room as a template" writes it. */
 export interface RoomView {
   /** Grid rect `[x0, y0, x1, y1]` framed on first join; absent = the
    * client's own default district. */
@@ -86,6 +90,10 @@ export interface ParsedHello {
   elements: ElementSpec[];
   probes: Probe[];
   panels: Panel[];
+  /** The room's in-place oscilloscopes. Room state like `panels` — NOT the
+   * `view.scopes` seeds, which are a template's opening offer and are
+   * materialized into this list once, server-side, when the room is made. */
+  scopes: WireScope[];
   room: RoomHello | null;
   drift: WireDrift[];
 }
@@ -109,7 +117,7 @@ export function parseHello(raw: unknown): ParsedHello {
 
   if (!isRecord(raw)) {
     note('hello', 'object', raw);
-    return { you: 0, elements: [], probes: [], panels: [], room: null, drift };
+    return { you: 0, elements: [], probes: [], panels: [], scopes: [], room: null, drift };
   }
   const m = raw;
 
@@ -127,6 +135,7 @@ export function parseHello(raw: unknown): ParsedHello {
   const elements = list<ElementSpec>(m.elements, 'hello.elements');
   const probes = list<Probe>(m.probes, 'hello.probes');
   const panels = list<Panel>(m.panels, 'hello.panels');
+  const scopes = list<WireScope>(m.scopes, 'hello.scopes');
 
   // No `room` key at all = a server from before rooms existed. That is a
   // supported server, not drift: the chip says "this server has no room list"
@@ -208,7 +217,7 @@ export function parseHello(raw: unknown): ParsedHello {
     }
   }
 
-  return { you, elements, probes, panels, room, drift };
+  return { you, elements, probes, panels, scopes, room, drift };
 }
 
 /** One line per drifted field, for a console or a toast. */
@@ -246,6 +255,7 @@ export interface NetHandlers {
     elements: ElementSpec[],
     probes: Probe[],
     panels: Panel[],
+    scopes: WireScope[],
     room: RoomHello | null,
   ): void;
   /** The room was renamed by somebody (possibly us): every open chip, tab
@@ -260,6 +270,10 @@ export interface NetHandlers {
   onDoc(op: DocOp): void;
   onProbes(list: Probe[]): void;
   onPanels(list: Panel[]): void;
+  /** The room's in-place oscilloscopes, whole list, after any change — the
+   * step that used to be missing entirely. Same contract as `onPanels`: the
+   * server's list is the truth, including for whoever sent the op. */
+  onScopes(list: WireScope[]): void;
   /** Sensor layers plus who is driving each, `[[lid, who], ...]`. Rectangles
    * and claims only — there is no field on this message for a device, and
    * there must never be one. */
@@ -309,6 +323,8 @@ export interface Net {
   sendProbe(elem: number, pin: number, kind: 'v' | 'i'): void;
   sendProbeRef(pid: number, elem: number, pin: number): void;
   sendPanel(op: PanelOp): void;
+  /** Place, move, retune or close an in-place oscilloscope. */
+  sendScope(op: ScopeOp): void;
   sendLayer(op: LayerOp): void;
   /** Take or drop the right to drive a layer with your own device. */
   sendLayerClaim(lid: number, claim: boolean): void;
@@ -413,7 +429,7 @@ export function connect(h: NetHandlers, room: string | null = null): Net {
           console.error(`hello: wire drift — ${describeDrift(p.drift)}`);
           h.onWireDrift?.(p.drift);
         }
-        h.onHello(p.you, p.elements, p.probes, p.panels, p.room);
+        h.onHello(p.you, p.elements, p.probes, p.panels, p.scopes, p.room);
         // Sensor layers ride the hello beside `panels`. Deliberately routed
         // through the SAME handler the live broadcast uses, so a late joiner
         // and a running client can never disagree about what a layer is.
@@ -444,6 +460,9 @@ export function connect(h: NetHandlers, room: string | null = null): Net {
         break;
       case 'panels':
         h.onPanels(m.list ?? []);
+        break;
+      case 'scopes':
+        h.onScopes(m.list ?? []);
         break;
       case 'layers':
         h.onLayers(m.list ?? [], m.claims ?? []);
@@ -495,6 +514,7 @@ export function connect(h: NetHandlers, room: string | null = null): Net {
     sendProbe: (elem, pin, kind) => send({ t: 'probe', elem, pin, kind }),
     sendProbeRef: (pid, elem, pin) => send({ t: 'proberef', pid, elem, pin }),
     sendPanel: (op) => send({ t: 'panel', op }),
+    sendScope: (op) => send({ t: 'scope', op }),
     sendLayer: (op) => send({ t: 'layer', op }),
     sendLayerClaim: (lid, claim) => send({ t: 'layerclaim', lid, claim }),
     // Integers, enforced HERE and not merely expected: the one message a

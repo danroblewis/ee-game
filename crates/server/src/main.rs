@@ -943,6 +943,158 @@ struct Panel {
     name: String,
 }
 
+/// An IN-PLACE OSCILLOSCOPE: a world-anchored instrument rectangle plus the
+/// settings and the channel selection it carries.
+///
+/// Room state, exactly like `Panel`, and for the same reason: an instrument
+/// one player places, drags or retunes is one every player is looking at.
+///
+/// It was not always. Scopes used to be per-browser state in `localStorage`,
+/// which LOOKED like replication for as long as the two clients under test
+/// were two tabs of the same browser (they share the store, so a reload in
+/// one showed what the other had done) and stopped looking like it the
+/// moment they were two players. Nothing about a scope ever reached the
+/// server, so there was nothing to broadcast.
+///
+/// What is deliberately NOT here: the per-frame rendering state — auto-scale
+/// hysteresis and the last accepted trigger time. Those are re-derived from
+/// the trace by whoever is drawing, they differ between clients legitimately,
+/// and replicating them would fight sixty times a second.
+#[derive(Clone, Debug, serde::Serialize, Deserialize)]
+struct Scope {
+    sid: u32,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    #[serde(default)]
+    set: ScopeSet,
+    /// Probe ids this scope displays, or None for "every probe in the room".
+    #[serde(default)]
+    pids: Option<Vec<u32>>,
+}
+
+/// The instrument settings of a `Scope` — everything the on-canvas control
+/// row can change. Field names are the client's (`scope.ts: ScopeSettings`)
+/// so the wire form is that object minus its two live-render fields; every
+/// one of them defaults, so a hand-written template may set just a timebase.
+#[derive(Clone, Debug, serde::Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct ScopeSet {
+    /// Seconds across the full width (10 divisions).
+    timebase: f64,
+    /// "auto" = per-channel 1-2-5 autoscale, "manual" = `y_step`/`y_offset`.
+    y_mode: String,
+    y_step: f64,
+    y_offset: f64,
+    /// "off" | "auto" | "normal".
+    trig_mode: String,
+    /// "rising" | "falling".
+    trig_slope: String,
+    trig_level: f64,
+    trig_auto_level: bool,
+    /// Index into the scope's displayed-channel list.
+    trig_source: u32,
+}
+
+impl Default for ScopeSet {
+    fn default() -> Self {
+        ScopeSet {
+            timebase: 5.0,
+            y_mode: "auto".into(),
+            y_step: 1.0,
+            y_offset: 0.0,
+            trig_mode: "off".into(),
+            trig_slope: "rising".into(),
+            trig_level: 0.0,
+            trig_auto_level: true,
+            trig_source: 0,
+        }
+    }
+}
+
+/// A finite number inside `[lo, hi]`, or `dflt` when it is neither.
+fn fin(v: f64, lo: f64, hi: f64, dflt: f64) -> f64 {
+    if v.is_finite() {
+        v.clamp(lo, hi)
+    } else {
+        dflt
+    }
+}
+
+impl ScopeSet {
+    /// Force hand-edited or hostile settings back onto their invariants. Two
+    /// sources are untrusted and get the same treatment: a template file the
+    /// owner wrote by hand, and a client message.
+    fn sane(mut self) -> ScopeSet {
+        let d = ScopeSet::default();
+        self.timebase = fin(self.timebase, MIN_TIMEBASE, MAX_TIMEBASE, d.timebase);
+        if self.y_mode != "auto" && self.y_mode != "manual" {
+            self.y_mode = d.y_mode;
+        }
+        self.y_step = if self.y_step.is_finite() && self.y_step > 0.0 {
+            self.y_step.clamp(1e-12, 1e12)
+        } else {
+            d.y_step
+        };
+        self.y_offset = fin(self.y_offset, -1e12, 1e12, d.y_offset);
+        if !matches!(self.trig_mode.as_str(), "off" | "auto" | "normal") {
+            self.trig_mode = d.trig_mode;
+        }
+        if !matches!(self.trig_slope.as_str(), "rising" | "falling") {
+            self.trig_slope = d.trig_slope;
+        }
+        self.trig_level = fin(self.trig_level, -1e12, 1e12, d.trig_level);
+        self.trig_source = self.trig_source.min(MAX_PROBES as u32);
+        self
+    }
+}
+
+impl Scope {
+    /// A template's SEED (`view.scopes`, a hand-editable JSON object carrying
+    /// a rect, a channel list and a timebase) as a real instrument. Every
+    /// field is optional and every one is clamped: a template is a file
+    /// somebody typed, and it must never be able to create a room that
+    /// arrives with an unusable scope on the bench.
+    fn from_seed(v: &serde_json::Value, sid: u32) -> Scope {
+        let num = |k: &str, d: f64| v.get(k).and_then(|x| x.as_f64()).unwrap_or(d);
+        let pids = v.get("pids").and_then(|p| p.as_array()).map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_u64().map(|n| n as u32))
+                .collect::<Vec<u32>>()
+        });
+        Scope {
+            sid,
+            x: num("x", 0.0),
+            y: num("y", 0.0),
+            w: num("w", 12.0),
+            h: num("h", 6.0),
+            set: ScopeSet {
+                timebase: num("timebase", 5.0),
+                ..ScopeSet::default()
+            },
+            pids,
+        }
+        .sane()
+    }
+
+    /// The same deal for the geometry and the channel list. A scope smaller
+    /// than `MIN_SCOPE_SPAN` has no room for its own control row, and a
+    /// channel list is at most one entry per probe the room can hold.
+    fn sane(mut self) -> Scope {
+        self.x = fin(self.x, -MAX_SCOPE_COORD, MAX_SCOPE_COORD, 0.0);
+        self.y = fin(self.y, -MAX_SCOPE_COORD, MAX_SCOPE_COORD, 0.0);
+        self.w = fin(self.w, MIN_SCOPE_SPAN, MAX_SCOPE_SPAN, 12.0);
+        self.h = fin(self.h, MIN_SCOPE_SPAN, MAX_SCOPE_SPAN, 6.0);
+        self.set = self.set.sane();
+        if let Some(pids) = &mut self.pids {
+            pids.dedup();
+            pids.truncate(MAX_PROBES);
+        }
+        self
+    }
+}
+
 /// A SENSOR LAYER: a rectangle of the world that a player's browser points a
 /// real-world source at (a camera today; a microphone spectrum strip and a
 /// gamepad diagram are the same rectangle with a different provider — that
@@ -1012,6 +1164,61 @@ const MAX_PANELS: usize = 256;
 const MAX_PANEL_NAME: usize = 28;
 /// Smallest accepted region in grid units: a stray click must not make one.
 const MIN_PANEL_SPAN: f64 = 1.0;
+
+/// Instruments one room will hold. Generous — a district-sized room can want
+/// a scope per bench — but bounded, because every one of them is broadcast
+/// as a whole list on every change.
+const MAX_SCOPES: usize = 32;
+/// Scope geometry limits, in grid units. The minimum is what the on-canvas
+/// control row needs to exist at all; the client enforces a larger one at the
+/// resize corner, and this is the floor under a hand-edited template.
+const MIN_SCOPE_SPAN: f64 = 2.0;
+const MAX_SCOPE_SPAN: f64 = 400.0;
+const MAX_SCOPE_COORD: f64 = 1.0e6;
+/// Seconds across the scope's full width. Same ladder the client's wheel
+/// walks, so a retune that lands here is never clamped back at the player.
+const MIN_TIMEBASE: f64 = 0.001;
+const MAX_TIMEBASE: f64 = 60.0;
+
+/// The four things a player can do to an in-place scope, as ops rather than
+/// as a whole-list write: the same shape `PanelOp` has, for the same reason —
+/// two players dragging two scopes must not overwrite each other.
+///
+/// `Rect` and `Set` are both ABSOLUTE writes, so a drag can throttle its
+/// stream to one op per 60 ms and applying the last is applying all of them.
+#[derive(Clone, Deserialize)]
+#[serde(tag = "t", rename_all = "lowercase")]
+enum ScopeOp {
+    Add {
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        #[serde(default)]
+        set: ScopeSet,
+        #[serde(default)]
+        pids: Option<Vec<u32>>,
+    },
+    Remove {
+        sid: u32,
+    },
+    /// Move/resize: the client drags the title bar or the bottom-right grip.
+    Rect {
+        sid: u32,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+    },
+    /// Retune: everything that is not geometry — timebase, vertical, trigger
+    /// and the channel selection — written at once.
+    Set {
+        sid: u32,
+        set: ScopeSet,
+        #[serde(default)]
+        pids: Option<Vec<u32>>,
+    },
+}
 
 #[derive(Clone, Deserialize)]
 #[serde(tag = "t", rename_all = "lowercase")]
@@ -1175,6 +1382,9 @@ enum Cmd {
     Panel {
         op: PanelOp,
     },
+    Scope {
+        op: ScopeOp,
+    },
     Layer {
         op: LayerOp,
     },
@@ -1236,6 +1446,9 @@ struct Room {
     probes: std::sync::Mutex<Vec<Probe>>,
     /// Room-scoped control-panel regions (shared, same rationale as probes).
     panels: std::sync::Mutex<Vec<Panel>>,
+    /// Room-scoped in-place oscilloscopes (shared, same rationale again: an
+    /// instrument on the bench is an instrument everyone is reading).
+    scopes: std::sync::Mutex<Vec<Scope>>,
     /// Room-scoped sensor layers (shared: everybody sees where the light is).
     layers: std::sync::Mutex<Vec<Layer>>,
     /// Who is currently driving each layer, `(lid, who)`. Live only — NEVER
@@ -1245,6 +1458,7 @@ struct Room {
     next_client: AtomicU32,
     next_pid: AtomicU32,
     next_plid: AtomicU32,
+    next_sid: AtomicU32,
     next_lid: AtomicU32,
     population: AtomicU32,
     /// Set when the document changes; the sim task checkpoints to disk.
@@ -1300,6 +1514,20 @@ struct SaveFile {
     panels: Vec<Panel>,
     #[serde(default)]
     next_plid: u32,
+    /// In-place oscilloscopes. `Option`, and the difference between the two
+    /// empties is the whole migration:
+    ///
+    ///   absent   this file was written before scopes were room state, so the
+    ///            room's instruments are whatever `view.scopes` seeds;
+    ///   `[]`     a room whose players closed every scope, and re-seeding it
+    ///            would put back the ones they deliberately shut.
+    ///
+    /// That is the same null-vs-empty record the client's per-browser bench
+    /// used to keep in `localStorage`, moved to where it belongs.
+    #[serde(default)]
+    scopes: Option<Vec<Scope>>,
+    #[serde(default)]
+    next_sid: u32,
     /// Sensor layers: WHERE in the world a real-world source is pointed.
     /// Defaulted, so every save written before external inputs existed loads
     /// with no layers, which is exactly what it had.
@@ -1382,6 +1610,8 @@ impl Default for SaveFile {
             next_pid: 1,
             panels: Vec::new(),
             next_plid: 1,
+            scopes: None,
+            next_sid: 1,
             layers: Vec::new(),
             next_lid: 1,
             machine: None,
@@ -1414,6 +1644,8 @@ impl SaveFile {
             next_pid: self.next_pid.max(1),
             panels: self.panels,
             next_plid: self.next_plid.max(1),
+            scopes: self.scopes,
+            next_sid: self.next_sid.max(1),
             layers: self.layers,
             next_lid: self.next_lid.max(1),
             machine,
@@ -1447,6 +1679,8 @@ impl SaveFile {
             next_pid: s.next_pid,
             panels: s.panels.clone(),
             next_plid: s.next_plid,
+            scopes: s.scopes.clone(),
+            next_sid: s.next_sid,
             layers: s.layers.clone(),
             next_lid: s.next_lid,
             machine: Some(s.machine),
@@ -1872,6 +2106,14 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
                                     .events
                                     .send(json!({"t": "probes", "list": *probes}).to_string());
                             }
+                            // A channel whose probe just died would draw a
+                            // flat line forever; drop it from every scope.
+                            let mut scopes = room.scopes.lock().unwrap();
+                            if prune_scope_pids(&mut scopes, &probes) {
+                                let _ = room
+                                    .events
+                                    .send(json!({"t": "scopes", "list": *scopes}).to_string());
+                            }
                         }
                         let _ = room.events.send(json!({"t": "doc", "op": op}).to_string());
                     }
@@ -1904,6 +2146,14 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
                     let _ = room
                         .events
                         .send(json!({"t": "probes", "list": *probes}).to_string());
+                    // Toggling a probe off retires its pid; no scope may keep
+                    // showing a channel that can never sample again.
+                    let mut scopes = room.scopes.lock().unwrap();
+                    if prune_scope_pids(&mut scopes, &probes) {
+                        let _ = room
+                            .events
+                            .send(json!({"t": "scopes", "list": *scopes}).to_string());
+                    }
                 }
                 Cmd::ProbeRef { pid, elem, pin } => {
                     let mut probes = room.probes.lock().unwrap();
@@ -1926,6 +2176,15 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
                         let _ = room
                             .events
                             .send(json!({"t": "panels", "list": *panels}).to_string());
+                    }
+                }
+                Cmd::Scope { op } => {
+                    let mut scopes = room.scopes.lock().unwrap();
+                    if apply_scope_op(&mut scopes, &room.next_sid, &op) {
+                        room.dirty.store(true, Ordering::Relaxed);
+                        let _ = room
+                            .events
+                            .send(json!({"t": "scopes", "list": *scopes}).to_string());
                     }
                 }
                 Cmd::Layer { op } => {
@@ -2801,6 +3060,87 @@ fn apply_panel_op(panels: &mut Vec<Panel>, next_plid: &AtomicU32, op: &PanelOp) 
     }
 }
 
+/// Apply a scope op to the room's instrument list. Returns false to drop the
+/// op (unknown sid, scope budget reached) — same contract as
+/// `apply_panel_op`, so the caller broadcasts on true and stays silent on
+/// false.
+fn apply_scope_op(scopes: &mut Vec<Scope>, next_sid: &AtomicU32, op: &ScopeOp) -> bool {
+    match op {
+        ScopeOp::Add {
+            x,
+            y,
+            w,
+            h,
+            set,
+            pids,
+        } => {
+            if scopes.len() >= MAX_SCOPES {
+                return false;
+            }
+            let sid = next_sid.fetch_add(1, Ordering::Relaxed);
+            scopes.push(
+                Scope {
+                    sid,
+                    x: *x,
+                    y: *y,
+                    w: *w,
+                    h: *h,
+                    set: set.clone(),
+                    pids: pids.clone(),
+                }
+                .sane(),
+            );
+            true
+        }
+        ScopeOp::Remove { sid } => {
+            let before = scopes.len();
+            scopes.retain(|s| s.sid != *sid);
+            scopes.len() != before
+        }
+        ScopeOp::Rect { sid, x, y, w, h } => {
+            let Some(s) = scopes.iter_mut().find(|s| s.sid == *sid) else {
+                return false;
+            };
+            s.x = fin(*x, -MAX_SCOPE_COORD, MAX_SCOPE_COORD, s.x);
+            s.y = fin(*y, -MAX_SCOPE_COORD, MAX_SCOPE_COORD, s.y);
+            s.w = fin(*w, MIN_SCOPE_SPAN, MAX_SCOPE_SPAN, s.w);
+            s.h = fin(*h, MIN_SCOPE_SPAN, MAX_SCOPE_SPAN, s.h);
+            true
+        }
+        ScopeOp::Set { sid, set, pids } => {
+            let Some(s) = scopes.iter_mut().find(|s| s.sid == *sid) else {
+                return false;
+            };
+            s.set = set.clone().sane();
+            s.pids = pids.clone().map(|mut p| {
+                p.dedup();
+                p.truncate(MAX_PROBES);
+                p
+            });
+            true
+        }
+    }
+}
+
+/// Drop dead channels from every scope. A probe that goes away takes its
+/// trace with it, and a scope left holding the pid would show a channel that
+/// can never draw again. Returns true when anything changed, i.e. when the
+/// caller owes the room a `scopes` broadcast.
+///
+/// A scope showing "every probe" (`pids == None`) is untouched: it follows
+/// the room's probe list by construction.
+fn prune_scope_pids(scopes: &mut [Scope], alive: &[Probe]) -> bool {
+    let mut changed = false;
+    for s in scopes.iter_mut() {
+        if let Some(pids) = &mut s.pids {
+            let before = pids.len();
+            pids.retain(|pid| alive.iter().any(|p| p.pid == *pid));
+            changed |= pids.len() != before;
+        }
+    }
+    changed
+}
+
 // ------------------------------------------------------- external inputs
 //
 // EVERYTHING ABOUT THIS FEATURE THAT MATTERS IS A NEGATIVE. `sim-core` never
@@ -3075,6 +3415,9 @@ enum ClientMsg {
     Panel {
         op: PanelOp,
     },
+    Scope {
+        op: ScopeOp,
+    },
     Layer {
         op: LayerOp,
     },
@@ -3149,6 +3492,7 @@ fn hello_msg(handle: &RoomHandle, me: u32) -> String {
     let elems = room.elements.lock().unwrap();
     let probes = room.probes.lock().unwrap();
     let panels = room.panels.lock().unwrap();
+    let scopes = room.scopes.lock().unwrap();
     let layers = room.layers.lock().unwrap();
     let claims = room.claims.lock().unwrap();
     let view = handle.view.lock().unwrap();
@@ -3159,7 +3503,7 @@ fn hello_msg(handle: &RoomHandle, me: u32) -> String {
             "players": room.population.load(Ordering::Relaxed),
         },
         "elements": *elems,
-        "probes": *probes, "panels": *panels,
+        "probes": *probes, "panels": *panels, "scopes": *scopes,
         // The rectangles, and who is currently driving each. Never a device
         // id, never a resolution, never a frame: a late joiner learns WHERE
         // the hole in the world is and WHOSE eye is behind it, and nothing
@@ -3245,6 +3589,9 @@ async fn client_session(mut socket: WebSocket, reg: Arc<Registry>, handle: Arc<R
                         }
                         Ok(ClientMsg::Panel { op }) => {
                             let _ = room.cmds.send(Cmd::Panel { op });
+                        }
+                        Ok(ClientMsg::Scope { op }) => {
+                            let _ = room.cmds.send(Cmd::Scope { op });
                         }
                         Ok(ClientMsg::Layer { op }) => {
                             let _ = room.cmds.send(Cmd::Layer { op });
@@ -3980,9 +4327,11 @@ mod tests {
             elements: std::sync::Mutex::new(elements),
             probes: std::sync::Mutex::new(Vec::new()),
             panels: std::sync::Mutex::new(Vec::new()),
+            scopes: std::sync::Mutex::new(Vec::new()),
             next_client: AtomicU32::new(1),
             next_pid: AtomicU32::new(1),
             next_plid: AtomicU32::new(1),
+            next_sid: AtomicU32::new(1),
             layers: std::sync::Mutex::new(Vec::new()),
             claims: std::sync::Mutex::new(Vec::new()),
             next_lid: AtomicU32::new(1),
@@ -4449,9 +4798,11 @@ mod tests {
             elements: std::sync::Mutex::new(elements),
             probes: std::sync::Mutex::new(Vec::new()),
             panels: std::sync::Mutex::new(Vec::new()),
+            scopes: std::sync::Mutex::new(Vec::new()),
             next_client: AtomicU32::new(1),
             next_pid: AtomicU32::new(1),
             next_plid: AtomicU32::new(1),
+            next_sid: AtomicU32::new(1),
             layers: std::sync::Mutex::new(Vec::new()),
             claims: std::sync::Mutex::new(Vec::new()),
             next_lid: AtomicU32::new(1),
@@ -5140,6 +5491,233 @@ mod tests {
             &PanelOp::Remove { plid }
         ));
         assert_eq!(panels.len(), MAX_PANELS - 1);
+    }
+
+    // ---------------------------------------------------------------- scopes
+    //
+    // An in-place oscilloscope is room state, and these are the tests that
+    // say so. Before it was, the failure was invisible from either end: the
+    // client happily moved a scope, nothing went on the wire, and the only
+    // reason it ever LOOKED replicated was two tabs of one browser sharing a
+    // `localStorage` key.
+
+    #[test]
+    fn scope_ops_add_move_retune_remove() {
+        let mut scopes: Vec<Scope> = Vec::new();
+        let next = AtomicU32::new(1);
+
+        assert!(apply_scope_op(
+            &mut scopes,
+            &next,
+            &ScopeOp::Add {
+                x: 4.0,
+                y: 5.0,
+                w: 12.0,
+                h: 6.0,
+                set: ScopeSet::default(),
+                pids: None,
+            }
+        ));
+        let sid = scopes[0].sid;
+        assert_eq!(sid, 1);
+        assert_eq!((scopes[0].x, scopes[0].y), (4.0, 5.0));
+
+        // The move a player drags, as the client sends it.
+        assert!(apply_scope_op(
+            &mut scopes,
+            &next,
+            &ScopeOp::Rect {
+                sid,
+                x: 30.0,
+                y: 17.0,
+                w: 18.0,
+                h: 9.0,
+            }
+        ));
+        assert_eq!((scopes[0].x, scopes[0].y), (30.0, 17.0));
+        assert_eq!((scopes[0].w, scopes[0].h), (18.0, 9.0));
+
+        // ...and the retune, which carries the channels with it.
+        assert!(apply_scope_op(
+            &mut scopes,
+            &next,
+            &ScopeOp::Set {
+                sid,
+                set: ScopeSet {
+                    timebase: 0.02,
+                    trig_mode: "normal".into(),
+                    trig_slope: "falling".into(),
+                    trig_level: 1.5,
+                    trig_auto_level: false,
+                    ..ScopeSet::default()
+                },
+                pids: Some(vec![2, 3]),
+            }
+        ));
+        assert_eq!(scopes[0].set.timebase, 0.02);
+        assert_eq!(scopes[0].set.trig_mode, "normal");
+        assert_eq!(scopes[0].set.trig_slope, "falling");
+        assert_eq!(scopes[0].set.trig_level, 1.5);
+        assert!(!scopes[0].set.trig_auto_level);
+        assert_eq!(scopes[0].pids, Some(vec![2, 3]));
+
+        // An op naming a scope that is not here changes nothing and says so,
+        // so the caller does not broadcast a list nobody altered.
+        assert!(!apply_scope_op(
+            &mut scopes,
+            &next,
+            &ScopeOp::Rect {
+                sid: sid + 99,
+                x: 0.0,
+                y: 0.0,
+                w: 8.0,
+                h: 4.0,
+            }
+        ));
+        assert!(!apply_scope_op(&mut scopes, &next, &ScopeOp::Remove { sid: 999 }));
+
+        assert!(apply_scope_op(&mut scopes, &next, &ScopeOp::Remove { sid }));
+        assert!(scopes.is_empty());
+    }
+
+    #[test]
+    fn a_hostile_scope_op_is_clamped_not_honoured() {
+        let mut scopes: Vec<Scope> = Vec::new();
+        let next = AtomicU32::new(1);
+        assert!(apply_scope_op(
+            &mut scopes,
+            &next,
+            &ScopeOp::Add {
+                x: f64::NAN,
+                y: 1e30,
+                w: 0.0,
+                h: -5.0,
+                set: ScopeSet {
+                    timebase: -1.0,
+                    y_mode: "sideways".into(),
+                    trig_mode: "whenever".into(),
+                    trig_slope: "diagonal".into(),
+                    y_step: 0.0,
+                    trig_level: f64::INFINITY,
+                    trig_source: 9999,
+                    ..ScopeSet::default()
+                },
+                pids: None,
+            }
+        ));
+        let s = &scopes[0];
+        assert_eq!(s.x, 0.0, "NaN is not a coordinate");
+        assert_eq!(s.y, MAX_SCOPE_COORD);
+        assert_eq!(s.w, MIN_SCOPE_SPAN);
+        assert_eq!(s.h, MIN_SCOPE_SPAN);
+        assert_eq!(s.set.timebase, MIN_TIMEBASE);
+        assert_eq!(s.set.y_mode, "auto");
+        assert_eq!(s.set.trig_mode, "off");
+        assert_eq!(s.set.trig_slope, "rising");
+        assert!(s.set.y_step > 0.0);
+        assert!(s.set.trig_level.is_finite());
+        assert_eq!(s.set.trig_source, MAX_PROBES as u32);
+    }
+
+    #[test]
+    fn a_scope_op_arrives_as_a_client_message() {
+        let msg: ClientMsg = serde_json::from_str(
+            r#"{"t":"scope","op":{"t":"add","x":2,"y":3,"w":12,"h":6,
+                 "set":{"timebase":0.5},"pids":[1,2]}}"#,
+        )
+        .unwrap();
+        let ClientMsg::Scope { op } = msg else {
+            panic!("expected a scope message")
+        };
+        let mut scopes = Vec::new();
+        assert!(apply_scope_op(&mut scopes, &AtomicU32::new(4), &op));
+        assert_eq!(scopes[0].sid, 4);
+        assert_eq!(scopes[0].set.timebase, 0.5);
+        // The settings the message did NOT mention keep their defaults rather
+        // than arriving as zeroes: a client only has to say what it changed.
+        assert_eq!(scopes[0].set.y_mode, "auto");
+        assert!(scopes[0].set.trig_auto_level);
+        assert_eq!(scopes[0].pids, Some(vec![1, 2]));
+    }
+
+    #[test]
+    fn a_dead_probe_leaves_no_channel_behind() {
+        let mut scopes = vec![
+            Scope {
+                sid: 1,
+                x: 0.0,
+                y: 0.0,
+                w: 12.0,
+                h: 6.0,
+                set: ScopeSet::default(),
+                pids: Some(vec![1, 2, 3]),
+            },
+            // "every probe" follows the room by construction and must not be
+            // rewritten into a frozen list.
+            Scope {
+                sid: 2,
+                x: 0.0,
+                y: 0.0,
+                w: 12.0,
+                h: 6.0,
+                set: ScopeSet::default(),
+                pids: None,
+            },
+        ];
+        let alive = vec![
+            Probe {
+                pid: 1,
+                elem: 10,
+                pin: 0,
+                kind: ProbeKind::V,
+                r: None,
+            },
+            Probe {
+                pid: 3,
+                elem: 11,
+                pin: 0,
+                kind: ProbeKind::V,
+                r: None,
+            },
+        ];
+        assert!(prune_scope_pids(&mut scopes, &alive));
+        assert_eq!(scopes[0].pids, Some(vec![1, 3]));
+        assert_eq!(scopes[1].pids, None);
+        // Idempotent: nothing changed, so nothing is broadcast.
+        assert!(!prune_scope_pids(&mut scopes, &alive));
+    }
+
+    /// THE MIGRATION, both directions. A save written before scopes were room
+    /// state has no `scopes` key at all, and its room's instruments are the
+    /// template's seeds. A save written after has the key — and an EMPTY list
+    /// means "the players closed them", which must survive a restart.
+    #[test]
+    fn an_absent_scope_list_seeds_and_an_empty_one_does_not() {
+        let seed = serde_json::json!([{"x": 26, "y": 22, "w": 18, "h": 9,
+                                       "pids": [1, 2], "timebase": 0.5}]);
+        let with_view = |scopes: Option<Vec<Scope>>| RoomSetup {
+            scopes,
+            view: View {
+                home: None,
+                scopes: seed.as_array().unwrap().clone(),
+            },
+            ..RoomSetup::default()
+        };
+
+        let seeded = with_view(None).normalize().unwrap();
+        let list = seeded.scopes.unwrap();
+        assert_eq!(list.len(), 1, "an absent list takes the template's seeds");
+        assert_eq!((list[0].x, list[0].y), (26.0, 22.0));
+        assert_eq!(list[0].set.timebase, 0.5);
+        assert_eq!(list[0].pids, Some(vec![1, 2]));
+        assert!(seeded.next_sid > list[0].sid);
+
+        let closed = with_view(Some(Vec::new())).normalize().unwrap();
+        assert_eq!(
+            closed.scopes.unwrap().len(),
+            0,
+            "a room whose players closed every scope must not be re-seeded"
+        );
     }
 
     #[test]

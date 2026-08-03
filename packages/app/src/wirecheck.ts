@@ -49,7 +49,7 @@ import {
 import type { ElementSpec } from './circuit';
 import type { Panel } from './panel';
 import type { Layer } from './layer';
-import type { Probe } from './scope';
+import type { Probe, WireScope } from './scope';
 
 // This file runs under node (see package.json), never in the browser, and the
 // repo carries no @types/node — one honest declaration beats a dependency.
@@ -295,13 +295,14 @@ def('WebSocket', StubSocket);
 def('location', { protocol: 'https:', host: 'game.example' });
 def('window', { setTimeout: () => 0, clearTimeout: () => {} });
 
-/** Exactly the five arguments `onHello` is handed — the client's whole idea of
+/** Exactly the six arguments `onHello` is handed — the client's whole idea of
  * the room it just joined. */
 interface HelloCall {
   you: number;
   elements: ElementSpec[];
   probes: Probe[];
   panels: Panel[];
+  scopes: WireScope[];
   room: RoomHello | null;
 }
 
@@ -314,8 +315,8 @@ function dial(code: string | null = null) {
   const sensorCalls: [number, number][][] = [];
   const nop = () => {};
   const handlers: NetHandlers = {
-    onHello: (you, elements, probes, panels, room) =>
-      hellos.push({ you, elements, probes, panels, room }),
+    onHello: (you, elements, probes, panels, scopes, room) =>
+      hellos.push({ you, elements, probes, panels, scopes, room }),
     onRoomMeta: nop,
     onRoomGone: nop,
     onFrame: nop,
@@ -323,6 +324,7 @@ function dial(code: string | null = null) {
     onDoc: nop,
     onProbes: nop,
     onPanels: nop,
+    onScopes: nop,
     onLayers: (list, cl) => layerCalls.push({ list, claims: cl }),
     onSensors: (list) => sensorCalls.push(list),
     onMachine: nop,
@@ -363,6 +365,14 @@ console.log('connect — the room object onHello RECEIVES is the parsed one');
   check('elements', got?.elements.length === 4);
   check('probes', got?.probes.length === 2);
   check('panels', got?.panels.length === 1);
+  // The room's INSTRUMENTS, beside its panels. Room state — the seed under
+  // `view.scopes` is what the template offered, this is what the room has.
+  check(
+    'scopes — the bench arrives as room state',
+    got?.scopes.length === 1 && got.scopes[0]?.set?.timebase === 0.5,
+    JSON.stringify(got?.scopes),
+  );
+  check('scopes carry a server-minted sid', got?.scopes[0]?.sid === 1);
   check('room.id', room?.id === '7AWF4N');
   check('room.name', room?.name === 'Hoist practice');
   check('room.template', room?.template === 'hoist');

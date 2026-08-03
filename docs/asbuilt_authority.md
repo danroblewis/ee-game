@@ -22,8 +22,8 @@ authoritative for anything electrical violates pillar 1.
 
 | owner | state |
 |---|---|
-| Server (per room, one tokio task, sole owner of that room's `Engine` — no lock, no sharing) | the document, the solver, sim time, probes, panels (rects + names), the machine, damage, and the verdict on every mutation |
-| Client (never sent to the server) | camera, selection, clipboard, undo/redo history, the in-place scope bench (localStorage per room code), panel *window* positions, which speaker it listens to |
+| Server (per room, one tokio task, sole owner of that room's `Engine` — no lock, no sharing) | the document, the solver, sim time, probes, panels (rects + names), in-place scopes (rect + settings + channels), sensor layers, the machine, damage, and the verdict on every mutation |
+| Client (never sent to the server) | camera, selection, clipboard, undo/redo history, panel *window* positions, a scope's autoscale hysteresis and trigger latch, which speaker it listens to |
 | Derived, never stored | panel *membership* (an element belongs to a panel iff every pin is inside its rect, recomputed each frame — there is no membership list to desync) |
 
 The client is "a renderer of server truth" (`net.ts`, first line). Its local WASM
@@ -258,10 +258,12 @@ already showing both. Design consequences:
   — absent (legacy, gets the hoist), `"none"` (no fixture ids, no machine
   telemetry, ever), or `"hoist"` with rect and state.
 - **Templates are validated before the room exists** (`normalize()`: pin counts,
-  duplicate ids, dangling probes dropped, rect sanitized) — a hand-edited file can
-  never produce a room that arrives broken. The camera/scope `View` is
-  deliberately *opaque* to the server: giving the server a schema for client
-  chrome would be inventing replication this feature doesn't need.
+  duplicate ids, dangling probes dropped, rects and scope settings sanitized) — a
+  hand-edited file can never produce a room that arrives broken. `normalize()` is
+  also where a template's scope **seeds** (`view.scopes`, still a loose JSON list
+  a human can type) become the room's real instruments, exactly once: an absent
+  `scopes` key means "seed me", an empty one means "the players closed them all",
+  and the difference is what stops every restart from re-littering a bench.
 
 ## 6. The hello boundary
 

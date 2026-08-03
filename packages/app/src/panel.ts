@@ -789,11 +789,16 @@ export interface PanelHostDeps {
   /** Sample history for the scope widgets: the very store the canvas scopes
    * draw, so a scope shows the same waveform wherever it is displayed. */
   traces(): TraceStore;
-  /** Every client-local floating scope. main.ts owns the array; panels only
+  /** Every in-place scope in the room. main.ts owns the array; panels only
    * borrow the ones their region contains. */
   scopes(): FloatScope[];
   /** Delete a floating scope (a panel-owned scope has no canvas chrome). */
   removeScope(sid: number): void;
+  /** This widget just changed a scope's settings or channels IN PLACE.
+   * Scopes are room state, so the change has to be replicated — the host
+   * sends the same op the canvas surface sends. Every mutation of a
+   * `FloatScope` in this file is followed by one of these calls. */
+  scopeChanged(s: FloatScope): void;
   /** Same interact path the canvas uses (optimistic + server echo). */
   interact(e: ElementSpec, op: InteractOp): void;
   /** Panel ops (rename / delete from the window chrome). */
@@ -1225,6 +1230,7 @@ function scopeWidget(sid: number, deps: PanelHostDeps): Widget {
     if (!scope || !id) return;
     ev.preventDefault();
     applyScopeControl(scope.set, id, active().length);
+    deps.scopeChanged(scope);
   });
   cv.addEventListener('pointermove', (ev) => {
     cv.style.cursor = ctrlAt(ev) ? 'pointer' : 'default';
@@ -1237,6 +1243,7 @@ function scopeWidget(sid: number, deps: PanelHostDeps): Widget {
       ev.preventDefault();
       ev.stopPropagation();
       scope.set.timebase = clamp(scope.set.timebase * Math.exp(ev.deltaY * 0.001), 0.001, 60);
+      deps.scopeChanged(scope);
     },
     { passive: false },
   );
@@ -1246,6 +1253,7 @@ function scopeWidget(sid: number, deps: PanelHostDeps): Widget {
     if (!s) return;
     if (s.pids === null) s.pids = probes.map((p) => p.pid);
     s.pids = s.pids.includes(pid) ? s.pids.filter((x) => x !== pid) : [...s.pids, pid];
+    deps.scopeChanged(s);
   };
 
   // The canvas scope's channel dots live in its title bar, which a panel-owned

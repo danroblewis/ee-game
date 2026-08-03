@@ -16,10 +16,16 @@ truth.** It computes presentation, never physics.
 ## 1. Three distinctions that organize all client state
 
 **Shared vs. local.** Server-owned and replicated: the document, probes, panels
-(rects + names), damage, machine state, cursors, frames, sample/audio streams —
-wholesale replaced on `hello`. Local and never sent: camera, selection, clipboard,
-undo, the scope bench (localStorage per room code), panel window positions, dock
-state, volume.
+(rects + names), in-place scopes (rect + settings + channels), damage, machine
+state, cursors, frames, sample/audio streams — wholesale replaced on `hello`.
+Local and never sent: camera, selection, clipboard, undo, panel window positions,
+a scope's autoscale hysteresis and trigger latch, dock state, volume.
+
+The scope bench used to be on the local side of that line — a `localStorage`
+record per room code. It read as replicated whenever the two clients under test
+were two tabs of one browser (they share the store, so a reload showed the other
+tab's change) and was not replicated at all between two players. It is room state
+now: `hello.scopes` on join, `{"t":"scopes"}` on every change.
 
 **Derived vs. stored — derive-per-frame is the house style.** Panel membership is
 never stored: an element belongs to a panel iff *every* pin is inside the rect,
@@ -117,7 +123,12 @@ which wanders over non-integer periods). One `controlLayout` feeds both the draw
 control row and its hit test, "so a button can never be drawn where it is not
 clickable." The same instrument object renders in three hosts (floating, panel
 row, dock) from the same settings and store. Templates ship scope *seeds* —
-clamped as untrusted input — materialized once into player-owned instruments.
+clamped as untrusted input — materialized once, SERVER-SIDE and at room
+creation, into the room's shared instruments. Every later change (place, move,
+resize, retune, re-channel, close) is a `scope` op the server applies and
+broadcasts; whoever is holding the pointer or the wheel owns that half of the
+instrument's state until they stop, so their own 60 ms-old echo cannot drag it
+back out from under them.
 
 ## 5. Audio: solver samples end to end
 

@@ -116,7 +116,7 @@ import {
 import { History, isTypingTarget } from './history';
 import { createHoist, type MachineRect } from './hoist';
 import { connect, type RoomHello } from './net';
-import { createRooms, loadBench, saveBench } from './rooms';
+import { createRooms } from './rooms';
 import {
   applyPanelOp,
   drawPanelGhost,
@@ -149,17 +149,24 @@ import {
 import { SpatialIndex } from './spatial';
 import {
   applyScopeControl,
+  applyScopeOp,
+  applyWireScopes,
   defaultScopeSettings,
   probeColor,
   renderScopeInto,
   scopeChannels,
   scopeControlAt,
+  scopeRectOp,
+  scopeSetOp,
   scopeToSeed,
   seedToScope,
   TraceStore,
+  wireScopeSet,
   type FloatScope,
   type Probe,
   type ScopeControlId,
+  type ScopeOp,
+  type WireScope,
 } from './scope';
 import { createDock } from './dock';
 import {
@@ -351,10 +358,98 @@ type ClipItem = { kind: ElementKind; pins: Point[]; tier?: number; rot?: number 
 let clipboard: ClipItem[] = [];
 let pasting: ClipItem[] | null = null;
 
-/** In-place oscilloscopes: world-anchored, per-player instruments (the shape
- * lives in scope.ts because panel.ts renders the ones a region encloses). */
+/** In-place oscilloscopes: world-anchored SHARED instruments (the shape lives
+ * in scope.ts because panel.ts renders the ones a region encloses).
+ *
+ * Online this is a mirror of room state — the server owns the list, mints the
+ * sids and broadcasts every change. `sidCounter` is only for the offline
+ * client, which runs the same rules locally. */
 let floatScopes: FloatScope[] = [];
 let sidCounter = 1;
+
+/** Scopes are room state: online the server owns the list (its broadcast is
+ * the truth), offline we apply the same rules locally. Exactly the deal
+ * `panelOp` and `layerOp` strike, and the one scopes never had. */
+function scopeOp(op: ScopeOp) {
+  if (online) {
+    net.sendScope(op);
+    return;
+  }
+  floatScopes = applyScopeOp(floatScopes, op, () => {
+    for (const s of floatScopes) sidCounter = Math.max(sidCounter, s.sid + 1);
+    return sidCounter++;
+  });
+}
+
+// Retuning: the throttle and the echo hold.
+//
+// Every on-canvas control, every panel-widget button and every channel toggle
+// ends in `scopeRetuned`, so no way of changing an instrument can forget to
+// replicate. Two of those ways are STREAMS, not clicks — the timebase wheel
+// and a dragged trigger level — which is why this looks like the drag path
+// rather than like a plain send.
+/** Per-scope throttle state. KEYED BY SID, and that is the whole point: one
+ * shared slot meant that retuning scope 1 and then touching scope 2 inside
+ * the same 80 ms window overwrote scope 1's pending op with scope 2's, and
+ * scope 1's last notch was silently dropped. It converged — the broadcast is
+ * the whole list, so the very op that caused the loss re-synced the scope it
+ * lost — but "one notch of a fast two-scope flick doesn't take" is still a
+ * lie told to the player's fingers. A stream per instrument needs a slot per
+ * instrument. */
+type Retune = { at: number; pending: FloatScope | null; timer: number };
+const retune = new Map<number, Retune>();
+/** The scope whose SETTINGS this client is currently in the middle of
+ * changing, and until when. A wheel gesture has no pointer-up to end it, so
+ * the hold is a short window past the last change rather than a flag. */
+let retuneHeld: { sid: number; until: number } | null = null;
+
+/** Send this scope's settings and channel list as they stand now: at most one
+ * op per 60 ms PER SCOPE, and always one more after the last change, because
+ * the value the player meant is the one they stopped on. */
+function scopeRetuned(s: FloatScope) {
+  const now = performance.now();
+  retuneHeld = { sid: s.sid, until: now + 250 };
+  let r = retune.get(s.sid);
+  if (!r) {
+    r = { at: 0, pending: null, timer: 0 };
+    retune.set(s.sid, r);
+  }
+  if (now - r.at > 60) {
+    r.at = now;
+    scopeOp(scopeSetOp(s));
+    return;
+  }
+  r.pending = s;
+  if (!r.timer) {
+    r.timer = window.setTimeout(() => {
+      const cur = retune.get(s.sid);
+      if (!cur) return;
+      cur.timer = 0;
+      cur.at = performance.now();
+      if (cur.pending) scopeOp(scopeSetOp(cur.pending));
+      cur.pending = null;
+    }, 80);
+  }
+}
+
+/**
+ * The room's scope list, applied. Merged rather than replaced, so instrument
+ * identity — and this client's own autoscale and trigger state — survives.
+ *
+ * THE ECHO. A scope drag sends one op per 60 ms and gets each of them back;
+ * applying our own confirmation of where the pointer WAS would fight the
+ * pointer where it IS, and the scope would stutter backwards under the
+ * cursor. So while this client holds a scope it owns that rectangle, and the
+ * pointer-up sends the final rect that reconciles the two. Identical to the
+ * bargain `onDoc` already strikes for a machine drag.
+ */
+function applyScopes(list: WireScope[]) {
+  floatScopes = applyWireScopes(floatScopes, list, (sid, what) =>
+    what === 'rect'
+      ? scopeDrag?.s.sid === sid || scopeResize?.s.sid === sid
+      : retuneHeld?.sid === sid && performance.now() < retuneHeld.until,
+  );
+}
 
 const localSim = new Sim(DT);
 localSim.setElements(elements);
@@ -586,59 +681,26 @@ function resetForRoom(room: RoomHello | null) {
     ? { x0: home![0]!, y0: home![1]!, x1: home![2]!, y1: home![3]! }
     : { ...DEFAULT_HOME };
 
-  // The bench. In-place scopes exist only in this browser (see `loadBench`),
-  // so there are two questions and they are not the same one:
-  //
-  //   have I been in this room before?  -> restore what I left here
-  //   never been?                       -> materialize the template's seeds
-  //
-  // `loadBench` answers the first with null-vs-array, so a player who closed
-  // every scope keeps an empty bench instead of being handed the template's
-  // again, and a player who reloads gets their own instruments back where
-  // THEY put them rather than where the template first put them.
+  // The camera frames the template's SEED rects — where the author aimed it.
+  // Deliberately the seeds and not the room's live scopes: `home` is a fixed
+  // place to arrive at, and it must not drift every time somebody drags an
+  // instrument across the district.
   const seeds = room?.view?.scopes ?? [];
-  // The camera frames the seeds wherever the bench came from: they are where
-  // the author aimed it, and they do not move when the player moves a scope.
   homeSeeds = seeds.map((s) => {
     const r = seedToScope(s, 0);
     return [r.x, r.y, r.x + r.w, r.y + r.h] as [number, number, number, number];
   });
   fitHome();
-
-  if (room) {
-    const kept = loadBench(room.id);
-    for (const s of kept ?? seeds) floatScopes.push(seedToScope(s, sidCounter++));
-    // Write straight back — including the empty list, and including a room
-    // whose template ships nothing. The stored list IS the "I have been here"
-    // record, so it has to exist from the first join, not from the first time
-    // the player happens to touch a scope.
-    benchSaved = '';
-    persistBench();
-  }
+  // The bench itself is NOT built here any more. It is room state now, so it
+  // arrives with `hello` like the parts and the panels do — including the
+  // seeds, which the server materialized once when the room was created.
+  //
+  // What used to be here was a per-browser `localStorage` bench, and it is
+  // worth recording why it went: it made scopes look replicated whenever the
+  // two clients being tested were two tabs of one browser (same store, so a
+  // reload in B showed what A had done) and not replicated at all between two
+  // players. Nothing about a scope ever reached the server.
 }
-
-// The bench is saved by watching it rather than by hooking each of the dozen
-// places that can change one (drag, resize, retune, channel toggle, close,
-// the panel host's own remove). A serialize-and-compare a second is cheap
-// next to a frame, and unlike a hook it cannot be forgotten by the next
-// person who adds a way to move a scope.
-let benchSaved = '';
-let benchCheckedAt = 0;
-
-/** Persist this room's in-place scopes, if they changed. No-op offline and
- * against a pre-rooms server: with no room code there is nothing to key. */
-function persistBench() {
-  if (!roomKey) return;
-  const list = floatScopes.map(scopeToSeed);
-  const json = JSON.stringify(list);
-  if (json === benchSaved) return;
-  benchSaved = json;
-  saveBench(roomKey, list);
-}
-
-// A reload is the case that lost the bench in the first place, and it can
-// land between two ticks of the watcher.
-window.addEventListener('pagehide', () => persistBench());
 
 /** `?room=CODE` in the address bar is an invite link: it is where a shared
  * URL lands, and it is what a reload comes back to. No code = the server's
@@ -649,7 +711,7 @@ const roomFromUrl = (): string | null => {
 };
 
 const net = connect({
-  onHello(you, serverElements, serverProbes, serverPanels, room) {
+  onHello(you, serverElements, serverProbes, serverPanels, serverScopes, room) {
     online = true;
     myId = you;
     elements = serverElements;
@@ -669,12 +731,14 @@ const net = connect({
     // the camera back to the district the player deliberately left.
     const key = room?.id ?? '';
     if (key !== roomKey) {
-      // Bank the bench we are about to drop, under the code it belongs to,
-      // before `roomKey` names somewhere else.
-      persistBench();
       roomKey = key;
       resetForRoom(room);
     }
+    // AFTER `resetForRoom`, which empties the bench: the room's instruments
+    // arrive with the hello, exactly like its parts and its panels. Routed
+    // through the same handler the live broadcast uses so a late joiner and a
+    // running client can never end up with different rules.
+    applyScopes(serverScopes);
     roomsUI.onHello(room);
   },
   onFrame(f) {
@@ -719,6 +783,9 @@ const net = connect({
   },
   onPanels(list) {
     panels = list;
+  },
+  onScopes(list) {
+    applyScopes(list);
   },
   onLayers(list, cl) {
     layers = list;
@@ -797,7 +864,6 @@ const net = connect({
     // district every 2.5 s while they are panning around the local sim. If
     // `roomKey` is already null there is nothing left to drop.
     if (roomKey !== null) {
-      persistBench();
       roomKey = null;
       resetForRoom(null);
       hoist.clear(); // whatever machine that room had, it is not ours any more
@@ -1059,6 +1125,10 @@ function pruneProbeUsers() {
   const alive = new Set(probes.map((p) => p.pid));
   traces.prune(alive);
   if (selectedProbe !== null && !alive.has(selectedProbe)) selectedProbe = null;
+  // Local mirror of what the server does on its side of a probe removal
+  // (`prune_scope_pids`), so an offline client behaves the same and an online
+  // one does not draw one frame of a channel that has just died. The
+  // authoritative version arrives as the next `scopes` broadcast.
   for (const s of floatScopes) if (s.pids) s.pids = s.pids.filter((pid) => alive.has(pid));
   if (audio.pid !== null && !alive.has(audio.pid)) audio.stop();
 }
@@ -1366,8 +1436,16 @@ const panelHost = new PanelHost({
   traces: () => traces,
   scopes: () => floatScopes,
   removeScope: (sid) => {
-    floatScopes = floatScopes.filter((s) => s.sid !== sid);
+    // Drop the throttle slot with the scope, or a closed instrument leaves a
+    // pending timer that fires an op for a sid the room no longer has.
+    const r = retune.get(sid);
+    if (r?.timer) window.clearTimeout(r.timer);
+    retune.delete(sid);
+    scopeOp({ t: 'remove', sid });
   },
+  // A widget retuned an instrument (control row, timebase wheel, channel
+  // button). Same op the canvas sends, so the two surfaces cannot drift.
+  scopeChanged: scopeRetuned,
   interact: (e, op) => interact(e, op),
   op: panelOp,
   hover: (h) => {
@@ -2557,15 +2635,17 @@ function openCtxMenu(x: number, y: number, items: MenuItem[]) {
   openCtxPanel(0, items, x, y);
 }
 
-/** Drop an in-place oscilloscope with its top-left at a grid point. */
+/** Drop an in-place oscilloscope with its top-left at a grid point. It
+ * appears when the room says it did — the sid is the server's to mint, the
+ * same way a panel's plid is. */
 function addFloatScope(at: Point) {
-  floatScopes.push({
-    sid: sidCounter++,
+  scopeOp({
+    t: 'add',
     x: at[0],
     y: at[1],
     w: 12,
     h: 6,
-    set: defaultScopeSettings(5),
+    set: wireScopeSet(defaultScopeSettings(5)),
     pids: null,
   });
 }
@@ -2729,8 +2809,8 @@ let moveDrag: {
   moved: boolean;
   clickTarget: number;
 } | null = null;
-let scopeDrag: { s: FloatScope; dx: number; dy: number } | null = null;
-let scopeResize: { s: FloatScope } | null = null;
+let scopeDrag: { s: FloatScope; dx: number; dy: number; lastSent: number } | null = null;
+let scopeResize: { s: FloatScope; lastSent: number } | null = null;
 /** Dragging the whole machine assembly. Its own gesture, not moveDrag: the
  * machine is not an element, and its children are locked against the document
  * Move op that moveDrag issues. */
@@ -2899,6 +2979,7 @@ canvas.addEventListener('wheel', (ev) => {
   if (z) {
     const tb = z.s.set.timebase;
     z.s.set.timebase = Math.min(60, Math.max(0.001, tb * Math.exp(ev.deltaY * 0.001)));
+    scopeRetuned(z.s);
     return;
   }
   const k = Math.exp(-ev.deltaY * 0.0015);
@@ -2990,18 +3071,22 @@ canvas.addEventListener('pointerdown', (ev) => {
   const z = scopeZoneAt(ev.clientX, ev.clientY);
   if (z) {
     if (z.zone === 'close') {
-      floatScopes = floatScopes.filter((s) => s.sid !== z.s.sid);
+      scopeOp({ t: 'remove', sid: z.s.sid });
     } else if (z.zone === 'chan') {
+      // Applied locally FIRST (the dot has to light under the click) and then
+      // sent; the broadcast confirms it, exactly as a panel drag does.
       const s = z.s;
       if (s.pids === null) s.pids = probes.map((p) => p.pid);
       s.pids = s.pids.includes(z.pid) ? s.pids.filter((x) => x !== z.pid) : [...s.pids, z.pid];
+      scopeRetuned(s);
     } else if (z.zone === 'ctrl') {
       applyScopeControl(z.s.set, z.id, scopeProbes(z.s).length);
+      scopeRetuned(z.s);
     } else if (z.zone === 'title') {
       const [gx, gy] = toGrid(ev.clientX, ev.clientY);
-      scopeDrag = { s: z.s, dx: gx - z.s.x, dy: gy - z.s.y };
+      scopeDrag = { s: z.s, dx: gx - z.s.x, dy: gy - z.s.y, lastSent: 0 };
     } else if (z.zone === 'resize') {
-      scopeResize = { s: z.s };
+      scopeResize = { s: z.s, lastSent: 0 };
     }
     return;
   }
@@ -3146,12 +3231,23 @@ canvas.addEventListener('pointermove', (ev) => {
     const [gx, gy] = toGrid(ev.clientX, ev.clientY);
     scopeDrag.s.x = Math.round(gx - scopeDrag.dx);
     scopeDrag.s.y = Math.round(gy - scopeDrag.dy);
+    // Optimistic; the broadcast confirms — and while this drag is live
+    // `applyScopes` leaves the rect alone, so the confirmation cannot arrive
+    // late and drag the instrument back out from under the pointer.
+    if (now - scopeDrag.lastSent > 60) {
+      scopeDrag.lastSent = now;
+      scopeOp(scopeRectOp(scopeDrag.s));
+    }
     return;
   }
   if (scopeResize) {
     const [gx, gy] = toGrid(ev.clientX, ev.clientY);
     scopeResize.s.w = Math.max(6, Math.round(gx - scopeResize.s.x));
     scopeResize.s.h = Math.max(4, Math.round(gy - scopeResize.s.y));
+    if (now - scopeResize.lastSent > 60) {
+      scopeResize.lastSent = now;
+      scopeOp(scopeRectOp(scopeResize.s));
+    }
     return;
   }
   if (layerDrag) {
@@ -3336,8 +3432,13 @@ canvas.addEventListener('pointerup', (ev) => {
     return;
   }
   if (scopeDrag || scopeResize) {
+    // The op that reconciles: the throttle can have swallowed the last
+    // pointer sample, and this client has been ignoring the echo for the
+    // whole drag, so the final rect has to be stated outright.
+    const s = scopeDrag?.s ?? scopeResize!.s;
     scopeDrag = null;
     scopeResize = null;
+    scopeOp(scopeRectOp(s));
     return;
   }
   if (layerDrag) {
@@ -4143,10 +4244,6 @@ function frame(now: number) {
   const wallDt = Math.min(0.1, Math.max(0, (now - lastT) / 1000));
   lastT = now;
 
-  if (now - benchCheckedAt > 1000) {
-    benchCheckedAt = now;
-    persistBench();
-  }
 
   // Speakers are sources of sound the moment they exist in the document.
   // No-op unless the document actually changed since the last frame.
