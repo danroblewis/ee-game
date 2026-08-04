@@ -2,8 +2,8 @@
  "v": 1,
  "kind": "template",
  "id": "intro-07-opamp",
- "name": "7 \u00b7 The Decider",
- "blurb": "The op-amp compares two voltages and slams to a rail \u2014 and 25 mA is all it can push.",
+ "name": "7 · The Decider",
+ "blurb": "The op-amp compares two voltages and slams to a rail — and 25 mA is all it can push.",
  "elements": [
   {
    "id": 1,
@@ -26,7 +26,7 @@
    "kind": {
     "t": "Potentiometer",
     "ohms": 10000.0,
-    "wiper": 0.4
+    "wiper": 0.6
    },
    "pins": [
     [

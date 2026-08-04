@@ -315,9 +315,15 @@ save(
     "7 · The Decider",
     "The op-amp compares two voltages and slams to a rail — and 25 mA is all it can push.",
     [
-        # decider bench: pot wiper vs a 2 V reference, LED on the verdict
+        # decider bench: pot wiper vs a 2 V reference, LED on the verdict.
+        # WIPER 0.6, NOT 0.4. The wiper is measured from the grounded end, so
+        # 0.4 puts 2.40 V on in+ -- already past the 2.25 V the step checks
+        # for. The room opened with the badge at 1/3 and the LED lit, so a
+        # player never caused the snap-ON the lesson exists to show them.
+        # 0.6 is 1.60 V: below the reference, LED dark, and the turn is the
+        # lesson.
         rail(1, 4.0, (4, 3)),
-        pot(2, 10000.0, 0.4, (4, 3), (6, 6), (4, 9)),
+        pot(2, 10000.0, 0.6, (4, 3), (6, 6), (4, 9)),
         gnd(3, (4, 9)),
         wire(4, (6, 6), (12, 6)),
         battery(5, 2.0, (14, 2), (17, 2)),

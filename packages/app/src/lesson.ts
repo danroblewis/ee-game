@@ -219,7 +219,12 @@ const LESSONS: Record<string, LessonSpec> = {
         check: (c) => !c.broken(12) && !closed(c, 10),
       },
     ],
-    hint: '20 mA × 2 V = 0.04 W is fine. 0.65 A × 7 V is 4.5 W in a 5 mm package: 0.35 s.',
+    // MEASURED, not assumed. This said "0.65 A x 7 V is 4.5 W" and the 7 V
+    // is the RESISTOR's drop, not the LED's -- probing the burning LED reads
+    // ~2.3 V, so it is ~1.5 W. The old line contradicted this lesson's own
+    // step 2 and lesson 6's fixed-toll teaching. The LED still dies for a
+    // true reason: 1.5 W against a 0.04 W part is 40x over budget.
+    hint: '20 mA × 2 V = 0.04 W is fine. 0.65 A × ~2.3 V is ~1.5 W in a 5 mm package rated 0.04 W — forty times over. 0.35 s.',
     next: 'intro-05-time',
     nextLabel: '5 · Time',
   },
