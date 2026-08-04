@@ -318,8 +318,16 @@ pub fn clock_555(
     let pp = sh.part(id0 + 3, pot(pot_ohms, wiper), (a.0 + 10, dis.1), E, 4, false);
     sh.run(&[pp[1], (a.0 + 14, dis.1 - 2), pp[2]]);
     sh.run(&[pp[2], (a.0 + 14, a.1 + 8), (a.0 - 1, a.1 + 8), (a.0 - 1, a.1 + 3)]);
-    // The diode straight across the whole leg, anode on the DIS side.
-    sh.two(id0 + 4, K::Diode, (a.0 + 6, a.1 + 8), (a.0 + 6, dis.1));
+    // The diode straight across the whole leg, ANODE ON THE DIS SIDE — and
+    // that direction is the entire point of the part, not a detail. The
+    // charge current runs rail → ra → DIS node → cap, so the diode has to
+    // conduct THAT way to shunt the rheostat and make the HIGH time short;
+    // pointed the other way it shunts the discharge instead and the 555
+    // comes out high about 95 % of the time. A room hung off that gets a
+    // trigger that never falls, an envelope capacitor that is never allowed
+    // to decay, and a drum that sits silently at DC — which is exactly how
+    // this shipped the first time. `Diode`'s anode is pin 0.
+    sh.two(id0 + 4, K::Diode, (a.0 + 6, dis.1), (a.0 + 6, a.1 + 8));
     sh.run(&[(a.0 + 6, a.1 + 8), (a.0 - 1, a.1 + 8)]);
     sh.two(id0 + 5, cap(farads), (a.0 - 3, a.1 + 8), (a.0 - 1, a.1 + 8));
     sh.ground((a.0 - 3, a.1 + 8), LEFT);

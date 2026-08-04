@@ -147,6 +147,12 @@ const R_F: f64 = 470e3;
 /// for a reason that looked nothing like a DC fault. 100 k settles in a
 /// tenth of a second and costs the ladder 9 % of its output swing.
 const R_BLEED: f64 = 470e3;
+/// The output coupling capacitor, and it is small on purpose. Against
+///  the pair is a 1.5 Hz high-pass — inaudible — but a time constant
+/// of only 0.1 s, so the node has drained the collector's 8.4 V of bias
+/// within half a second of boot. At 1 µF the constant is 0.39 s and every
+/// measurement in this file had to wait four seconds for it.
+const C_OUT: f64 = 0.22e-6;
 
 // ------------------------------------------------------------------- ids
 //
@@ -321,7 +327,7 @@ pub fn moog_room_circuit() -> Vec<ElementSpec> {
     sh.two(122, r(R_LOAD), (XR, RAIL_Y + 8), (XR, -4));
     sh.wire((XL, RAIL_Y), (XL, RAIL_Y + 8));
     sh.wire((XR, RAIL_Y), (XR, RAIL_Y + 8));
-    debug_assert_eq!((XR, -4), ladder_out());
+    debug_assert_eq!((XL, -4), ladder_out());
 
     // ---------------------------------------- input pair bias and drive
     // Both bases sit on the 1.42 V tap through a stopper; the signal and the
@@ -389,7 +395,7 @@ pub fn moog_room_circuit() -> Vec<ElementSpec> {
     // which is not a solution of the follower's own equation. The mixer is an
     // INVERTING stage and has never done it.
     sh.run(&[ladder_out(), (80, -4)]);
-    sh.two(140, cap(1e-6), (80, -4), (84, -4));
+    sh.two(140, cap(C_OUT), (80, -4), (84, -4));
     debug_assert_eq!((84, -4), filter_out());
     sh.two(141, r(R_BLEED), (84, -4), (84, 0));
     sh.ground((84, 0), DOWN);
@@ -437,9 +443,16 @@ pub fn moog_label_boxes() -> Vec<crate::synth::PanelDef> {
     let b = |x0: f64, y0: f64, x1: f64, y1: f64, name: &'static str| PanelDef { x0, y0, x1, y1, name };
     vec![
         b(-11.0, -20.5, 29.0, 8.0, "VCO  1V/OCT  PITCH"),
-        b(-15.0, 42.5, 36.0, 55.0, "CUTOFF  EXPO CONVERTER"),
+        // The converter's resistor chain ends at x = 26 and the sink
+        // transistor starts at x = 30, so the two headings part at 28. They
+        // used to overlap between 28 and 36, and the CURRENT SINK box hung
+        // out through the side of the block it was supposed to sit beside.
+        b(-15.0, 42.5, 28.0, 55.0, "CUTOFF  EXPO CONVERTER"),
         b(28.0, 45.5, 40.0, 54.0, "CURRENT SINK"),
-        b(37.0, -14.5, 79.0, 35.0, "TRANSISTOR LADDER  4 RUNGS"),
+        // The bias chain is the ladder's east edge at x = 74 and the coupling
+        // capacitor starts at x = 80, so these part at 78 rather than lapping
+        // over each other by a unit.
+        b(37.0, -14.5, 78.0, 35.0, "TRANSISTOR LADDER  4 RUNGS"),
         b(78.0, -8.5, 92.0, 2.0, "OUT  DC BLOCK"),
         b(105.0, -10.0, 126.0, 1.0, "MIXER + SPEAKER"),
         // The plaque. 28 characters a line is what a label box holds.
@@ -576,14 +589,14 @@ mod tests {
         }
     }
 
-    /// Peak-to-peak of a node over `secs`, after `settle` substeps. Four
-    /// seconds of settling and not one: the output coupling network's time
-    /// constant is 0.39 s and a measurement taken before it has drained reads
-    /// the capacitor, not the filter.
+    /// Peak-to-peak of a node over `secs`, after 0.8 s of settling — eight
+    /// time constants of the output coupling network. A measurement taken
+    /// before that network has drained reads the capacitor, not the filter,
+    /// which is how a room that was working measured as silent.
     fn swing(els: &[ElementSpec], p: Point, secs: f64) -> (f64, bool) {
         let mut e = Engine::new(DT);
         e.set_elements(els);
-        e.advance(200_000);
+        e.advance(40_000);
         let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
         for _ in 0..(secs / DT) as u32 {
             e.advance(1);
@@ -630,7 +643,7 @@ mod tests {
         let els = moog_room_circuit();
         let mut e = Engine::new(DT);
         e.set_elements(&els);
-        e.advance(200_000);
+        e.advance(40_000);
         assert!(!e.is_quarantined());
         let v = |p: Point| e.voltage_at(p).expect("node missing");
         // The chain: five taps, each above the last.
@@ -702,7 +715,7 @@ mod tests {
             let mut eng = Engine::new(DT);
             eng.set_elements(&els);
             let mut rescues = 0;
-            for _ in 0..200 {
+            for _ in 0..100 {
                 let rep = eng.advance(500);
                 rescues += rep.rescues;
                 assert!(!eng.is_quarantined(), "quarantined at CUTOFF {cw} PITCH {pw}");

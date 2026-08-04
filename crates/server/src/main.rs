@@ -81,6 +81,7 @@ mod modules;
 mod moog;
 mod tr808;
 mod vco555;
+mod bass;
 #[cfg(test)]
 mod roombench;
 

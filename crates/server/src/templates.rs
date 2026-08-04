@@ -455,6 +455,12 @@ pub static BUILTINS: &[Builtin] = &[
         build: tr808_setup,
     },
     Builtin {
+        id: "bass-plus-plus",
+        name: "BASS++ (Thomas Henry)",
+        blurb: "Thomas Henry's drum voice: one envelope both pings a transconductance shell and sweeps its pitch. PITCH takes it from a ping to a boom. Hit it.",
+        build: bass_setup,
+    },
+    Builtin {
         id: "sandbox",
         name: "Sandbox",
         blurb: "An empty plane. Build anything.",
@@ -605,6 +611,39 @@ fn tr808_setup() -> RoomSetup {
         [-27.0, -31.0, 123.0, 103.0],
         json!({
             "x": 74.0, "y": 50.0, "w": 26.0, "h": 18.0,
+            "pids": [1, 2, 3], "timebase": 0.1
+        }),
+    )
+}
+
+/// Thomas Henry's BASS++ as a room. See `bass.rs` for the history, the
+/// one-envelope-two-jobs trick, the stand-ins and the measurements.
+fn bass_setup() -> RoomSetup {
+    instrument_setup(
+        crate::bass::bass_room_circuit(),
+        crate::bass::bass_panels(),
+        crate::bass::bass_label_boxes(),
+        vec![
+            // The shell resonator itself — the drum, before any gain.
+            SavedProbe { pid: 1, elem: 40, pin: 2, kind: ProbeKind::V, r: None },
+            // The envelope capacitor: one trace that is both the sweep and
+            // the mallet, which is the whole point of the design.
+            SavedProbe { pid: 2, elem: 34, pin: 0, kind: ProbeKind::V, r: None },
+            // What the speaker hears.
+            SavedProbe {
+                pid: 3,
+                elem: crate::bass::ID_SPEAKER,
+                pin: 0,
+                kind: ProbeKind::V,
+                r: None,
+            },
+        ],
+        // Wide enough to hold the honesty plaque out east of the mixer: it
+        // sits from x = 66 to 98, and a home view that stopped at 66 cut it
+        // in half on arrival.
+        [-30.0, -30.0, 102.0, 40.0],
+        json!({
+            "x": 30.0, "y": 26.0, "w": 24.0, "h": 15.0,
             "pids": [1, 2, 3], "timebase": 0.1
         }),
     )
