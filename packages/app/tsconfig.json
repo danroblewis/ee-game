@@ -5,6 +5,12 @@
     "moduleResolution": "bundler",
     "strict": true,
     "noUncheckedIndexedAccess": true,
+    // A missing `break` in the wire-message router silently routed every
+    // `scopes` broadcast into `onLabelBoxes` as well, and a Scope has no
+    // `name`, so the frame loop threw and the whole game froze. The compiler
+    // can rule that class out entirely; nothing in this codebase wants an
+    // implicit fallthrough badly enough to keep the risk.
+    "noFallthroughCasesInSwitch": true,
     "skipLibCheck": true,
     "lib": ["ES2022", "DOM", "DOM.Iterable"]
   },

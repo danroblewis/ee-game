@@ -511,6 +511,7 @@ export function connect(h: NetHandlers, room: string | null = null): Net {
         break;
       case 'scopes':
         h.onScopes(m.list ?? []);
+        break;
       case 'labelboxes':
         h.onLabelBoxes(m.list ?? []);
         break;
