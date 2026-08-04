@@ -338,3 +338,73 @@ pub fn clock_555(
 /// all four and clippy would otherwise call the import dead.
 #[allow(dead_code)]
 pub const WEST: Point = W;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sim_core::Engine;
+
+    const DT: f64 = 20e-6;
+
+    /// `clock_555` PROMISES A TRIGGER, NOT A GATE: a short high and a long
+    /// low, so that whatever hangs off it sees a pulse. That promise lives
+    /// entirely in the orientation of one diode, and pointed the wrong way
+    /// the part still oscillates, still looks right on a scope, and comes
+    /// out HIGH about 95 % of the time instead of 2 %.
+    ///
+    /// Nothing caught it, because nothing used the module until BASS++ did.
+    /// The room that did got a trigger that never fell, an envelope capacitor
+    /// that was never allowed to decay, and a drum sitting silently at DC.
+    /// So: measure the duty cycle, and refuse a gate.
+    #[test]
+    fn clock_555_emits_a_short_trigger_not_a_gate() {
+        let mut sh = Sheet::new(300);
+        let rail_y = -20;
+        sh.two(
+            1,
+            K::VoltageSource {
+                dc: 9.0,
+                amp: 0.0,
+                hz: 0.0,
+                phase: 0.0,
+                wave: sim_core::Wave::Sine,
+            },
+            (-8, rail_y),
+            (-8, rail_y + 4),
+        );
+        sh.ground((-8, rail_y + 4), DOWN);
+        // Every tap a VERTEX of the run: `clock_555` reaches the rail at
+        // `a.0` and `a.0 + 4`.
+        sh.run(&[(-8, rail_y), (0, rail_y), (4, rail_y)]);
+        let out = clock_555(&mut sh, 20, (0, -12), (0, rail_y), 10e3, 47e3, 1e6, 0.40, 1e-6);
+        // A load, so `out` is a real node and not an unreferenced pin.
+        sh.two(40, r(100e3), out, (out.0, out.1 + 6));
+        sh.ground((out.0, out.1 + 6), DOWN);
+        let els = sh.finish();
+
+        let mut e = Engine::new(DT);
+        e.set_elements(&els);
+        e.advance(50_000);
+        assert!(!e.is_quarantined(), "the clock quarantined");
+        let mut high = 0u32;
+        let n = 150_000u32;
+        let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+        for _ in 0..n {
+            e.advance(1);
+            let v = e.voltage_at(out).unwrap_or(0.0);
+            lo = lo.min(v);
+            hi = hi.max(v);
+            if v > 4.0 {
+                high += 1;
+            }
+        }
+        assert!(hi - lo > 4.0, "the clock is not swinging: {:.2} Vpp", hi - lo);
+        let duty = f64::from(high) / f64::from(n);
+        assert!(
+            duty > 0.001 && duty < 0.25,
+            "duty cycle {:.1} % — that is a gate, not a trigger, and the \
+             diode across the timing leg is the thing to look at",
+            duty * 100.0
+        );
+    }
+}

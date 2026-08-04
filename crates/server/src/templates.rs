@@ -461,6 +461,12 @@ pub static BUILTINS: &[Builtin] = &[
         build: bass_setup,
     },
     Builtin {
+        id: "the-scream",
+        name: "The Scream (Korg MS-20)",
+        blurb: "Two poles, a feedback loop round them and two diodes clamping it — the MS-20's trick. Turn PEAK up until it sings, and the diodes are what stop it running away.",
+        build: ms20_setup,
+    },
+    Builtin {
         id: "sandbox",
         name: "Sandbox",
         blurb: "An empty plane. Build anything.",
@@ -645,6 +651,44 @@ fn bass_setup() -> RoomSetup {
         json!({
             "x": 30.0, "y": 26.0, "w": 24.0, "h": 15.0,
             "pids": [1, 2, 3], "timebase": 0.1
+        }),
+    )
+}
+
+/// The MS-20's filter as a room. See `ms20.rs` for the history, the diode
+/// limiter that is the whole point, and the measurements behind every number
+/// on the plaque.
+fn ms20_setup() -> RoomSetup {
+    instrument_setup(
+        crate::ms20::ms20_room_circuit(),
+        crate::ms20::ms20_panels(),
+        crate::ms20::ms20_label_boxes(),
+        vec![
+            // The VCO's square going in: element 29 is the comparator, pin 2
+            // its output.
+            SavedProbe { pid: 1, elem: 29, pin: 2, kind: ProbeKind::V, r: None },
+            // THE RESONANCE NODE — the one to watch. Pin 0 of the first
+            // diode is the node the pair clamps, so a player can SEE the
+            // tops come off the waveform as PEAK goes up.
+            SavedProbe { pid: 2, elem: 74, pin: 0, kind: ProbeKind::V, r: None },
+            // What the speaker hears.
+            SavedProbe {
+                pid: 3,
+                elem: crate::ms20::ID_SPEAKER,
+                pin: 0,
+                kind: ProbeKind::V,
+                r: None,
+            },
+        ],
+        // Margin on the LEFT is deliberate. The control panel is a screen-
+        // space overlay about 300 px wide, so whatever the home view puts in
+        // its first 300 px arrives hidden — the VCO block did, at the first
+        // framing. Opening the left edge out to −68 parks that overlay over
+        // empty sheet instead.
+        [-68.0, -40.0, 152.0, 40.0],
+        json!({
+            "x": 22.0, "y": 24.0, "w": 28.0, "h": 16.0,
+            "pids": [1, 2, 3], "timebase": 0.01
         }),
     )
 }

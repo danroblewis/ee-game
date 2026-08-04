@@ -96,6 +96,7 @@ mod tests {
         measure("tr-808", &crate::tr808::tr808_room_circuit(), steps);
         measure("the-ladder", &crate::moog::moog_room_circuit(), steps);
         measure("bass-plus-plus", &crate::bass::bass_room_circuit(), steps);
+        measure("the-scream", &crate::ms20::ms20_room_circuit(), steps);
         // Rooms land here one at a time, each measured before the next
         // begins; a missing line means the room does not exist yet.
     }
@@ -108,11 +109,12 @@ mod tests {
     /// Cheap to run, so it runs for all of them.
     #[test]
     fn no_instrument_room_overlaps_its_own_label_boxes() {
-        let rooms: [(&str, Vec<crate::synth::PanelDef>); 4] = [
+        let rooms: [(&str, Vec<crate::synth::PanelDef>); 5] = [
             ("vco-555", crate::vco555::vco555_label_boxes()),
             ("tr-808", crate::tr808::tr808_label_boxes()),
             ("the-ladder", crate::moog::moog_label_boxes()),
             ("bass-plus-plus", crate::bass::bass_label_boxes()),
+            ("the-scream", crate::ms20::ms20_label_boxes()),
         ];
         for (room, boxes) in rooms {
             for (i, a) in boxes.iter().enumerate() {
