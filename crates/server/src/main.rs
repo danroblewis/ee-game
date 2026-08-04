@@ -77,6 +77,13 @@ mod synth;
 mod drums;
 #[allow(dead_code)]
 mod synth_vco;
+mod modules;
+mod moog;
+mod tr808;
+mod vco555;
+mod bass;
+#[cfg(test)]
+mod roombench;
 
 use damage::DamageModel;
 use machine::Hoist;
