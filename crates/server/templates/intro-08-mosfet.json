@@ -1,0 +1,384 @@
+{
+ "v": 1,
+ "kind": "template",
+ "id": "intro-08-mosfet",
+ "name": "8 \u00b7 The Gate",
+ "blurb": "A gate that draws nothing commands a current that matters \u2014 if you switch the low side.",
+ "elements": [
+  {
+   "id": 1,
+   "kind": {
+    "t": "Rail",
+    "dc": 5.0,
+    "amp": 0.0,
+    "hz": 0.0,
+    "phase": 0.0
+   },
+   "pins": [
+    [
+     8,
+     1
+    ]
+   ]
+  },
+  {
+   "id": 2,
+   "kind": {
+    "t": "Wire"
+   },
+   "pins": [
+    [
+     8,
+     1
+    ],
+    [
+     8,
+     3
+    ]
+   ]
+  },
+  {
+   "id": 3,
+   "kind": {
+    "t": "Lamp",
+    "ohms": 25.0,
+    "rated_watts": 1.0
+   },
+   "pins": [
+    [
+     8,
+     3
+    ],
+    [
+     8,
+     7
+    ]
+   ]
+  },
+  {
+   "id": 4,
+   "kind": {
+    "t": "Nmos",
+    "vt": 2.0,
+    "k": 0.05
+   },
+   "pins": [
+    [
+     4,
+     9
+    ],
+    [
+     8,
+     7
+    ],
+    [
+     8,
+     11
+    ]
+   ]
+  },
+  {
+   "id": 5,
+   "kind": {
+    "t": "Ground"
+   },
+   "pins": [
+    [
+     8,
+     11
+    ]
+   ]
+  },
+  {
+   "id": 6,
+   "kind": {
+    "t": "Rail",
+    "dc": 5.0,
+    "amp": 0.0,
+    "hz": 0.0,
+    "phase": 0.0
+   },
+   "pins": [
+    [
+     2,
+     7
+    ]
+   ]
+  },
+  {
+   "id": 7,
+   "kind": {
+    "t": "Wire"
+   },
+   "pins": [
+    [
+     2,
+     7
+    ],
+    [
+     2,
+     9
+    ]
+   ]
+  },
+  {
+   "id": 8,
+   "kind": {
+    "t": "Switch",
+    "closed": false
+   },
+   "pins": [
+    [
+     2,
+     9
+    ],
+    [
+     4,
+     9
+    ]
+   ]
+  },
+  {
+   "id": 9,
+   "kind": {
+    "t": "Resistor",
+    "ohms": 100000.0
+   },
+   "pins": [
+    [
+     4,
+     9
+    ],
+    [
+     4,
+     13
+    ]
+   ]
+  },
+  {
+   "id": 10,
+   "kind": {
+    "t": "Ground"
+   },
+   "pins": [
+    [
+     4,
+     13
+    ]
+   ]
+  },
+  {
+   "id": 11,
+   "kind": {
+    "t": "Rail",
+    "dc": 5.0,
+    "amp": 0.0,
+    "hz": 0.0,
+    "phase": 0.0
+   },
+   "pins": [
+    [
+     26,
+     1
+    ]
+   ]
+  },
+  {
+   "id": 12,
+   "kind": {
+    "t": "Wire"
+   },
+   "pins": [
+    [
+     26,
+     1
+    ],
+    [
+     26,
+     3
+    ]
+   ]
+  },
+  {
+   "id": 13,
+   "kind": {
+    "t": "Nmos",
+    "vt": 2.0,
+    "k": 0.05
+   },
+   "pins": [
+    [
+     22,
+     5
+    ],
+    [
+     26,
+     3
+    ],
+    [
+     26,
+     7
+    ]
+   ]
+  },
+  {
+   "id": 14,
+   "kind": {
+    "t": "Lamp",
+    "ohms": 25.0,
+    "rated_watts": 1.0
+   },
+   "pins": [
+    [
+     26,
+     7
+    ],
+    [
+     26,
+     11
+    ]
+   ]
+  },
+  {
+   "id": 15,
+   "kind": {
+    "t": "Ground"
+   },
+   "pins": [
+    [
+     26,
+     11
+    ]
+   ]
+  },
+  {
+   "id": 16,
+   "kind": {
+    "t": "Rail",
+    "dc": 5.0,
+    "amp": 0.0,
+    "hz": 0.0,
+    "phase": 0.0
+   },
+   "pins": [
+    [
+     20,
+     3
+    ]
+   ]
+  },
+  {
+   "id": 17,
+   "kind": {
+    "t": "Wire"
+   },
+   "pins": [
+    [
+     20,
+     3
+    ],
+    [
+     20,
+     5
+    ]
+   ]
+  },
+  {
+   "id": 18,
+   "kind": {
+    "t": "Switch",
+    "closed": false
+   },
+   "pins": [
+    [
+     20,
+     5
+    ],
+    [
+     22,
+     5
+    ]
+   ]
+  },
+  {
+   "id": 19,
+   "kind": {
+    "t": "Resistor",
+    "ohms": 100000.0
+   },
+   "pins": [
+    [
+     22,
+     5
+    ],
+    [
+     22,
+     9
+    ]
+   ]
+  },
+  {
+   "id": 20,
+   "kind": {
+    "t": "Ground"
+   },
+   "pins": [
+    [
+     22,
+     9
+    ]
+   ]
+  }
+ ],
+ "probes": [
+  {
+   "pid": 1,
+   "elem": 3,
+   "pin": 0,
+   "kind": "i",
+   "r": null
+  },
+  {
+   "pid": 2,
+   "elem": 4,
+   "pin": 0,
+   "kind": "i",
+   "r": null
+  },
+  {
+   "pid": 3,
+   "elem": 14,
+   "pin": 0,
+   "kind": "i",
+   "r": null
+  }
+ ],
+ "next_pid": 4,
+ "panels": [],
+ "next_plid": 1,
+ "machine": {
+  "kind": "none"
+ },
+ "view": {
+  "home": [
+   -16.0,
+   -1.0,
+   31.0,
+   23.0
+  ],
+  "scopes": [
+   {
+    "x": 2.0,
+    "y": 14.5,
+    "w": 16.0,
+    "h": 7.5,
+    "pids": [
+     1,
+     2,
+     3
+    ],
+    "timebase": 2.0
+   }
+  ]
+ }
+}

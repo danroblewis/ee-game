@@ -54,6 +54,7 @@
 //! whose template declares none (a sandbox, a synth world) never mentions
 //! the hoist and never gets ids 900-999 injected into it.
 
+mod lessons;
 mod lobby;
 mod registry;
 mod templates;

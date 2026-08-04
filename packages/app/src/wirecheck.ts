@@ -664,27 +664,58 @@ console.log('privacy — the client has no way to transmit media, and cannot gro
       return false;
     }
   });
-  // The ONE exclusion, and it is not a shipped file: this checker is compiled
-  // by `tsc` and run under node, never bundled and never loaded by a browser,
-  // so the banned names in its own `banned` array are data, not call sites.
-  // Every file that CAN reach a browser is scanned.
-  const files: string[] = srcDir
-    ? fs
-        .readdirSync(srcDir)
-        .filter((f: string) => f.endsWith('.ts') && !f.endsWith('.d.ts') && f !== 'wirecheck.ts')
-    : [];
-  if (files.length < 20) throw new Error(`wirecheck: only found ${files.length} sources — refusing to certify a scan that may have missed files`);
+  // RECURSIVE, and that word is the whole point.
+  //
+  // This scan has now been wrong twice, the same way both times: it named 18
+  // files by hand while `src/` held 25, and when that was replaced with a
+  // directory read the read was FLAT — so every ban was void inside
+  // `src/machines/`, which holds four browser-reachable files today. A guard
+  // that silently stops covering part of the tree is worse than no guard,
+  // because it reports "ok".
+  //
+  // The ONE exclusion is not a shipped file: this checker is compiled by
+  // `tsc` and run under node, never bundled and never loaded by a browser, so
+  // the banned names in its own `banned` array are data, not call sites.
+  const walk = (dir: string): string[] => {
+    const out: string[] = [];
+    for (const e of fs.readdirSync(dir)) {
+      const full = dir.replace(/\/$/, '') + '/' + e;
+      let isDir = false;
+      try {
+        isDir = fs.statSync(full).isDirectory();
+      } catch {
+        isDir = false;
+      }
+      if (isDir) out.push(...walk(full));
+      else if (e.endsWith('.ts') && !e.endsWith('.d.ts') && e !== 'wirecheck.ts') out.push(full);
+    }
+    return out;
+  };
+  const files: string[] = srcDir ? walk(srcDir) : [];
+  // The floor is a tripwire for the scan silently finding nothing, and it has
+  // to rise with the tree or it stops meaning anything.
+  if (files.length < 25)
+    throw new Error(
+      `wirecheck: only found ${files.length} sources — refusing to certify a scan that may have missed files`,
+    );
+  // And a directory that EXISTS must be represented, so a future subdirectory
+  // cannot quietly fall outside the walk the way `machines/` just did.
+  for (const sub of ['machines']) {
+    if (!files.some((f) => f.includes('/' + sub + '/')))
+      throw new Error(`wirecheck: nothing scanned in src/${sub}/ — the walk is not reaching it`);
+  }
   const hits: string[] = [];
   let read = 0;
   for (const f of files) {
+    // `walk` returns paths already rooted at `srcDir`, so read them as-is.
+    // The old loop re-prefixed a bare filename with each candidate root,
+    // which silently produced `src/src/machines/hoist.ts` once the walk went
+    // recursive and would have skipped every nested file without a word.
     let src = '';
-    for (const base of ['src/', 'packages/app/src/']) {
-      try {
-        src = fs.readFileSync(base + f, 'utf8');
-        break;
-      } catch {
-        /* try the next root */
-      }
+    try {
+      src = fs.readFileSync(f, 'utf8');
+    } catch {
+      src = '';
     }
     if (!src) continue;
     read++;

@@ -117,7 +117,25 @@ function meanLuma(
       n++;
     }
   }
-  return n === 0 ? 0 : sum / n / 255;
+  if (n === 0) return 0;
+  // VIDEO RANGE, not full range. Cameras deliver BT.601/709 limited-range
+  // luma: black is Y=16 and white is Y=235, not 0 and 255. Dividing by 255
+  // meant a genuinely black picture reported 16/255 = 6.3% light, so a
+  // photocell floored at ~648 kOhm instead of its r_dark and its symbol
+  // rendered lit forever — the "always active even when the picture is
+  // basically black" the owner reported.
+  //
+  // Corrected HERE, in the worker, and deliberately not at the render
+  // threshold: dimming the glyph while the resistance stayed wrong would be
+  // cosmetic dishonesty, and the resistance is what the solver stamps.
+  //
+  // Clamped both ends because the range is a convention, not a guarantee:
+  // a full-range source (some virtual cameras, some screen shares) legally
+  // sends 0 and 255, and super-white/super-black footroom exists precisely
+  // so overshoot is representable.
+  const y = sum / n;
+  const lit = (y - 16) / 219;
+  return lit < 0 ? 0 : lit > 1 ? 1 : lit;
 }
 
 function emit(w: number, h: number, stride: number, offset: number, t0: number) {

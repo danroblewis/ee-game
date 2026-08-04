@@ -155,7 +155,10 @@ import {
 } from './annotate';
 import { History, isTypingTarget } from './history';
 import { createHoist, type MachineRect } from './hoist';
+import { createLesson } from './lesson';
 import { connect, MAX_CHAT_LEN, type RoomHello } from './net';
+// NOT loadBench/saveBench: the intro branch predates scopes becoming room
+// state, and those two were deleted when the per-browser bench went away.
 import { createRooms } from './rooms';
 import {
   applyPanelOp,
@@ -706,6 +709,18 @@ const roomsUI = createRooms({
   toast: (m) => toast(m),
 });
 
+/** The intro-series lesson card (lesson.ts). Shown only in rooms made from
+ * an `intro-*` template; its step checks read the same live map every other
+ * instrument reads. */
+const lessonUI = createLesson(document.body, {
+  elements: () => elements,
+  live: () => live,
+  isBroken: (id) => isBroken(id),
+  machine: () => hoist.state(),
+  join: (code) => net.join(code),
+  toast: (m) => toast(m),
+});
+
 /**
  * Leave a room. Every line here is state that is scoped to ONE room and
  * would be wrong — not merely stale — in the next one:
@@ -850,6 +865,7 @@ const net = connect({
     // answer.
     netMap = emptyNetMap();
     roomsUI.onHello(room);
+    lessonUI.onRoom(room ? { id: room.id, template: room.template } : null);
   },
   onFrame(f) {
     simTime = f.time;
@@ -988,6 +1004,7 @@ const net = connect({
       roomKey = null;
       resetForRoom(null);
       hoist.clear(); // whatever machine that room had, it is not ours any more
+      lessonUI.onRoom(null);
     }
     roomsUI.onGone(id, reason);
   },
@@ -3985,7 +4002,7 @@ canvas.addEventListener('pointermove', (ev) => {
   const nl2 = z || pz || bz2 ? null : netLabelAt(cam, netLabels, ev.clientX, ev.clientY);
   canvas.style.cursor = repairing
     ? REPAIR_CURSOR
-    : placing || pasting || panelTool || labelBoxTool || netLabelTool
+    : placing || pasting || panelTool || labelBoxTool || netLabelTool || layerTool
     ? 'crosshair'
     : spaceHeld
       ? 'grab'
@@ -4234,6 +4251,7 @@ window.addEventListener('keydown', (ev) => {
   if (panelHost.owns(ev.target)) return; // typing in a panel window
   if (roomsUI.owns(ev.target)) return; // typing in the room browser
   if (chatOwns(ev.target)) return; // typing a chat line
+  if (lessonUI.owns(ev.target)) return; // a focused lesson-card button
 
   // Clipboard first: ⌘/Ctrl+C copies, ⌘/Ctrl+V arms pasting at the cursor.
   if (ev.metaKey || ev.ctrlKey) {
@@ -4417,6 +4435,21 @@ window.addEventListener('keydown', (ev) => {
       const lb = labelBoxHotAt(cam, labelBoxes, mouse.x, mouse.y);
       if (lb) {
         labelBoxOp({ t: 'remove', blid: lb.blid });
+        return;
+      }
+      // A CAMERA LAYER, last of the annotations and for the same reason the
+      // comment above gives: a shape a player can make and cannot unmake is a
+      // trap. The wire has always carried LayerOp Remove, but no gesture
+      // reached it except shift+click on the name plate — undocumented, and a
+      // mis-aim of the add-to-selection gesture. Delete over the layer works
+      // now, like every other thing on the sheet.
+      //
+      // LAST because `layerAt` is a BODY hit, not an edge-or-plate hit like
+      // the two above: a camera layer is a district-sized rectangle, and
+      // testing it earlier would shadow every part standing inside it.
+      const ly = layerAt(cam, layers, mouse.x, mouse.y);
+      if (ly && !elementAt(mouse.x, mouse.y)) {
+        layerOp({ t: 'remove', lid: ly.lid });
         return;
       }
     }
@@ -5077,6 +5110,10 @@ function frame(now: number) {
     damage,
     dots,
   });
+
+  // The lesson card's step checks, against this frame's live map (throttled
+  // inside; a room that is not a lesson costs one boolean here).
+  lessonUI.tick(now);
 
   // Hover highlight (blue element + pin dots), Falstad-style.
   const zHover = mouse ? scopeZoneAt(mouse.x, mouse.y) : null;

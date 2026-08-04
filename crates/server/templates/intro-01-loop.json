@@ -1,0 +1,122 @@
+{
+ "v": 1,
+ "kind": "template",
+ "id": "intro-01-loop",
+ "name": "1 \u00b7 The Loop",
+ "blurb": "A battery, a lamp, and a gap. Nothing flows until the loop closes \u2014 start here.",
+ "elements": [
+  {
+   "id": 1,
+   "kind": {
+    "t": "VoltageSource",
+    "dc": 9.0,
+    "amp": 0.0,
+    "hz": 0.0,
+    "phase": 0.0
+   },
+   "pins": [
+    [
+     4,
+     3
+    ],
+    [
+     4,
+     9
+    ]
+   ]
+  },
+  {
+   "id": 2,
+   "kind": {
+    "t": "Wire"
+   },
+   "pins": [
+    [
+     4,
+     3
+    ],
+    [
+     14,
+     3
+    ]
+   ]
+  },
+  {
+   "id": 3,
+   "kind": {
+    "t": "Lamp",
+    "ohms": 90.0,
+    "rated_watts": 1.0
+   },
+   "pins": [
+    [
+     14,
+     3
+    ],
+    [
+     14,
+     9
+    ]
+   ]
+  },
+  {
+   "id": 4,
+   "kind": {
+    "t": "Wire"
+   },
+   "pins": [
+    [
+     14,
+     9
+    ],
+    [
+     9,
+     9
+    ]
+   ]
+  }
+ ],
+ "probes": [
+  {
+   "pid": 1,
+   "elem": 3,
+   "pin": 0,
+   "kind": "i",
+   "r": null
+  },
+  {
+   "pid": 2,
+   "elem": 1,
+   "pin": 1,
+   "kind": "i",
+   "r": null
+  }
+ ],
+ "next_pid": 3,
+ "panels": [],
+ "next_plid": 1,
+ "machine": {
+  "kind": "none"
+ },
+ "view": {
+  "home": [
+   -1.0,
+   0.0,
+   27.0,
+   21.5
+  ],
+  "scopes": [
+   {
+    "x": 2.0,
+    "y": 11.5,
+    "w": 14.0,
+    "h": 7.0,
+    "pids": [
+     1,
+     2
+    ],
+    "timebase": 2.0
+   }
+  ]
+ }
+}

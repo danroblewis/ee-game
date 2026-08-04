@@ -1,0 +1,346 @@
+{
+ "v": 1,
+ "kind": "template",
+ "id": "intro-03-kirchhoff",
+ "name": "3 \u00b7 Kirchhoff",
+ "blurb": "Current in equals current out, and the drops around a loop share the battery's push.",
+ "elements": [
+  {
+   "id": 1,
+   "kind": {
+    "t": "VoltageSource",
+    "dc": 6.0,
+    "amp": 0.0,
+    "hz": 0.0,
+    "phase": 0.0
+   },
+   "pins": [
+    [
+     4,
+     3
+    ],
+    [
+     4,
+     11
+    ]
+   ]
+  },
+  {
+   "id": 2,
+   "kind": {
+    "t": "Wire"
+   },
+   "pins": [
+    [
+     4,
+     3
+    ],
+    [
+     9,
+     3
+    ]
+   ]
+  },
+  {
+   "id": 3,
+   "kind": {
+    "t": "Lamp",
+    "ohms": 60.0,
+    "rated_watts": 1.0
+   },
+   "pins": [
+    [
+     9,
+     3
+    ],
+    [
+     9,
+     11
+    ]
+   ]
+  },
+  {
+   "id": 4,
+   "kind": {
+    "t": "Wire"
+   },
+   "pins": [
+    [
+     9,
+     3
+    ],
+    [
+     14,
+     3
+    ]
+   ]
+  },
+  {
+   "id": 5,
+   "kind": {
+    "t": "Switch",
+    "closed": true
+   },
+   "pins": [
+    [
+     14,
+     3
+    ],
+    [
+     14,
+     6
+    ]
+   ]
+  },
+  {
+   "id": 6,
+   "kind": {
+    "t": "Lamp",
+    "ohms": 120.0,
+    "rated_watts": 0.5
+   },
+   "pins": [
+    [
+     14,
+     6
+    ],
+    [
+     14,
+     11
+    ]
+   ]
+  },
+  {
+   "id": 7,
+   "kind": {
+    "t": "Wire"
+   },
+   "pins": [
+    [
+     14,
+     11
+    ],
+    [
+     9,
+     11
+    ]
+   ]
+  },
+  {
+   "id": 8,
+   "kind": {
+    "t": "Wire"
+   },
+   "pins": [
+    [
+     9,
+     11
+    ],
+    [
+     4,
+     11
+    ]
+   ]
+  },
+  {
+   "id": 9,
+   "kind": {
+    "t": "VoltageSource",
+    "dc": 9.0,
+    "amp": 0.0,
+    "hz": 0.0,
+    "phase": 0.0
+   },
+   "pins": [
+    [
+     22,
+     3
+    ],
+    [
+     22,
+     11
+    ]
+   ]
+  },
+  {
+   "id": 10,
+   "kind": {
+    "t": "Wire"
+   },
+   "pins": [
+    [
+     22,
+     3
+    ],
+    [
+     27,
+     3
+    ]
+   ]
+  },
+  {
+   "id": 11,
+   "kind": {
+    "t": "Resistor",
+    "ohms": 2000.0
+   },
+   "pins": [
+    [
+     27,
+     3
+    ],
+    [
+     27,
+     7
+    ]
+   ]
+  },
+  {
+   "id": 12,
+   "kind": {
+    "t": "Resistor",
+    "ohms": 1000.0
+   },
+   "pins": [
+    [
+     27,
+     7
+    ],
+    [
+     27,
+     11
+    ]
+   ]
+  },
+  {
+   "id": 13,
+   "kind": {
+    "t": "Wire"
+   },
+   "pins": [
+    [
+     27,
+     11
+    ],
+    [
+     22,
+     11
+    ]
+   ]
+  },
+  {
+   "id": 14,
+   "kind": {
+    "t": "Ground"
+   },
+   "pins": [
+    [
+     22,
+     11
+    ]
+   ]
+  }
+ ],
+ "probes": [
+  {
+   "pid": 1,
+   "elem": 1,
+   "pin": 1,
+   "kind": "i",
+   "r": null
+  },
+  {
+   "pid": 2,
+   "elem": 3,
+   "pin": 0,
+   "kind": "i",
+   "r": null
+  },
+  {
+   "pid": 3,
+   "elem": 6,
+   "pin": 0,
+   "kind": "i",
+   "r": null
+  },
+  {
+   "pid": 4,
+   "elem": 11,
+   "pin": 0,
+   "kind": "v",
+   "r": [
+    11,
+    1
+   ]
+  },
+  {
+   "pid": 5,
+   "elem": 12,
+   "pin": 0,
+   "kind": "v",
+   "r": [
+    12,
+    1
+   ]
+  },
+  {
+   "pid": 6,
+   "elem": 9,
+   "pin": 0,
+   "kind": "v",
+   "r": [
+    9,
+    1
+   ]
+  }
+ ],
+ "next_pid": 7,
+ "panels": [
+  {
+   "plid": 1,
+   "x0": 20.0,
+   "y0": 1.5,
+   "x1": 31.0,
+   "y1": 12.5,
+   "name": "ONE LOOP, ONE PUSH"
+  }
+ ],
+ "next_plid": 2,
+ "machine": {
+  "kind": "none"
+ },
+ "view": {
+  "home": [
+   -24.0,
+   0.0,
+   33.0,
+   23.0
+  ],
+  "scopes": [
+   {
+    "x": 2.0,
+    "y": 13.5,
+    "w": 13.0,
+    "h": 7.0,
+    "pids": [
+     1,
+     2,
+     3
+    ],
+    "timebase": 2.0
+   },
+   {
+    "x": 17.0,
+    "y": 13.5,
+    "w": 13.0,
+    "h": 7.0,
+    "pids": [
+     4,
+     5,
+     6
+    ],
+    "timebase": 2.0
+   }
+  ]
+ }
+}
