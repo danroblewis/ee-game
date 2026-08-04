@@ -464,7 +464,10 @@
          the elements; this is only their look). Bottom-left, above the
          scope dock, never in the way of the goal card. */
       #toasts {
-        position: fixed; left: calc(12px + var(--rail-l)); bottom: 36px; z-index: 25;
+        position: fixed; left: calc(12px + var(--rail-l)); z-index: 25;
+        /* Lifted above the chat when chat has something to show — main.ts
+           sets --toasts-b so the two bottom-left tenants never overlap. */
+        bottom: var(--toasts-b, 36px);
         display: flex; flex-direction: column; gap: 6px;
         pointer-events: none; max-width: 430px;
       }
@@ -480,6 +483,38 @@
         from { opacity: 0; transform: translateY(6px); }
         to { opacity: 1; transform: none; }
       }
+
+      /* ---- room chat (main.ts owns the elements; this is only their look).
+         Bottom-left under the toasts, and QUIET: lines fade away after a few
+         seconds, the input exists only while Enter has opened it, and nothing
+         here ever swallows a pointer aimed at the schematic. */
+      #chat {
+        position: fixed; left: calc(12px + var(--rail-l)); bottom: 36px; z-index: 24;
+        display: flex; flex-direction: column; gap: 3px;
+        pointer-events: none; max-width: 430px; width: min(430px, 60vw);
+        font: 12px/1.45 ui-monospace, monospace;
+      }
+      .cline {
+        color: #c9d6de; background: #0d0d13cc;
+        border: 1px solid #23232c; border-left: 3px solid var(--cwho, #8a8a98);
+        border-radius: 4px; padding: 3px 8px;
+        overflow-wrap: anywhere; /* a 240-char word must wrap, not escape */
+        transition: opacity 600ms ease;
+        animation: toastin 140ms ease-out;
+      }
+      .cline.faded { opacity: 0; }
+      .cline.gone { display: none; }
+      /* While the input is open the whole tail is readable again. */
+      #chat.open .cline { display: block; opacity: 1; }
+      .cline .cwho { color: var(--cwho, #8a8a98); font-weight: 600; margin-right: 6px; }
+      #chatinput {
+        display: none; pointer-events: auto; width: 100%; box-sizing: border-box;
+        background: #0d0d13; color: #e8e8f0; margin-top: 3px;
+        border: 1px solid #6a6a80; border-radius: 4px;
+        padding: 3px 8px; font: inherit; outline: none;
+      }
+      #chat.open #chatinput { display: block; }
+      #chatinput:focus { border-color: #8ee7ff; }
 
       /* Win: the card goes gold (the band flashes on the canvas). */
       .goalcard.win {

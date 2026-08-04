@@ -155,7 +155,7 @@ import {
 } from './annotate';
 import { History, isTypingTarget } from './history';
 import { createHoist, type MachineRect } from './hoist';
-import { connect, type RoomHello } from './net';
+import { connect, MAX_CHAT_LEN, type RoomHello } from './net';
 import { createRooms } from './rooms';
 import {
   applyPanelOp,
@@ -740,6 +740,9 @@ function resetForRoom(room: RoomHello | null) {
   layers = [];
   claims = new Map();
   localLidCounter = 1;
+  // The conversation belongs to the room it happened in: the next room's
+  // tail arrives right after its hello, as ordinary chat messages.
+  chatClear();
   // Annotation is room state, so it leaves with the room. The next hello
   // brings the new room's own.
   labelBoxes = [];
@@ -991,6 +994,11 @@ const net = connect({
   onCursor(who, x, y) {
     if (who !== myId) cursors.set(who, { x, y, seen: performance.now() });
   },
+  onChat(who, text) {
+    // Our own line comes back through the broadcast too — render it from
+    // here, not optimistically, so what we see is what everyone saw.
+    chatAddLine(who, text);
+  },
   onWireDrift(drift) {
     // The server said something this client does not understand. Fields that
     // arrive this way fail by NOT HAPPENING — a camera that never flies, a
@@ -1045,6 +1053,108 @@ function toast(text: string) {
   while (toastBox.childElementCount > 4) toastBox.firstElementChild?.remove();
   setTimeout(() => el.remove(), 7000);
 }
+
+// ------------------------------------------------------------- room chat
+//
+// Enter opens the input, Enter sends, Escape closes (keeping the draft).
+// While the input has focus every part hotkey is dead — the same two
+// mechanisms the panel name field relies on: the input stops propagation of
+// its own keydowns (like #nameedit), AND the window handler returns early on
+// anything the chat owns (like panelHost.owns). Lose either and "hi there"
+// litters the room with resistors and a rotated inductor.
+//
+// The lines are DOM, not canvas: textContent only, so whatever another
+// player typed renders as text — never markup, never a link. Identity is the
+// cursor's identity: the same `who` and the same hue formula, so the name on
+// a line and the triangle on the sheet agree about who is who.
+
+const chatBox = document.createElement('div');
+chatBox.id = 'chat';
+const chatLog = document.createElement('div');
+chatLog.style.display = 'contents';
+const chatInput = document.createElement('input');
+chatInput.id = 'chatinput';
+chatInput.type = 'text';
+chatInput.maxLength = MAX_CHAT_LEN;
+chatInput.autocomplete = 'off';
+chatInput.spellcheck = false;
+chatInput.placeholder = 'say something…  (Enter sends, Esc closes)';
+chatBox.append(chatLog, chatInput);
+document.body.appendChild(chatBox);
+
+const CHAT_KEEP = 40; // lines held in the DOM for the input-open backlog
+const CHAT_FADE_MS = 9000;
+
+/** Same formula as `drawCursors`: one identity, two renderings. */
+const whoHue = (who: number) => (who * 137.5) % 360;
+
+function chatAddLine(who: number, text: string) {
+  const el = document.createElement('div');
+  el.className = 'cline';
+  el.style.setProperty('--cwho', `hsl(${whoHue(who)} 80% 60%)`);
+  const name = document.createElement('span');
+  name.className = 'cwho';
+  name.textContent = who === myId ? `P${who} (you)` : `P${who}`;
+  const body = document.createElement('span');
+  body.textContent = text; // text, never markup
+  el.append(name, body);
+  chatLog.appendChild(el);
+  while (chatLog.childElementCount > CHAT_KEEP) chatLog.firstElementChild?.remove();
+  // Quiet by default: fade, then stop occupying the corner. The `gone` class
+  // is display:none, which #chat.open overrides — so opening the input brings
+  // the whole kept tail back.
+  setTimeout(() => el.classList.add('faded'), CHAT_FADE_MS);
+  setTimeout(() => {
+    el.classList.add('gone');
+    syncToastOffset();
+  }, CHAT_FADE_MS + 700);
+  syncToastOffset();
+}
+
+/** Keep the damage toasts above the chat instead of on top of it. */
+function syncToastOffset() {
+  const h = chatBox.getBoundingClientRect().height;
+  document.documentElement.style.setProperty('--toasts-b', h > 4 ? `${42 + h}px` : '36px');
+}
+
+function chatOpen() {
+  chatBox.classList.add('open');
+  chatInput.focus();
+  syncToastOffset();
+}
+
+/** Close the input but keep the draft: a stray click must not eat a
+ * half-typed sentence. Escape clears it deliberately. */
+function chatClose() {
+  chatBox.classList.remove('open');
+  chatInput.blur();
+  syncToastOffset();
+}
+
+function chatClear() {
+  chatLog.replaceChildren();
+  chatInput.value = '';
+  chatClose();
+}
+
+const chatOwns = (t: EventTarget | null) => t instanceof Node && chatBox.contains(t);
+
+chatInput.addEventListener('keydown', (ev) => {
+  ev.stopPropagation(); // never let a part hotkey fire while typing a line
+  if (ev.key === 'Enter') {
+    ev.preventDefault();
+    const text = chatInput.value.trim();
+    if (text) net.sendChat(text);
+    chatInput.value = '';
+    chatClose();
+  } else if (ev.key === 'Escape') {
+    ev.preventDefault();
+    chatInput.value = '';
+    chatClose();
+  }
+});
+// A click on the canvas mid-sentence: close quietly, keep the draft.
+chatInput.addEventListener('blur', () => chatClose());
 
 // ------------------------------------------------- the placement gate (DRC)
 //
@@ -4123,6 +4233,7 @@ window.addEventListener('keydown', (ev) => {
   }
   if (panelHost.owns(ev.target)) return; // typing in a panel window
   if (roomsUI.owns(ev.target)) return; // typing in the room browser
+  if (chatOwns(ev.target)) return; // typing a chat line
 
   // Clipboard first: ⌘/Ctrl+C copies, ⌘/Ctrl+V arms pasting at the cursor.
   if (ev.metaKey || ev.ctrlKey) {
@@ -4196,6 +4307,15 @@ window.addEventListener('keydown', (ev) => {
     selectedProbe = null;
     selectedMachine = false;
     canvas.style.cursor = 'default';
+    return;
+  }
+  if (ev.key === 'Enter' && !isTypingTarget(ev)) {
+    // Enter opens the chat line. Enter, because every bare letter in this
+    // app is a part ('t' is the potentiometer, 'c' the capacitor) and Enter
+    // is the one key a player already expects to start a message with — it
+    // is also the key that will send it.
+    chatOpen();
+    ev.preventDefault();
     return;
   }
   if (ev.key === 'R') {
@@ -5110,7 +5230,7 @@ function frame(now: number) {
   const hints = hintsOpen
     ? `\nparts: R C L W G V D N P M A U 5 S B T Z E F I · ⇧V rail · drag part = move · drag the hoist chip = move the machine · dbl-click = edit values · right-click = menu` +
       `\ndrag pin = reshape part · W then drag = wire · drag empty = select · Q rotate · X/Y flip · ⌘Z undo · ⌘C/⌘V copy/paste · 1/2 probe · 3 listen · 0 ref · O scope · \` dock · J panel · ⇧J label box · ⇧W name a net · [ ] sidebars · K repair · Del delete` +
-      `\nH home district · shift+H fit everything · ⇧R rooms · wheel = zoom (0.4–200 px/unit) · pan: middle / ctrl+drag / space+drag · ? hides this`
+      `\nH home district · shift+H fit everything · ⇧R rooms · Enter chat · wheel = zoom (0.4–200 px/unit) · pan: middle / ctrl+drag / space+drag · ? hides this`
     : `\n? controls`;
   // Which room, first thing on the status line — the clickable version of
   // the same fact is the chip in the top-right corner.
