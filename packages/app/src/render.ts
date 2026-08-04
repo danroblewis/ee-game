@@ -4,6 +4,7 @@
 
 import { logicPins, pinLabels } from './circuit';
 import type { ElemLive, ElementKind, ElementSpec, Point } from './circuit';
+import { gfx } from './gfx';
 
 export interface Camera {
   scale: number; // px per grid unit
@@ -14,6 +15,11 @@ export interface Camera {
 const V_FULL = 10; // voltage at full color saturation
 
 export function voltageColor(v: number): string {
+  // Turned off, every wire draws in the neutral grey that 0 V already uses,
+  // so the schematic reads as a plain drawing. Nothing else changes: the
+  // solver still knows the voltage, the probes still report it, and the
+  // colour comes straight back when it is turned on again.
+  if (!gfx.voltageColor) return 'rgb(96,96,96)';
   const t = Math.max(-1, Math.min(1, v / V_FULL));
   // gray at 0V -> green positive, red negative (Falstad convention)
   const base = 96;
@@ -60,7 +66,12 @@ export function dotSpeed(current: number): number {
   const a = Math.abs(current);
   if (a < DOT_MIN_AMPS) return 0;
   const v = 0.6 + 0.5 * Math.log10(a / DOT_MIN_AMPS);
-  return Math.sign(current) * Math.min(DOT_SPEED_MAX, Math.max(DOT_SPEED_MIN, v));
+  // The player's speed multiplier rides OUTSIDE the clamp on purpose: the
+  // clamp exists so the default never aliases against the frame rate, and
+  // someone who asks for 4x has asked to see that happen.
+  return (
+    Math.sign(current) * Math.min(DOT_SPEED_MAX, Math.max(DOT_SPEED_MIN, v)) * gfx.dotSpeed
+  );
 }
 
 /** Animated dot phase per element, advanced by simulated current. */
@@ -82,17 +93,22 @@ export function drawDots(
   phase: number,
   current: number,
 ) {
+  if (!gfx.dots) return;
   if (Math.abs(current) < DOT_MIN_AMPS) return;
   const len = mag(sub(b, a)) / cam.scale;
   if (len < 1e-6) return;
+  ctx.save();
   ctx.fillStyle = '#ffe95e';
+  ctx.globalAlpha *= gfx.dotAlpha;
+  const r = Math.max(2, cam.scale * 0.055) * gfx.dotSize;
   let p = ((phase % DOT_SPACING) + DOT_SPACING) % DOT_SPACING;
   for (; p < len; p += DOT_SPACING) {
     const [x, y] = lerp(a, b, p / len);
     ctx.beginPath();
-    ctx.arc(x, y, Math.max(2, cam.scale * 0.055), 0, Math.PI * 2);
+    ctx.arc(x, y, r, 0, Math.PI * 2);
     ctx.fill();
   }
+  ctx.restore();
 }
 
 /** Dots along a multi-segment lead, phase continuing across the corners. */

@@ -155,6 +155,7 @@ import {
 } from './annotate';
 import { History, isTypingTarget } from './history';
 import { createHoist, type MachineRect } from './hoist';
+import { createGfx } from './gfx';
 import { createLesson } from './lesson';
 import { connect, MAX_CHAT_LEN, type RoomHello } from './net';
 // NOT loadBench/saveBench: the intro branch predates scopes becoming room
@@ -720,6 +721,11 @@ const lessonUI = createLesson(document.body, {
   join: (code) => net.join(code),
   toast: (m) => toast(m),
 });
+
+/** Graphics preferences (⇧G). Per-player display state only — nothing here
+ *  reaches the document, the wire or the solver, so two players may disagree
+ *  about every setting and still be looking at the same circuit. */
+const gfxUI = createGfx(document.body);
 
 /**
  * Leave a room. Every line here is state that is scoped to ONE room and
@@ -4252,6 +4258,7 @@ window.addEventListener('keydown', (ev) => {
   if (roomsUI.owns(ev.target)) return; // typing in the room browser
   if (chatOwns(ev.target)) return; // typing a chat line
   if (lessonUI.owns(ev.target)) return; // a focused lesson-card button
+  if (gfxUI.owns(ev.target)) return; // a slider in the graphics dialog
 
   // Clipboard first: ⌘/Ctrl+C copies, ⌘/Ctrl+V arms pasting at the cursor.
   if (ev.metaKey || ev.ctrlKey) {
@@ -4342,6 +4349,12 @@ window.addEventListener('keydown', (ev) => {
     if (roomsUI.isOpen()) roomsUI.close();
     else roomsUI.open('rooms');
     ev.preventDefault();
+    return;
+  }
+  // Graphics preferences. Shift+G, because plain g is Ground and every
+  // unshifted letter is already a part.
+  if (ev.key === 'G') {
+    gfxUI.toggle();
     return;
   }
   if (ev.key === 'h' || ev.key === 'H') {

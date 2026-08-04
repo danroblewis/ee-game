@@ -280,6 +280,16 @@
         cursor: pointer; padding: 0 3px; margin-left: auto;
       }
       .pwin-x:hover { color: #ff8f8f; }
+      /* The graphics dialog: top-right, clear of the sheet's middle, because
+         judging a dot speed means WATCHING the dots while you drag. */
+      .gfxwin { top: 64px; right: 16px; left: auto; width: 268px; z-index: 40; }
+      .gfxwin input[type=range] { width: 108px; accent-color: #8ee7ff; }
+      .gfx-reset {
+        display: block; margin: 6px 8px 8px auto; padding: 3px 8px;
+        background: #222a33; color: #9fb4c4; border: 1px solid #33404c;
+        border-radius: 4px; font: 11px ui-monospace, monospace; cursor: pointer;
+      }
+      .gfx-reset:hover { color: #d7e6f2; border-color: #4a5b6a; }
       .pwin-body { padding: 4px 0; }
       .prow {
         display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
