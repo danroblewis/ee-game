@@ -102,3 +102,67 @@ stream at 3.125 kHz and the client keeps 120 s per pid (`scope.ts`
 it, since the stream is per-probe: either a transient client-side capture, or
 a reason to let the server sample a hovered node briefly. Worth deciding
 before building.
+
+---
+
+# Ask questions. Do not give instructions.
+
+*Owner, same session, and this is the strongest statement of the whole
+direction:*
+
+> "There should be questions for the player to answer by changing the
+> schematic, there should not be instructions. When initially introducing
+> topics, we can include diagrams and information explaining how electronics
+> and electricity works, but we should favor having questions, and if we can
+> have questions only then that is perfect. That is good learning."
+
+## The distinction, concretely
+
+Every step in the shipped course is an **instruction**. Lesson 1, step 1:
+
+> "The bottom wire is missing. Press W, then drag across the gap. The lamp
+> lights the moment the loop closes."
+
+That sentence contains the observation, the diagnosis, the method AND the
+expected result. Nothing is left for the player to find. Passing it requires
+only obedience, and obedience teaches nothing — which is exactly why an
+expert skimmed it and clicked.
+
+The same room as a **question**:
+
+> "The lamp is dark. Make it light."
+
+Now the player has to look, notice the gap, know that a circuit must be a
+loop, and find the tool. The check is unchanged. The room is unchanged. The
+only thing removed is the answer — and removing the answer is the entire
+lesson.
+
+More of the same transformation:
+
+| instruction (today) | question (wanted) |
+|---|---|
+| "Click any wire and press Delete. Everything stops at once." | "Stop the lamp WITHOUT touching it. What does that tell you about where current goes?" |
+| "Turn the pot until the meter reads 1.00 V." | "Set this divider to hand you exactly 1.00 V. What did you have to know?" |
+| "Wire the FET low-side; the source must sit at ground." | "Make the comparator switch this lamp. It will not work high-side — find out why." |
+
+## The rule
+
+**Information may be OFFERED; it may not be REQUIRED.** When a topic is
+introduced for the first time, a diagram and a paragraph explaining how the
+thing actually works are welcome — that is what a good textbook is for, and
+this project cares about being right. But it belongs beside the question, not
+in front of it, and a player who ignores it entirely must still be able to
+reach the answer by experimenting on the schematic.
+
+**The target is questions only.** Where a room can pose its problem with no
+prose at all — a dark lamp, a crate on the floor, a meter reading the wrong
+number — that is the best version of the room, and the prose that remains
+should be there for the player who wants to know *why* after they have
+already found out *that*.
+
+## Why this compounds with everything else in this note
+
+A question is unanswerable without observation, and observation is exactly
+what the balls, the wire colouring, and a probe the player placed themselves
+are for. Instructions make those decorations. Questions make them
+instruments. The two halves of this document are the same change.
