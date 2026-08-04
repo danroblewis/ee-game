@@ -380,6 +380,18 @@ pub static BUILTINS: &[Builtin] = &[
         build: vco555_setup,
     },
     Builtin {
+        id: "the-ladder",
+        name: "The Ladder (Moog 904A)",
+        blurb: "A real Moog transistor ladder — ten NPNs, four bridging capacitors and one exponential current sink — with an oscillator already droning through it. Turn CUTOFF.",
+        build: moog_setup,
+    },
+    Builtin {
+        id: "tr-808",
+        name: "Rhythm Composer (TR-808)",
+        blurb: "Four bridged-T resonators — kick, two snare shells, claves — plus hiss and a snappy gate, banged by a four-step CMOS pattern. Already playing when you arrive.",
+        build: tr808_setup,
+    },
+    Builtin {
         id: "sandbox",
         name: "Sandbox",
         blurb: "An empty plane. Build anything.",
@@ -471,6 +483,66 @@ fn vco555_setup() -> RoomSetup {
         json!({
             "x": 13.0, "y": 12.0, "w": 10.0, "h": 8.0,
             "pids": [1, 2], "timebase": 0.02
+        }),
+    )
+}
+
+/// The Moog ladder as a room. See `moog.rs` for the history, the control law,
+/// the resonance loop that did not ship and the four measurements that killed
+/// it.
+fn moog_setup() -> RoomSetup {
+    instrument_setup(
+        crate::moog::moog_room_circuit(),
+        crate::moog::moog_panels(),
+        crate::moog::moog_label_boxes(),
+        vec![
+            // The VCO's square, going in: element 30 is the comparator, and
+            // pin 2 is its output.
+            SavedProbe { pid: 1, elem: 30, pin: 2, kind: ProbeKind::V, r: None },
+            // ...and the filtered signal coming out of the ladder, pin 1 of
+            // the left-hand collector load.
+            SavedProbe { pid: 2, elem: 121, pin: 1, kind: ProbeKind::V, r: None },
+            SavedProbe {
+                pid: 3,
+                elem: crate::moog::ID_SPEAKER,
+                pin: 0,
+                kind: ProbeKind::V,
+                r: None,
+            },
+        ],
+        [-22.0, -26.0, 132.0, 66.0],
+        json!({
+            "x": 2.0, "y": 14.0, "w": 26.0, "h": 16.0,
+            "pids": [1, 2, 3], "timebase": 0.02
+        }),
+    )
+}
+
+/// The TR-808 as a room. See `tr808.rs` for the history, the stand-ins, the
+/// two voices that are missing and why, and the measurements.
+fn tr808_setup() -> RoomSetup {
+    instrument_setup(
+        crate::tr808::tr808_room_circuit(),
+        crate::tr808::tr808_panels(),
+        crate::tr808::tr808_label_boxes(),
+        vec![
+            // The kick's own resonator node: pin 2 of the BD op-amp.
+            SavedProbe { pid: 1, elem: 21, pin: 2, kind: ProbeKind::V, r: None },
+            // The lower snare shell, so the two rings can be compared.
+            SavedProbe { pid: 2, elem: 31, pin: 2, kind: ProbeKind::V, r: None },
+            // What the speaker hears.
+            SavedProbe {
+                pid: 3,
+                elem: crate::tr808::ID_SPEAKER,
+                pin: 0,
+                kind: ProbeKind::V,
+                r: None,
+            },
+        ],
+        [-27.0, -31.0, 123.0, 103.0],
+        json!({
+            "x": 74.0, "y": 50.0, "w": 26.0, "h": 18.0,
+            "pids": [1, 2, 3], "timebase": 0.1
         }),
     )
 }

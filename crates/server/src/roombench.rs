@@ -93,6 +93,8 @@ mod tests {
         let steps = 150_000;
         measure("synth (shipped reference)", &crate::synth::synth_room_circuit(), steps);
         measure("vco-555", &crate::vco555::vco555_room_circuit(), steps);
+        measure("tr-808", &crate::tr808::tr808_room_circuit(), steps);
+        measure("the-ladder", &crate::moog::moog_room_circuit(), steps);
         // Rooms land here one at a time, each measured before the next
         // begins; a missing line means the room does not exist yet.
     }
