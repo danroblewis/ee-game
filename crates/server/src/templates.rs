@@ -374,12 +374,106 @@ pub static BUILTINS: &[Builtin] = &[
         build: synth_setup,
     },
     Builtin {
+        id: "vco-555",
+        name: "555-VCO (Thomas Henry)",
+        blurb: "Thomas Henry's sawtooth VCO: an exponential current charges a cap and a 555 snaps it back. One knob, two waves, a vibrato LFO — droning as you arrive.",
+        build: vco555_setup,
+    },
+    Builtin {
         id: "sandbox",
         name: "Sandbox",
         blurb: "An empty plane. Build anything.",
         build: sandbox_setup,
     },
 ];
+
+/// Shared assembly for the instrument rooms: one control panel spanning the
+/// sheet, block-heading label boxes, probes and a scope already armed. Every
+/// synth room registers through this so the UI furniture cannot drift.
+fn instrument_setup(
+    elements: Vec<ElementSpec>,
+    panels: Vec<crate::synth::PanelDef>,
+    boxes: Vec<crate::synth::PanelDef>,
+    probes: Vec<SavedProbe>,
+    home: [f64; 4],
+    scope: serde_json::Value,
+) -> RoomSetup {
+    let next_pid = probes.iter().map(|p| p.pid + 1).max().unwrap_or(1);
+    let panels: Vec<Panel> = panels
+        .into_iter()
+        .enumerate()
+        .map(|(i, p)| Panel {
+            plid: i as u32 + 1,
+            x0: p.x0,
+            y0: p.y0,
+            x1: p.x1,
+            y1: p.y1,
+            name: p.name.to_string(),
+        })
+        .collect();
+    let next_plid = panels.len() as u32 + 1;
+    let label_boxes: Vec<LabelBox> = boxes
+        .into_iter()
+        .enumerate()
+        .map(|(i, b)| LabelBox {
+            blid: i as u32 + 1,
+            x0: b.x0,
+            y0: b.y0,
+            x1: b.x1,
+            y1: b.y1,
+            name: b.name.to_string(),
+        })
+        .collect();
+    let next_blid = label_boxes.len() as u32 + 1;
+    RoomSetup {
+        elements,
+        probes,
+        next_pid,
+        panels,
+        next_plid,
+        label_boxes,
+        next_blid,
+        machine: MachineSpec::None,
+        view: View {
+            home: Some(home),
+            scopes: vec![scope],
+        },
+        ..RoomSetup::default()
+    }
+}
+
+/// Thomas Henry's 555-VCO as a bench room. See `vco555.rs` for the history,
+/// the stand-ins and the measurements.
+fn vco555_setup() -> RoomSetup {
+    instrument_setup(
+        crate::vco555::vco555_room_circuit(),
+        crate::vco555::vco555_panels(),
+        crate::vco555::vco555_label_boxes(),
+        vec![
+            // The sawtooth itself, on the timing cap.
+            SavedProbe {
+                pid: 1,
+                elem: 21,
+                pin: 0,
+                kind: ProbeKind::V,
+                r: None,
+            },
+            // What the speaker hears.
+            SavedProbe {
+                pid: 2,
+                elem: crate::vco555::ID_SPEAKER,
+                pin: 0,
+                kind: ProbeKind::V,
+                r: None,
+            },
+        ],
+        [-13.0, -13.0, 53.0, 26.0],
+        json!({
+            "x": 13.0, "y": 12.0, "w": 10.0, "h": 8.0,
+            "pids": [1, 2], "timebase": 0.02
+        }),
+    )
+}
 
 /// Today's `None` branch, bit for bit: the showcase plus a hoist. Still the
 /// default, so a fresh checkout boots into exactly what it booted into
