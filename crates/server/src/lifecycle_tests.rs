@@ -737,3 +737,34 @@ async fn renaming_a_room_broadcasts_and_persists() {
     let reloaded = Registry::open(&rd, &td);
     assert_eq!(reloaded.get(&h.meta().id).unwrap().meta().name, "After");
 }
+
+/// A CHAT MESSAGE IS NOT ROOM STATE. The scrollback lives in memory beside
+/// `claims`, and the save file must never learn what anybody said: a
+/// checkpoint is the circuit, the panels and the instruments — a conversation
+/// is not part of the document, and a player who joins later has not missed
+/// a wire. Serialize a real snapshot of a room WITH chat in it and prove the
+/// words are not in the bytes.
+#[test]
+fn a_conversation_never_reaches_the_save_file() {
+    let (rd, td) = dirs("chatnodisk");
+    let reg = Registry::open(&rd, &td);
+    let h = reg.create("Chatty", "sandbox").unwrap();
+    crate::push_chat(
+        &mut h.room.chat.lock().unwrap(),
+        crate::ChatLine {
+            who: 3,
+            text: "meet at the north rail".into(),
+        },
+    );
+    let save = h.snapshot(&MachineSpec::None, &DamageModel::new());
+    let json = serde_json::to_string(&save).unwrap();
+    assert!(
+        !json.contains("north rail") && !json.contains("\"chat\""),
+        "a chat line leaked into the checkpoint: {json}"
+    );
+    // And the round trip agrees: a reloaded room starts with an empty tail.
+    h.checkpoint(&MachineSpec::None, &DamageModel::new());
+    let reloaded = Registry::open(&rd, &td);
+    let h2 = reloaded.get(&h.meta().id).unwrap();
+    assert!(h2.room.chat.lock().unwrap().is_empty());
+}

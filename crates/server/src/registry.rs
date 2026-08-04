@@ -649,6 +649,7 @@ pub fn build_handle(path: PathBuf, meta: RoomMeta, setup: RoomSetup) -> Arc<Room
         layers: Mutex::new(layers),
         // Never restored from anywhere: a fresh room has nobody looking.
         claims: Mutex::new(Vec::new()),
+        chat: Mutex::new(std::collections::VecDeque::new()),
         next_client: AtomicU32::new(1),
         next_pid: AtomicU32::new(next_pid.max(1)),
         next_plid: AtomicU32::new(next_plid.max(1)),

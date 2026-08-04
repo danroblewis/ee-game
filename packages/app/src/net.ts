@@ -339,6 +339,13 @@ export interface NetHandlers {
   onAudio(t0: number, dts: number, s: Record<string, number[]>, rt: number | null): void;
   onPresence(n: number): void;
   onCursor(who: number, x: number, y: number): void;
+  /** One line of room chat. `who` is the SAME per-connection id the cursors
+   * carry, so a line and a cursor agree about who is who. Includes the
+   * scrollback a joiner is replayed right after `hello` (same message shape,
+   * so a joiner and a resident can never disagree about what a line is).
+   * The text arrives cleaned and capped BY THE SERVER; render it as text —
+   * never markup, never a link. */
+  onChat(who: number, text: string): void;
   /** An op was refused by the placement gate. Broadcast to everyone (every
    * client already ignores messages it does not care about), because the
    * SENDER needs it to roll back its optimistic local apply. */
@@ -390,6 +397,9 @@ export interface Net {
    * is allowed on the server-owned hoist fixture. */
   sendRepair(id: number): void;
   sendCursor(x: number, y: number): void;
+  /** Say a line to the room. Trimmed and capped client-side for the typist's
+   * benefit; the server cleans, caps and rate-limits it regardless. */
+  sendChat(text: string): void;
   /** Switch rooms in place: drop this socket and open one on `code` (null =
    * the server's default room). No page navigation — see `resetForRoom` in
    * main.ts for the state that has to be dropped with the old room. */
@@ -397,6 +407,11 @@ export interface Net {
   /** The code this socket is in, or trying to be in. */
   code(): string | null;
 }
+
+/** Longest chat line, in characters. Mirrors the server's `MAX_CHAT_LEN` —
+ * the input's maxlength and `sendChat`'s slice are a courtesy so a player
+ * sees the cap while typing; the server enforces it regardless. */
+export const MAX_CHAT_LEN = 240;
 
 const RECONNECT_MS = 2500;
 
@@ -548,6 +563,11 @@ export function connect(h: NetHandlers, room: string | null = null): Net {
       case 'cursor':
         h.onCursor(m.who, m.x, m.y);
         break;
+      case 'chat':
+        if (typeof m.who === 'number' && typeof m.text === 'string' && m.text.length > 0) {
+          h.onChat(m.who, m.text);
+        }
+        break;
       case 'reject':
         h.onReject({
           who: m.who,
@@ -608,6 +628,13 @@ export function connect(h: NetHandlers, room: string | null = null): Net {
       send({ t: 'machinemove', dx: Math.round(dx), dy: Math.round(dy) }),
     sendRepair: (id) => send({ t: 'repair', id }),
     sendCursor: (x, y) => send({ t: 'cursor', x, y }),
+    // Trimmed and capped HERE as well as on the server: the client-side cap
+    // is in CHARACTERS (code points, matching the server's `.chars()`), so
+    // an emoji is one unit on both ends, not a surrogate pair split in two.
+    sendChat: (text) => {
+      const t = [...text.trim()].slice(0, MAX_CHAT_LEN).join('');
+      if (t.length > 0) send({ t: 'chat', text: t });
+    },
     join,
     code: () => want,
   };

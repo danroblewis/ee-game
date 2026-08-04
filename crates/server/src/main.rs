@@ -1654,6 +1654,11 @@ struct Room {
     /// checkpointed, never in a template: a claim is a browser tab with a
     /// camera open, and no such thing survives a restart.
     claims: std::sync::Mutex<Vec<(u32, u32)>>,
+    /// Chat scrollback, last `CHAT_SCROLLBACK` lines. Live only, like
+    /// `claims`: a conversation is not part of the document, so it is not in
+    /// `SaveFile` and cannot reach disk. Joiners get it replayed as ordinary
+    /// `chat` messages right after `hello`.
+    chat: std::sync::Mutex<std::collections::VecDeque<ChatLine>>,
     next_client: AtomicU32,
     next_pid: AtomicU32,
     next_plid: AtomicU32,
@@ -3273,11 +3278,29 @@ fn apply_doc_op_to(elems: &mut Vec<ElementSpec>, op: &DocOp) -> bool {
 /// name against `sim_core::MAX_NAME`.
 fn clean_name(name: &str, max: usize) -> String {
     name.chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| !c.is_control() && !is_bidi_control(*c))
         .take(max)
         .collect::<String>()
         .trim()
         .to_string()
+}
+
+/// The Unicode BIDI control characters. `char::is_control` covers only Cc,
+/// and these are Cf — so U+202E (RIGHT-TO-LEFT OVERRIDE) sailed straight
+/// through `clean_name` and could visually reverse everything drawn after it.
+/// On a label that is a prank; on a chat line it is one player rewriting how
+/// another player's screen reads. Stripped everywhere a player writes text.
+///
+/// Deliberately NOT the whole of Cf: ZWJ/ZWNJ (U+200C/D) are orthographically
+/// required in Persian and inside emoji sequences, and stripping them would
+/// break honest text to spite dishonest text.
+fn is_bidi_control(c: char) -> bool {
+    matches!(c,
+        '\u{061C}'               // ARABIC LETTER MARK
+        | '\u{200E}' | '\u{200F}' // LRM, RLM
+        | '\u{202A}'..='\u{202E}' // LRE, RLE, PDF, LRO, RLO
+        | '\u{2066}'..='\u{2069}' // LRI, RLI, FSI, PDI
+    )
 }
 
 /// Normalize a drag rectangle. None = degenerate or non-finite input, which
@@ -3890,6 +3913,53 @@ fn layers_msg(layers: &[Layer], claims: &[(u32, u32)]) -> String {
     json!({"t": "layers", "list": layers, "claims": claims}).to_string()
 }
 
+// ----------------------------------------------------------------- chat
+//
+// A chat line is NOT room state. A checkpoint is the circuit, the panels and
+// the instruments; a conversation is not part of the document, and a player
+// who joins later has not missed a wire. So chat takes the CURSOR's path, not
+// the panel's: the session loop broadcasts it straight onto `events`, no Cmd,
+// no sim task, no dirty flag — and therefore no way for a line to reach disk.
+// The only state is a short in-memory scrollback so a joiner sees the tail of
+// the conversation, and it dies with the room's process.
+
+/// Longest chat line, in CHARACTERS (same cap rule as every player-written
+/// name: a cap is a cap in every script). Enforced server-side by
+/// `clean_chat_text`; the client's input maxlength is a courtesy, not the law.
+const MAX_CHAT_LEN: usize = 240;
+/// Lines a late joiner is replayed. Small on purpose: it is "the tail of the
+/// conversation you walked in on", not a log.
+const CHAT_SCROLLBACK: usize = 12;
+
+/// One line of room chat. `who` is the SAME per-connection id the cursors
+/// carry, so a line and a cursor agree about who is who; there is nothing
+/// else a player is, so there is nothing else on it.
+#[derive(Clone, serde::Serialize)]
+struct ChatLine {
+    who: u32,
+    text: String,
+}
+
+/// The one gate every chat line passes on its way to other players' screens:
+/// control characters and BIDI overrides stripped, length capped in
+/// characters, ends trimmed — exactly what a panel name gets, from the same
+/// `clean_name`. Empty out = the line is dropped, never broadcast.
+fn clean_chat_text(text: &str) -> String {
+    clean_name(text, MAX_CHAT_LEN)
+}
+
+fn chat_msg(line: &ChatLine) -> String {
+    json!({"t": "chat", "who": line.who, "text": line.text}).to_string()
+}
+
+/// Record a line in the in-memory scrollback, oldest out first.
+fn push_chat(chat: &mut std::collections::VecDeque<ChatLine>, line: ChatLine) {
+    chat.push_back(line);
+    while chat.len() > CHAT_SCROLLBACK {
+        chat.pop_front();
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "t", rename_all = "lowercase")]
 enum ClientMsg {
@@ -3956,6 +4026,12 @@ enum ClientMsg {
     /// The repair tool: put a broken part back into service.
     Repair {
         id: u32,
+    },
+    /// `{"t":"chat","text":"..."}` — a line of room chat. Cleaned, capped and
+    /// rate-limited in the session loop, then broadcast like a cursor; see
+    /// the chat section above for why it never becomes room state.
+    Chat {
+        text: String,
     },
 }
 
@@ -4054,12 +4130,33 @@ async fn client_session(mut socket: WebSocket, reg: Arc<Registry>, handle: Arc<R
     // half again the tick rate — enough that a 60 fps sampler never trips it
     // and a runaway one is throttled at the socket rather than at the queue.
     let mut sensor_budget = TokenBucket::new(45.0, 10.0);
+    // Chat gets its own, much smaller bucket: 1 line/s sustained, burst of 5.
+    // Faster than anyone types, far slower than a held-down Enter key — and it
+    // matters because `cmds` never sees chat but `events` reaches EVERY
+    // subscriber, so an unthrottled sender would be flooding every screen in
+    // the room. Over budget is dropped, not queued, same as sensors.
+    let mut chat_budget = TokenBucket::new(1.0, 5.0);
 
     let hello = hello_msg(&handle, me);
     if socket.send(Message::Text(hello.into())).await.is_err() {
         reg.leave(&handle);
         let _ = room.cmds.send(Cmd::Leave { who: me });
         return;
+    }
+    // Replay the chat tail AFTER hello, as ordinary `chat` messages — the
+    // same shape the live broadcast uses, so a joiner and a resident can
+    // never disagree about what a line is. (Collected first: the lock must
+    // not be held across an await.)
+    let backlog: Vec<String> = {
+        let chat = room.chat.lock().unwrap();
+        chat.iter().map(chat_msg).collect()
+    };
+    for msg in backlog {
+        if socket.send(Message::Text(msg.into())).await.is_err() {
+            reg.leave(&handle);
+            let _ = room.cmds.send(Cmd::Leave { who: me });
+            return;
+        }
     }
 
     loop {
@@ -4142,6 +4239,22 @@ async fn client_session(mut socket: WebSocket, reg: Arc<Registry>, handle: Arc<R
                         }
                         Ok(ClientMsg::Repair { id }) => {
                             let _ = room.cmds.send(Cmd::Repair { who: me, id });
+                        }
+                        Ok(ClientMsg::Chat { text }) => {
+                            // Rate first (a flood must not even pay for
+                            // cleaning), then clean, then drop what cleaned
+                            // away to nothing. Straight onto `events` like a
+                            // cursor: no Cmd, no dirty flag, no disk.
+                            if !chat_budget.take() {
+                                continue;
+                            }
+                            let text = clean_chat_text(&text);
+                            if text.is_empty() {
+                                continue;
+                            }
+                            let line = ChatLine { who: me, text };
+                            push_chat(&mut room.chat.lock().unwrap(), line.clone());
+                            let _ = room.events.send(chat_msg(&line));
                         }
                         Ok(ClientMsg::Cursor { x, y }) => {
                             let _ = room.events.send(
@@ -4252,6 +4365,86 @@ mod tests {
     use super::*;
     use sim_core::ElementKind as K;
     use sim_golden::{dc, gnd, r, spec, spec3};
+
+    // ------------------------------------------------------------- chat
+    //
+    // The bounds face ANOTHER PLAYER'S SCREEN — a chat line is the first
+    // feature where one client types arbitrary text that lands on every
+    // other client — so each bound is pinned here, against the exact
+    // functions the session loop calls.
+
+    /// The cap is characters, not bytes: 300 two-byte chars must cap at
+    /// MAX_CHAT_LEN chars, not at MAX_CHAT_LEN bytes' worth.
+    #[test]
+    fn chat_length_is_capped_in_characters() {
+        let long: String = std::iter::repeat('x').take(1000).collect();
+        assert_eq!(clean_chat_text(&long).chars().count(), MAX_CHAT_LEN);
+        let wide: String = std::iter::repeat('é').take(300).collect();
+        let cleaned = clean_chat_text(&wide);
+        assert_eq!(cleaned.chars().count(), MAX_CHAT_LEN);
+        assert!(cleaned.chars().all(|c| c == 'é'));
+    }
+
+    /// Control characters are stripped, and so are the BIDI overrides that
+    /// `char::is_control` does not cover (they are Cf, not Cc). U+202E on a
+    /// chat line would visually reverse everything the victim reads after
+    /// it — this is the review finding about `clean_name`, now pinned.
+    #[test]
+    fn chat_strips_control_and_bidi_override() {
+        assert_eq!(clean_chat_text("hi\u{7}the\nre\r"), "hithere");
+        assert_eq!(clean_chat_text("a\u{202E}b\u{202A}c\u{2066}d\u{200F}e"), "abcde");
+        // ...and the same hole is closed for every named thing on the sheet.
+        assert_eq!(clean_name("EVIL\u{202E}LIVE", 28), "EVILLIVE");
+        // ZWJ survives: stripping it would break emoji sequences and Persian.
+        assert_eq!(clean_chat_text("👨\u{200D}👩\u{200D}👧"), "👨\u{200D}👩\u{200D}👧");
+    }
+
+    /// A line that cleans away to nothing is dropped by the session loop's
+    /// `is_empty` check; these are the shapes that must clean to empty.
+    #[test]
+    fn chat_whitespace_and_control_only_lines_clean_to_empty() {
+        assert_eq!(clean_chat_text("   \t  "), "");
+        assert_eq!(clean_chat_text("\u{202E}\u{7}\n"), "");
+        assert_eq!(clean_chat_text(""), "");
+    }
+
+    /// The scrollback a joiner is replayed is bounded and keeps the NEWEST
+    /// lines — walking in on the end of a conversation, not the start.
+    #[test]
+    fn chat_scrollback_is_bounded_and_keeps_the_tail() {
+        let mut chat = std::collections::VecDeque::new();
+        for i in 0..(CHAT_SCROLLBACK as u32 + 20) {
+            push_chat(&mut chat, ChatLine { who: 1, text: format!("line {i}") });
+        }
+        assert_eq!(chat.len(), CHAT_SCROLLBACK);
+        assert_eq!(chat.back().unwrap().text, format!("line {}", CHAT_SCROLLBACK + 19));
+        assert_eq!(chat.front().unwrap().text, "line 20");
+    }
+
+    /// The chat bucket: the burst goes through, the burst-plus-first is
+    /// refused. The session loop DROPS an over-budget line before cleaning
+    /// it, so a held-down Enter key cannot flood every screen in the room.
+    #[test]
+    fn chat_rate_limit_denies_a_flood() {
+        // Same parameters the session loop constructs.
+        let mut budget = TokenBucket::new(1.0, 5.0);
+        for i in 0..5 {
+            assert!(budget.take(), "message {i} is within the burst");
+        }
+        assert!(!budget.take(), "the sixth immediate message is refused");
+    }
+
+    /// What actually goes on the wire: `who` is the cursor's id, the text is
+    /// the text, and nothing else rides along.
+    #[test]
+    fn chat_msg_is_who_plus_text_and_nothing_else() {
+        let m = chat_msg(&ChatLine { who: 7, text: "hi".into() });
+        let v: serde_json::Value = serde_json::from_str(&m).unwrap();
+        assert_eq!(v["t"], "chat");
+        assert_eq!(v["who"], 7);
+        assert_eq!(v["text"], "hi");
+        assert_eq!(v.as_object().unwrap().len(), 3);
+    }
 
     /// Substeps in one room tick, exactly as `sim_task` budgets them.
     fn steps_per_tick() -> u32 {
@@ -4861,6 +5054,7 @@ mod tests {
             next_nlid: AtomicU32::new(1),
             layers: std::sync::Mutex::new(Vec::new()),
             claims: std::sync::Mutex::new(Vec::new()),
+            chat: std::sync::Mutex::new(std::collections::VecDeque::new()),
             next_lid: AtomicU32::new(1),
             population: AtomicU32::new(0),
             dirty: std::sync::atomic::AtomicBool::new(false),
@@ -5336,6 +5530,7 @@ mod tests {
             next_nlid: AtomicU32::new(1),
             layers: std::sync::Mutex::new(Vec::new()),
             claims: std::sync::Mutex::new(Vec::new()),
+            chat: std::sync::Mutex::new(std::collections::VecDeque::new()),
             next_lid: AtomicU32::new(1),
             population: AtomicU32::new(0),
             dirty: std::sync::atomic::AtomicBool::new(false),

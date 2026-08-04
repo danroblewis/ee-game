@@ -344,6 +344,7 @@ function dial(code: string | null = null) {
     onAudio: nop,
     onPresence: nop,
     onCursor: nop,
+    onChat: nop,
     onClose: nop,
     onReject: nop,
     onWireDrift: (d) => drifts.push(d),
