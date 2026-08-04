@@ -10,6 +10,27 @@
 //! the 20 µs budget. The LIVE number — the server's own `rt` read off its
 //! audio frames over a websocket — is the one that ships in each room's
 //! scope notes; this offline one is the regression guard.
+//!
+//! ## MEASURE ONE ROOM AT A TIME, AND KNOW WHY
+//!
+//! A room keeps simulating after its last player disconnects. So walking a
+//! browser through five instrument rooms in sequence does not measure five
+//! rooms — it measures one room, then two, then five, all sharing the same
+//! process. Measured exactly that way on an otherwise idle machine:
+//!
+//! ```text
+//!   five rooms live at once     vco-555 0.998  the-ladder 0.998
+//!                               tr-808  0.834  bass++     0.970
+//!                               the-scream 0.998
+//!   each room alone, fresh server   every one of them 0.998
+//! ```
+//!
+//! Nothing was wrong with the TR-808. It is simply the room with the least
+//! headroom — 16.9 µs of a 20 µs budget, against 2.5 for BASS++ — so it is
+//! the first to go flat when the budget is shared, and the second-tightest
+//! goes next. That ordering is the useful part: THE MARGIN IN THIS TABLE IS
+//! HOW MANY OTHER ROOMS A SERVER CAN CARRY ALONGSIDE, not slack for one room
+//! on its own. A room at 1.19x offline is a room that must be alone.
 
 use sim_core::{ElementKind as K, ElementSpec, Engine};
 use std::time::Instant;
