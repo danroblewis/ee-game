@@ -580,7 +580,7 @@ async fn joining_resumes_a_parked_room_and_parking_preserves_everything() {
     assert!(!h.is_live(), "a room with nobody in it has no sim task");
 
     // A player joins: the room resumes.
-    reg.enter(&h);
+    let presence = reg.enter(&h, 1);
     assert!(h.is_live());
     assert!(h.parked.lock().unwrap().is_none());
 
@@ -620,7 +620,7 @@ async fn joining_resumes_a_parked_room_and_parking_preserves_everything() {
 
     // They leave and the room parks. `Stop` is the same handover the 30 s
     // empty-room timer takes, without making the test wait 30 s for it.
-    reg.leave(&h);
+    drop(presence);
     let _ = h.room.cmds.send(crate::Cmd::Stop { checkpoint: true });
     for _ in 0..80 {
         if !h.is_live() {
@@ -655,9 +655,9 @@ async fn joining_resumes_a_parked_room_and_parking_preserves_everything() {
     assert!(back.has_machine);
 
     // And it resumes again.
-    reg.enter(&h);
+    let presence = reg.enter(&h, 2);
     assert!(h.is_live());
-    reg.leave(&h);
+    drop(presence);
     let _ = h.room.cmds.send(crate::Cmd::Stop { checkpoint: true });
 }
 
@@ -667,8 +667,8 @@ async fn two_rooms_step_independently() {
     let reg = Registry::open(&rd, &td);
     let a = reg.create("A", "sandbox").unwrap();
     let b = reg.create("B", "sandbox").unwrap();
-    reg.enter(&a);
-    reg.enter(&b);
+    let pa = reg.enter(&a, 1);
+    let pb = reg.enter(&b, 1);
     // An edit in A is an edit in A. Nothing crosses.
     for e in small_circuit() {
         let _ = a.room.cmds.send(crate::Cmd::Edit {
@@ -682,8 +682,8 @@ async fn two_rooms_step_independently() {
     assert_eq!(a.room.elements.lock().unwrap().len(), 4);
     assert!(b.room.elements.lock().unwrap().is_empty());
     assert!(a.is_live() && b.is_live());
+    drop((pa, pb));
     for h in [&a, &b] {
-        reg.leave(h);
         let _ = h.room.cmds.send(crate::Cmd::Stop { checkpoint: true });
     }
 }
@@ -695,7 +695,7 @@ async fn deleting_a_room_evicts_its_players_and_removes_its_file() {
     let keep = reg.create("Keep", "sandbox").unwrap();
     let doomed = reg.create("Doomed", "sandbox").unwrap();
     let code = doomed.meta().id;
-    reg.enter(&doomed);
+    let _presence = reg.enter(&doomed, 1);
     let mut life = doomed.subscribe_life();
     assert!(doomed.path.is_file());
 
@@ -767,4 +767,93 @@ fn a_conversation_never_reaches_the_save_file() {
     let reloaded = Registry::open(&rd, &td);
     let h2 = reloaded.get(&h.meta().id).unwrap();
     assert!(h2.room.chat.lock().unwrap().is_empty());
+}
+
+/// The regression that motivated `Presence`: population must return to zero
+/// no matter HOW a session ends — clean drop, panic, or the whole future
+/// dropped mid-await. The old three hand-placed `leave()` calls covered only
+/// the returns; a session that ended any other way kept its +1 forever,
+/// which is exactly "the player count climbs by one per refresh and never
+/// comes down" (and, since a room parks only at population 0, also "the sim
+/// task of an abandoned room runs forever").
+#[tokio::test]
+async fn population_returns_to_zero_by_every_exit_path() {
+    let (rd, td) = dirs("presence");
+    let reg = Arc::new(Registry::open(&rd, &td));
+    let h = reg.create("Bench", "sandbox").unwrap();
+    let pop = || h.room.population.load(Ordering::SeqCst);
+
+    // Exit path 1: the ordinary drop at the end of a session.
+    let p1 = reg.enter(&h, 1);
+    let p2 = reg.enter(&h, 2);
+    assert_eq!(pop(), 2, "two enters count two players");
+    drop(p1);
+    assert_eq!(pop(), 1);
+
+    // Exit path 2: a panic while present. Unwinding drops the guard.
+    let reg2 = reg.clone();
+    let h2 = h.clone();
+    let died = std::thread::spawn(move || {
+        let _p = reg2.enter(&h2, 3);
+        panic!("session died mid-flight");
+    })
+    .join();
+    assert!(died.is_err(), "the thread must actually have panicked");
+    assert_eq!(pop(), 1, "a panicked session still uncounts itself");
+
+    // Exit path 3: the future is DROPPED, not returned from — no code after
+    // the await point ever runs. This is what happens to any task the
+    // runtime aborts, and it is the path no hand-placed call can cover.
+    let p4 = reg.enter(&h, 4);
+    assert_eq!(pop(), 2);
+    let task = tokio::spawn(async move {
+        let _held = p4;
+        std::future::pending::<()>().await;
+    });
+    tokio::task::yield_now().await;
+    task.abort();
+    let _ = task.await;
+    assert_eq!(pop(), 1, "an aborted session still uncounts itself");
+
+    drop(p2);
+    assert_eq!(pop(), 0, "everyone gone reads zero — the room can park");
+    let _ = h.room.cmds.send(crate::Cmd::Stop { checkpoint: false });
+}
+
+/// The socket resolved its handle, then the room was deleted before the
+/// session entered. The count must still balance — an unbalanced enter here
+/// would pin a ghost in a room that no longer exists.
+#[tokio::test]
+async fn entering_a_room_being_deleted_still_balances_the_count() {
+    let (rd, td) = dirs("presence-del");
+    let reg = Registry::open(&rd, &td);
+    let h = reg.create("Doomed", "sandbox").unwrap();
+    assert!(reg.delete(&h.meta().id));
+    let p = reg.enter(&h, 1);
+    assert!(!h.is_live(), "a deleted room must not be resumed");
+    assert_eq!(h.room.population.load(Ordering::SeqCst), 1);
+    drop(p);
+    assert_eq!(h.room.population.load(Ordering::SeqCst), 0);
+}
+
+/// The room-side half of leaving rides the same guard: dropping a Presence
+/// sends `Cmd::Leave { who }`, so the sim task drops the player's layer
+/// claims and fails their driven parts dark no matter how the session ended.
+#[tokio::test]
+async fn dropping_a_presence_tells_the_room_who_left() {
+    let (rd, td) = dirs("presence-cmd");
+    let reg = Registry::open(&rd, &td);
+    let h = reg.create("Bench", "sandbox").unwrap();
+    // Steal the parked receiver first, so entering cannot resume a sim task
+    // that would race this test for the command stream.
+    let mut rx = h.parked.lock().unwrap().take().unwrap().rx;
+    let p = reg.enter(&h, 7);
+    drop(p);
+    let mut saw = false;
+    while let Ok(cmd) = rx.try_recv() {
+        if matches!(cmd, crate::Cmd::Leave { who: 7 }) {
+            saw = true;
+        }
+    }
+    assert!(saw, "the room must hear who left");
 }

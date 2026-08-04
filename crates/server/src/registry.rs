@@ -549,22 +549,27 @@ impl Registry {
     /// parked. Both halves happen under the SAME lock the parking path
     /// takes, which is what closes the "task parks while a player joins"
     /// race.
-    pub fn enter(&self, h: &Arc<RoomHandle>) {
+    ///
+    /// The count comes back down when the returned [`Presence`] drops —
+    /// there is deliberately no `leave()` to call. Three hand-placed
+    /// `leave()` calls used to cover three hand-identified exit paths, and
+    /// any session that ended some fourth way (a panic, a cancelled future,
+    /// a handler blocked forever) kept its +1 for the life of the process.
+    /// That is exactly the "population climbs by one per refresh and never
+    /// comes down" bug; a guard makes the class unrepresentable.
+    pub fn enter(&self, h: &Arc<RoomHandle>, who: u32) -> Presence {
         let mut slot = h.parked.lock().unwrap();
         h.room.population.fetch_add(1, Ordering::SeqCst);
+        let presence = Presence { h: h.clone(), who };
         if h.deleted.load(Ordering::SeqCst) {
-            return;
+            return presence;
         }
         if let Some(p) = slot.take() {
             h.meta.lock().unwrap().played = now_secs();
             h.life.send_replace(Life::Live);
             tokio::spawn(crate::sim_task(h.clone(), p));
         }
-    }
-
-    pub fn leave(&self, h: &Arc<RoomHandle>) {
-        h.room.population.fetch_sub(1, Ordering::SeqCst);
-        h.meta.lock().unwrap().played = now_secs();
+        presence
     }
 
     /// Every live room, for graceful shutdown.
@@ -598,6 +603,30 @@ impl Registry {
         // 30^6 codes and 64 rooms: unreachable in practice, but a server must
         // not loop forever if the clock is frozen.
         format!("Z{:05}", rooms.len())
+    }
+}
+
+/// A counted presence in a room, returned by [`Registry::enter`] and held
+/// for the whole client session. Dropping it is what uncounts the player and
+/// tells the room they are gone — so every way a session can end (return,
+/// `?`, panic, a future dropped by the runtime) runs the same cleanup, and
+/// no future edit to the session can forget it.
+#[must_use = "dropping the Presence is what uncounts the player — binding it to `_` uncounts immediately"]
+pub struct Presence {
+    h: Arc<RoomHandle>,
+    who: u32,
+}
+
+impl Drop for Presence {
+    fn drop(&mut self) {
+        self.h.room.population.fetch_sub(1, Ordering::SeqCst);
+        self.h.meta.lock().unwrap().played = now_secs();
+        // Room-side cleanup rides the same guard: layer claims dropped,
+        // driven parts going dark, the presence count rebroadcast. A send
+        // failure means the room's task is gone (deleted) — nothing to
+        // clean. A parked room keeps the message queued and applies it on
+        // resume, where it is idempotent.
+        let _ = self.h.room.cmds.send(crate::Cmd::Leave { who: self.who });
     }
 }
 
