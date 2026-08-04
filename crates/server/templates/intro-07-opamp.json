@@ -1,0 +1,397 @@
+{
+ "v": 1,
+ "kind": "template",
+ "id": "intro-07-opamp",
+ "name": "7 \u00b7 The Decider",
+ "blurb": "The op-amp compares two voltages and slams to a rail \u2014 and 25 mA is all it can push.",
+ "elements": [
+  {
+   "id": 1,
+   "kind": {
+    "t": "Rail",
+    "dc": 4.0,
+    "amp": 0.0,
+    "hz": 0.0,
+    "phase": 0.0
+   },
+   "pins": [
+    [
+     4,
+     3
+    ]
+   ]
+  },
+  {
+   "id": 2,
+   "kind": {
+    "t": "Potentiometer",
+    "ohms": 10000.0,
+    "wiper": 0.4
+   },
+   "pins": [
+    [
+     4,
+     3
+    ],
+    [
+     6,
+     6
+    ],
+    [
+     4,
+     9
+    ]
+   ]
+  },
+  {
+   "id": 3,
+   "kind": {
+    "t": "Ground"
+   },
+   "pins": [
+    [
+     4,
+     9
+    ]
+   ]
+  },
+  {
+   "id": 4,
+   "kind": {
+    "t": "Wire"
+   },
+   "pins": [
+    [
+     6,
+     6
+    ],
+    [
+     12,
+     6
+    ]
+   ]
+  },
+  {
+   "id": 5,
+   "kind": {
+    "t": "VoltageSource",
+    "dc": 2.0,
+    "amp": 0.0,
+    "hz": 0.0,
+    "phase": 0.0
+   },
+   "pins": [
+    [
+     14,
+     2
+    ],
+    [
+     17,
+     2
+    ]
+   ]
+  },
+  {
+   "id": 6,
+   "kind": {
+    "t": "Ground"
+   },
+   "pins": [
+    [
+     17,
+     2
+    ]
+   ]
+  },
+  {
+   "id": 7,
+   "kind": {
+    "t": "Wire"
+   },
+   "pins": [
+    [
+     12,
+     4
+    ],
+    [
+     12,
+     2
+    ]
+   ]
+  },
+  {
+   "id": 8,
+   "kind": {
+    "t": "Wire"
+   },
+   "pins": [
+    [
+     12,
+     2
+    ],
+    [
+     14,
+     2
+    ]
+   ]
+  },
+  {
+   "id": 9,
+   "kind": {
+    "t": "OpAmp",
+    "rail": 5.0,
+    "isc": 0.025
+   },
+   "pins": [
+    [
+     12,
+     6
+    ],
+    [
+     12,
+     4
+    ],
+    [
+     16,
+     5
+    ]
+   ]
+  },
+  {
+   "id": 10,
+   "kind": {
+    "t": "Resistor",
+    "ohms": 220.0
+   },
+   "pins": [
+    [
+     16,
+     5
+    ],
+    [
+     20,
+     5
+    ]
+   ]
+  },
+  {
+   "id": 11,
+   "kind": {
+    "t": "Led",
+    "color": 1
+   },
+   "pins": [
+    [
+     20,
+     5
+    ],
+    [
+     20,
+     9
+    ]
+   ]
+  },
+  {
+   "id": 12,
+   "kind": {
+    "t": "Ground"
+   },
+   "pins": [
+    [
+     20,
+     9
+    ]
+   ]
+  },
+  {
+   "id": 13,
+   "kind": {
+    "t": "Rail",
+    "dc": 4.0,
+    "amp": 0.0,
+    "hz": 0.0,
+    "phase": 0.0
+   },
+   "pins": [
+    [
+     24,
+     6
+    ]
+   ]
+  },
+  {
+   "id": 14,
+   "kind": {
+    "t": "Wire"
+   },
+   "pins": [
+    [
+     24,
+     6
+    ],
+    [
+     26,
+     6
+    ]
+   ]
+  },
+  {
+   "id": 15,
+   "kind": {
+    "t": "Ground"
+   },
+   "pins": [
+    [
+     26,
+     4
+    ]
+   ]
+  },
+  {
+   "id": 16,
+   "kind": {
+    "t": "OpAmp",
+    "rail": 5.0,
+    "isc": 0.025
+   },
+   "pins": [
+    [
+     26,
+     6
+    ],
+    [
+     26,
+     4
+    ],
+    [
+     30,
+     5
+    ]
+   ]
+  },
+  {
+   "id": 17,
+   "kind": {
+    "t": "Switch",
+    "closed": false
+   },
+   "pins": [
+    [
+     30,
+     5
+    ],
+    [
+     33,
+     5
+    ]
+   ]
+  },
+  {
+   "id": 18,
+   "kind": {
+    "t": "Lamp",
+    "ohms": 30.0,
+    "rated_watts": 0.5
+   },
+   "pins": [
+    [
+     33,
+     5
+    ],
+    [
+     33,
+     9
+    ]
+   ]
+  },
+  {
+   "id": 19,
+   "kind": {
+    "t": "Ground"
+   },
+   "pins": [
+    [
+     33,
+     9
+    ]
+   ]
+  }
+ ],
+ "probes": [
+  {
+   "pid": 1,
+   "elem": 2,
+   "pin": 1,
+   "kind": "v",
+   "r": null
+  },
+  {
+   "pid": 2,
+   "elem": 9,
+   "pin": 2,
+   "kind": "v",
+   "r": null
+  },
+  {
+   "pid": 3,
+   "elem": 16,
+   "pin": 2,
+   "kind": "i",
+   "r": null
+  }
+ ],
+ "next_pid": 4,
+ "panels": [
+  {
+   "plid": 1,
+   "x0": 2.0,
+   "y0": 1.0,
+   "x1": 8.0,
+   "y1": 10.5,
+   "name": "SETPOINT KNOB"
+  },
+  {
+   "plid": 2,
+   "x0": 28.5,
+   "y0": 3.0,
+   "x1": 35.0,
+   "y1": 10.5,
+   "name": "MUSCLE TEST"
+  }
+ ],
+ "next_plid": 3,
+ "machine": {
+  "kind": "none"
+ },
+ "view": {
+  "home": [
+   -30.0,
+   -1.0,
+   37.0,
+   21.0
+  ],
+  "scopes": [
+   {
+    "x": 2.0,
+    "y": 12.0,
+    "w": 13.0,
+    "h": 7.0,
+    "pids": [
+     1,
+     2
+    ],
+    "timebase": 4.0
+   },
+   {
+    "x": 17.0,
+    "y": 12.0,
+    "w": 11.0,
+    "h": 7.0,
+    "pids": [
+     3
+    ],
+    "timebase": 2.0
+   }
+  ]
+ }
+}

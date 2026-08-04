@@ -1,0 +1,287 @@
+{
+ "v": 1,
+ "kind": "template",
+ "id": "intro-06-diode",
+ "name": "6 \u00b7 One Way",
+ "blurb": "Current has a one-way valve, and the valve charges a fixed toll \u2014 this is why the LED died.",
+ "elements": [
+  {
+   "id": 1,
+   "kind": {
+    "t": "VoltageSource",
+    "dc": -5.0,
+    "amp": 0.0,
+    "hz": 0.0,
+    "phase": 0.0
+   },
+   "pins": [
+    [
+     4,
+     3
+    ],
+    [
+     4,
+     9
+    ]
+   ]
+  },
+  {
+   "id": 2,
+   "kind": {
+    "t": "Wire"
+   },
+   "pins": [
+    [
+     4,
+     3
+    ],
+    [
+     9,
+     3
+    ]
+   ]
+  },
+  {
+   "id": 3,
+   "kind": {
+    "t": "Diode"
+   },
+   "pins": [
+    [
+     9,
+     3
+    ],
+    [
+     9,
+     6
+    ]
+   ]
+  },
+  {
+   "id": 4,
+   "kind": {
+    "t": "Lamp",
+    "ohms": 60.0,
+    "rated_watts": 0.5
+   },
+   "pins": [
+    [
+     9,
+     6
+    ],
+    [
+     9,
+     9
+    ]
+   ]
+  },
+  {
+   "id": 5,
+   "kind": {
+    "t": "Wire"
+   },
+   "pins": [
+    [
+     9,
+     9
+    ],
+    [
+     4,
+     9
+    ]
+   ]
+  },
+  {
+   "id": 6,
+   "kind": {
+    "t": "Ground"
+   },
+   "pins": [
+    [
+     4,
+     9
+    ]
+   ]
+  },
+  {
+   "id": 7,
+   "kind": {
+    "t": "VoltageSource",
+    "dc": 0.0,
+    "amp": 4.0,
+    "hz": 1.0,
+    "phase": 0.0
+   },
+   "pins": [
+    [
+     20,
+     3
+    ],
+    [
+     20,
+     9
+    ]
+   ]
+  },
+  {
+   "id": 8,
+   "kind": {
+    "t": "Wire"
+   },
+   "pins": [
+    [
+     20,
+     3
+    ],
+    [
+     25,
+     3
+    ]
+   ]
+  },
+  {
+   "id": 9,
+   "kind": {
+    "t": "Diode"
+   },
+   "pins": [
+    [
+     25,
+     3
+    ],
+    [
+     25,
+     6
+    ]
+   ]
+  },
+  {
+   "id": 10,
+   "kind": {
+    "t": "Resistor",
+    "ohms": 300.0
+   },
+   "pins": [
+    [
+     25,
+     6
+    ],
+    [
+     25,
+     9
+    ]
+   ]
+  },
+  {
+   "id": 11,
+   "kind": {
+    "t": "Wire"
+   },
+   "pins": [
+    [
+     25,
+     9
+    ],
+    [
+     20,
+     9
+    ]
+   ]
+  },
+  {
+   "id": 12,
+   "kind": {
+    "t": "Ground"
+   },
+   "pins": [
+    [
+     20,
+     9
+    ]
+   ]
+  }
+ ],
+ "probes": [
+  {
+   "pid": 1,
+   "elem": 4,
+   "pin": 0,
+   "kind": "i",
+   "r": null
+  },
+  {
+   "pid": 2,
+   "elem": 3,
+   "pin": 0,
+   "kind": "v",
+   "r": [
+    3,
+    1
+   ]
+  },
+  {
+   "pid": 3,
+   "elem": 7,
+   "pin": 0,
+   "kind": "v",
+   "r": null
+  },
+  {
+   "pid": 4,
+   "elem": 10,
+   "pin": 0,
+   "kind": "v",
+   "r": [
+    10,
+    1
+   ]
+  }
+ ],
+ "next_pid": 5,
+ "panels": [
+  {
+   "plid": 1,
+   "x0": 2.0,
+   "y0": 1.5,
+   "x1": 12.0,
+   "y1": 10.5,
+   "name": "PUSH IT BOTH WAYS"
+  }
+ ],
+ "next_plid": 2,
+ "machine": {
+  "kind": "none"
+ },
+ "view": {
+  "home": [
+   -22.0,
+   0.0,
+   30.0,
+   21.5
+  ],
+  "scopes": [
+   {
+    "x": 2.0,
+    "y": 12.0,
+    "w": 12.0,
+    "h": 7.0,
+    "pids": [
+     1,
+     2
+    ],
+    "timebase": 2.0
+   },
+   {
+    "x": 16.0,
+    "y": 12.0,
+    "w": 12.0,
+    "h": 7.0,
+    "pids": [
+     3,
+     4
+    ],
+    "timebase": 2.0
+   }
+  ]
+ }
+}

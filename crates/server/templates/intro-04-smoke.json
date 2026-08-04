@@ -1,0 +1,278 @@
+{
+ "v": 1,
+ "kind": "template",
+ "id": "intro-04-smoke",
+ "name": "4 \u00b7 Smoke",
+ "blurb": "Watts are volts times amps. Parts have ratings. The damage is real \u2014 burn one and see.",
+ "elements": [
+  {
+   "id": 1,
+   "kind": {
+    "t": "VoltageSource",
+    "dc": 9.0,
+    "amp": 0.0,
+    "hz": 0.0,
+    "phase": 0.0
+   },
+   "pins": [
+    [
+     4,
+     3
+    ],
+    [
+     4,
+     9
+    ]
+   ]
+  },
+  {
+   "id": 2,
+   "kind": {
+    "t": "Wire"
+   },
+   "pins": [
+    [
+     4,
+     3
+    ],
+    [
+     10,
+     3
+    ]
+   ]
+  },
+  {
+   "id": 3,
+   "kind": {
+    "t": "Led",
+    "color": 0
+   },
+   "pins": [
+    [
+     10,
+     3
+    ],
+    [
+     10,
+     9
+    ]
+   ]
+  },
+  {
+   "id": 4,
+   "kind": {
+    "t": "VoltageSource",
+    "dc": 9.0,
+    "amp": 0.0,
+    "hz": 0.0,
+    "phase": 0.0
+   },
+   "pins": [
+    [
+     16,
+     3
+    ],
+    [
+     16,
+     9
+    ]
+   ]
+  },
+  {
+   "id": 5,
+   "kind": {
+    "t": "Wire"
+   },
+   "pins": [
+    [
+     16,
+     3
+    ],
+    [
+     20,
+     3
+    ]
+   ]
+  },
+  {
+   "id": 6,
+   "kind": {
+    "t": "Led",
+    "color": 1
+   },
+   "pins": [
+    [
+     24,
+     3
+    ],
+    [
+     24,
+     9
+    ]
+   ]
+  },
+  {
+   "id": 7,
+   "kind": {
+    "t": "Wire"
+   },
+   "pins": [
+    [
+     24,
+     9
+    ],
+    [
+     16,
+     9
+    ]
+   ]
+  },
+  {
+   "id": 8,
+   "kind": {
+    "t": "VoltageSource",
+    "dc": 9.0,
+    "amp": 0.0,
+    "hz": 0.0,
+    "phase": 0.0
+   },
+   "pins": [
+    [
+     4,
+     13
+    ],
+    [
+     4,
+     19
+    ]
+   ]
+  },
+  {
+   "id": 9,
+   "kind": {
+    "t": "Wire"
+   },
+   "pins": [
+    [
+     4,
+     13
+    ],
+    [
+     7,
+     13
+    ]
+   ]
+  },
+  {
+   "id": 10,
+   "kind": {
+    "t": "Switch",
+    "closed": false
+   },
+   "pins": [
+    [
+     7,
+     13
+    ],
+    [
+     10,
+     13
+    ]
+   ]
+  },
+  {
+   "id": 11,
+   "kind": {
+    "t": "Resistor",
+    "ohms": 10.0
+   },
+   "pins": [
+    [
+     10,
+     13
+    ],
+    [
+     13,
+     13
+    ]
+   ],
+   "tier": 1
+  },
+  {
+   "id": 12,
+   "kind": {
+    "t": "Led",
+    "color": 0
+   },
+   "pins": [
+    [
+     13,
+     13
+    ],
+    [
+     13,
+     19
+    ]
+   ]
+  },
+  {
+   "id": 13,
+   "kind": {
+    "t": "Wire"
+   },
+   "pins": [
+    [
+     13,
+     19
+    ],
+    [
+     4,
+     19
+    ]
+   ]
+  }
+ ],
+ "probes": [
+  {
+   "pid": 1,
+   "elem": 12,
+   "pin": 0,
+   "kind": "i",
+   "r": null
+  },
+  {
+   "pid": 2,
+   "elem": 6,
+   "pin": 0,
+   "kind": "i",
+   "r": null
+  }
+ ],
+ "next_pid": 3,
+ "panels": [],
+ "next_plid": 1,
+ "machine": {
+  "kind": "none"
+ },
+ "view": {
+  "home": [
+   -24.0,
+   0.0,
+   31.0,
+   22.0
+  ],
+  "scopes": [
+   {
+    "x": 16.0,
+    "y": 12.0,
+    "w": 12.0,
+    "h": 7.0,
+    "pids": [
+     1,
+     2
+    ],
+    "timebase": 2.0
+   }
+  ]
+ }
+}

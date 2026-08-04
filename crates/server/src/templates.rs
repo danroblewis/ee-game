@@ -249,6 +249,69 @@ pub struct Builtin {
 /// in sim-core and this registry never learns about it — `ElementSpec` is
 /// the entire vocabulary here.
 pub static BUILTINS: &[Builtin] = &[
+    // ---- the intro series, in course order (crates/server/src/lessons.rs).
+    // Listed first so "new room" opens on lesson 1: the answer to "I have no
+    // idea how to begin" has to be the first thing a beginner is offered.
+    Builtin {
+        id: "intro-01-loop",
+        name: "1 · The Loop",
+        blurb: "A battery, a lamp, and a gap. Nothing flows until the loop closes — start here.",
+        build: crate::lessons::lesson_01,
+    },
+    Builtin {
+        id: "intro-02-divider",
+        name: "2 · Volts, Ohms, the Divider",
+        blurb: "Ohm's law with a slider, and the voltage divider you will use forever.",
+        build: crate::lessons::lesson_02,
+    },
+    Builtin {
+        id: "intro-03-kirchhoff",
+        name: "3 · Kirchhoff",
+        blurb: "Current in equals current out, and the drops around a loop share the battery's push.",
+        build: crate::lessons::lesson_03,
+    },
+    Builtin {
+        id: "intro-04-smoke",
+        name: "4 · Smoke",
+        blurb: "Watts are volts times amps. Parts have ratings. The damage is real — burn one and see.",
+        build: crate::lessons::lesson_04,
+    },
+    Builtin {
+        id: "intro-05-time",
+        name: "5 · Time",
+        blurb: "A capacitor charges through a resistor on a curve, holds what it stored, and dumps it in a flash.",
+        build: crate::lessons::lesson_05,
+    },
+    Builtin {
+        id: "intro-06-diode",
+        name: "6 · One Way",
+        blurb: "Current has a one-way valve, and the valve charges a fixed toll — this is why the LED died.",
+        build: crate::lessons::lesson_06,
+    },
+    Builtin {
+        id: "intro-07-opamp",
+        name: "7 · The Decider",
+        blurb: "The op-amp compares two voltages and slams to a rail — and 25 mA is all it can push.",
+        build: crate::lessons::lesson_07,
+    },
+    Builtin {
+        id: "intro-08-mosfet",
+        name: "8 · The Gate",
+        blurb: "A gate that draws nothing commands a current that matters — if you switch the low side.",
+        build: crate::lessons::lesson_08,
+    },
+    Builtin {
+        id: "intro-09-muscle",
+        name: "9 · Muscle",
+        blurb: "Why the brain cannot be the muscle: watts land in the package, and packages have tiers.",
+        build: crate::lessons::lesson_09,
+    },
+    Builtin {
+        id: "intro-10-close-the-loop",
+        name: "10 · Close the Loop",
+        blurb: "Sense, compare, drive: the hoist with its benches standing and one wire missing.",
+        build: crate::lessons::lesson_10,
+    },
     Builtin {
         id: "demo",
         name: "Showcase + Hoist",

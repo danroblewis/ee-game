@@ -1,0 +1,233 @@
+{
+ "v": 1,
+ "kind": "template",
+ "id": "intro-02-divider",
+ "name": "2 \u00b7 Volts, Ohms, the Divider",
+ "blurb": "Ohm's law with a slider, and the voltage divider you will use forever.",
+ "elements": [
+  {
+   "id": 1,
+   "kind": {
+    "t": "VoltageSource",
+    "dc": 3.0,
+    "amp": 0.0,
+    "hz": 0.0,
+    "phase": 0.0
+   },
+   "pins": [
+    [
+     4,
+     3
+    ],
+    [
+     4,
+     9
+    ]
+   ]
+  },
+  {
+   "id": 2,
+   "kind": {
+    "t": "Wire"
+   },
+   "pins": [
+    [
+     4,
+     3
+    ],
+    [
+     10,
+     3
+    ]
+   ]
+  },
+  {
+   "id": 3,
+   "kind": {
+    "t": "Resistor",
+    "ohms": 1000.0
+   },
+   "pins": [
+    [
+     10,
+     3
+    ],
+    [
+     10,
+     9
+    ]
+   ]
+  },
+  {
+   "id": 4,
+   "kind": {
+    "t": "Wire"
+   },
+   "pins": [
+    [
+     10,
+     9
+    ],
+    [
+     4,
+     9
+    ]
+   ]
+  },
+  {
+   "id": 5,
+   "kind": {
+    "t": "VoltageSource",
+    "dc": 4.0,
+    "amp": 0.0,
+    "hz": 0.0,
+    "phase": 0.0
+   },
+   "pins": [
+    [
+     18,
+     3
+    ],
+    [
+     18,
+     9
+    ]
+   ]
+  },
+  {
+   "id": 6,
+   "kind": {
+    "t": "Wire"
+   },
+   "pins": [
+    [
+     18,
+     3
+    ],
+    [
+     24,
+     3
+    ]
+   ]
+  },
+  {
+   "id": 7,
+   "kind": {
+    "t": "Potentiometer",
+    "ohms": 10000.0,
+    "wiper": 0.5
+   },
+   "pins": [
+    [
+     24,
+     3
+    ],
+    [
+     26,
+     6
+    ],
+    [
+     24,
+     9
+    ]
+   ]
+  },
+  {
+   "id": 8,
+   "kind": {
+    "t": "Wire"
+   },
+   "pins": [
+    [
+     24,
+     9
+    ],
+    [
+     18,
+     9
+    ]
+   ]
+  },
+  {
+   "id": 9,
+   "kind": {
+    "t": "Ground"
+   },
+   "pins": [
+    [
+     18,
+     9
+    ]
+   ]
+  }
+ ],
+ "probes": [
+  {
+   "pid": 1,
+   "elem": 3,
+   "pin": 0,
+   "kind": "i",
+   "r": null
+  },
+  {
+   "pid": 2,
+   "elem": 7,
+   "pin": 1,
+   "kind": "v",
+   "r": null
+  }
+ ],
+ "next_pid": 3,
+ "panels": [
+  {
+   "plid": 1,
+   "x0": 2.0,
+   "y0": 1.5,
+   "x1": 12.0,
+   "y1": 10.5,
+   "name": "OHM BENCH \u2014 DIAL 5.0 mA"
+  },
+  {
+   "plid": 2,
+   "x0": 16.0,
+   "y0": 1.5,
+   "x1": 28.0,
+   "y1": 10.5,
+   "name": "DIVIDER \u2014 DIAL 1.00 V"
+  }
+ ],
+ "next_plid": 3,
+ "machine": {
+  "kind": "none"
+ },
+ "view": {
+  "home": [
+   -23.0,
+   0.0,
+   31.0,
+   21.0
+  ],
+  "scopes": [
+   {
+    "x": 2.0,
+    "y": 12.0,
+    "w": 12.0,
+    "h": 6.5,
+    "pids": [
+     1
+    ],
+    "timebase": 2.0
+   },
+   {
+    "x": 16.0,
+    "y": 12.0,
+    "w": 12.0,
+    "h": 6.5,
+    "pids": [
+     2
+    ],
+    "timebase": 2.0
+   }
+  ]
+ }
+}

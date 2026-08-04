@@ -478,6 +478,30 @@
       .goalcard.win .goal-title { color: #ffe6a1; }
       .goalcard.win .goal-fill { background: linear-gradient(#ffd76b, #c98f22); }
 
+      /* ---- lesson card: the intro series' steps (lesson.ts owns it).
+         Same instrument language as the goal card, anchored top-LEFT under
+         the HUD so lesson 10 can show both cards at once. */
+      .lessoncard {
+        right: auto; bottom: auto;
+        left: calc(12px + var(--rail-l)); top: 96px; width: 330px;
+      }
+      .lesson-step {
+        display: flex; gap: 7px; align-items: flex-start;
+        padding: 5px 2px; border-bottom: 1px solid #2a323c;
+      }
+      .lesson-step:last-child { border-bottom: none; }
+      .lesson-step b {
+        flex: none; width: 14px; text-align: center;
+        color: #6f8290; font-weight: 600;
+      }
+      .lesson-step span { color: #cfe3ee; }
+      .lesson-step.done b { color: #7dffb0; }
+      .lesson-step.done span { color: #718899; }
+      .lesson-step.now b { color: #8ee7ff; }
+      .lesson-step.later b, .lesson-step.later span { color: #4c5c66; }
+      .lesson-next { color: #ffe6a1; border-color: #a9862f; }
+      .lesson-next:hover { background: #4a3a12; color: #ffefc4; }
+
       /* ---- rooms: which room am I in, and how do I get to another one
          (rooms.ts owns the elements; this is only their look).
 

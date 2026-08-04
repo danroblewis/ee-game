@@ -113,6 +113,7 @@ import {
 } from './catalog';
 import { History, isTypingTarget } from './history';
 import { createHoist, type MachineRect } from './hoist';
+import { createLesson } from './lesson';
 import { connect, type RoomHello } from './net';
 import { createRooms, loadBench, saveBench } from './rooms';
 import {
@@ -513,6 +514,18 @@ const roomsUI = createRooms({
   toast: (m) => toast(m),
 });
 
+/** The intro-series lesson card (lesson.ts). Shown only in rooms made from
+ * an `intro-*` template; its step checks read the same live map every other
+ * instrument reads. */
+const lessonUI = createLesson(document.body, {
+  elements: () => elements,
+  live: () => live,
+  isBroken: (id) => isBroken(id),
+  machine: () => hoist.state(),
+  join: (code) => net.join(code),
+  toast: (m) => toast(m),
+});
+
 /**
  * Leave a room. Every line here is state that is scoped to ONE room and
  * would be wrong — not merely stale — in the next one:
@@ -656,6 +669,7 @@ const net = connect({
       resetForRoom(room);
     }
     roomsUI.onHello(room);
+    lessonUI.onRoom(room ? { id: room.id, template: room.template } : null);
   },
   onFrame(f) {
     simTime = f.time;
@@ -781,6 +795,7 @@ const net = connect({
       roomKey = null;
       resetForRoom(null);
       hoist.clear(); // whatever machine that room had, it is not ours any more
+      lessonUI.onRoom(null);
     }
     roomsUI.onGone(id, reason);
   },
@@ -3343,6 +3358,7 @@ window.addEventListener('keydown', (ev) => {
   }
   if (panelHost.owns(ev.target)) return; // typing in a panel window
   if (roomsUI.owns(ev.target)) return; // typing in the room browser
+  if (lessonUI.owns(ev.target)) return; // a focused lesson-card button
 
   // Clipboard first: ⌘/Ctrl+C copies, ⌘/Ctrl+V arms pasting at the cursor.
   if (ev.metaKey || ev.ctrlKey) {
@@ -4084,6 +4100,10 @@ function frame(now: number) {
     damage,
     dots,
   });
+
+  // The lesson card's step checks, against this frame's live map (throttled
+  // inside; a room that is not a lesson costs one boolean here).
+  lessonUI.tick(now);
 
   // Hover highlight (blue element + pin dots), Falstad-style.
   const zHover = mouse ? scopeZoneAt(mouse.x, mouse.y) : null;

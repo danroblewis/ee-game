@@ -1,0 +1,234 @@
+{
+ "v": 1,
+ "kind": "template",
+ "id": "intro-05-time",
+ "name": "5 \u00b7 Time",
+ "blurb": "A capacitor charges through a resistor on a curve, holds what it stored, and dumps it in a flash.",
+ "elements": [
+  {
+   "id": 1,
+   "kind": {
+    "t": "VoltageSource",
+    "dc": 5.0,
+    "amp": 0.0,
+    "hz": 0.0,
+    "phase": 0.0
+   },
+   "pins": [
+    [
+     4,
+     3
+    ],
+    [
+     4,
+     11
+    ]
+   ]
+  },
+  {
+   "id": 2,
+   "kind": {
+    "t": "Wire"
+   },
+   "pins": [
+    [
+     4,
+     3
+    ],
+    [
+     7,
+     3
+    ]
+   ]
+  },
+  {
+   "id": 3,
+   "kind": {
+    "t": "Button",
+    "closed": false
+   },
+   "pins": [
+    [
+     7,
+     3
+    ],
+    [
+     11,
+     3
+    ]
+   ]
+  },
+  {
+   "id": 4,
+   "kind": {
+    "t": "Resistor",
+    "ohms": 1000.0
+   },
+   "pins": [
+    [
+     11,
+     3
+    ],
+    [
+     15,
+     3
+    ]
+   ]
+  },
+  {
+   "id": 5,
+   "kind": {
+    "t": "Wire"
+   },
+   "pins": [
+    [
+     15,
+     3
+    ],
+    [
+     16,
+     3
+    ]
+   ]
+  },
+  {
+   "id": 6,
+   "kind": {
+    "t": "Capacitor",
+    "farads": 0.001
+   },
+   "pins": [
+    [
+     16,
+     3
+    ],
+    [
+     16,
+     11
+    ]
+   ]
+  },
+  {
+   "id": 7,
+   "kind": {
+    "t": "Wire"
+   },
+   "pins": [
+    [
+     16,
+     11
+    ],
+    [
+     4,
+     11
+    ]
+   ]
+  },
+  {
+   "id": 8,
+   "kind": {
+    "t": "Ground"
+   },
+   "pins": [
+    [
+     4,
+     11
+    ]
+   ]
+  },
+  {
+   "id": 9,
+   "kind": {
+    "t": "Button",
+    "closed": false
+   },
+   "pins": [
+    [
+     16,
+     3
+    ],
+    [
+     20,
+     3
+    ]
+   ]
+  },
+  {
+   "id": 10,
+   "kind": {
+    "t": "Lamp",
+    "ohms": 20.0,
+    "rated_watts": 0.5
+   },
+   "pins": [
+    [
+     20,
+     3
+    ],
+    [
+     20,
+     11
+    ]
+   ]
+  },
+  {
+   "id": 11,
+   "kind": {
+    "t": "Wire"
+   },
+   "pins": [
+    [
+     20,
+     11
+    ],
+    [
+     16,
+     11
+    ]
+   ]
+  }
+ ],
+ "probes": [
+  {
+   "pid": 1,
+   "elem": 6,
+   "pin": 0,
+   "kind": "v",
+   "r": null
+  },
+  {
+   "pid": 2,
+   "elem": 10,
+   "pin": 0,
+   "kind": "i",
+   "r": null
+  }
+ ],
+ "next_pid": 3,
+ "panels": [],
+ "next_plid": 1,
+ "machine": {
+  "kind": "none"
+ },
+ "view": {
+  "home": [
+   -17.0,
+   0.0,
+   27.0,
+   23.5
+  ],
+  "scopes": [
+   {
+    "x": 2.0,
+    "y": 13.5,
+    "w": 16.0,
+    "h": 8.0,
+    "pids": [
+     1,
+     2
+    ],
+    "timebase": 4.0
+   }
+  ]
+ }
+}
