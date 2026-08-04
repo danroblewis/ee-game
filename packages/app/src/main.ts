@@ -4604,14 +4604,25 @@ const dock = createDock(scopeDiv, scopeCv, audio);
  *  first. Forcing the colour at the context instead means the highlight is
  *  drawn by exactly the code that draws the part, so a symbol that changes
  *  shape tomorrow highlights correctly with no further work. */
+const NO_FILL = new Set(['fill', 'fillRect', 'fillText']);
+
 function tinted(base: CanvasRenderingContext2D, color: string): CanvasRenderingContext2D {
   return new Proxy(base, {
     get(t, k) {
+      // FILLS ARE DROPPED, not recoloured. Forcing fillStyle too painted a
+      // chip's body as one solid blue slab, and a Shift Register under the
+      // cursor simply vanished -- you could not see its interior, its pin
+      // labels, or where its edges were. The part is already drawn underneath
+      // this pass; the highlight only has to re-stroke its OUTLINE, so every
+      // fill here is a no-op and the symbol shows through.
+      if (NO_FILL.has(k as string)) return () => {};
       const v = Reflect.get(t, k) as unknown;
       return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(t) : v;
     },
     set(t, k, v) {
-      Reflect.set(t, k, k === 'strokeStyle' || k === 'fillStyle' ? color : v);
+      // Only strokes take the tint. `fillStyle` is still allowed through so
+      // the underlying context is left in a sane state for the next caller.
+      Reflect.set(t, k, k === 'strokeStyle' ? color : v);
       return true;
     },
   }) as CanvasRenderingContext2D;
