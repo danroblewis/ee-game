@@ -4563,36 +4563,61 @@ const dock = createDock(scopeDiv, scopeCv, audio);
 
 /** Blue highlight over an element: its pin-chain plus dots on every pin
  * (pins must overlap exactly to connect — make them visible). */
+/** A canvas context whose every stroke and fill comes out one colour.
+ *
+ *  The symbol draw is a 900-line switch that picks its own colours from
+ *  voltage, current, damage and audio, and re-implementing any of that to
+ *  produce a blue copy would be a second renderer to keep in step with the
+ *  first. Forcing the colour at the context instead means the highlight is
+ *  drawn by exactly the code that draws the part, so a symbol that changes
+ *  shape tomorrow highlights correctly with no further work. */
+function tinted(base: CanvasRenderingContext2D, color: string): CanvasRenderingContext2D {
+  return new Proxy(base, {
+    get(t, k) {
+      const v = Reflect.get(t, k) as unknown;
+      return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(t) : v;
+    },
+    set(t, k, v) {
+      Reflect.set(t, k, k === 'strokeStyle' || k === 'fillStyle' ? color : v);
+      return true;
+    },
+  }) as CanvasRenderingContext2D;
+}
+
+/** Hover / selection highlight: THE PART ITSELF GOES BLUE.
+ *
+ *  It used to be a rounded box drawn round the whole part, on the reasoning
+ *  that the symbol already draws its own geometry so the highlight only had
+ *  to say "this one". In practice a big translucent rectangle over a dense
+ *  schematic hides the thing it is pointing at, and on a wide part (a chip,
+ *  a stretched wire) it covers everything the part crosses as well.
+ *
+ *  So the part is simply drawn again, in blue, over itself: same geometry,
+ *  same line widths, one colour. `live`, `dmg`, `sound` and `time` are all
+ *  deliberately omitted so the second pass draws the SYMBOL and not the
+ *  current dots, the heat glow, the smoke or the speaker halo — those are
+ *  state the player is reading, and a highlight must not double them up. */
 function drawHighlight(e: ElementSpec, strong: boolean) {
-  // One soft rounded box over the WHOLE part — no pin-to-pin "skeleton"
-  // lines: the symbol already draws its own geometry, so the highlight only
-  // has to say "this one", not re-trace it.
-  const P = e.pins.map(toPx);
-  const pad = Math.max(6, cam.scale * 0.5);
-  let x0 = Math.min(...P.map((p) => p[0])) - pad;
-  let y0 = Math.min(...P.map((p) => p[1])) - pad;
-  let x1 = Math.max(...P.map((p) => p[0])) + pad;
-  let y1 = Math.max(...P.map((p) => p[1])) + pad;
-  // One-pin parts draw their body away from the pin: stretch to cover it.
-  if (e.kind.t === 'Rail') y0 -= cam.scale * 0.85;
-  if (e.kind.t === 'Ground') y1 += cam.scale * 0.72;
-  ctx.fillStyle = strong ? '#5a8cff' : '#4a7de0';
-  ctx.globalAlpha = strong ? 0.22 : 0.14;
-  roundRectPath(ctx, x0, y0, x1 - x0, y1 - y0, Math.min(8, pad * 0.6));
-  ctx.fill();
-  ctx.globalAlpha = strong ? 0.55 : 0.35;
-  ctx.strokeStyle = strong ? '#5a8cff' : '#4a7de0';
-  ctx.lineWidth = 1.5;
-  ctx.stroke();
-  // Pin dots stay: they are the wire targets, not skeleton.
+  const t = tinted(ctx, strong ? '#7db1ff' : '#5a8cff');
+  ctx.save();
+  ctx.globalAlpha = strong ? 1 : 0.75;
+  // A touch wider than the symbol underneath, so the blue reads as the part
+  // rather than as a slightly-off redraw of it.
+  const grow = Math.max(1.5, cam.scale * 0.05);
+  ctx.lineWidth = Math.max(2, cam.scale * 0.07) + grow;
+  drawElement({ ctx: t, cam, dots, dtSec: 0 }, e);
+  ctx.restore();
+  // Pin dots stay: they are the wire targets, and they are what a player is
+  // aiming at when they hover a part at all.
+  ctx.save();
   ctx.fillStyle = '#7db1ff';
   ctx.globalAlpha = 0.9;
-  for (const [x, y] of P) {
+  for (const [x, y] of e.pins.map(toPx)) {
     ctx.beginPath();
     ctx.arc(x, y, Math.max(3, cam.scale * 0.11), 0, Math.PI * 2);
     ctx.fill();
   }
-  ctx.globalAlpha = 1;
+  ctx.restore();
 }
 
 /** A control panel is pointing at something: light it up in exactly the
