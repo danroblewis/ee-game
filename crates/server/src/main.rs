@@ -3144,11 +3144,39 @@ fn hello_msg(handle: &RoomHandle, me: u32) -> String {
     .to_string()
 }
 
+/// How long one websocket send may take before the peer is declared dead.
+/// A send to a vanished peer (a phone whose radio slept, a proxy hop that
+/// swallowed the FIN — cloudflared and the vite dev proxy both sit in that
+/// position) does not error: it fills the kernel buffer and then blocks
+/// FOREVER, and a session blocked in send never reaches any cleanup. A
+/// client that cannot absorb a frame of a 30 Hz stream for this long is
+/// gone, or unrecoverably behind — either way the session ends.
+const WS_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Ping cadence, for sessions with nothing else to say (an idle room emits
+/// no frames, and a client watching one sends nothing).
+const WS_PING_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+/// A peer silent for this long — no message, no pong (browsers answer pings
+/// automatically) — is gone. Generous on purpose: a backgrounded tab still
+/// pongs, so only a dead connection trips it.
+const WS_DEAD_AFTER: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// Send with a deadline; `Err` means the session is over. See
+/// [`WS_SEND_TIMEOUT`] for why a raw `.send().await` is not safe here.
+async fn ws_send(socket: &mut WebSocket, msg: Message) -> Result<(), ()> {
+    match tokio::time::timeout(WS_SEND_TIMEOUT, socket.send(msg)).await {
+        Ok(Ok(())) => Ok(()),
+        _ => Err(()),
+    }
+}
+
 async fn client_session(mut socket: WebSocket, reg: Arc<Registry>, handle: Arc<RoomHandle>) {
     let room = handle.room.clone();
     let me = room.next_client.fetch_add(1, Ordering::Relaxed);
-    // Counts the player AND resumes the room if it was parked.
-    reg.enter(&handle);
+    // Counts the player AND resumes the room if it was parked. The count
+    // comes back down when `_presence` drops, which covers EVERY exit from
+    // this function — return, panic, or the whole future being dropped.
+    // (Named `_presence`, not bound to `_`: `let _ =` would drop it here.)
+    let _presence = reg.enter(&handle, me);
     let _ = room.cmds.send(Cmd::Join);
     let mut events = room.events.subscribe();
     let mut life = handle.subscribe_life();
@@ -3158,8 +3186,7 @@ async fn client_session(mut socket: WebSocket, reg: Arc<Registry>, handle: Arc<R
     // with no sim task.
     if matches!(*life.borrow(), Life::Gone) {
         let msg = json!({"t": "roomgone", "id": handle.meta().id, "reason": "deleted"}).to_string();
-        let _ = socket.send(Message::Text(msg.into())).await;
-        reg.leave(&handle);
+        let _ = ws_send(&mut socket, Message::Text(msg.into())).await;
         return;
     }
 
@@ -3170,11 +3197,16 @@ async fn client_session(mut socket: WebSocket, reg: Arc<Registry>, handle: Arc<R
     let mut sensor_budget = TokenBucket::new(45.0, 10.0);
 
     let hello = hello_msg(&handle, me);
-    if socket.send(Message::Text(hello.into())).await.is_err() {
-        reg.leave(&handle);
-        let _ = room.cmds.send(Cmd::Leave { who: me });
+    if ws_send(&mut socket, Message::Text(hello.into())).await.is_err() {
         return;
     }
+
+    // The deadman: `last_heard` moves on every frame the peer sends
+    // (including automatic pong replies), pings keep an otherwise-quiet
+    // wire moving in both directions.
+    let mut ping = tokio::time::interval(WS_PING_EVERY);
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_heard = std::time::Instant::now();
 
     loop {
         tokio::select! {
@@ -3183,13 +3215,21 @@ async fn client_session(mut socket: WebSocket, reg: Arc<Registry>, handle: Arc<R
                 if gone {
                     let msg = json!({"t": "roomgone", "id": handle.meta().id,
                                      "reason": "deleted"}).to_string();
-                    let _ = socket.send(Message::Text(msg.into())).await;
+                    let _ = ws_send(&mut socket, Message::Text(msg.into())).await;
+                    break;
+                }
+            },
+            _ = ping.tick() => {
+                if last_heard.elapsed() >= WS_DEAD_AFTER {
+                    break;
+                }
+                if ws_send(&mut socket, Message::Ping(Default::default())).await.is_err() {
                     break;
                 }
             },
             ev = events.recv() => match ev {
                 Ok(msg) => {
-                    if socket.send(Message::Text(msg.into())).await.is_err() {
+                    if ws_send(&mut socket, Message::Text(msg.into())).await.is_err() {
                         break;
                     }
                 }
@@ -3200,6 +3240,7 @@ async fn client_session(mut socket: WebSocket, reg: Arc<Registry>, handle: Arc<R
             },
             incoming = socket.recv() => {
                 let Some(Ok(msg)) = incoming else { break };
+                last_heard = std::time::Instant::now();
                 if let Message::Text(text) = msg {
                     match serde_json::from_str::<ClientMsg>(&text) {
                         Ok(ClientMsg::Interact { id, op }) => {
@@ -3260,10 +3301,10 @@ async fn client_session(mut socket: WebSocket, reg: Arc<Registry>, handle: Arc<R
         }
     }
 
-    reg.leave(&handle);
-    // `who` matters here: leaving drops this player's layer claims and fails
-    // every part they were driving to dark on the very next tick.
-    let _ = room.cmds.send(Cmd::Leave { who: me });
+    // No explicit cleanup: `_presence` drops here (and on every other exit),
+    // uncounting the player and sending `Cmd::Leave` — which drops their
+    // layer claims and fails every part they were driving to dark on the
+    // very next tick.
 }
 
 #[tokio::main]
