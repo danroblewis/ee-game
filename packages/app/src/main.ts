@@ -4002,7 +4002,7 @@ canvas.addEventListener('pointermove', (ev) => {
   const nl2 = z || pz || bz2 ? null : netLabelAt(cam, netLabels, ev.clientX, ev.clientY);
   canvas.style.cursor = repairing
     ? REPAIR_CURSOR
-    : placing || pasting || panelTool || labelBoxTool || netLabelTool
+    : placing || pasting || panelTool || labelBoxTool || netLabelTool || layerTool
     ? 'crosshair'
     : spaceHeld
       ? 'grab'
@@ -4435,6 +4435,21 @@ window.addEventListener('keydown', (ev) => {
       const lb = labelBoxHotAt(cam, labelBoxes, mouse.x, mouse.y);
       if (lb) {
         labelBoxOp({ t: 'remove', blid: lb.blid });
+        return;
+      }
+      // A CAMERA LAYER, last of the annotations and for the same reason the
+      // comment above gives: a shape a player can make and cannot unmake is a
+      // trap. The wire has always carried LayerOp Remove, but no gesture
+      // reached it except shift+click on the name plate — undocumented, and a
+      // mis-aim of the add-to-selection gesture. Delete over the layer works
+      // now, like every other thing on the sheet.
+      //
+      // LAST because `layerAt` is a BODY hit, not an edge-or-plate hit like
+      // the two above: a camera layer is a district-sized rectangle, and
+      // testing it earlier would shadow every part standing inside it.
+      const ly = layerAt(cam, layers, mouse.x, mouse.y);
+      if (ly && !elementAt(mouse.x, mouse.y)) {
+        layerOp({ t: 'remove', lid: ly.lid });
         return;
       }
     }
