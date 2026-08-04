@@ -79,6 +79,7 @@ mod drums;
 mod synth_vco;
 mod modules;
 mod moog;
+mod slew;
 mod tr808;
 mod vco555;
 mod bass;
@@ -2124,6 +2125,9 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
     // Seeded from the room, not from `false`: this flag has to survive a park
     // because the `win` it qualifies does. See `Room::ext`.
     let mut ext_driven = room.ext.load(Ordering::Relaxed);
+    // Knobs currently travelling toward the value a hand asked for. Empty
+    // whenever nobody is turning anything, which is nearly always.
+    let mut slews = slew::Slews::default();
 
     let tick = std::time::Duration::from_secs_f64(1.0 / TICK_HZ);
     let mut interval = tokio::time::interval(tick);
@@ -2230,17 +2234,30 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
                     // placement gate) and a knob write carrying an
                     // out-of-range value — `SetValue` on a source's dc had
                     // no clamp at all.
-                    let candidate = {
+                    // Read the wiper's CURRENT position while we hold the
+                    // document lock for the candidate, so the slew starts
+                    // from the same state the gate is judging against.
+                    let (candidate, was_wiper) = {
                         let elems = room.elements.lock().unwrap();
                         let mut next = elems.clone();
                         apply_interact_to(&mut next, id, op);
-                        next
+                        (next, wiper_of(&elems, id))
                     };
                     if let Err(r) = check_room_doc(&candidate) {
                         let _ = room.events.send(reject_msg(who, "interact", &r));
                         continue;
                     }
+                    // A wiper does not teleport. Aim it from where it is at
+                    // the value the gate just approved, then put the engine
+                    // back where the knob physically IS — `interact()` has
+                    // recompiled from a document that already holds the
+                    // target, so without this the jump happens anyway. The
+                    // walk itself runs on the machine cadence below.
+                    if let (InteractOp::SetValue { value }, Some(from)) = (op, was_wiper) {
+                        slews.aim(id, from, value.clamp(0.01, 0.99));
+                    }
                     eng.interact(id, op);
+                    slews.reassert(&mut eng, id);
                     *room.elements.lock().unwrap() = candidate;
                     let _ = room
                         .events
@@ -2329,6 +2346,10 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
                         let elems = room.elements.lock().unwrap().clone();
                         sources = source_ids(&elems);
                         eng.set_elements(&elems); // continuous state survives by id
+                        // This rebuilt every wiper from the document, i.e. from
+                        // its TARGET, so any knob in flight has just arrived.
+                        // Walking on from a stale position would drag it back.
+                        slews.clear();
                                                   // Ratings follow the document (a SetKind can change
                                                   // them); stress and the broken set follow the id, so
                                                   // moving a dead part does not repair it. An
@@ -2703,6 +2724,7 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
                     // cannot change — a move touches no element's kind.
                     let elems = room.elements.lock().unwrap().clone();
                     eng.set_elements(&elems);
+                    slews.clear(); // as above: wipers are back at their targets
                     // The children reach every client through the ordinary doc
                     // path, and the new footprint rides this tick's `machine`
                     // message — so a client that never sent the op is consistent
@@ -2815,6 +2837,15 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
                     motor_i = eng.pin_current(MOTOR_ID, 0).unwrap_or(0.0);
                     writes = Some(machine_step(&mut eng, &mut hoist, &sources));
                     impact = impact.max(hoist.impact);
+                }
+                // Knobs travel on the machine's cadence, for the machine's
+                // reason: it is the coarsest subdivision that is still far
+                // finer than the thing being smoothed. 640 µs gives a drag
+                // 52 positions inside a tick that used to have one, and a
+                // still room pays nothing because `advance` returns
+                // immediately on an empty set.
+                if !slews.is_empty() && (c + 1) % per_machine == 0 {
+                    slews.advance(&mut eng, MACHINE_H);
                 }
             }
             if listeners && !probes.is_empty() {
@@ -3159,6 +3190,16 @@ fn reject_msg(who: u32, ctx: &str, r: &sim_core::Reject) -> String {
 /// `Engine::interact`), so the placement gate can judge the document the op
 /// would produce BEFORE the engine sees it — and so late joiners get
 /// current switch positions and values once it commits.
+/// The wiper position of `id`, if `id` is a potentiometer at all. `None` for
+/// every other part, which is how the tick tells a knob drag (slewed) from a
+/// resistance or a source voltage being typed in (not).
+fn wiper_of(elems: &[ElementSpec], id: u32) -> Option<f64> {
+    elems.iter().find(|e| e.id == id).and_then(|e| match e.kind {
+        ElementKind::Potentiometer { wiper, .. } => Some(wiper),
+        _ => None,
+    })
+}
+
 fn apply_interact_to(elems: &mut [ElementSpec], id: u32, op: InteractOp) {
     use sim_core::ElementKind as K;
     let Some(e) = elems.iter_mut().find(|e| e.id == id) else {
