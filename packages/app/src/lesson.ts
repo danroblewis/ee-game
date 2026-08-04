@@ -141,14 +141,36 @@ const LESSONS: Record<string, LessonSpec> = {
       },
       {
         text: 'Click any wire — even one the lamp is “after” — and press Delete. Everything stops at once: there is no “used up along the way”.',
-        check: (c) => ia(c, 3) < 0.001,
+        // Current stopped AND the lamp and the battery are both still there.
+        // Deleting the LAMP also stops the current, and latching on that
+        // would teach the exact opposite of this step: the point is that
+        // breaking the loop ANYWHERE stops it, not that removing the load
+        // does. Checked by KIND rather than by id so it survives the
+        // template being renumbered.
+        check: (c) => {
+          if (ia(c, 3) >= 0.001) return false;
+          let lamp = false;
+          let src = false;
+          for (const e of c.byId.values()) {
+            if (e.kind.t === 'Lamp') lamp = true;
+            if (e.kind.t === 'VoltageSource') src = true;
+          }
+          return lamp && src;
+        },
       },
       {
         text: 'Draw it back. Both meters read the same 100 mA = 9 V ÷ 90 Ω: one current, everywhere in the loop.',
         check: (c) => ia(c, 3) > 0.05,
       },
     ],
-    hint: 'A circuit is a loop. Current flows around it — it is not consumed.',
+    // The COURSE TEACHES W, R, K, Delete and double-click, and nothing else.
+    // Two mechanics a beginner cannot deduce were missing entirely, and
+    // both cost the verifier real time on its playthrough: how to put down
+    // a part that has no hotkey, and that a wire crossing a pin mid-span
+    // connects to NOTHING (it regulated at a wrong, plausible-looking
+    // voltage for minutes). They belong in lesson 1, where a player first
+    // needs them, not in a manual nobody opens.
+    hint: 'A circuit is a loop. Current flows around it — it is not consumed. · Right-click empty space to ADD any part; W draws wire. · Wires join at ENDPOINTS and pins only — crossing a pin mid-wire connects nothing.',
     next: 'intro-02-divider',
     nextLabel: '2 · Volts, Ohms, the Divider',
   },
@@ -356,7 +378,10 @@ const LESSONS: Record<string, LessonSpec> = {
         check: (c) => Math.abs(dc(c, 9) - 3.2) > 0.15,
       },
     ],
-    hint: 'Sense → compare → drive. You are no longer the feedback: the circuit is.',
+    // Repeated here on purpose: the next room is the bare hoist, where a
+    // player must build from nothing, and every part they need beyond
+    // wire and resistor lives behind the right-click menu.
+    hint: 'Sense → compare → drive. You are no longer the feedback: the circuit is. · The hoist is bare: right-click to add the op-amp, the power MOSFET and the supplies.',
     next: 'hoist',
     nextLabel: 'THE HOIST — the real one, bare',
   },
