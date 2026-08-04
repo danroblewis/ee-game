@@ -437,12 +437,217 @@ pub static BUILTINS: &[Builtin] = &[
         build: synth_setup,
     },
     Builtin {
+        id: "vco-555",
+        name: "555-VCO (Thomas Henry)",
+        blurb: "Thomas Henry's sawtooth VCO: an exponential current charges a cap and a 555 snaps it back. One knob, two waves, a vibrato LFO — droning as you arrive.",
+        build: vco555_setup,
+    },
+    Builtin {
+        id: "the-ladder",
+        name: "The Ladder (Moog 904A)",
+        blurb: "A real Moog transistor ladder — ten NPNs, four bridging capacitors and one exponential current sink — with an oscillator already droning through it. Turn CUTOFF.",
+        build: moog_setup,
+    },
+    Builtin {
+        id: "tr-808",
+        name: "Rhythm Composer (TR-808)",
+        blurb: "Four bridged-T resonators — kick, two snare shells, claves — plus hiss and a snappy gate, banged by a four-step CMOS pattern. Already playing when you arrive.",
+        build: tr808_setup,
+    },
+    Builtin {
+        id: "bass-plus-plus",
+        name: "BASS++ (Thomas Henry)",
+        blurb: "Thomas Henry's drum voice: one envelope both pings a transconductance shell and sweeps its pitch. PITCH takes it from a ping to a boom. Hit it.",
+        build: bass_setup,
+    },
+    Builtin {
         id: "sandbox",
         name: "Sandbox",
         blurb: "An empty plane. Build anything.",
         build: sandbox_setup,
     },
 ];
+
+/// Shared assembly for the instrument rooms: one control panel spanning the
+/// sheet, block-heading label boxes, probes and a scope already armed. Every
+/// synth room registers through this so the UI furniture cannot drift.
+fn instrument_setup(
+    elements: Vec<ElementSpec>,
+    panels: Vec<crate::synth::PanelDef>,
+    boxes: Vec<crate::synth::PanelDef>,
+    probes: Vec<SavedProbe>,
+    home: [f64; 4],
+    scope: serde_json::Value,
+) -> RoomSetup {
+    let next_pid = probes.iter().map(|p| p.pid + 1).max().unwrap_or(1);
+    let panels: Vec<Panel> = panels
+        .into_iter()
+        .enumerate()
+        .map(|(i, p)| Panel {
+            plid: i as u32 + 1,
+            x0: p.x0,
+            y0: p.y0,
+            x1: p.x1,
+            y1: p.y1,
+            name: p.name.to_string(),
+        })
+        .collect();
+    let next_plid = panels.len() as u32 + 1;
+    let label_boxes: Vec<LabelBox> = boxes
+        .into_iter()
+        .enumerate()
+        .map(|(i, b)| LabelBox {
+            blid: i as u32 + 1,
+            x0: b.x0,
+            y0: b.y0,
+            x1: b.x1,
+            y1: b.y1,
+            name: b.name.to_string(),
+        })
+        .collect();
+    let next_blid = label_boxes.len() as u32 + 1;
+    RoomSetup {
+        elements,
+        probes,
+        next_pid,
+        panels,
+        next_plid,
+        label_boxes,
+        next_blid,
+        machine: MachineSpec::None,
+        view: View {
+            home: Some(home),
+            scopes: vec![scope],
+        },
+        ..RoomSetup::default()
+    }
+}
+
+/// Thomas Henry's 555-VCO as a bench room. See `vco555.rs` for the history,
+/// the stand-ins and the measurements.
+fn vco555_setup() -> RoomSetup {
+    instrument_setup(
+        crate::vco555::vco555_room_circuit(),
+        crate::vco555::vco555_panels(),
+        crate::vco555::vco555_label_boxes(),
+        vec![
+            // The sawtooth itself, on the timing cap.
+            SavedProbe {
+                pid: 1,
+                elem: 21,
+                pin: 0,
+                kind: ProbeKind::V,
+                r: None,
+            },
+            // What the speaker hears.
+            SavedProbe {
+                pid: 2,
+                elem: crate::vco555::ID_SPEAKER,
+                pin: 0,
+                kind: ProbeKind::V,
+                r: None,
+            },
+        ],
+        [-13.0, -13.0, 53.0, 26.0],
+        json!({
+            "x": 13.0, "y": 12.0, "w": 10.0, "h": 8.0,
+            "pids": [1, 2], "timebase": 0.02
+        }),
+    )
+}
+
+/// The Moog ladder as a room. See `moog.rs` for the history, the control law,
+/// the resonance loop that did not ship and the four measurements that killed
+/// it.
+fn moog_setup() -> RoomSetup {
+    instrument_setup(
+        crate::moog::moog_room_circuit(),
+        crate::moog::moog_panels(),
+        crate::moog::moog_label_boxes(),
+        vec![
+            // The VCO's square, going in: element 30 is the comparator, and
+            // pin 2 is its output.
+            SavedProbe { pid: 1, elem: 30, pin: 2, kind: ProbeKind::V, r: None },
+            // ...and the filtered signal coming out of the ladder, pin 1 of
+            // the left-hand collector load.
+            SavedProbe { pid: 2, elem: 121, pin: 1, kind: ProbeKind::V, r: None },
+            SavedProbe {
+                pid: 3,
+                elem: crate::moog::ID_SPEAKER,
+                pin: 0,
+                kind: ProbeKind::V,
+                r: None,
+            },
+        ],
+        [-22.0, -26.0, 132.0, 66.0],
+        json!({
+            "x": 2.0, "y": 14.0, "w": 26.0, "h": 16.0,
+            "pids": [1, 2, 3], "timebase": 0.02
+        }),
+    )
+}
+
+/// The TR-808 as a room. See `tr808.rs` for the history, the stand-ins, the
+/// two voices that are missing and why, and the measurements.
+fn tr808_setup() -> RoomSetup {
+    instrument_setup(
+        crate::tr808::tr808_room_circuit(),
+        crate::tr808::tr808_panels(),
+        crate::tr808::tr808_label_boxes(),
+        vec![
+            // The kick's own resonator node: pin 2 of the BD op-amp.
+            SavedProbe { pid: 1, elem: 21, pin: 2, kind: ProbeKind::V, r: None },
+            // The lower snare shell, so the two rings can be compared.
+            SavedProbe { pid: 2, elem: 31, pin: 2, kind: ProbeKind::V, r: None },
+            // What the speaker hears.
+            SavedProbe {
+                pid: 3,
+                elem: crate::tr808::ID_SPEAKER,
+                pin: 0,
+                kind: ProbeKind::V,
+                r: None,
+            },
+        ],
+        [-27.0, -31.0, 123.0, 103.0],
+        json!({
+            "x": 74.0, "y": 50.0, "w": 26.0, "h": 18.0,
+            "pids": [1, 2, 3], "timebase": 0.1
+        }),
+    )
+}
+
+/// Thomas Henry's BASS++ as a room. See `bass.rs` for the history, the
+/// one-envelope-two-jobs trick, the stand-ins and the measurements.
+fn bass_setup() -> RoomSetup {
+    instrument_setup(
+        crate::bass::bass_room_circuit(),
+        crate::bass::bass_panels(),
+        crate::bass::bass_label_boxes(),
+        vec![
+            // The shell resonator itself — the drum, before any gain.
+            SavedProbe { pid: 1, elem: 40, pin: 2, kind: ProbeKind::V, r: None },
+            // The envelope capacitor: one trace that is both the sweep and
+            // the mallet, which is the whole point of the design.
+            SavedProbe { pid: 2, elem: 34, pin: 0, kind: ProbeKind::V, r: None },
+            // What the speaker hears.
+            SavedProbe {
+                pid: 3,
+                elem: crate::bass::ID_SPEAKER,
+                pin: 0,
+                kind: ProbeKind::V,
+                r: None,
+            },
+        ],
+        // Wide enough to hold the honesty plaque out east of the mixer: it
+        // sits from x = 66 to 98, and a home view that stopped at 66 cut it
+        // in half on arrival.
+        [-30.0, -30.0, 102.0, 40.0],
+        json!({
+            "x": 30.0, "y": 26.0, "w": 24.0, "h": 15.0,
+            "pids": [1, 2, 3], "timebase": 0.1
+        }),
+    )
+}
 
 /// Today's `None` branch, bit for bit: the showcase plus a hoist. Still the
 /// default, so a fresh checkout boots into exactly what it booted into
