@@ -1461,16 +1461,30 @@ function setProbeRef(pid: number, elem: number, pin: number) {
 
 /** Panels are room state: online the server owns the list (its broadcast is
  * the truth), offline we apply the same rules locally. */
-function panelOp(op: PanelOp) {
-  if (online) {
-    net.sendPanel(op);
-    return;
+function panelOp(op: PanelOp, record = true): void {
+  const prevId = 'plid' in op ? op.plid : undefined;
+  const send = (o: PanelOp) => {
+    if (online) {
+      net.sendPanel(o);
+      return;
+    }
+    panels = applyPanelOp(panels, o, () => {
+      // Never reuse a plid a restored/server panel already holds.
+      for (const p of panels) localPlidCounter = Math.max(localPlidCounter, p.plid + 1);
+      return localPlidCounter++;
+    });
+  };
+  if (record) {
+    recordRectAnnotation(
+      op,
+      'panel',
+      () => panels,
+      (r) => (r as unknown as { plid: number }).plid,
+      prevId,
+      (o) => panelOp(o as PanelOp, false),
+    );
   }
-  panels = applyPanelOp(panels, op, () => {
-    // Never reuse a plid a restored/server panel already holds.
-    for (const p of panels) localPlidCounter = Math.max(localPlidCounter, p.plid + 1);
-    return localPlidCounter++;
-  });
+  send(op);
 }
 
 // A NEW ANNOTATION NAMES ITSELF. Both primitives exist to carry a word, so
@@ -1535,16 +1549,108 @@ function renameNetLabel(l: NetLabel) {
  * NOTHING ELSE happens here. There is no window to open, no membership to
  * recompute and no widget list to touch — the entire feature is "the box now
  * says this, and everybody can see it". */
-function labelBoxOp(op: LabelBoxOp) {
-  if (online) {
-    net.sendLabelBox(op);
-    return;
+
+/** Undo support for a RECTANGULAR annotation — a label box or a panel.
+ *
+ *  Both have the same four ops (`add` / `remove` / `rect` / `rename`) over
+ *  the same fields, so they get one implementation rather than two that
+ *  drift. Scopes are close but not identical (`set` instead of `rename`) and
+ *  already have a visible close button, so they are left for later rather
+ *  than forced through a shape that does not quite fit.
+ *
+ *  Everything here follows the net-label pattern, for the same reasons: the
+ *  inverse is issued as another OP so it works online, and the target is
+ *  found by its RECTANGLE rather than its id because online the id belongs
+ *  to the server and has not arrived yet when the undo entry is recorded. */
+function recordRectAnnotation<O extends { t: string }>(
+  op: O & { x0?: number; y0?: number; x1?: number; y1?: number; name?: string },
+  kind: string,
+  list: () => Array<{ x0: number; y0: number; x1: number; y1: number; name: string }>,
+  idOf: (r: { x0: number; y0: number; x1: number; y1: number; name: string }) => number,
+  prevId: number | undefined,
+  send: (o: O) => void,
+): void {
+  const mk = (o: unknown) => send(o as O);
+  const at = (x0: number, y0: number) => list().find((r) => r.x0 === x0 && r.y0 === y0);
+  const was = prevId === undefined ? undefined : list().find((r) => idOf(r) === prevId);
+  const snap = was ? { ...was } : undefined;
+
+  if (op.t === 'add' && op.x0 !== undefined && op.y0 !== undefined) {
+    const { x0, y0 } = op;
+    const { x1, y1, name } = op;
+    history.pushAction({
+      label: `add ${kind}`,
+      undo: () => {
+        const r = at(x0, y0);
+        if (r) mk({ t: 'remove', blid: idOf(r), plid: idOf(r) });
+      },
+      redo: () => mk({ t: 'add', x0, y0, x1, y1, name }),
+    });
+  } else if (snap) {
+    const w = snap;
+    if (op.t === 'remove') {
+      history.pushAction({
+        label: `delete ${kind}`,
+        undo: () => mk({ t: 'add', x0: w.x0, y0: w.y0, x1: w.x1, y1: w.y1, name: w.name }),
+        redo: () => {
+          const r = at(w.x0, w.y0);
+          if (r) mk({ t: 'remove', blid: idOf(r), plid: idOf(r) });
+        },
+      });
+    } else if (op.t === 'rect' && op.x0 !== undefined) {
+      const to = { x0: op.x0, y0: op.y0!, x1: op.x1!, y1: op.y1! };
+      history.pushAction({
+        label: `resize ${kind}`,
+        undo: () => {
+          const r = at(to.x0, to.y0);
+          if (r) mk({ t: 'rect', blid: idOf(r), plid: idOf(r), ...w });
+        },
+        redo: () => {
+          const r = at(w.x0, w.y0);
+          if (r) mk({ t: 'rect', blid: idOf(r), plid: idOf(r), ...to });
+        },
+      });
+    } else if (op.t === 'rename') {
+      const to = op.name;
+      history.pushAction({
+        label: `rename ${kind}`,
+        undo: () => {
+          const r = at(w.x0, w.y0);
+          if (r) mk({ t: 'rename', blid: idOf(r), plid: idOf(r), name: w.name });
+        },
+        redo: () => {
+          const r = at(w.x0, w.y0);
+          if (r) mk({ t: 'rename', blid: idOf(r), plid: idOf(r), name: to });
+        },
+      });
+    }
   }
-  labelBoxes = applyLabelBoxOp(labelBoxes, op, () => {
-    for (const b of labelBoxes) localBlidCounter = Math.max(localBlidCounter, b.blid + 1);
-    return localBlidCounter++;
-  });
-  resolvePendingNames();
+}
+
+function labelBoxOp(op: LabelBoxOp, record = true): void {
+  const prevId = 'blid' in op ? op.blid : undefined;
+  const send = (o: LabelBoxOp) => {
+    if (online) {
+      net.sendLabelBox(o);
+      return;
+    }
+    labelBoxes = applyLabelBoxOp(labelBoxes, o, () => {
+      for (const b of labelBoxes) localBlidCounter = Math.max(localBlidCounter, b.blid + 1);
+      return localBlidCounter++;
+    });
+    resolvePendingNames();
+  };
+  if (record) {
+    recordRectAnnotation(
+      op,
+      'label box',
+      () => labelBoxes,
+      (r) => (r as unknown as { blid: number }).blid,
+      prevId,
+      (o) => labelBoxOp(o as LabelBoxOp, false),
+    );
+  }
+  send(op);
 }
 
 /** Net labels, same rule. Offline there is no `netmap` broadcast (nothing is
@@ -1937,6 +2043,7 @@ const cam: Camera = { scale: 48, ox: 60, oy: 60 };
 Object.defineProperty(window, '__els', { get: () => elements });
 // End-to-end tests need to see annotations too, not just parts.
 Object.defineProperty(window, '__nl', { get: () => netLabels });
+Object.defineProperty(window, '__lb', { get: () => labelBoxes });
 // And the instruments, for the same reason: a probe placed by an armed touch
 // tool draws a flag on a canvas, and a canvas cannot be asked what it means.
 Object.defineProperty(window, '__probes', { get: () => probes });
