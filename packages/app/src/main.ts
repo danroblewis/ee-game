@@ -167,6 +167,7 @@ import { createHoist, type MachineRect } from './hoist';
 import { createGfx } from './gfx';
 import { createLesson } from './lesson';
 import { connect, MAX_CHAT_LEN, type RoomHello } from './net';
+import { createPalette, type Armed, type ToolId } from './palette';
 // NOT loadBench/saveBench: the intro branch predates scopes becoming room
 // state, and those two were deleted when the per-browser bench went away.
 import { createRooms } from './rooms';
@@ -1837,6 +1838,9 @@ const cam: Camera = { scale: 48, ox: 60, oy: 60 };
 // frames of an untouched schematic differ), and "it looked right" is not a
 // measurement. A getter, because `elements` is rebound whenever a room loads.
 Object.defineProperty(window, '__els', { get: () => elements });
+// And the instruments, for the same reason: a probe placed by an armed touch
+// tool draws a flag on a canvas, and a canvas cannot be asked what it means.
+Object.defineProperty(window, '__probes', { get: () => probes });
 const dots = new DotFlow();
 let mouse: { x: number; y: number } | null = null;
 
@@ -1994,6 +1998,26 @@ fitHome();
 let placing: PartDef | null = null;
 let placeRot = 0; // 0..3, quarter turns; Q rotates
 
+// ---- the armed instruments, which exist only for fingers
+//
+// '1', '2' and '3' probe WHATEVER THE MOUSE IS HOVERING. A finger does not
+// hover: it is down or it is gone, so those three keys have no translation at
+// all — the only honest one is to arm the instrument first and let the next
+// tap say where. The touch palette arms it, `touchDown`/`touchUp` fire it and
+// `disarmTools` drops it; nothing else in the file reads it, so no mouse or
+// pen gesture can ever reach this state. (Declared up here with the other
+// armed-tool state, not down in the touch block, so `disarmTools` can never
+// be reached before it exists.)
+type TouchTool = 'v' | 'i' | 'listen';
+let touchTool: TouchTool | null = null;
+/** The finger carrying an armed instrument. `live` goes false the moment the
+ *  finger disqualifies itself — by travelling (that is a pan, not an aim) or
+ *  by a second finger joining (two fingers are ALWAYS the camera). Firing on
+ *  the way UP rather than on the way down is what makes that possible. */
+let touchShot: { id: number; x: number; y: number; live: boolean } | null = null;
+/** How far a finger may slide and still count as a tap, in CSS px. */
+const TOUCH_TAP_SLOP = 12;
+
 const ROT_DIRS: Point[] = [
   [1, 0],
   [0, 1],
@@ -2080,6 +2104,10 @@ function disarmTools() {
   layerTool = false;
   layerDrag = null;
   repairing = false;
+  // The touch instruments are armed tools like any other, so Esc, a hotkey
+  // and the palette's × all put them down through this one door. Always null
+  // on a desktop session: only the touch palette can ever set it.
+  touchTool = null;
 }
 
 function choosePart(p: PartDef) {
@@ -3608,6 +3636,24 @@ let touchNav: { a: number; b: number; cx: number; cy: number; d: number } | null
  *  its own, so it must not be handed to the one-finger dispatch mid-air. */
 let touchNavTail = false;
 
+/** One armed instrument, aimed at the part under the finger that just lifted.
+ *  A miss leaves the tool armed: a mis-tap on empty canvas should cost one
+ *  more tap, not a trip back to the palette. */
+function fireTouchTool(x: number, y: number) {
+  const t = touchTool;
+  if (!t) return;
+  const e = elementAt(x, y);
+  if (!e || e.kind.t === 'Ground') {
+    toast(t === 'listen' ? 'tap a part to listen to it' : 'tap a part to probe it');
+    return;
+  }
+  if (t === 'v') toggleProbe(e.id, nearestPin(e, x, y), 'v');
+  else if (t === 'i') toggleProbe(e.id, 0, 'i');
+  else toggleListen(e.id, nearestPin(e, x, y));
+  touchTool = null; // single shot, like the key it replaces
+  canvas.style.cursor = 'default';
+}
+
 /** Centroid and span of two tracked fingers; null if either has gone. */
 function touchSpan(a: number, b: number) {
   const p = touchPts.get(a);
@@ -3620,7 +3666,16 @@ function touchSpan(a: number, b: number) {
  *  below must not see it. */
 function touchDown(ev: PointerEvent): boolean {
   touchPts.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
-  if (touchPts.size < 2 && !touchNavTail) return false; // one finger: today's dispatch
+  if (touchShot) touchShot.live = false; // a second finger is never a tap
+  if (touchPts.size < 2 && !touchNavTail) {
+    if (touchTool) {
+      // The instrument owns this finger: no marquee, no part drag, no
+      // selection change underneath it. It fires (or does not) on the lift.
+      touchShot = { id: ev.pointerId, x: ev.clientX, y: ev.clientY, live: true };
+      return true;
+    }
+    return false; // one finger: today's dispatch
+  }
   try { canvas.setPointerCapture(ev.pointerId); } catch { /* synthetic pointers */ }
   if (touchPts.size >= 2) {
     // THE SECOND FINGER CANCELS THE FIRST. Whatever one finger had begun —
@@ -3639,6 +3694,15 @@ function touchMove(ev: PointerEvent): boolean {
   if (p) {
     p.x = ev.clientX;
     p.y = ev.clientY;
+  }
+  if (touchShot && touchShot.id === ev.pointerId) {
+    // A travelling finger is a pan attempt, not an aim. The instrument stays
+    // armed for the next tap; this finger is spent either way, so the canvas
+    // dispatch below must not get it and start a drag halfway through.
+    if (Math.hypot(ev.clientX - touchShot.x, ev.clientY - touchShot.y) > TOUCH_TAP_SLOP) {
+      touchShot.live = false;
+    }
+    return true;
   }
   if (!touchNav) return touchNavTail;
   if (ev.pointerId !== touchNav.a && ev.pointerId !== touchNav.b) return true; // a third finger
@@ -3660,9 +3724,17 @@ function touchMove(ev: PointerEvent): boolean {
 }
 
 /** Shared by `pointerup` and `pointercancel`: a finger leaving is the same
- *  event to the camera either way. */
-function touchUp(ev: PointerEvent): boolean {
+ *  event to the camera either way. `tap` is false for a CANCELLED finger —
+ *  the camera does not care, but an armed instrument must not fire on a
+ *  gesture the browser tore up. */
+function touchUp(ev: PointerEvent, tap = true): boolean {
   touchPts.delete(ev.pointerId);
+  let spent = false;
+  if (touchShot && touchShot.id === ev.pointerId) {
+    if (tap && touchShot.live) fireTouchTool(touchShot.x, touchShot.y);
+    touchShot = null;
+    spent = true;
+  }
   if (touchNav && (ev.pointerId === touchNav.a || ev.pointerId === touchNav.b)) {
     // Three fingers down and one lifts: the camera re-anchors on the two that
     // are left rather than jumping.
@@ -3674,7 +3746,86 @@ function touchUp(ev: PointerEvent): boolean {
   if (owned) {
     try { canvas.releasePointerCapture(ev.pointerId); } catch { /* synthetic pointers */ }
   }
-  return owned;
+  return owned || spent;
+}
+
+// ------------------------------------------------------------- the palette
+//
+// THE HOTKEY IS THE PALETTE in this game — a part is armed by pressing its
+// letter — so a phone, which has no letters, could look at the world and
+// rearrange it but never add anything to it. This is that keyboard, drawn.
+//
+// It arms through the SAME calls the keys use (`choosePart`, `armRepair`, the
+// net-label tool), so there is one placement path in the client and not two
+// that drift. It is built from `CATALOG` and `CATEGORIES`, so a new part is a
+// new button with no edit anywhere. And it does not exist at all until a real
+// finger has touched the screen: see palette.ts.
+const palette = createPalette(document.body, {
+  categories: CATEGORIES,
+  parts: CATALOG,
+  choosePart,
+  armTool: (t: ToolId) => {
+    if (t === 'repair') {
+      armRepair();
+      return;
+    }
+    if (t === 'netname') {
+      disarmTools();
+      netLabelTool = true;
+      placing = null;
+      pasting = null;
+      canvas.style.cursor = 'crosshair';
+      toast('tap a point on the net to name it — a name joins nothing');
+      return;
+    }
+    disarmTools(); // arming is exclusive, exactly as it is for the keys
+    placing = null;
+    pasting = null;
+    closeCtxMenu();
+    touchTool = t === 'probe-v' ? 'v' : t === 'probe-i' ? 'i' : 'listen';
+    toast(
+      t === 'listen' ? 'tap a part to listen to that node' : 'tap a part to put a probe on it',
+    );
+  },
+  // The × on the chip. This is Esc's tool layer, and on glass it is the only
+  // way out: there is no Escape key, and the browser's back-swipe leaves the
+  // room instead of the tool.
+  disarm: () => {
+    placing = null;
+    pasting = null;
+    disarmTools();
+    pendingBoxName = null;
+    pendingNetName = null;
+    canvas.style.cursor = 'default';
+  },
+  // Q and X/Y, for a hand that cannot reach them. Armed-only, like the keys:
+  // with nothing being placed the chip is not on screen to be pressed.
+  rotate: () => {
+    if (placing) placeRot = (placeRot + 1) % 4;
+  },
+  flip: (axis: 'x' | 'y') => {
+    if (!placing) return;
+    if (axis === 'x') placeFlipX = !placeFlipX;
+    else placeFlipY = !placeFlipY;
+  },
+});
+
+/** What the armed chip should be showing this frame — the editor's own state,
+ *  read fresh, so a tool dropped by Esc or armed by a hotkey shows up here
+ *  too. Null means nothing is armed and the chip goes away. */
+function armedForPalette(): Armed | null {
+  const base = { orient: false, rot: placeRot, flipX: placeFlipX, flipY: placeFlipY };
+  if (placing) return { ...base, label: placing.name, orient: true, part: placing.name };
+  if (pasting) return { ...base, label: `paste ${pasting.length}` };
+  if (touchTool === 'v') return { ...base, label: 'probe V', tool: 'probe-v' };
+  if (touchTool === 'i') return { ...base, label: 'probe I', tool: 'probe-i' };
+  if (touchTool === 'listen') return { ...base, label: 'listen', tool: 'listen' };
+  if (repairing) return { ...base, label: 'repair', tool: 'repair' };
+  if (netLabelTool) return { ...base, label: 'net name', tool: 'netname' };
+  if (panelTool) return { ...base, label: 'panel region' };
+  if (labelBoxTool) return { ...base, label: 'label box' };
+  if (layerTool) return { ...base, label: 'camera layer' };
+  return null;
 }
 
 canvas.addEventListener('wheel', (ev) => {
@@ -4481,7 +4632,7 @@ canvas.addEventListener('pointerleave', () => (mouse = null));
 // used to do, an open `history.begin()` for the next edit to fall into. Every
 // gesture ends here, through the same teardown `pointerup` reconciles with.
 canvas.addEventListener('pointercancel', (ev) => {
-  if (ev.pointerType === 'touch' && touchUp(ev)) return;
+  if (ev.pointerType === 'touch' && touchUp(ev, false)) return;
   endCanvasGestures('commit');
 });
 
@@ -5503,6 +5654,12 @@ function frame(now: number) {
   panelHost.setCanvasHover(hover?.id ?? null);
 
   dock.update(now, probes, traces, dockScope, netNames());
+
+  // The armed chip. Pulled once a frame rather than pushed from the dozen
+  // places that arm and disarm, so it cannot go stale — and it is a no-op
+  // both while the palette is unmounted (every desktop session) and while
+  // the description has not changed.
+  palette.sync(armedForPalette());
 
   // Deliberately NO hover readout: voltages, currents and power are only
   // visible through probes, scopes and panel meters — placing an instrument

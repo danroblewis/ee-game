@@ -572,6 +572,103 @@
       .lesson-next { color: #ffe6a1; border-color: #a9862f; }
       .lesson-next:hover { background: #4a3a12; color: #ffefc4; }
 
+      /* ---- the touch palette (palette.ts owns the elements; this is only
+         their look). NONE OF IT EXISTS ON A DESKTOP SESSION: the whole tree
+         is built on the first pointerdown whose pointerType is 'touch', so
+         these rules match nothing until a finger lands.
+
+         It is anchored to the bottom because that is where a thumb is, and
+         it sits above the scope dock (--dock-h) with the phone's home-bar
+         inset added, so neither can bury the other. The strip itself is
+         pointer-events: none — only the actual controls take a tap, and the
+         world behind the gap between them stays reachable. */
+      #tpal {
+        position: fixed; left: 0; right: 0; bottom: var(--dock-h); z-index: 27;
+        display: flex; flex-direction: column; align-items: center; gap: 6px;
+        padding: 0 8px calc(8px + env(safe-area-inset-bottom, 0px));
+        pointer-events: none;
+        font: 12px/1.4 ui-monospace, monospace; color: #c9c9d4;
+        user-select: none; -webkit-user-select: none;
+      }
+      #tpal > * { pointer-events: auto; }
+      /* Every control is a finger target: 44 px is the floor the touch
+         literature settles on, and anything below it is a mis-tap that
+         edits a shared room. */
+      #tpal button {
+        min-height: 40px; font: inherit; cursor: pointer;
+        background: #22222c; color: #c9c9d4; border: 1px solid #3a3a48;
+        border-radius: 6px; padding: 6px 12px;
+        /* manipulation, not none: these are taps and scrolls, never drags,
+           and it kills the double-tap-to-zoom delay. */
+        touch-action: manipulation;
+      }
+      #tpal button.on { background: #14303a; color: #8ee7ff; border-color: #2f6a7f; }
+
+      .tpal-sheet {
+        width: min(720px, 100%); max-height: 46vh; display: flex; flex-direction: column;
+        background: #16161df2; border: 1px solid #3a3a48; border-radius: 8px;
+        box-shadow: 0 14px 40px #000b;
+      }
+      .tpal-hd {
+        display: flex; align-items: center; gap: 8px;
+        padding: 4px 6px 4px 10px;
+      }
+      .tpal-title {
+        font: 600 11px ui-monospace, monospace; color: #fff;
+        letter-spacing: 0.14em; flex: none;
+      }
+      /* The instruments, on their own line: on a 390 px phone they wrap, and
+         wrapping them around a corner-parked × looked like a bug. */
+      .tpal-tools {
+        display: flex; gap: 6px; flex-wrap: wrap;
+        padding: 0 8px 6px; border-bottom: 1px solid #2c2c38;
+      }
+      .tpal-tool { flex: 1 1 auto; }
+      .tpal-close {
+        margin-left: auto; flex: none; min-width: 40px; padding: 6px 10px;
+        font-size: 15px; color: #8a8a98;
+      }
+      /* The category strip scrolls sideways rather than wrapping into three
+         lines on a phone; pan-x so the flick is a scroll, never a page drag. */
+      .tpal-tabs {
+        display: flex; gap: 6px; padding: 6px 8px; overflow-x: auto;
+        touch-action: pan-x; border-bottom: 1px solid #2c2c38;
+      }
+      .tpal-tab { flex: 0 0 auto; color: #9a9aa5; }
+      .tpal-grid {
+        display: grid; gap: 6px; padding: 8px;
+        /* Wide enough for "Potentiometer" and its key badge: two columns on
+           a phone, five on a tablet. Three narrow columns truncated half the
+           catalogue into "Potentio…", which is not a part list. */
+        grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+        overflow-y: auto; touch-action: pan-y; flex: 1 1 auto;
+      }
+      .tpal-part {
+        display: flex; align-items: center; justify-content: space-between; gap: 6px;
+        text-align: left; padding: 6px 8px;
+      }
+      .tpal-pn { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .tpal-key {
+        flex: none; color: #6e6e7e; font-size: 10px; letter-spacing: 0.08em;
+        border: 1px solid #33333f; border-radius: 3px; padding: 0 4px;
+      }
+      .tpal-tier { flex: none; color: #a9862f; font-size: 10px; }
+
+      /* The bar: the launcher, and — while something is armed — the chip
+         that says so. The × is the only exit from an armed tool on glass. */
+      .tpal-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: center; }
+      .tpal-open { background: #0d0d12e6; }
+      .tpal-chip {
+        display: flex; align-items: center; gap: 6px; padding: 3px 4px 3px 10px;
+        background: #14303a; border: 1px solid #2f6a7f; border-radius: 8px;
+        color: #8ee7ff; box-shadow: 0 6px 20px #000a;
+      }
+      .tpal-what { white-space: nowrap; }
+      .tpal-orient { display: flex; gap: 4px; }
+      #tpal .tpal-b { min-height: 34px; padding: 4px 8px; background: #0f2630; border-color: #2f6a7f; }
+      #tpal .tpal-b.on { background: #8ee7ff; color: #0d0d13; border-color: #8ee7ff; }
+      #tpal .tpal-off { background: #2a1c1c; color: #ffb3b3; border-color: #6a3a3a; font-size: 15px; }
+
       /* ---- rooms: which room am I in, and how do I get to another one
          (rooms.ts owns the elements; this is only their look).
 
