@@ -1131,8 +1131,11 @@ export function relabelKeyboard(win: HTMLElement): void {
     if (!badge || badge === kbLearning) return;
     badge.textContent = key ? kbCap(key) : '·';
     badge.classList.toggle('unbound', !key);
+    const shared = key ? resolved.filter((r) => r === key).length : 0;
+    badge.classList.toggle('shared', shared > 1);
     badge.title = key
-      ? `bound to "${key}" — click to rebind, then press a key (Esc clears)`
+      ? `bound to "${key}"${shared > 1 ? ` — shared with ${shared - 1} other control(s), they fire together` : ''}` +
+        ' — click to rebind, then press a key (Esc clears)'
       : 'click, then press a key to bind one';
     if (!badge.dataset.wired) {
       badge.dataset.wired = '1';
@@ -1152,13 +1155,21 @@ export function relabelKeyboard(win: HTMLElement): void {
 // One listener for every panel, in the CAPTURE phase so the canvas hotkeys
 // never see a key the panel has claimed.
 if (typeof window !== 'undefined') {
-  const hit = (ev: KeyboardEvent): KbControl | null => {
-    if (!kbPanel || ev.ctrlKey || ev.metaKey || ev.altKey) return null;
+  /** EVERY control bound to this key, not just the first.
+   *
+   *  Two controls may share a key, and that is deliberate. The alternative —
+   *  making a new binding silently steal the key from whoever had it — is
+   *  destructive: it would quietly undo a binding the player had set on
+   *  purpose, somewhere they may not be looking. Sharing is additive, it is
+   *  VISIBLE (both keycaps read the same letter, so nothing is hidden), and
+   *  on a panel of drum voices one key firing three of them is a chord
+   *  rather than a bug. */
+  const hits = (ev: KeyboardEvent): KbControl[] => {
+    if (!kbPanel || ev.ctrlKey || ev.metaKey || ev.altKey) return [];
     const k = ev.key.length === 1 ? ev.key.toLowerCase() : ev.key;
-    for (const c of kbPanel.querySelectorAll<HTMLElement>('[data-kb]')) {
-      if (c.dataset.kbKey && c.dataset.kbKey === k) return c as KbControl;
-    }
-    return null;
+    return [...kbPanel.querySelectorAll<HTMLElement>('[data-kb]')].filter(
+      (c) => c.dataset.kbKey && c.dataset.kbKey === k,
+    ) as KbControl[];
   };
 
   /** A keycap is waiting: the next key press BINDS instead of acting. */
@@ -1183,22 +1194,22 @@ if (typeof window !== 'undefined') {
     'keydown',
     (ev) => {
       if (learn(ev)) return;
-      const c = hit(ev);
-      if (!c) return;
+      const cs = hits(ev);
+      if (cs.length === 0) return;
       ev.preventDefault();
       ev.stopPropagation();
-      if (!ev.repeat) c.__kbDown?.();
+      if (!ev.repeat) for (const c of cs) c.__kbDown?.();
     },
     true,
   );
   window.addEventListener(
     'keyup',
     (ev) => {
-      const c = hit(ev);
-      if (!c) return;
+      const cs = hits(ev);
+      if (cs.length === 0) return;
       ev.preventDefault();
       ev.stopPropagation();
-      c.__kbUp?.();
+      for (const c of cs) c.__kbUp?.();
     },
     true,
   );

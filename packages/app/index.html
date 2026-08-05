@@ -350,6 +350,9 @@
       /* Unbound rows show a faint dot you can click; bound ones a keycap.
          Both are targets, so binding is discoverable from the control. */
       .pkb.unbound { opacity: 0.35; }
+      /* A key more than one control answers to. Firing together is the
+         intent, but it should be visible that it will happen. */
+      .pkb.shared { border-color: #c9a227; color: #e8c95a; }
       .pkb.learning {
         border-color: #6cf;
         color: #6cf;
