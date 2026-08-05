@@ -891,6 +891,38 @@
       .rcheck { cursor: pointer; }
       .rcheck > input { flex: none; accent-color: #4ad4ff; }
       .rcheck > span { flex: 1 1 auto; color: #8a8a98; font-size: 11.5px; }
+
+      /* ---- NARROW VIEWPORTS ------------------------------------------
+         Every rule below fires only under 500 px, which is a phone held
+         upright and nothing else — a desktop window is never this narrow by
+         accident, and a media query cannot reach the mouse path anyway.
+         The complaint each one answers was measured on a 390x844 profile.
+
+         Nothing here redesigns a panel. The rule is REACHABILITY: chrome
+         that covers the world starts folded, and folding is one tap from
+         being undone. */
+      @media (max-width: 500px) {
+        /* The status line reserved 320 px of top-right gutter for the room
+           chip. On a 390 px screen that leaves 70 px, so the line rendered
+           as a 90 px stub: "EE Game  ". Put it UNDER the chip instead of
+           beside it and it gets the whole width. */
+        #hud {
+          top: 44px;
+          /* border-box, or the plate's own 20 px of padding and border hang
+             off the right edge of the screen. */
+          box-sizing: border-box;
+          max-width: calc(100vw - 16px - var(--rail-l) - var(--rail-r));
+        }
+        /* A 300 px card on a 320 px phone touches both edges. */
+        .goalcard {
+          width: min(300px, calc(100vw - 20px));
+          right: calc(10px + var(--rail-r));
+        }
+        /* The room browser and the props dialog are already full-bleed; the
+           toasts and chat are the last two fixed blocks sized for a desktop
+           gutter. */
+        #toasts, #chat { max-width: calc(100vw - 24px); width: auto; }
+      }
     </style>
   </head>
   <body>

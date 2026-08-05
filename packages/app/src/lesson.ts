@@ -446,7 +446,11 @@ export function createLesson(root: HTMLElement, deps: LessonDeps): LessonUI {
 
   // Collapse state is per-course, not per-room: fold it once, it stays folded.
   const OPEN_KEY = 'ee.lesson.open';
-  let open = lsGet(OPEN_KEY) !== '0';
+  // And on a phone it starts folded, for the same reason the hoist's goal
+  // card does: a 300 px card anchored over a 390 px world is not a hint, it
+  // is a lid. The header tap that opens it is already the whole affordance.
+  // (500 px matches the @media block in index.html.)
+  let open = (lsGet(OPEN_KEY) ?? (window.innerWidth < 500 ? '0' : '1')) !== '0';
   const applyOpen = () => {
     el.classList.toggle('collapsed', !open);
     caret.textContent = open ? '▾' : '▸';

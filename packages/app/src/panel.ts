@@ -542,6 +542,22 @@ const RAIL_BAR_PX = 24;
  * they are fitted into `innerWidth - CANVAS_MIN_PX` between them, so on a
  * narrow window they can never overlap each other or cover the canvas. */
 const CANVAS_MIN_PX = 200;
+/** Viewport width below which the chrome takes a phone posture. Matches the
+ * `@media (max-width: 500px)` block in index.html and hoist.ts's NARROW_PX. */
+const NARROW_PX = 500;
+/** A RAIL THAT CAN NEVER OPEN IS A PANEL NOBODY CAN REACH.
+ *
+ * On a 390 px phone `innerWidth - CANVAS_MIN_PX` is 190 px, which is under
+ * RAIL_W_MIN, so fitRails folded both rails to their 24 px strips — and the
+ * strip's own click could not undo it, because the next fit folded it again.
+ * Knobs, sliders and switches were landscape-only, silently.
+ *
+ * Under NARROW_PX the schematic gives up its guaranteed share: one rail may
+ * take nearly the screen, which is the honest posture for a phone (the
+ * sidebar IS the view while it is open), and the strip that is left over is
+ * one tap from putting it away. Above NARROW_PX nothing changes at all. */
+const canvasMinPx = () =>
+  window.innerWidth < NARROW_PX ? RAIL_BAR_PX + 8 : CANVAS_MIN_PX;
 /** Dead zone before a header press becomes a drag (dock.ts uses the same). */
 const DRAG_DEAD_PX = 4;
 /** Slack outside a rail that still counts as aiming at it. */
@@ -587,12 +603,17 @@ let openSeq = 0;
 let onRailsChanged: () => void = () => {};
 
 function readRailPrefs(side: RailSide): { open: boolean; w: number; order: number[] } {
+  // A rail that can now take the whole screen must not take it uninvited:
+  // under NARROW_PX both sides start as strips whatever a wider session
+  // preferred, and one tap on a strip opens it. (Widths and order are still
+  // remembered — only the open/shut posture is overruled.)
+  const narrow = window.innerWidth < NARROW_PX;
   const raw = lsGet(`rail:${side}`);
   if (raw) {
     try {
       const o = JSON.parse(raw) as { open?: unknown; w?: unknown; order?: unknown };
       return {
-        open: o.open !== false,
+        open: !narrow && o.open !== false,
         w:
           typeof o.w === 'number' && Number.isFinite(o.w)
             ? clamp(o.w, RAIL_W_MIN, RAIL_W_MAX)
@@ -605,7 +626,7 @@ function readRailPrefs(side: RailSide): { open: boolean; w: number; order: numbe
       /* fall through */
     }
   }
-  return { open: true, w: RAIL_W_DEFAULT, order: [] };
+  return { open: !narrow, w: RAIL_W_DEFAULT, order: [] };
 }
 
 const writeRailPrefs = (r: RailState) =>
@@ -628,7 +649,7 @@ function fitRails(
   R: Record<RailSide, RailState>,
   disp: Record<RailSide, boolean>,
 ): { px: Record<RailSide, number>; folded: Record<RailSide, boolean> } {
-  const avail = Math.max(2 * RAIL_BAR_PX, window.innerWidth - CANVAS_MIN_PX);
+  const avail = Math.max(2 * RAIL_BAR_PX, window.innerWidth - canvasMinPx());
   const folded: Record<RailSide, boolean> = { left: false, right: false };
   const measure = (): Record<RailSide, number> => ({
     left: !disp.left ? 0 : R.left.open && !folded.left ? R.left.width : RAIL_BAR_PX,

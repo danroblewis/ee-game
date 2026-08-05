@@ -1088,6 +1088,17 @@ function toast(text: string) {
   setTimeout(() => el.remove(), 7000);
 }
 
+/** Say it once. A refusal that fires on every tap stacks four copies of
+ *  itself over the schematic and reads as a fault rather than an answer. */
+let toastRepeat: { text: string; at: number } | null = null;
+const TOAST_REPEAT_MS = 3000;
+function toastOnce(text: string) {
+  const now = performance.now();
+  if (toastRepeat && toastRepeat.text === text && now - toastRepeat.at < TOAST_REPEAT_MS) return;
+  toastRepeat = { text, at: now };
+  toast(text);
+}
+
 // ------------------------------------------------------------- room chat
 //
 // Enter opens the input, Enter sends, Escape closes (keeping the draft).
@@ -1862,6 +1873,11 @@ const toPx = (p: Point): [number, number] => [cam.ox + p[0] * cam.scale, cam.oy 
  * 1920 px window (the world is big now); 200 is knee-deep in one symbol. */
 const MIN_SCALE = 0.4;
 const MAX_SCALE = 200;
+/** The zoom at which a fingertip stops being able to name a grid cell: 26 px
+ * of contact over 8 px/unit is more than three cells wide. Placement by touch
+ * is refused below it — see the pointerdown gate. A mouse has no such floor;
+ * it is one pixel wide at every zoom. */
+const TOUCH_BUILD_SCALE = 8;
 
 /** The starter district: joining frames THIS, not the whole document, so a
  * world with a 40k-element city two thousand units east still opens on the
@@ -2844,6 +2860,50 @@ function armPaste() {
 /** Pointer hit-test slack in px (matches elementAt's threshold). */
 const HIT_PX = 14;
 
+// A MOUSE POINTS AT ONE PIXEL; A FINGER COVERS A HUNDRED OF THEM.
+//
+// 14 px is about 3.7 mm — roughly half the 7–9 mm a fingertip actually
+// occupies, so every radius below is a mouse number and a finger misses with
+// all of them. They are widened for touch and ONLY for touch, keyed off the
+// last pointer that was on the glass: a touchscreen laptop keeps mouse
+// numbers until a finger lands, and goes back to them the moment the mouse
+// moves again. Nothing here is a media query.
+/** Body hit slack under a fingertip. ~7 mm, the low end of the range the
+ *  touch-target literature gives, because this radius also decides what
+ *  counts as EMPTY canvas — and empty canvas is where a finger pans. */
+const HIT_PX_TOUCH = 26;
+/** A pin's grab radius grows with zoom (0.4 of a grid cell) so that zooming
+ *  out never turns a screenful of pins into one mush. Touch keeps that shape
+ *  and only changes the two ends of it: a higher ceiling, and a floor, so a
+ *  terminal is never smaller than a finger can ask for. The floor is what
+ *  makes reshaping possible at all below ~30 px/unit. */
+const PIN_PX_TOUCH_MAX = 26;
+const PIN_PX_TOUCH_MIN = 12;
+/** A probe flag is a 9 px pennant — unhittable with a thumb. 18 and not 26,
+ *  because a flag is pinned 14 px right and 18 px up of the terminal it
+ *  belongs to (`probeFlagPx`), i.e. 22.8 px away, and the flag is tested
+ *  BEFORE the pin in the press chain: any radius past that would make a
+ *  probed part's terminal impossible to grab. */
+const PROBE_PX = 9;
+const PROBE_PX_TOUCH = 18;
+
+/** Was the last pointer to touch this page a finger? Written by a capture
+ *  listener so that no shared handler had to change to answer it. */
+let lastTouch = false;
+const onAnyPointer = (ev: PointerEvent) => {
+  lastTouch = ev.pointerType === 'touch';
+};
+window.addEventListener('pointerdown', onAnyPointer, true);
+window.addEventListener('pointermove', onAnyPointer, true);
+
+/** Body hit slack for whatever is driving right now. */
+const hitPx = () => (lastTouch ? HIT_PX_TOUCH : HIT_PX);
+/** Pin grab radius for whatever is driving right now. */
+const pinPx = () =>
+  lastTouch
+    ? Math.min(PIN_PX_TOUCH_MAX, Math.max(PIN_PX_TOUCH_MIN, cam.scale * 0.4))
+    : Math.min(HIT_PX, cam.scale * 0.4);
+
 /** Elements whose bbox could reach a cursor point: one bucket query, never
  * a document scan. `padPx` is the hit slack, `padGrid` covers the body
  * distance hitTest allows past the pins. */
@@ -2855,10 +2915,11 @@ function nearCursor(x: number, y: number, padPx: number, padGrid = 1): ElementSp
 }
 
 function elementAt(x: number, y: number): ElementSpec | undefined {
+  const slack = hitPx();
   let best: ElementSpec | undefined;
-  let bestD = HIT_PX;
+  let bestD = slack;
   let bestSeq = Infinity;
-  for (const e of nearCursor(x, y, HIT_PX)) {
+  for (const e of nearCursor(x, y, slack)) {
     const d = hitTest(cam, e, x, y);
     const seq = space.seqOf(e.id);
     // Bucket order is not document order: break exact ties the way the old
@@ -2878,7 +2939,11 @@ function elementAt(x: number, y: number): ElementSpec | undefined {
  * part wins, so the pin you see highlighted is the pin you grab. Fixture
  * children are bolted down and never reshape. */
 function pinOwnerAt(x: number, y: number): { e: ElementSpec; k: number } | null {
-  const r = Math.min(HIT_PX, cam.scale * 0.4);
+  const r = pinPx();
+  // The "selected part wins a shared junction" bias has to be at least as
+  // big as the radius it is competing inside, or a touch-widened radius
+  // quietly loses the tie it was written to win.
+  const bias = lastTouch ? r : HIT_PX;
   let best: { e: ElementSpec; k: number } | null = null;
   let bestScore = r;
   for (const e of nearCursor(x, y, r, 0)) {
@@ -2886,7 +2951,7 @@ function pinOwnerAt(x: number, y: number): { e: ElementSpec; k: number } | null 
     for (let k = 0; k < e.pins.length; k++) {
       const [px, py] = toPx(e.pins[k]!);
       const d = Math.hypot(px - x, py - y);
-      const score = selectedIds.has(e.id) ? d - HIT_PX : d; // selected wins ties
+      const score = selectedIds.has(e.id) ? d - bias : d; // selected wins ties
       if (d < r && score < bestScore) {
         bestScore = score;
         best = { e, k };
@@ -2897,7 +2962,7 @@ function pinOwnerAt(x: number, y: number): { e: ElementSpec; k: number } | null 
 }
 
 function pinAt(x: number, y: number): Point | null {
-  const r = Math.min(HIT_PX, cam.scale * 0.4);
+  const r = pinPx();
   let best: Point | null = null;
   let bestD = r;
   for (const e of nearCursor(x, y, r, 0)) {
@@ -2931,9 +2996,10 @@ function probeFlagPx(p: Probe): [number, number] | null {
 }
 
 function probeAt(x: number, y: number): Probe | undefined {
+  const r = lastTouch ? PROBE_PX_TOUCH : PROBE_PX;
   for (const p of probes) {
     const c = probeFlagPx(p);
-    if (c && Math.hypot(x - c[0], y - c[1]) < 9) return p;
+    if (c && Math.hypot(x - c[0], y - c[1]) < r) return p;
   }
   return undefined;
 }
@@ -3295,6 +3361,38 @@ let pinDrag: {
   startPins: Point[];
 } | null = null;
 let placeDrag: { a: Point; b: Point } | null = null;
+
+// THE FINGER IS ON TOP OF THE ONE PIXEL THAT MATTERS.
+//
+// Both drags above carry a POINT — the far end of a part being drawn out, or
+// the terminal being reshaped — and on glass that point is under the pad of
+// the finger placing it, which is the one place it cannot be looked at. So on
+// touch the carried point rides up and to the left of the fingertip, the iOS
+// text-caret / Procreate idiom, with a leader line drawn back to the contact
+// so the relationship is stated rather than guessed at.
+//
+// The offset costs nothing in accuracy because both ends are ALREADY grid
+// snapped: a finger only has to land in the right CELL, never on the right
+// pixel. And it is applied on the MOVE, never on the press — a tap still
+// places exactly where it lands, which is what the palette's tap-to-place
+// was measured doing and must keep doing.
+const TOUCH_GHOST_DX = -48;
+const TOUCH_GHOST_DY = -48;
+/** Where the finger currently running a place/pin drag actually is, so the
+ *  leader line can be drawn from it. Null for every mouse gesture. */
+let touchGhost: { fx: number; fy: number } | null = null;
+
+/** The point a drag is AIMING at: the pointer itself for a mouse or a pen,
+ *  the offset ghost for a finger. Also records the contact for the leader. */
+function aimPx(ev: PointerEvent): [number, number] {
+  if (ev.pointerType !== 'touch') {
+    touchGhost = null;
+    return [ev.clientX, ev.clientY];
+  }
+  touchGhost = { fx: ev.clientX, fy: ev.clientY };
+  return [ev.clientX + TOUCH_GHOST_DX, ev.clientY + TOUCH_GHOST_DY];
+}
+
 /** How a click or sweep combines with what is already selected. Ctrl is taken
  *  by map panning, so SUBTRACT is Alt — the CAD convention (shift adds, alt
  *  removes) and the only free modifier. Shift is strictly ADDITIVE: a careful
@@ -4171,6 +4269,7 @@ window.addEventListener(
 );
 
 canvas.addEventListener('pointerdown', (ev) => {
+  touchGhost = null; // a new gesture aims from scratch; the leader waits for a move
   if (ev.pointerType === 'touch' && touchDown(ev)) return; // the camera claimed it
   if (ev.button === 2) return; // right button only ever opens the menu
   if (swallowPointer) {
@@ -4233,6 +4332,19 @@ canvas.addEventListener('pointerdown', (ev) => {
     // names whichever label just appeared on that point — resolved at commit
     // time, because online the nlid is the server's to allocate.
     pendingNetName = { x: gx, y: gy, deadline: performance.now() + PENDING_NAME_MS };
+    return;
+  }
+  // ZOOMED THIS FAR OUT, A FINGER IS NOT AIMING, IT IS GUESSING.
+  //
+  // Below ~8 px per grid unit the pad of a thumb spans four or five cells and
+  // the symbols have already dropped their detail, so a placement is a coin
+  // toss over which cell it lands in — and a part in the wrong cell is worse
+  // than no part, because it is wired to the wrong things and has to be found
+  // again to be undone. Refuse, say why, and stay armed so the answer is one
+  // pinch and one tap. Selection, panning and the menus are untouched: LOOKING
+  // at a circuit from far away is exactly what far away is for.
+  if (ev.pointerType === 'touch' && (placing || pasting) && cam.scale < TOUCH_BUILD_SCALE) {
+    toastOnce('zoom in to build — pinch out until the parts have detail');
     return;
   }
   if (pasting) {
@@ -4594,11 +4706,11 @@ canvas.addEventListener('pointermove', (ev) => {
     return;
   }
   if (placeDrag) {
-    placeDrag.b = snap(ev.clientX, ev.clientY);
+    placeDrag.b = snap(...aimPx(ev));
     return;
   }
   if (pinDrag) {
-    const here = snap(ev.clientX, ev.clientY);
+    const here = snap(...aimPx(ev));
     const e = elemById(pinDrag.id);
     if (e) {
       // TWO TERMINALS ARE A PART; THREE ARE A SYMBOL.
@@ -5930,6 +6042,46 @@ function frame(now: number) {
       ctx.lineWidth = 2;
       ctx.beginPath();
       ctx.arc(bx, by, Math.max(5, cam.scale * 0.18), 0, Math.PI * 2);
+      ctx.stroke();
+    }
+  }
+
+  // THE OFFSET GHOST'S LEADER. The carried point is drawn up and left of the
+  // contact (see `aimPx`); without a line back to the finger the part simply
+  // reads as lagging behind the hand. With one, the offset is the point: this
+  // ring is you, that cross is where the end is going.
+  if (touchGhost && (placeDrag || pinDrag)) {
+    const live = placeDrag
+      ? toPx(placeDrag.b)
+      : (() => {
+          const e = elemById(pinDrag!.id);
+          const p = e?.pins[pinDrag!.k];
+          return p ? toPx(p) : null;
+        })();
+    if (live) {
+      const { fx, fy } = touchGhost;
+      ctx.strokeStyle = '#ffb24d99';
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([3, 4]);
+      ctx.beginPath();
+      ctx.moveTo(fx, fy);
+      ctx.lineTo(live[0], live[1]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      // The contact patch, drawn at the size it actually is, so the reason
+      // for the offset is on screen: this is what your finger is covering.
+      ctx.strokeStyle = '#ffb24d55';
+      ctx.beginPath();
+      ctx.arc(fx, fy, HIT_PX_TOUCH, 0, Math.PI * 2);
+      ctx.stroke();
+      // Crosshair on the snapped point itself — the cell, not the pixel.
+      ctx.strokeStyle = '#ffb24d';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(live[0] - 9, live[1]);
+      ctx.lineTo(live[0] + 9, live[1]);
+      ctx.moveTo(live[0], live[1] - 9);
+      ctx.lineTo(live[0], live[1] + 9);
       ctx.stroke();
     }
   }
