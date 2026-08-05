@@ -2908,28 +2908,34 @@ impl Island {
                     // impedance instead of being ideal — which a buffered
                     // chip output has anyway, so the model gets more honest
                     // rather than less.
-                    let bi = self.num_nodes + branch.ok_or(())?;
                     let (vin, vout, vrt, vgnd) = (node[0], node[1], node[2], node[3]);
+                    let g_rt = 1.0 / crate::PT_R_RT;
                     if need_factor {
-                        for (pin, sgn) in [(vrt, 1.0), (vgnd, -1.0)] {
-                            if pin > 0 {
-                                self.a[bi * n + (pin - 1)] += sgn;
-                                self.a[(pin - 1) * n + bi] += sgn;
-                            }
-                        }
                         self.stamp_g(vin, vgnd, BBD_G_IN);
                         self.stamp_g(vout, vgnd, PT_G_OUT);
+                        self.stamp_g(vrt, vgnd, g_rt);
                     }
-                    self.b[bi] = crate::PT_V_RT;
-                    // Norton half of the output: a Thevenin source of the
-                    // held sample behind PT_R_OUT.
-                    let inj = state.v_prev * PT_G_OUT;
-                    if vout > 0 {
-                        self.b[vout - 1] += inj;
-                    }
-                    if vgnd > 0 {
-                        self.b[vgnd - 1] -= inj;
-                    }
+                    // Two Thevenin sources as Nortons: the held sample behind
+                    // PT_R_OUT at the output, and the reference behind
+                    // PT_R_RT at RT. Neither is ideal, so this part owns no
+                    // branch unknown at all — and, more to the point, RT tied
+                    // to ground is now an ORDINARY circuit rather than a
+                    // contradiction the gate has to refuse.
+                    //
+                    // It also makes a FLOATING RT mean exactly zero current
+                    // instead of the trickle the input tether used to leak,
+                    // so an unwired delay pin is honest silence rather than a
+                    // six-second delay that reads as a broken part.
+                    let mut inject = |p: usize, q: usize, i: f64| {
+                        if p > 0 {
+                            self.b[p - 1] += i;
+                        }
+                        if q > 0 {
+                            self.b[q - 1] -= i;
+                        }
+                    };
+                    inject(vout, vgnd, state.v_prev * PT_G_OUT);
+                    inject(vrt, vgnd, crate::PT_V_RT * g_rt);
                 }
                 ElementKind::Bbd { .. } => {
                     // Pins [IN, OUT, CLK, GND].
@@ -3684,10 +3690,11 @@ impl Island {
                     st.pin_i[0] = bi_val.unwrap_or(0.0);
                 }
                 ElementKind::Pt2399 => {
-                    // The branch unknown IS the RT current, which is the
-                    // whole reason the branch was spent there.
-                    let i_rt = bi_val.unwrap_or(0.0).abs();
                     let vgnd = vs[3];
+                    // What the player's resistor is drawing, from the solver's
+                    // own answer for the RT node. Zero when nothing is wired
+                    // there, which is the honest reading of an open pin.
+                    let i_rt = ((crate::PT_V_RT - (vs[2] - vgnd)) / crate::PT_R_RT).max(0.0);
                     // The chip's own oscillator: a phase accumulator, so
                     // nothing has to be wired to a clock pin. Clamped at one
                     // shift per substep — the engine cannot move a sample

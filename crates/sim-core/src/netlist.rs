@@ -784,7 +784,6 @@ impl ElementKind {
                 | ElementKind::Timer555
                 | ElementKind::Motor { .. }
                 | ElementKind::Bbd { .. }
-                | ElementKind::Pt2399
         )
     }
 
@@ -861,6 +860,18 @@ pub const MAX_BBD_STAGES: u16 = 4096;
 pub const PT_STAGES: u16 = 1024;
 /// The RT pin's internal reference, in volts.
 pub const PT_V_RT: f64 = 2.5;
+/// Internal series resistance behind that reference, in ohms.
+///
+/// NOT cosmetic. As an IDEAL source, RT tied straight to ground was two
+/// contradictory constraints on one node, so the placement gate refused the
+/// edit with `Unsolvable` — and tying a pin to ground is the first thing
+/// anybody tries. With a real internal impedance that wiring is legal and
+/// means what a reader expects: least resistance, most current, fastest
+/// clock, SHORTEST delay.
+///
+/// 10 Ω is small enough that it costs 0.2 % of the delay at the datasheet's
+/// shortest setting, which is well inside the tolerance of the real part.
+pub const PT_R_RT: f64 = 10.0;
 /// Oscillator frequency per amp drawn from RT.
 ///
 /// Fitted to the datasheet's two endpoints: 5 kΩ draws 500 µA and must give

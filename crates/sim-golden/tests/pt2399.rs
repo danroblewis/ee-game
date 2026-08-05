@@ -96,3 +96,57 @@ fn more_resistance_is_more_delay() {
         long * 1000.0
     );
 }
+
+/// THE THREE WAYS SOMEBODY ACTUALLY WIRES THIS, all of which must behave
+/// sensibly. Two of them did not, and that is why the RT reference has a
+/// real internal impedance now:
+///
+///   * RT LEFT FLOATING used to leak a trickle through the input tether and
+///     produce a SIX-SECOND delay — a part that looks broken rather than
+///     unwired. It must draw exactly nothing and pass exactly nothing.
+///   * RT TIED STRAIGHT TO GROUND used to be two contradictory constraints
+///     on one node, so the placement gate refused the edit as `Unsolvable`.
+///     Tying a pin to ground is the FIRST thing anybody tries, and being
+///     refused with no reason is the worst answer available. It must be
+///     legal, and it must mean the shortest delay.
+///   * RT through a resistor is the documented way and must land on the
+///     model.
+#[test]
+fn every_plausible_wiring_of_rt_behaves() {
+    // 1. Floating: legal, and silent — not a mystery delay.
+    let float = rig(0.0, 3.0);
+    let mut d: Vec<sim_core::ElementSpec> = float.into_iter().filter(|e| e.id != 4 && e.id != 5).collect();
+    assert_eq!(sim_core::check_document(&d, DT), Ok(()), "a floating RT must still be a legal part");
+    let mut eng = Engine::new(DT);
+    eng.set_elements(&d);
+    eng.advance(150_000); // three seconds
+    assert!(
+        eng.voltage_at((8, 0)).unwrap().abs() < 1e-9,
+        "an unwired RT must pass NOTHING, not a six-second delay — got {} V",
+        eng.voltage_at((8, 0)).unwrap()
+    );
+
+    // 2. Straight to ground: legal, and the shortest delay the part has.
+    d.push(gnd(9, (0, 8)));
+    assert_eq!(
+        sim_core::check_document(&d, DT),
+        Ok(()),
+        "RT tied to ground must be an ordinary circuit, not Unsolvable"
+    );
+    let mut e2 = Engine::new(DT);
+    e2.set_elements(&d);
+    let floor = f64::from(sim_core::PT_STAGES) * DT;
+    let mut got = None;
+    for k in 1..100_000u32 {
+        e2.advance(1);
+        if e2.voltage_at((8, 0)).unwrap() > 1.5 {
+            got = Some(f64::from(k) * DT);
+            break;
+        }
+    }
+    let got = got.expect("RT grounded should give the shortest delay, not silence");
+    assert!(
+        (got - floor).abs() < floor * 0.2,
+        "RT grounded should clamp to the shortest delay {floor:.4} s, got {got:.4} s"
+    );
+}
