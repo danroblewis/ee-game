@@ -812,7 +812,10 @@ impl ElementKind {
     pub fn is_nonlinear(&self) -> bool {
         matches!(
             self,
-            ElementKind::Diode
+            // The echo chip's internal op-amps clip, which is discrete: it
+            // buys Newton passes to settle the regions, never a refactor.
+            ElementKind::Pt2399
+                | ElementKind::Diode
                 | ElementKind::Zener { .. }
                 | ElementKind::Led { .. }
                 | ElementKind::Npn { .. }
@@ -844,7 +847,10 @@ impl ElementKind {
     /// GLOBAL to the room, so one misclassified gate disarms reuse for every
     /// op-amp and 555 sharing the matrix with it.
     pub fn is_discrete_nonlinear(&self) -> bool {
-        matches!(self, ElementKind::OpAmp { .. } | ElementKind::Timer555) || self.is_logic()
+        matches!(
+            self,
+            ElementKind::OpAmp { .. } | ElementKind::Timer555 | ElementKind::Pt2399
+        ) || self.is_logic()
     }
 
     /// Devices that genuinely need Newton iteration: their conductance is a
@@ -912,23 +918,30 @@ pub const PT_OA_GM: f64 = 5e3;
 /// impedance is its open-loop value divided by the loop gain anyway, so the
 /// honest figure for a stage in feedback is far below even this.
 pub const PT_OA_GOUT: f64 = 0.5;
-/// The rails an internal op-amp would clip at, on the chip's single 5 V
-/// supply referred to PT_V_RT.
-///
-/// NOT ENFORCED YET, and that is a real gap rather than an oversight worth
-/// hiding. Clipping is a discrete nonlinearity, so the region has to be
-/// iterated to consistency inside Newton like `OpAmp`'s is — and at a gain
-/// of 1e4 the inverting input only has to move half a millivolt to traverse
-/// the whole rail range, so a first attempt at that region test CHATTERED
-/// and quarantined the room after four rescues. A linear stage that always
-/// converges beats a clipping one that can take a player's circuit down, so
-/// these are documentation until the region test is done properly.
-///
-/// What it costs: an overdriven internal op-amp keeps amplifying instead of
-/// clipping, so an echo with a feedback gain above unity grows without bound
-/// rather than settling into distortion the way the real chip does.
+/// The rails an internal op-amp clips at, on the chip's single 5 V supply
+/// referred to PT_V_RT. Symmetric about it, so the linear input window is
+/// the same size either way.
 pub const PT_OA_LO: f64 = 0.4;
 pub const PT_OA_HI: f64 = 4.6;
+
+/// Half the linear INPUT window: how far the inverting input may sit from
+/// the reference before the stage runs out of swing.
+///
+/// This is the number that makes clipping work at all, and it took two
+/// failed attempts to find. Deciding the region from the OUTPUT — "is the
+/// solved output past a rail?" — cannot settle at a gain of 1e4: pin the
+/// output at a rail and the feedback drags the input the other way, so the
+/// next pass wants the opposite rail, forever. The solver chattered and
+/// quarantined the room after four rescues, with the island frozen so even
+/// the input source stopped moving.
+///
+/// Deciding it from the INPUT settles, because the input is what the
+/// external network holds. Inside this window the stage is a
+/// transconductance; outside it, gm delivers a constant current and the
+/// output rests on its rail — which is what an output stage out of swing
+/// actually does, and it SAGS under load rather than pretending to be a
+/// stiff voltage source.
+pub const PT_OA_VLIN: f64 = (PT_OA_HI - PT_V_RT) / (PT_OA_GM / PT_OA_GOUT);
 /// Sample-clock frequency per amp drawn from the VCO pin.
 ///
 /// Calibrated so `PT_STAGES / f` reproduces Table 1's DELAY column, which is

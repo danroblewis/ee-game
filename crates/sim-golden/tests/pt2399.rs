@@ -49,20 +49,28 @@ fn expected(rt_ohms: f64) -> f64 {
 }
 
 /// Measure the time from a step at IN to its arrival at OUT.
+/// The chip's signal path rests at REF, so the line is flushed AT REF and
+/// then stepped away from it. Measuring against 0 V — which is what this did
+/// first — reports every delay as zero, because the output is already past
+/// the threshold before the step is applied.
+const REST: f64 = sim_core::PT_V_RT;
+const STEP: f64 = REST + 2.0;
+const TRIP: f64 = REST + 1.0;
+
 fn measure(rt_ohms: f64) -> f64 {
     let mut eng = Engine::new(DT);
-    let mut d = rig(rt_ohms, 0.0);
+    let mut d = rig(rt_ohms, REST);
     eng.set_elements(&d);
     let want = expected(rt_ohms);
     eng.advance((want / DT * 1.5) as u32);
-    let mut d2 = rig(rt_ohms, 3.0);
+    let mut d2 = rig(rt_ohms, STEP);
     d2[1].id = 2;
     d = d2;
     eng.set_elements(&d);
     let t0 = eng.time();
     for _ in 0..((want / DT * 3.0) as u32) {
         eng.advance(1);
-        if eng.voltage_at((8, 0)).unwrap() > 1.5 {
+        if eng.voltage_at((8, 0)).unwrap() > TRIP {
             return eng.time() - t0;
         }
     }
@@ -148,15 +156,21 @@ fn more_resistance_is_more_delay() {
 #[test]
 fn every_plausible_wiring_of_rt_behaves() {
     // 1. Floating: legal, and silent — not a mystery delay.
-    let float = rig(0.0, 3.0);
+    let float = rig(0.0, STEP);
     let mut d: Vec<sim_core::ElementSpec> = float.into_iter().filter(|e| e.id != 4 && e.id != 5).collect();
     assert_eq!(sim_core::check_document(&d, DT), Ok(()), "a floating RT must still be a legal part");
     let mut eng = Engine::new(DT);
     eng.set_elements(&d);
     eng.advance(150_000); // three seconds
+    // With no clock the chain never shifts, so the output holds the level it
+    // powered up at — the chip's own reference — and the input never reaches
+    // it. "Passes nothing" means "stays at rest", not "sits at zero".
+    // Near rest, not exactly at it: the output has a real source impedance,
+    // so a 100 kΩ load pulls 2.5 V down to 2.475. That divider is physics,
+    // not slop, and a 1e-6 tolerance was asserting the output was ideal.
     assert!(
-        eng.voltage_at((8, 0)).unwrap().abs() < 1e-9,
-        "an unwired RT must pass NOTHING, not a six-second delay — got {} V",
+        (eng.voltage_at((8, 0)).unwrap() - REST).abs() < REST * 0.02,
+        "an unwired VCO must pass NOTHING and hold near rest ({REST} V) — got {} V",
         eng.voltage_at((8, 0)).unwrap()
     );
 
@@ -178,7 +192,7 @@ fn every_plausible_wiring_of_rt_behaves() {
     let mut got = None;
     for k in 1..100_000u32 {
         e2.advance(1);
-        if e2.voltage_at((8, 0)).unwrap() > 1.5 {
+        if e2.voltage_at((8, 0)).unwrap() > TRIP {
             got = Some(f64::from(k) * DT);
             break;
         }
@@ -188,4 +202,64 @@ fn every_plausible_wiring_of_rt_behaves() {
         (got - floor).abs() < floor * 0.2,
         "VCO grounded should give the datasheet's fastest {floor:.4} s, got {got:.4} s"
     );
+}
+
+/// AN OVERDRIVEN ECHO MUST CLIP, NOT RUN AWAY.
+///
+/// The repeats path is a feedback loop around the delay. Below unity it
+/// decays; at or above unity it grows — and what a real chip does then is
+/// SATURATE into a howl. Without clipping it grows without bound instead,
+/// which cooks the part and eventually quarantines the room, and that was
+/// the state this shipped in.
+#[test]
+fn too_much_feedback_clips_instead_of_running_away() {
+    // 4.7 kΩ of repeats against a 10 kΩ mixer leg is a loop gain above 2 —
+    // far past what any real echo would take.
+    let mut d = vec![
+        sim_core::ElementSpec {
+            id: 1,
+            kind: K::Pt2399,
+            pins: vec![(0,0),(10,0),(0,2),(10,2),(0,5),(10,5),(0,7),(10,7)],
+            ..Default::default()
+        },
+        spec(2, r(10_000.0), (0, 2), (0, 24)),
+        gnd(3, (0, 24)),
+        gnd(4, (10, 2)),
+        // A kick into OP1's summing junction, then silence.
+        spec(5, K::VoltageSource { dc: 4.0, amp: 0.0, hz: 0.0, phase: 0.0, wave: Wave::Sine }, (30, 5), (30, 20)),
+        gnd(6, (30, 20)),
+        spec(7, r(10_000.0), (30, 5), (0, 5)),
+        spec(8, r(10_000.0), (0, 5), (10, 5)),      // OP1 feedback
+        spec(9, K::Wire, (10, 5), (0, 0)),           // OP1 out -> delay in
+        spec(10, r(10_000.0), (10, 0), (0, 7)),      // delay out -> OP2
+        spec(11, r(10_000.0), (0, 7), (10, 7)),      // OP2 feedback
+        spec(12, r(4_700.0), (10, 0), (0, 5)),       // RUNAWAY repeats
+        spec(13, r(100_000.0), (10, 7), (10, 20)),
+        gnd(14, (10, 20)),
+    ];
+    let mut eng = Engine::new(DT);
+    eng.set_elements(&d);
+    eng.advance(20_000);
+    if let K::VoltageSource { ref mut dc, .. } = d[4].kind {
+        *dc = 2.5;
+    }
+    eng.set_elements(&d);
+
+    // Five seconds of a loop that wants to grow forever.
+    let mut worst = 0.0f64;
+    for _ in 0..250 {
+        eng.advance(1_000);
+        for pt in [(10, 5), (10, 7), (10, 0)] {
+            worst = worst.max(eng.voltage_at(pt).unwrap().abs());
+        }
+    }
+    assert!(!eng.is_quarantined(), "an overdriven echo must not take the room down");
+    // Every node in the chip is bounded by its own rails. Without clipping
+    // this reached hundreds of volts and climbing.
+    assert!(
+        worst < 6.0,
+        "an overdriven echo should saturate at the rails, not run away — peaked at {worst:.1} V"
+    );
+    println!("overdriven echo peaked at {worst:.2} V (rails are {} .. {})",
+        sim_core::PT_OA_LO, sim_core::PT_OA_HI);
 }

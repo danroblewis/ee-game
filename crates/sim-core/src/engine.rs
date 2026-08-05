@@ -779,7 +779,7 @@ mod delay_line_tests {
     /// write slot and the oldest sample.
     #[test]
     fn a_chain_is_first_in_first_out() {
-        let mut d = DelayLine::new(3);
+        let mut d = DelayLine::new(3, 0.0);
         // A fresh chain is full of its power-up zeros, so the first three
         // pushes get those back.
         assert_eq!(d.shift(1.0), 0.0);
@@ -797,7 +797,7 @@ mod delay_line_tests {
     /// struggled.
     #[test]
     fn rollback_undoes_exactly_one_shift() {
-        let mut d = DelayLine::new(4);
+        let mut d = DelayLine::new(4, 0.0);
         for v in [1.0, 2.0, 3.0, 4.0] {
             d.shift(v);
         }
@@ -814,9 +814,17 @@ mod delay_line_tests {
 }
 
 impl DelayLine {
-    fn new(stages: usize) -> Self {
+    /// `rest` is what the chain holds before anything has been put in it.
+    ///
+    /// Zero for a bucket brigade, which has no reference of its own — but
+    /// the PT2399's whole signal path sits at REF, and a chain that powers
+    /// up at 0 V hands the stage after it a 2.5 V step it never asked for.
+    /// That slams the output op-amp into its rail for a full delay period at
+    /// power-up, which was invisible while those op-amps could swing
+    /// anywhere and became a quarantined room the moment they could not.
+    fn new(stages: usize, rest: f64) -> Self {
         DelayLine {
-            buf: vec![0.0; stages.max(2)],
+            buf: vec![rest; stages.max(2)],
             w: 0,
             undo: None,
         }
@@ -1379,7 +1387,16 @@ impl Engine {
             if s.pins.len() != s.kind.pin_count() {
                 continue; // malformed element: drop rather than panic
             }
-            let (state, broken) = old_state.get(&s.id).copied().unwrap_or_default();
+            let (mut state, broken) = old_state.get(&s.id).copied().unwrap_or_default();
+            // A fresh echo chip's HELD OUTPUT starts at its own reference,
+            // for the same reason its delay chain does: the whole signal path
+            // rests at REF, and an output that starts at 0 V hands the stage
+            // after it a 2.5 V step at power-up. `v_prev` is what the output
+            // stamps, so seeding the chain alone was not enough — the chain
+            // rested correctly and the pin still read zero.
+            if matches!(s.kind, ElementKind::Pt2399) && !old_state.contains_key(&s.id) {
+                state.v_prev = crate::PT_V_RT;
+            }
             doc.push(CompiledElem {
                 spec: s.clone(),
                 node: [0; MAX_PINS],
@@ -1950,9 +1967,9 @@ impl Engine {
                     // the clock comes from differs: the BBD takes it from a
                     // pin, the PT2399 makes its own — and the PT's depth is
                     // fixed, because a real chip's RAM is.
-                    let stages = match e.spec.kind {
-                        ElementKind::Bbd { stages } => stages,
-                        ElementKind::Pt2399 => crate::PT_STAGES,
+                    let (stages, rest) = match e.spec.kind {
+                        ElementKind::Bbd { stages } => (stages, 0.0),
+                        ElementKind::Pt2399 => (crate::PT_STAGES, crate::PT_V_RT),
                         _ => return None,
                     };
                     {
@@ -1960,7 +1977,7 @@ impl Engine {
                         let dl = old_delays
                             .remove(&e.spec.id)
                             .filter(|d| d.buf.len() == want)
-                            .unwrap_or_else(|| DelayLine::new(want));
+                            .unwrap_or_else(|| DelayLine::new(want, rest));
                         Some((e.spec.id, dl))
                     }
                 })
@@ -2964,6 +2981,10 @@ impl Island {
                         .into_iter()
                         .enumerate()
                     {
+                        // 0 linear, 1 pinned low, 2 pinned high. Decided from
+                        // the INPUT in `update_guesses` — see there for why
+                        // that is the only version of this test that settles.
+                        let reg = (state.dstate >> (D_PT_OA + 2 * k)) & 3;
                         if need_factor {
                             self.stamp_g(out, vgnd, crate::PT_OA_GOUT);
                             // A gm stage's input is a pure control terminal
@@ -2972,15 +2993,35 @@ impl Island {
                             // op-amp nobody wired would be a singular row.
                             // Same tether the delay input carries.
                             self.stamp_g(inv, vgnd, BBD_G_IN);
-                            // -gm * v(inv) into `out`, referred to GND.
-                            let gm = crate::PT_OA_GM;
-                            for (r, sgn) in [(out, 1.0), (vgnd, -1.0)] {
-                                if r > 0 && inv > 0 {
-                                    self.a[(r - 1) * n + (inv - 1)] += sgn * gm;
+                            // -gm * v(inv) into `out`, referred to GND —
+                            // but ONLY while the stage is linear. Saturated,
+                            // the transconductance stops responding to its
+                            // input and becomes a constant current, which is
+                            // what a real output stage does when it runs out
+                            // of swing.
+                            if reg == 0 {
+                                let gm = crate::PT_OA_GM;
+                                for (r, sgn) in [(out, 1.0), (vgnd, -1.0)] {
+                                    if r > 0 && inv > 0 {
+                                        self.a[(r - 1) * n + (inv - 1)] += sgn * gm;
+                                    }
                                 }
                             }
                         }
-                        let drive = {
+                        let drive = if reg != 0 {
+                            // SATURATED: gm delivers its limit current, so
+                            // the open-circuit output sits exactly on the
+                            // rail — and UNDER LOAD IT SAGS, because a
+                            // saturated stage has finite drive. That sag is
+                            // free here and is the honest behaviour; a hard
+                            // voltage clamp would have pretended otherwise.
+                            let d = if reg == 2 {
+                                crate::PT_OA_HI - crate::PT_V_RT
+                            } else {
+                                crate::PT_OA_LO - crate::PT_V_RT
+                            };
+                            crate::PT_V_RT + d
+                        } else {
                             // The output is
                             //     v_out = VREF + A * (VREF - v_inv)
                             // and BOTH constant terms have to be here. The
@@ -3505,6 +3546,66 @@ impl Island {
                         converged = false;
                         st.region = latch;
                         discrete_flip = true;
+                    }
+                }
+                ElementKind::Pt2399 => {
+                    // The two internal op-amps pick their region HERE, inside
+                    // the Newton loop, from their INPUTS. See PT_OA_VLIN for
+                    // why the input and not the output: an output-side test
+                    // cannot settle at this gain, and the first version of
+                    // this chattered until the solver quarantined the room.
+                    let vgnd = self.xv(node[3]);
+                    for (k, inv) in [4usize, 6].into_iter().enumerate() {
+                        let d = crate::PT_V_RT - (self.xv(node[inv]) - vgnd);
+                        let reg = (self.elems[ei].state.dstate >> (D_PT_OA + 2 * k)) & 3;
+                        // HYSTERESIS, and it is not a nicety. The linear
+                        // window is +/-0.2 mV wide (the gain is 1e4 and the
+                        // swing is 2.1 V), so Newton lands inside it only
+                        // approximately — and a bare threshold flips the
+                        // region on the approach, every pass, until the
+                        // solver gives up and quarantines the room. That is
+                        // exactly what happened: a working echo died the
+                        // moment clipping was switched on.
+                        //
+                        // Leaving saturation needs the input to come WELL
+                        // back inside the window; entering needs it clearly
+                        // outside. The same trick `OpAmp` plays with its
+                        // 1.000001 factors, for the same reason.
+                        const OUT: f64 = 1.0; // enter at the window edge
+                        const BACK: f64 = 0.5; // leave at half of it
+                        let edge = crate::PT_OA_VLIN * if reg == 0 { OUT } else { BACK };
+                        let want: u32 = if d > edge {
+                            2 // driven past the top of its swing
+                        } else if d < -edge {
+                            1
+                        } else {
+                            0
+                        };
+                        // A SATURATED STAGE MAY NOT TELEPORT TO THE OTHER
+                        // RAIL. Going 2 -> 1 in one pass moves the output
+                        // 4.2 V in a single discontinuity, and the solver
+                        // cannot follow it: measured, a stage that had been
+                        // resting on its top rail for thousands of steps
+                        // flipped straight to the bottom one and took four
+                        // rescues and then the room with it.
+                        //
+                        // A real output stage slews THROUGH its linear
+                        // region, so this does too: the opposite rail is
+                        // reachable only by way of 0, which costs one extra
+                        // Newton pass and turns the jump into two steps the
+                        // integrator can take.
+                        let new_region = if reg != 0 && want != 0 && want != reg {
+                            0
+                        } else {
+                            want
+                        };
+                        let sh = D_PT_OA + 2 * k;
+                        let st = &mut self.elems[ei].state;
+                        if reg != new_region {
+                            converged = false;
+                            st.dstate = (st.dstate & !(3 << sh)) | (new_region << sh);
+                            discrete_flip = true;
+                        }
                     }
                 }
                 ElementKind::OpAmp { rail, isc } => {
