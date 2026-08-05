@@ -97,6 +97,10 @@ pub enum Shape {
     Transistor,
     /// `[end a, wiper, end b]`.
     Pot,
+    /// `[IN, OUT, CLK, GND]` — the bucket brigade. Rigid like the other
+    /// chips: a player may rotate and mirror it, but not drag its pins into
+    /// a shape no package has.
+    Bbd,
     /// `[in+, in-, out, bias]`.
     Ota,
     /// `[vcc, gnd, trg, thr, out, dis]` — a fixed 4x4 DIP footprint with no
@@ -119,6 +123,7 @@ impl Shape {
             "Potentiometer" => Shape::Pot,
             "Ota" => Shape::Ota,
             "Timer555" => Shape::Dip555,
+            "Bbd" => Shape::Bbd,
             _ => Shape::Free,
         }
     }
@@ -140,6 +145,7 @@ impl Shape {
             Shape::OpAmp | Shape::Transistor | Shape::Pot => 3,
             Shape::Ota => 4,
             Shape::Dip555 => 6,
+            Shape::Bbd => 4,
         }
     }
 
@@ -200,6 +206,17 @@ fn base(shape: Shape, l: i32) -> [Point; 6] {
             p[3] = (0, 3); // thr
             p[4] = (4, 3); // out
             p[5] = (4, 1); // dis
+        }
+        // Signal flows LEFT TO RIGHT across the package, which is the one
+        // thing a reader needs from a delay: IN on the left edge, OUT on the
+        // right. CLK sits under IN because it is the other thing you have to
+        // wire, and GND under OUT so the return is next to the output it
+        // sources from.
+        Shape::Bbd => {
+            p[0] = (0, 0); // in
+            p[1] = (5, 0); // out
+            p[2] = (0, 3); // clk
+            p[3] = (5, 3); // gnd
         }
     }
     p
@@ -537,6 +554,7 @@ pub fn straighten(shape: Shape, pins: &[Point]) -> Vec<Point> {
         // frame, so its dominant component is the axis; `vcc -> gnd` is pure
         // perpendicular and would tell us nothing about which is which.
         Shape::Dip555 => (pins[0], pins[4], 1, 4),
+        Shape::Bbd => (pins[0], pins[1], 2, 3),
         Shape::Single | Shape::Free => return pins.to_vec(),
     };
     let v = (b.0 - a.0, b.1 - a.1);
@@ -628,6 +646,7 @@ mod tests {
             },
             Shape::Ota => ElementKind::Ota,
             Shape::Dip555 => ElementKind::Timer555,
+            Shape::Bbd => ElementKind::Bbd { stages: 1024 },
             Shape::Single => ElementKind::Ground,
             Shape::Free => ElementKind::Wire,
         }

@@ -264,6 +264,18 @@ export const CATALOG: PartDef[] = [
     key: '5',
     make: () => ({ t: 'Timer555' }),
   },
+  {
+    name: 'Bucket Brigade (BBD)',
+    // Everything a player might call it while hunting for an echo.
+    keys: 'delay echo bbd bucket brigade chorus flanger reverb tape',
+    cat: 'Chips',
+    key: '⇧E',
+    // 1024 buckets: at a 10 kHz clock that is 51 ms, a slapback, and the
+    // clock range a 555 comfortably covers puts the useful span either side
+    // of it. Long enough to hear as an echo, short enough that the whole
+    // chain fits in 8 kB.
+    make: () => ({ t: 'Bbd', stages: 1024 }),
+  },
 
   // ------------------------------------------------------- the logic family
   //
@@ -396,6 +408,8 @@ export function pinCount(kind: ElementKind): number {
       return 1;
     case 'Timer555':
       return 6;
+    case 'Bbd':
+      return 4;
     case 'Ota':
       return 4;
     // The logic family: two supply pins plus its own signals.

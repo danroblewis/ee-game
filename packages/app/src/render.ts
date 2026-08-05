@@ -826,6 +826,78 @@ export function drawElement(d: DrawCtx, e: ElementSpec) {
       if (e.kind.closed) twoPinDots();
       break;
     }
+    case 'Bbd': {
+      // A DIP like the 555, but the innards worth hinting at are the BUCKETS:
+      // a row of little capacitors handing charge along. That row is the
+      // whole idea of the part, and it is the one picture that makes "why
+      // does the clock set the delay" obvious without a sentence.
+      //
+      // Local frame: x runs IN -> OUT (across the package), y runs CLK -> GND.
+      // The footprint is IN (0,0), OUT (5,0), CLK (0,3), GND (5,3) — so the
+      // package's LONG axis is IN->OUT and its short axis is IN->CLK. Taking
+      // the short axis from CLK->GND instead (which is what this did first)
+      // makes both basis vectors point the same way, and the symbol collapses
+      // into a fan of diagonals.
+      const [Ip, Op_, Cp] = [P[0]!, P[1]!, P[2]!];
+      const ex = norm(sub(Op_, Ip));
+      const ey = norm(sub(Cp, Ip));
+      const w = mag(sub(Op_, Ip)) / s;
+      const h = mag(sub(Cp, Ip)) / s;
+      const at = (x: number, y: number): Px => add(add(Ip, ex, x * s), ey, y * s);
+      const lx = (p: Px) => dot(sub(p, Ip), ex) / s;
+      const ly = (p: Px) => dot(sub(p, Ip), ey) / s;
+      const stub = Math.min(0.9, w * 0.25);
+      const [x0, x1, y0, y1] = [stub, w - stub, -0.5, h + 0.5];
+      P.forEach((p, k) => {
+        const left = lx(p) < w * 0.5;
+        stroke(ctx, voltageColor(v(k)), [p, at(left ? x0 : x1, ly(p))]);
+      });
+      ctx.fillStyle = '#181820';
+      ctx.strokeStyle = '#c9c9d4';
+      ctx.beginPath();
+      ctx.moveTo(...at(x0, y0));
+      ctx.lineTo(...at(x1, y0));
+      ctx.lineTo(...at(x1, y1));
+      ctx.lineTo(...at(x0, y1));
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+      if (cam.scale > 40) {
+        // The bucket chain: five capacitor pairs and an arrow, left to right.
+        // Five because it reads as "a row" at a glance; the part has 1024.
+        ctx.save();
+        ctx.globalAlpha = 0.35;
+        ctx.lineWidth = Math.max(1, s * 0.02);
+        const cy = (y0 + y1) * 0.5;
+        for (let i = 0; i < 5; i++) {
+          const cx = x0 + ((x1 - x0) * (i + 0.9)) / 6;
+          stroke(ctx, '#c9c9d4', [at(cx - 0.06, cy - 0.22), at(cx - 0.06, cy + 0.22)]);
+          stroke(ctx, '#c9c9d4', [at(cx + 0.06, cy - 0.22), at(cx + 0.06, cy + 0.22)]);
+          if (i < 4) {
+            const nx = x0 + ((x1 - x0) * (i + 1.9)) / 6;
+            stroke(ctx, '#c9c9d4', [at(cx + 0.06, cy), at(nx - 0.06, cy)]);
+          }
+        }
+        ctx.restore();
+      }
+      if (cam.scale > 24) {
+        const labels = pinLabels(e.kind);
+        ctx.fillStyle = '#8a8a98';
+        ctx.font = `${Math.round(s * 0.2)}px ui-monospace`;
+        P.forEach((p, k) => {
+          const left = lx(p) < w * 0.5;
+          ctx.textAlign = left ? 'left' : 'right';
+          const [tx, ty] = at(left ? x0 + 0.16 : x1 - 0.16, ly(p) + 0.08);
+          ctx.fillText(labels[k] ?? '', tx, ty);
+        });
+        ctx.textAlign = 'center';
+        ctx.fillStyle = '#c9c9d4';
+        ctx.font = `${Math.round(s * 0.26)}px ui-monospace`;
+        ctx.fillText('BBD', ...at(w * 0.5, y0 + 0.34));
+        ctx.textAlign = 'start';
+      }
+      break;
+    }
     case 'Timer555': {
       // Local package frame: x runs THR -> OUT (across the DIP), y runs
       // VCC -> GND (down the left edge), both in grid units.
