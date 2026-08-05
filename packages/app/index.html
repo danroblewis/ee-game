@@ -345,6 +345,18 @@
       .prow.dragging { background: #2b3a44; }
       .prow-grip { color: #4e5c68; cursor: grab; padding: 0 2px; touch-action: none; }
       .prow-grip:hover { color: #8fa2b0; }
+      /* The keycap on a control the keyboard can drive. Empty rows collapse
+         to nothing, so an unbound control looks exactly as it did. */
+      .pkb:not(:empty) {
+        margin-left: 6px;
+        padding: 0 4px;
+        border: 1px solid #4a4a58;
+        border-bottom-width: 2px;
+        border-radius: 3px;
+        font: 10px ui-monospace, monospace;
+        color: #cfcfe0;
+        background: #24242e;
+      }
       .prow-label { flex: 0 0 82px; color: #8ea3b1; font-size: 11px; letter-spacing: 0.04em; }
       .prow-ctl { flex: 1 1 110px; display: flex; align-items: center; gap: 6px; min-width: 0; }
       .prow-val {

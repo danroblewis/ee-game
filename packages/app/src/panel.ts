@@ -877,6 +877,8 @@ interface RowParts {
   lab: HTMLSpanElement;
   ctl: HTMLDivElement;
   val: HTMLSpanElement;
+  /** Set the row's text WITHOUT destroying its keycap badge. */
+  setLabel: (t: string) => void;
 }
 
 function makeRow(key: string, label: string): RowParts {
@@ -889,14 +891,24 @@ function makeRow(key: string, label: string): RowParts {
   grip.title = 'drag to reorder';
   const lab = document.createElement('span');
   lab.className = 'prow-label';
-  lab.textContent = label;
+  // The keyboard binding, drawn ON THE CONTROL. A binding you cannot see is
+  // a binding nobody uses; empty for rows the keyboard does not drive.
+  const kb = document.createElement('kbd');
+  kb.className = 'pkb';
+  const txt = document.createTextNode(label);
+  lab.append(txt, kb);
+  // Widgets must NOT write `lab.textContent` — that would delete the badge
+  // along with the text. They set the text node through this instead.
+  const setLabel = (t: string) => {
+    txt.nodeValue = t;
+  };
   const ctl = document.createElement('div');
   ctl.className = 'prow-ctl';
   const val = document.createElement('span');
   val.className = 'prow-val';
   val.textContent = '—';
   el.append(grip, lab, ctl, val);
-  return { el, lab, ctl, val };
+  return { el, lab, ctl, val, setLabel };
 }
 
 /** Throttled InteractOp sender: 40 ms while dragging, immediate on release
@@ -931,7 +943,7 @@ function rowLabel(spec: ElementSpec | undefined, fallback: string, extra?: strin
 
 /** Potentiometer: a real slider, or a knob you drag — per-widget choice. */
 function potWidget(plid: number, id: number, deps: PanelHostDeps): Widget {
-  const { el, lab, ctl, val } = makeRow(`pot:${id}`, `POT #${id}`);
+  const { el, lab, ctl, val, setLabel } = makeRow(`pot:${id}`, `POT #${id}`);
   let spec: ElementSpec | undefined;
   const push = sender(deps, () => spec);
 
@@ -1013,11 +1025,7 @@ function potWidget(plid: number, id: number, deps: PanelHostDeps): Widget {
       spec = ctx.byId.get(id);
       const k = spec?.kind;
       if (k?.t !== 'Potentiometer') return;
-      lab.textContent = rowLabel(
-        spec,
-        `POT #${id}`,
-        fmtEntry(k.ohms, quantityOf('Potentiometer', 'ohms')),
-      );
+      setLabel(rowLabel(spec, `POT #${id}`, fmtEntry(k.ohms, quantityOf('Potentiometer', 'ohms'))));
       if (!dragging) {
         slider.value = String(k.wiper);
         needle.style.transform = `rotate(${-135 + k.wiper * 270}deg)`;
@@ -1029,17 +1037,107 @@ function potWidget(plid: number, id: number, deps: PanelHostDeps): Widget {
   };
 }
 
+// --------------------------------------------------- keyboard bindings
+//
+// A KEYBOARD KEY IS A SWITCH. That is the whole design: rather than invent a
+// "keyboard chip" with pins that go high — a device that does not exist —
+// the top row of the keyboard is bound to the switches and buttons a panel
+// already has. Every Button in every room becomes playable the moment this
+// exists, which a new part could never do, and it costs the simulator
+// nothing: these drive the same `InteractOp` a click does.
+//
+// SCOPED BY HOVER, because `q` is rotate and `w` is wire. While the cursor is
+// over a panel that panel owns the keyboard; move away and the ordinary
+// bindings are back. The binding is drawn on the control itself, so it is
+// visible on the thing it acts on rather than hidden in a settings page.
+const KB_KEYS = ['q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p'];
+
+/** The panel the cursor is inside, or null. */
+let kbPanel: HTMLElement | null = null;
+
+/** Attach to a panel window so it can own the keyboard while hovered. */
+function armKeyboard(win: HTMLElement): void {
+  win.addEventListener('pointerenter', () => (kbPanel = win));
+  win.addEventListener('pointerleave', () => {
+    if (kbPanel === win) {
+      // Release anything still held, or a key-down that ends outside the
+      // panel would leave a momentary button stuck on forever.
+      for (const el of win.querySelectorAll<HTMLElement>('[data-kb]')) {
+        (el as KbControl).__kbUp?.();
+      }
+      kbPanel = null;
+    }
+  });
+}
+
+/** A control that the keyboard can drive. */
+type KbControl = HTMLElement & { __kbDown?: () => void; __kbUp?: () => void };
+
+/** Re-letter a panel's controls after its widget list changes. The Nth
+ *  keyboard-capable control gets the Nth key, in document order, so the
+ *  mapping is stable and needs no configuration to be useful. */
+export function relabelKeyboard(win: HTMLElement): void {
+  const ctrls = win.querySelectorAll<HTMLElement>('[data-kb]');
+  ctrls.forEach((c, i) => {
+    // `closest` rather than two parentElements: the control's depth inside
+    // its row is a widget's business, and hard-coding it silently produced
+    // no badges at all.
+    const badge = c.closest('.prow')?.querySelector<HTMLElement>('.pkb') ?? null;
+    if (badge) badge.textContent = i < KB_KEYS.length ? KB_KEYS[i]!.toUpperCase() : '';
+  });
+}
+
+// One listener for every panel, in the CAPTURE phase so the canvas hotkeys
+// never see a key the panel has claimed.
+if (typeof window !== 'undefined') {
+  const hit = (ev: KeyboardEvent): KbControl | null => {
+    if (!kbPanel || ev.ctrlKey || ev.metaKey || ev.altKey) return null;
+    const i = KB_KEYS.indexOf(ev.key.toLowerCase());
+    if (i < 0) return null;
+    const ctrls = kbPanel.querySelectorAll<HTMLElement>('[data-kb]');
+    return (ctrls[i] as KbControl) ?? null;
+  };
+  window.addEventListener(
+    'keydown',
+    (ev) => {
+      const c = hit(ev);
+      if (!c) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (!ev.repeat) c.__kbDown?.();
+    },
+    true,
+  );
+  window.addEventListener(
+    'keyup',
+    (ev) => {
+      const c = hit(ev);
+      if (!c) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      c.__kbUp?.();
+    },
+    true,
+  );
+}
+
 /** Switch / button: a toggle. */
 function switchWidget(id: number, deps: PanelHostDeps): Widget {
-  const { el, lab, ctl, val } = makeRow(`sw:${id}`, `SW #${id}`);
+  const { el, lab, ctl, val, setLabel } = makeRow(`sw:${id}`, `SW #${id}`);
   let spec: ElementSpec | undefined;
   const btn = document.createElement('button');
   btn.className = 'pswitch';
   btn.textContent = 'OFF';
-  btn.onclick = () => {
+  const toggle = () => {
     const e = spec;
     if (e?.kind.t === 'Switch') deps.interact(e, { t: 'SetSwitch', closed: !e.kind.closed });
   };
+  btn.onclick = toggle;
+  // A SWITCH TOGGLES on key-down and does nothing on key-up. A switch that
+  // sprang back when you let go would not be a switch — that is what the
+  // Button below is for, and the two parts mean different things.
+  btn.dataset.kb = '1';
+  (btn as KbControl).__kbDown = toggle;
   ctl.appendChild(btn);
   return {
     key: `sw:${id}`,
@@ -1048,7 +1146,54 @@ function switchWidget(id: number, deps: PanelHostDeps): Widget {
       spec = ctx.byId.get(id);
       const k = spec?.kind;
       if (k?.t !== 'Switch') return;
-      lab.textContent = rowLabel(spec, `SW #${id}`);
+      setLabel(rowLabel(spec, `SW #${id}`));
+      btn.textContent = k.closed ? 'ON' : 'OFF';
+      btn.classList.toggle('on', k.closed);
+      const l = ctx.live.get(id);
+      val.textContent = l ? fmtEng(l.i[0] ?? 0, 'A') : '—';
+    },
+  };
+}
+
+/** Button: MOMENTARY. Held while the pointer — or the key — is down.
+ *
+ *  This is the part the keyboard binding exists for. A row of these under
+ *  q..p is a playable keyboard, and it is a playable keyboard made of the
+ *  switches a real one is made of, rather than of a chip that pretends. */
+function buttonWidget(id: number, deps: PanelHostDeps): Widget {
+  const { el, lab, ctl, val, setLabel } = makeRow(`btn:${id}`, `BTN #${id}`);
+  let spec: ElementSpec | undefined;
+  const btn = document.createElement('button');
+  btn.className = 'pswitch';
+  btn.textContent = 'OFF';
+  const set = (closed: boolean) => {
+    const e = spec;
+    if (e?.kind.t === 'Button' && e.kind.closed !== closed) {
+      deps.interact(e, { t: 'SetSwitch', closed });
+    }
+  };
+  btn.addEventListener('pointerdown', (ev) => {
+    ev.preventDefault();
+    btn.setPointerCapture?.(ev.pointerId);
+    set(true);
+  });
+  // Release on up AND on cancel/leave: a press that ends anywhere other than
+  // on the button must still end, or the note sticks.
+  for (const t of ['pointerup', 'pointercancel'] as const) {
+    btn.addEventListener(t, () => set(false));
+  }
+  btn.dataset.kb = '1';
+  (btn as KbControl).__kbDown = () => set(true);
+  (btn as KbControl).__kbUp = () => set(false);
+  ctl.appendChild(btn);
+  return {
+    key: `btn:${id}`,
+    el,
+    update(ctx) {
+      spec = ctx.byId.get(id);
+      const k = spec?.kind;
+      if (k?.t !== 'Button') return;
+      setLabel(rowLabel(spec, `BTN #${id}`));
       btn.textContent = k.closed ? 'ON' : 'OFF';
       btn.classList.toggle('on', k.closed);
       const l = ctx.live.get(id);
@@ -1059,7 +1204,7 @@ function switchWidget(id: number, deps: PanelHostDeps): Widget {
 
 /** Lamp / LED: an indicator whose brightness tracks live power or current. */
 function indicatorWidget(id: number): Widget {
-  const { el, lab, ctl, val } = makeRow(`ind:${id}`, `#${id}`);
+  const { el, lab, ctl, val, setLabel } = makeRow(`ind:${id}`, `#${id}`);
   const dot = document.createElement('span');
   dot.className = 'pdot';
   ctl.appendChild(dot);
@@ -1074,12 +1219,12 @@ function indicatorWidget(id: number): Widget {
       if (k?.t === 'Lamp') {
         // Same normalization the schematic symbol uses: P / rated W.
         bright = clamp(Math.abs(l?.power ?? 0) / Math.max(1e-9, k.rated_watts), 0, 1);
-        lab.textContent = rowLabel(ctx.byId.get(id), `LAMP #${id}`);
+        setLabel(rowLabel(ctx.byId.get(id), `LAMP #${id}`));
         val.textContent = l ? fmtEng(l.power, 'W') : '—';
       } else if (k?.t === 'Led') {
         bright = clamp(Math.abs(l?.i[0] ?? 0) / 0.02, 0, 1);
         color = LED_COLORS[k.color] ?? LED_COLORS[0]!;
-        lab.textContent = rowLabel(ctx.byId.get(id), `LED #${id}`);
+        setLabel(rowLabel(ctx.byId.get(id), `LED #${id}`));
         val.textContent = l ? fmtEng(l.i[0] ?? 0, 'A') : '—';
       }
       dot.style.background = color;
@@ -1091,7 +1236,7 @@ function indicatorWidget(id: number): Widget {
 
 /** DC voltage source: numeric entry plus a slider. */
 function sourceWidget(id: number, dc0: number, deps: PanelHostDeps): Widget {
-  const { el, lab, ctl, val } = makeRow(`src:${id}`, `SRC #${id}`);
+  const { el, lab, ctl, val, setLabel } = makeRow(`src:${id}`, `SRC #${id}`);
   let spec: ElementSpec | undefined;
   const push = sender(deps, () => spec);
   let span = Math.max(12, Math.ceil(Math.abs(dc0) * 2));
@@ -1155,7 +1300,7 @@ function sourceWidget(id: number, dc0: number, deps: PanelHostDeps): Widget {
       spec = ctx.byId.get(id);
       const k = spec?.kind;
       if (k?.t !== 'VoltageSource') return;
-      lab.textContent = rowLabel(spec, `SRC #${id}`);
+      setLabel(rowLabel(spec, `SRC #${id}`));
       if (Math.abs(k.dc) > span) {
         span = Math.ceil(Math.abs(k.dc) * 1.2);
         applySpan();
@@ -1175,7 +1320,7 @@ function sourceWidget(id: number, dc0: number, deps: PanelHostDeps): Widget {
  * come from `scopeWidget` below: park an oscilloscope inside the region and it
  * moves into this window. */
 function probeWidget(pid: number): Widget {
-  const { el, lab, ctl, val } = makeRow(`pr:${pid}`, `METER ${pid}`);
+  const { el, lab, ctl, val, setLabel } = makeRow(`pr:${pid}`, `METER ${pid}`);
   const seg = document.createElement('span');
   seg.className = 'pseg';
   seg.style.color = probeColor(pid);
@@ -1194,7 +1339,7 @@ function probeWidget(pid: number): Widget {
       // A meter on a NAMED net says which net. `VOLT 3` is an index into a
       // list nobody keeps; `VOLT 3 · CUTOFF` is the wire you meant.
       const net = ctx.netNames?.get(pid);
-      lab.textContent = `${p.kind === 'v' ? 'VOLT' : 'AMP'} ${pid}${net ? ` · ${net}` : ''}`;
+      setLabel(`${p.kind === 'v' ? 'VOLT' : 'AMP'} ${pid}${net ? ` · ${net}` : ''}`);
       const l = ctx.live.get(p.elem);
       if (!l) {
         seg.textContent = `–.–– ${unit}`;
@@ -1221,7 +1366,7 @@ function probeWidget(pid: number): Widget {
  * plus the fractional-devicePixelRatio backing-store fix — one copy of that
  * sizing logic beats two. */
 function scopeWidget(sid: number, deps: PanelHostDeps): Widget {
-  const { el, lab, ctl, val } = makeRow(`sc:${sid}`, `SCOPE ${sid}`);
+  const { el, lab, ctl, val, setLabel } = makeRow(`sc:${sid}`, `SCOPE ${sid}`);
   el.classList.add('prow-scope');
 
   const chans = document.createElement('div');
@@ -1318,7 +1463,7 @@ function scopeWidget(sid: number, deps: PanelHostDeps): Widget {
       scope = ctx.scopes.find((s) => s.sid === sid);
       probes = ctx.probes;
       if (!scope) return;
-      lab.textContent = `SCOPE ${sid}`;
+      setLabel(`SCOPE ${sid}`);
       syncChans(ctx.netNames);
       val.textContent = `${fmtEng(scope.set.timebase / 10, 's', { trim: true })}/div`;
       renderScope(cv, ctx.traces, active(), scope.set.timebase, scope.set, ctx.netNames);
@@ -1346,6 +1491,9 @@ function widgetSpecs(
         break;
       case 'Switch':
         out.push({ key: `sw:${id}`, make: () => switchWidget(id, deps) });
+        break;
+      case 'Button':
+        out.push({ key: `btn:${id}`, make: () => buttonWidget(id, deps) });
         break;
       case 'Lamp':
       case 'Led':
@@ -1415,6 +1563,8 @@ class PanelWindow {
   ) {
     this.el = document.createElement('div');
     this.el.className = 'pwin';
+    // While the cursor is inside this window it owns the keyboard.
+    armKeyboard(this.el);
     const hd = document.createElement('div');
     hd.className = 'pwin-hd';
     this.hd = hd;
@@ -1836,6 +1986,10 @@ class PanelWindow {
       this.rebuild(specs);
     }
     for (const w of this.widgets.values()) w.update(ctx);
+    // Re-letter after every tick: rows come and go as parts enter and leave
+    // the region, and a keycap that names the wrong control is worse than
+    // none. Cheap — a querySelectorAll over one panel's rows.
+    relabelKeyboard(this.el);
     // Nothing to control: show the title bar and nothing else. This is
     // rendering state, NOT the player's own shut/open choice (`:shut`), so a
     // panel they left open springs back the moment a part lands inside it.
