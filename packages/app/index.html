@@ -2,6 +2,15 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
+    <!-- The world IS the canvas, so the browser's own zoom is a second,
+         competing camera: a stray pinch used to take visualViewport from 1 to
+         5 and every later hit test landed on the wrong grid point. That is
+         fixed by `touch-action: none` on the canvas, which is the surface the
+         pinch lands on — NOT by `maximum-scale=1, user-scalable=no`, which
+         this file briefly carried and which takes page zoom away from
+         everyone, everywhere, including the players who need it to read the
+         thing at all (WCAG 1.4.4). The app owns gestures on the canvas; the
+         browser keeps its zoom over the chrome. -->
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>EE Game — M1 demo</title>
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23101014'/%3E%3Cpath d='M4 20h6l3-9 4 14 3-9h8' fill='none' stroke='%234bff6a' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
@@ -12,7 +21,13 @@
          overlay below is positioned off them, so nothing has to know about
          anything else's geometry. */
       :root { --rail-l: 0px; --rail-r: 0px; --dock-h: 24px; }
-      #canvas { display: block; width: 100vw; height: 100vh; cursor: default; }
+      /* touch-action: none is what makes the canvas reachable by finger AT
+         ALL. Without it the browser claimed every touch drag as a scroll it
+         could never perform — one pointermove, then pointercancel — so no
+         wire, no part move, no marquee and no pan existed on a touchscreen.
+         It gates touch only: mouse and pen are not affected by this property,
+         so the desktop path is untouched. */
+      #canvas { display: block; width: 100vw; height: 100vh; cursor: default; touch-action: none; }
       /* The hint block used to be bare text over the world, so it smeared
          across anything it happened to sit in front of. Give it its own
          backdrop: chrome should read as chrome. */
@@ -32,6 +47,12 @@
         display: flex; align-items: center; gap: 14px; white-space: nowrap;
         color: #8a8a98; font: 11px/24px ui-monospace, monospace;
         cursor: ns-resize; user-select: none; -webkit-user-select: none;
+        /* The bar IS a drag handle (it resizes the dock) and the canvas under
+           it is a trace the finger reads along. Without this the browser took
+           both for a scroll it could never perform: a 100 px finger drag
+           across the dock produced one pointercancel and nothing else. Gates
+           touch only — the mouse never consults touch-action. */
+        touch-action: none;
       }
       #scope:not(.collapsed) #scopebar { border-bottom: 1px solid #2c2c38; }
       #scope.collapsed #scopebar { cursor: pointer; }
@@ -59,8 +80,33 @@
       #audiobuf { color: #5c5c6a; flex: none; font-variant-numeric: tabular-nums; }
       #audiobuf.warn { color: #ffd66b; }
       #audiobuf.bad { color: #ff8f8f; }
-      #scopecv { width: 100%; height: calc(100% - 24px); display: block; }
+      #scopecv { width: 100%; height: calc(100% - 24px); display: block; touch-action: none; }
       #scope.collapsed #scopecv { display: none; }
+      /* ---- TOUCH SIZING FOR THE CHROME THAT WAS ALREADY HERE.
+         Everything under `html.hastouch` is dead CSS until a pointerdown
+         whose pointerType is 'touch' has actually been seen (main.ts sets the
+         class, once, from the same capture listener that tracks hit radii).
+         A desktop session — including a touchscreen laptop nobody has touched
+         — never matches a single one of these rules, which is the same
+         guarantee the touch palette and the touch HUD give by not existing.
+
+         44 px is the floor the touch literature settles on. These two are the
+         surfaces that were still built for a cursor: the dock's open/close
+         caret, measured at 46x24, and the properties editor, whose five
+         controls measured 124x28, 14x16, 117x32, 117x32 — every one of them
+         under the floor, on the only screen where a value can be changed. */
+      html.hastouch #scopebar { height: 44px; font-size: 12px; line-height: 44px; }
+      html.hastouch #scopecaret { min-height: 44px; display: flex; align-items: center; padding-right: 6px; }
+      html.hastouch #scopecv { height: calc(100% - 44px); }
+      html.hastouch #propsdlg { width: min(340px, calc(100vw - 24px)); font-size: 15px; padding: 14px; }
+      html.hastouch #propsdlg input[type=number],
+      html.hastouch #propsdlg input[type=text] {
+        width: 140px; min-height: 44px; box-sizing: border-box; padding: 4px 8px; font-size: 15px;
+      }
+      html.hastouch #propsdlg button { min-height: 44px; }
+      html.hastouch #propsdlg h3 .xbtn {
+        min-width: 44px; min-height: 44px; font-size: 22px; margin: -8px -6px -8px 0;
+      }
       #props, #propsdlg {
         position: fixed; width: 240px; display: none;
         background: #16161de6; border: 1px solid #33333f; border-radius: 6px;
@@ -559,6 +605,150 @@
       .lesson-next { color: #ffe6a1; border-color: #a9862f; }
       .lesson-next:hover { background: #4a3a12; color: #ffefc4; }
 
+      /* ---- the touch palette (palette.ts owns the elements; this is only
+         their look). NONE OF IT EXISTS ON A DESKTOP SESSION: the whole tree
+         is built on the first pointerdown whose pointerType is 'touch', so
+         these rules match nothing until a finger lands.
+
+         It is anchored to the bottom because that is where a thumb is, and
+         it sits above the scope dock (--dock-h) with the phone's home-bar
+         inset added, so neither can bury the other. The strip itself is
+         pointer-events: none — only the actual controls take a tap, and the
+         world behind the gap between them stays reachable. */
+      #tpal {
+        position: fixed; left: 0; right: 0; bottom: var(--dock-h); z-index: 27;
+        display: flex; flex-direction: column; align-items: center; gap: 6px;
+        padding: 0 8px calc(8px + env(safe-area-inset-bottom, 0px));
+        pointer-events: none;
+        font: 12px/1.4 ui-monospace, monospace; color: #c9c9d4;
+        user-select: none; -webkit-user-select: none;
+      }
+      #tpal > * { pointer-events: auto; }
+      /* Every control is a finger target: 44 px is the floor the touch
+         literature settles on, and anything below it is a mis-tap that
+         edits a shared room. */
+      #tpal button {
+        min-height: 40px; font: inherit; cursor: pointer;
+        background: #22222c; color: #c9c9d4; border: 1px solid #3a3a48;
+        border-radius: 6px; padding: 6px 12px;
+        /* manipulation, not none: these are taps and scrolls, never drags,
+           and it kills the double-tap-to-zoom delay. */
+        touch-action: manipulation;
+      }
+      #tpal button.on { background: #14303a; color: #8ee7ff; border-color: #2f6a7f; }
+
+      .tpal-sheet {
+        width: min(720px, 100%); max-height: 46vh; display: flex; flex-direction: column;
+        background: #16161df2; border: 1px solid #3a3a48; border-radius: 8px;
+        box-shadow: 0 14px 40px #000b;
+      }
+      .tpal-hd {
+        display: flex; align-items: center; gap: 8px;
+        padding: 4px 6px 4px 10px;
+      }
+      .tpal-title {
+        font: 600 11px ui-monospace, monospace; color: #fff;
+        letter-spacing: 0.14em; flex: none;
+      }
+      /* The instruments, on their own line: on a 390 px phone they wrap, and
+         wrapping them around a corner-parked × looked like a bug. */
+      .tpal-tools {
+        display: flex; gap: 6px; flex-wrap: wrap;
+        padding: 0 8px 6px; border-bottom: 1px solid #2c2c38;
+      }
+      .tpal-tool { flex: 1 1 auto; }
+      .tpal-close {
+        margin-left: auto; flex: none; min-width: 40px; padding: 6px 10px;
+        font-size: 15px; color: #8a8a98;
+      }
+      /* The category strip scrolls sideways rather than wrapping into three
+         lines on a phone; pan-x so the flick is a scroll, never a page drag. */
+      .tpal-tabs {
+        display: flex; gap: 6px; padding: 6px 8px; overflow-x: auto;
+        touch-action: pan-x; border-bottom: 1px solid #2c2c38;
+      }
+      .tpal-tab { flex: 0 0 auto; color: #9a9aa5; }
+      .tpal-grid {
+        display: grid; gap: 6px; padding: 8px;
+        /* Wide enough for "Potentiometer" and its key badge: two columns on
+           a phone, five on a tablet. Three narrow columns truncated half the
+           catalogue into "Potentio…", which is not a part list. */
+        grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+        overflow-y: auto; touch-action: pan-y; flex: 1 1 auto;
+      }
+      .tpal-part {
+        display: flex; align-items: center; justify-content: space-between; gap: 6px;
+        text-align: left; padding: 6px 8px;
+      }
+      .tpal-pn { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .tpal-key {
+        flex: none; color: #6e6e7e; font-size: 10px; letter-spacing: 0.08em;
+        border: 1px solid #33333f; border-radius: 3px; padding: 0 4px;
+      }
+      .tpal-tier { flex: none; color: #a9862f; font-size: 10px; }
+
+      /* The bar: the launcher, and — while something is armed — the chip
+         that says so. The × is the only exit from an armed tool on glass. */
+      .tpal-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: center; }
+      .tpal-open { background: #0d0d12e6; }
+      .tpal-chip {
+        display: flex; align-items: center; gap: 6px; padding: 3px 4px 3px 10px;
+        background: #14303a; border: 1px solid #2f6a7f; border-radius: 8px;
+        color: #8ee7ff; box-shadow: 0 6px 20px #000a;
+      }
+      .tpal-what { white-space: nowrap; }
+      .tpal-orient { display: flex; gap: 4px; }
+      #tpal .tpal-b { min-height: 34px; padding: 4px 8px; background: #0f2630; border-color: #2f6a7f; }
+      #tpal .tpal-b.on { background: #8ee7ff; color: #0d0d13; border-color: #8ee7ff; }
+      #tpal .tpal-off { background: #2a1c1c; color: #ffb3b3; border-color: #6a3a3a; font-size: 15px; }
+
+      /* ---- the touch selection HUD (touchhud.ts owns the elements). Like
+         the palette, NONE OF IT EXISTS ON A DESKTOP SESSION — the tree is
+         built on the first pointerdown whose pointerType is 'touch'.
+
+         It floats immediately above the palette bar; `bottom` is written from
+         script because the bar wraps to two rows once the armed chip appears
+         and a fixed offset would cut through it. Centred, wrapping, and
+         pointer-events: none between the buttons so the world behind the gaps
+         stays tappable. */
+      #thud {
+        position: fixed; left: 0; right: 0; bottom: 60px; z-index: 28;
+        display: flex; flex-direction: column; align-items: center; gap: 6px;
+        padding: 0 8px; pointer-events: none;
+        font: 12px/1.4 ui-monospace, monospace; color: #c9c9d4;
+        user-select: none; -webkit-user-select: none;
+      }
+      .thud-grp {
+        display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+        justify-content: center; pointer-events: auto;
+        background: #0d0d12e6; border: 1px solid #23232c; border-radius: 10px;
+        padding: 5px 6px; box-shadow: 0 8px 26px #000a;
+      }
+      /* 44 px is the floor the touch literature settles on; below it a
+         mis-tap edits a shared room. */
+      #thud button {
+        min-height: 44px; min-width: 44px; font: 13px/1 ui-monospace, monospace;
+        cursor: pointer; background: #22222c; color: #c9c9d4;
+        border: 1px solid #3a3a48; border-radius: 6px; padding: 6px 8px;
+        touch-action: manipulation;
+      }
+      #thud button.on { background: #14303a; color: #8ee7ff; border-color: #2f6a7f; }
+      #thud .thud-del { background: #2a1c1c; color: #ffb3b3; border-color: #6a3a3a; }
+      #thud .thud-mode { min-width: 74px; font-size: 11px; }
+      #thud .thud-word { min-width: 56px; }
+      .thud-n { color: #8ee7ff; padding: 0 4px; white-space: nowrap; }
+      /* The arrows sit as one cluster so the four of them read as a d-pad
+         rather than as four more verbs. */
+      .thud-nudge { display: flex; gap: 2px; }
+      #thud .thud-arrow { min-width: 40px; padding: 6px 4px; }
+
+      /* Press-and-hold raises the SAME cascade the right button does, at a
+         size a fingertip can actually pick a row out of. */
+      #ctxmenu.touch .ctxpanel { min-width: 208px; font-size: 14px; padding: 6px; }
+      #ctxmenu.touch .mi { min-height: 44px; padding: 6px 12px; }
+      #ctxmenu.touch .hd { padding: 4px 12px 6px; }
+      #ctxmenu.touch .sep { margin: 6px 2px; }
+
       /* ---- rooms: which room am I in, and how do I get to another one
          (rooms.ts owns the elements; this is only their look).
 
@@ -734,6 +924,43 @@
       .rcheck { cursor: pointer; }
       .rcheck > input { flex: none; accent-color: #4ad4ff; }
       .rcheck > span { flex: 1 1 auto; color: #8a8a98; font-size: 11.5px; }
+
+      /* ---- THE PHONE POSTURE ------------------------------------------
+         Every rule below wants a phone held upright, and "under 500 px" is
+         not that: it is also a desktop window somebody dragged narrow, and
+         at 480 px with a mouse this block moved the status plate from
+         [8,8,180] to [8,44,464]. `pointer: coarse` says the primary input
+         cannot aim and `hover: none` says it cannot hover — a phone and a
+         tablet say yes to both, a desktop and a touchscreen laptop do not.
+         Width AND device, or the mouse path is not the mouse path.
+         (touchenv.ts asks the identical question from script, for the three
+         layout defaults that cannot be expressed in CSS.)
+
+         Nothing here redesigns a panel. The rule is REACHABILITY: chrome
+         that covers the world starts folded, and folding is one tap from
+         being undone. */
+      @media (max-width: 500px) and (pointer: coarse) and (hover: none) {
+        /* The status line reserved 320 px of top-right gutter for the room
+           chip. On a 390 px screen that leaves 70 px, so the line rendered
+           as a 90 px stub: "EE Game  ". Put it UNDER the chip instead of
+           beside it and it gets the whole width. */
+        #hud {
+          top: 44px;
+          /* border-box, or the plate's own 20 px of padding and border hang
+             off the right edge of the screen. */
+          box-sizing: border-box;
+          max-width: calc(100vw - 16px - var(--rail-l) - var(--rail-r));
+        }
+        /* A 300 px card on a 320 px phone touches both edges. */
+        .goalcard {
+          width: min(300px, calc(100vw - 20px));
+          right: calc(10px + var(--rail-r));
+        }
+        /* The room browser and the props dialog are already full-bleed; the
+           toasts and chat are the last two fixed blocks sized for a desktop
+           gutter. */
+        #toasts, #chat { max-width: calc(100vw - 24px); width: auto; }
+      }
     </style>
   </head>
   <body>

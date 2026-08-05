@@ -110,6 +110,32 @@ console.log('\none gesture is still one undo entry');
   check('nothing else was recorded', d.history.note() === 'nothing to undo', d.history.note());
 }
 
+// ----------------------------------------- new: a gesture thrown away whole
+console.log('\nan aborted gesture leaves nothing on the undo stack');
+{
+  const d = doc([wire(1, [0, 0], [4, 0])]);
+  // A one-finger part drag, interrupted by a second finger landing: the
+  // gesture's throttled Moves went out, then main.ts put the pins back with a
+  // compensating Move and aborted. ⌘Z must find the edit BEFORE the drag, not
+  // an entry that appears to do nothing.
+  d.edit({ t: 'Move', id: 1, pins: [[9, 9], [13, 9]] }); // an earlier, real edit
+  d.history.begin([d.elements[0]], 'move part');
+  d.edit({ t: 'Move', id: 1, pins: [[10, 9], [14, 9]] });
+  d.edit({ t: 'Move', id: 1, pins: [[11, 9], [15, 9]] });
+  d.edit({ t: 'Move', id: 1, pins: [[9, 9], [13, 9]] }); // the rollback itself
+  d.history.abort();
+  check('the rollback landed', pinsOf(d.elements, 1) === '[[9,9],[13,9]]');
+  d.history.undo(d.elements);
+  check(
+    'one ⌘Z reaches past the aborted gesture to the edit before it',
+    pinsOf(d.elements, 1) === '[[0,0],[4,0]]',
+    `${pinsOf(d.elements, 1)} / ${d.history.note()}`,
+  );
+  d.history.undo(d.elements);
+  check('and there was only ever the one entry', d.history.note() === 'nothing to undo',
+    d.history.note());
+}
+
 console.log('\na stale entry is skipped, not swallowed');
 {
   const d = doc([wire(1, [0, 0], [4, 0]), wire(2, [0, 4], [4, 4])]);

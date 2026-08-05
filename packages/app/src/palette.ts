@@ -1,0 +1,294 @@
+// THE TOUCH PALETTE — the keyboard, for people who do not have one.
+//
+// In this game the hotkey IS the palette: a part is armed by pressing its
+// letter (`PART_HOTKEYS` in main.ts), a tool by pressing k / ⇧W / 1 / 2 / 3,
+// and a tool is dropped with Esc. A phone has none of those keys, so on glass
+// the world could be navigated and rearranged but nothing could ever be
+// BUILT. This file is the missing keyboard: the same catalogue, the same
+// arming call, reachable with a thumb.
+//
+// THREE RULES IT IS BUILT UNDER.
+//
+// 1. IT DOES NOT MOUNT UNTIL A FINGER LANDS. Not `matchMedia('(pointer:
+//    coarse)')` — a touchscreen laptop is a mouse machine until somebody
+//    actually touches the screen, and a palette bar appearing under a
+//    desktop player who owns a keyboard is a regression, not a feature.
+//    Mount happens on the first `pointerdown` whose `pointerType` is
+//    'touch', anywhere in the document, and then never again.
+//
+// 2. IT ARMS, IT NEVER PLACES. Every button here ends in the arming call
+//    main.ts already had — `choosePart`, `armRepair`, the net-label tool —
+//    so the palette and the hotkey put the editor in the SAME state and
+//    there is exactly one placement path to keep working. A second
+//    placement mechanism would drift from the first inside a week.
+//
+// 3. THE PART LIST IS GENERATED FROM THE CATALOGUE. `CATALOG` and
+//    `CATEGORIES` are handed in whole; a new part in catalog.ts is a new
+//    button here with no edit to this file. A hand-written list would rot
+//    the first time somebody added a gate.
+
+import type { PartDef } from './catalog';
+
+/** The single-shot instruments the palette can arm. The three probes have no
+ *  keyboard equivalent that a finger can reach — '1'/'2'/'3' probe whatever
+ *  the MOUSE IS HOVERING, and a finger never hovers — so they are armed here
+ *  and aimed by the next tap. */
+export type ToolId = 'probe-v' | 'probe-i' | 'listen' | 'repair' | 'netname';
+
+const TOOLS: Array<{ id: ToolId; label: string; hint: string }> = [
+  { id: 'probe-v', label: 'probe V', hint: 'voltage probe — then tap a part' },
+  { id: 'probe-i', label: 'probe I', hint: 'current clamp — then tap a part' },
+  { id: 'listen', label: 'listen', hint: 'hear a node — then tap a part' },
+  { id: 'repair', label: 'repair', hint: 'then tap a charred part' },
+  { id: 'netname', label: 'net name', hint: 'then tap a point on the net' },
+];
+
+/** What the armed chip is showing. `orient` is true only while a PART is
+ *  armed: those are the placements whose rotation and mirrors can still be
+ *  chosen, because the part has not landed yet. */
+export interface Armed {
+  label: string;
+  orient: boolean;
+  rot: number;
+  flipX: boolean;
+  flipY: boolean;
+  /** Catalogue name of the armed part, if it is a part — lights its button. */
+  part?: string;
+  /** Which palette tool is armed, if it is a tool — lights its button. */
+  tool?: ToolId;
+}
+
+export interface PaletteHooks {
+  categories: readonly string[];
+  parts: readonly PartDef[];
+  choosePart(p: PartDef): void;
+  armTool(t: ToolId): void;
+  /** The × on the chip. Esc does not exist on a phone and the browser's
+   *  back-swipe must never be load-bearing, so this is the ONLY way out of
+   *  an armed tool on glass — it has to be visible and it has to work. */
+  disarm(): void;
+  rotate(): void;
+  flip(axis: 'x' | 'y'): void;
+}
+
+export interface PaletteUI {
+  /** Called once a frame with whatever is armed right now. Cheap: the DOM is
+   *  only touched when the description actually changes. */
+  sync(a: Armed | null): void;
+  /** Has a finger ever landed? False on every desktop session. */
+  isMounted(): boolean;
+  /** Is the parts sheet open over the bottom of the screen? The selection HUD
+   *  parks itself just above the bar and would sit under the sheet. */
+  sheetOpen(): boolean;
+  owns(t: EventTarget | null): boolean;
+  /** Test seam: mount without waiting for a finger. */
+  mountNow(): void;
+}
+
+export function createPalette(host: HTMLElement, hooks: PaletteHooks): PaletteUI {
+  let root: HTMLElement | null = null;
+  let sheet: HTMLElement | null = null;
+  let grid: HTMLElement | null = null;
+  let chip: HTMLElement | null = null;
+  let chipWhat: HTMLElement | null = null;
+  let rotBtn: HTMLButtonElement | null = null;
+  let fxBtn: HTMLButtonElement | null = null;
+  let fyBtn: HTMLButtonElement | null = null;
+  let orientWrap: HTMLElement | null = null;
+  let openBtn: HTMLButtonElement | null = null;
+  let cat = hooks.categories[0] ?? '';
+  let last = '?'; // signature of the last state painted ('?' matches none)
+  const tabs: HTMLButtonElement[] = [];
+  const toolBtns = new Map<ToolId, HTMLButtonElement>();
+  const partBtns = new Map<string, HTMLButtonElement>();
+
+  /** A button that never keeps focus. Focus would leave the on-screen
+   *  keyboard's Space aimed at a palette button (and Space is the pan
+   *  modifier), and a stuck :focus ring on glass reads as "still armed". */
+  const button = (cls: string, text: string, onTap: () => void) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = cls;
+    b.textContent = text;
+    b.onclick = () => {
+      b.blur();
+      onTap();
+    };
+    return b;
+  };
+
+  function paintTabs() {
+    for (const t of tabs) t.classList.toggle('on', t.dataset.cat === cat);
+  }
+
+  function paintGrid() {
+    if (!grid) return;
+    grid.textContent = '';
+    partBtns.clear();
+    for (const p of hooks.parts) {
+      if (p.cat !== cat) continue;
+      const b = button('tpal-part', '', () => {
+        hooks.choosePart(p);
+        setOpen(false);
+      });
+      const n = document.createElement('span');
+      n.className = 'tpal-pn';
+      n.textContent = p.name;
+      b.appendChild(n);
+      // The hotkey badge is not decoration: a tablet with a keyboard is the
+      // machine this game is most playable on, and the badge is how a touch
+      // player finds out the key exists.
+      const tag = p.key ?? (p.tier ? `T${p.tier}` : '');
+      if (tag) {
+        const k = document.createElement('span');
+        k.className = p.key ? 'tpal-key' : 'tpal-tier';
+        k.textContent = tag;
+        b.appendChild(k);
+      }
+      partBtns.set(p.name, b);
+      grid.appendChild(b);
+    }
+    paintArmedMarks();
+  }
+
+  /** Which button is lit. Both come from the editor's own state, once a
+   *  frame, so a tool dropped by Esc or by a hotkey unlights its button
+   *  here too — the palette never keeps its own idea of what is armed. */
+  let armedName: string | null = null;
+  let armedTool: ToolId | null = null;
+  function paintArmedMarks() {
+    for (const [name, b] of partBtns) b.classList.toggle('on', name === armedName);
+    for (const [id, b] of toolBtns) b.classList.toggle('on', id === armedTool);
+  }
+
+  function setOpen(o: boolean) {
+    if (!sheet || !openBtn) return;
+    sheet.style.display = o ? '' : 'none';
+    openBtn.classList.toggle('on', o);
+    openBtn.textContent = o ? '▾ parts' : '▸ parts';
+  }
+
+  function build() {
+    root = document.createElement('div');
+    root.id = 'tpal';
+
+    sheet = document.createElement('div');
+    sheet.className = 'tpal-sheet';
+    sheet.style.display = 'none';
+
+    const hd = document.createElement('div');
+    hd.className = 'tpal-hd';
+    const title = document.createElement('span');
+    title.className = 'tpal-title';
+    title.textContent = 'PARTS';
+    hd.appendChild(title);
+    hd.appendChild(button('tpal-close', '×', () => setOpen(false)));
+
+    // Instruments get their own row rather than a tab of their own: they are
+    // the verbs a player reaches for while watching a circuit run, and a tab
+    // would put them one hunt away from the thing they measure.
+    const tools = document.createElement('div');
+    tools.className = 'tpal-tools';
+    for (const t of TOOLS) {
+      const b = button('tpal-tool', t.label, () => {
+        hooks.armTool(t.id);
+        setOpen(false);
+      });
+      b.title = t.hint;
+      toolBtns.set(t.id, b);
+      tools.appendChild(b);
+    }
+
+    const tabRow = document.createElement('div');
+    tabRow.className = 'tpal-tabs';
+    for (const c of hooks.categories) {
+      const b = button('tpal-tab', c, () => {
+        cat = c;
+        paintTabs();
+        paintGrid();
+      });
+      b.dataset.cat = c;
+      tabs.push(b);
+      tabRow.appendChild(b);
+    }
+
+    grid = document.createElement('div');
+    grid.className = 'tpal-grid';
+    sheet.append(hd, tools, tabRow, grid);
+
+    // ---- the bar: the launcher, and the armed chip beside it
+    const bar = document.createElement('div');
+    bar.className = 'tpal-bar';
+    openBtn = button('tpal-open', '▸ parts', () => setOpen(sheet!.style.display === 'none'));
+    bar.appendChild(openBtn);
+
+    chip = document.createElement('div');
+    chip.className = 'tpal-chip';
+    chip.style.display = 'none';
+    chipWhat = document.createElement('span');
+    chipWhat.className = 'tpal-what';
+    orientWrap = document.createElement('span');
+    orientWrap.className = 'tpal-orient';
+    rotBtn = button('tpal-b', '⟳ 0°', () => hooks.rotate());
+    rotBtn.title = 'rotate the part being placed (Q)';
+    fxBtn = button('tpal-b', '⇋ X', () => hooks.flip('x'));
+    fxBtn.title = 'mirror left/right (X)';
+    fyBtn = button('tpal-b', '⇅ Y', () => hooks.flip('y'));
+    fyBtn.title = 'mirror up/down (Y)';
+    orientWrap.append(rotBtn, fxBtn, fyBtn);
+    const off = button('tpal-b tpal-off', '✕', () => hooks.disarm());
+    off.title = 'put the tool down (Esc)';
+    chip.append(chipWhat, orientWrap, off);
+    bar.appendChild(chip);
+
+    root.append(sheet, bar);
+    host.appendChild(root);
+    paintTabs();
+    paintGrid();
+  }
+
+  function mountNow() {
+    if (root) return;
+    build();
+  }
+
+  // Rule 1: the first real finger, and nothing else, brings this into being.
+  const onFirstTouch = (ev: PointerEvent) => {
+    if (ev.pointerType !== 'touch') return;
+    window.removeEventListener('pointerdown', onFirstTouch, true);
+    mountNow();
+  };
+  window.addEventListener('pointerdown', onFirstTouch, true);
+
+  function sync(a: Armed | null) {
+    if (!root || !chip || !chipWhat) return;
+    const sig = a
+      ? `${a.label}|${a.orient}|${a.rot}|${a.flipX}|${a.flipY}|${a.part ?? ''}|${a.tool ?? ''}`
+      : '';
+    if (sig === last) return;
+    last = sig;
+    chip.style.display = a ? '' : 'none';
+    if (!a) {
+      armedName = null;
+      armedTool = null;
+      paintArmedMarks();
+      return;
+    }
+    chipWhat.textContent = a.label;
+    orientWrap!.style.display = a.orient ? '' : 'none';
+    rotBtn!.textContent = `⟳ ${a.rot * 90}°`;
+    fxBtn!.classList.toggle('on', a.flipX);
+    fyBtn!.classList.toggle('on', a.flipY);
+    armedName = a.part ?? null;
+    armedTool = a.tool ?? null;
+    paintArmedMarks();
+  }
+
+  return {
+    sync,
+    isMounted: () => root !== null,
+    sheetOpen: () => sheet !== null && sheet.style.display !== 'none',
+    owns: (t) => t instanceof Node && root !== null && root.contains(t),
+    mountNow,
+  };
+}

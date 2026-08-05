@@ -30,6 +30,15 @@
 //   drag from a pin       reshape that part: stretch/shrink/reorient it by
 //                         carrying the pin (wires come from W + drag; pins
 //                         must overlap to connect)
+//   TOUCH: two fingers    the camera, always and in every state — a pinch
+//                         zooms about its own centroid and pans by however far
+//                         that centroid travels, one gesture. A SECOND FINGER
+//                         LANDING CANCELS AND ROLLS BACK whatever the first
+//                         had begun, so a pinch can never half-place a part.
+//                         One finger still means exactly what a mouse press
+//                         means above; there is no keyboard on glass yet, so
+//                         arming a part still needs one (the palette is a
+//                         later stage).
 //   ⌘/Ctrl+C, ⌘/Ctrl+V    copy selection / paste bound to cursor
 //   ⌘/Ctrl+Z, +Shift, ^Y  undo / redo — this player's own edits only
 //   Q                     rotate placement ghost, paste ghost, or selection
@@ -158,6 +167,8 @@ import { createHoist, type MachineRect } from './hoist';
 import { createGfx } from './gfx';
 import { createLesson } from './lesson';
 import { connect, MAX_CHAT_LEN, type RoomHello } from './net';
+import { createPalette, type Armed, type ToolId } from './palette';
+import { createTouchHud } from './touchhud';
 // NOT loadBench/saveBench: the intro branch predates scopes becoming room
 // state, and those two were deleted when the per-browser bench went away.
 import { createRooms } from './rooms';
@@ -1077,6 +1088,17 @@ function toast(text: string) {
   setTimeout(() => el.remove(), 7000);
 }
 
+/** Say it once. A refusal that fires on every tap stacks four copies of
+ *  itself over the schematic and reads as a fault rather than an answer. */
+let toastRepeat: { text: string; at: number } | null = null;
+const TOAST_REPEAT_MS = 3000;
+function toastOnce(text: string) {
+  const now = performance.now();
+  if (toastRepeat && toastRepeat.text === text && now - toastRepeat.at < TOAST_REPEAT_MS) return;
+  toastRepeat = { text, at: now };
+  toast(text);
+}
+
 // ------------------------------------------------------------- room chat
 //
 // Enter opens the input, Enter sends, Escape closes (keeping the draft).
@@ -1823,6 +1845,20 @@ function plateView(): [number, number, number] {
 const cam: Camera = { scale: 48, ox: 60, oy: 60 };
 // Exposed for end-to-end tests.
 (window as unknown as { __cam: Camera }).__cam = cam;
+// Likewise the document. A gesture test has to be able to ask what the pins
+// actually ARE: screenshots cannot answer it (the current dots animate, so two
+// frames of an untouched schematic differ), and "it looked right" is not a
+// measurement. A getter, because `elements` is rebound whenever a room loads.
+Object.defineProperty(window, '__els', { get: () => elements });
+// And the instruments, for the same reason: a probe placed by an armed touch
+// tool draws a flag on a canvas, and a canvas cannot be asked what it means.
+Object.defineProperty(window, '__probes', { get: () => probes });
+// And the selection, for the HUD's sake: "did the rotate button rotate the
+// thing I picked" is two questions, and this is the first of them.
+Object.defineProperty(window, '__sel', { get: () => [...selectedIds] });
+// And the floating instruments, whose rects and timebase are the only proof a
+// wheel over a scope did not become a wheel over the world.
+Object.defineProperty(window, '__scopes', { get: () => floatScopes });
 const dots = new DotFlow();
 let mouse: { x: number; y: number } | null = null;
 
@@ -1840,6 +1876,11 @@ const toPx = (p: Point): [number, number] => [cam.ox + p[0] * cam.scale, cam.oy 
  * 1920 px window (the world is big now); 200 is knee-deep in one symbol. */
 const MIN_SCALE = 0.4;
 const MAX_SCALE = 200;
+/** The zoom at which a fingertip stops being able to name a grid cell: 26 px
+ * of contact over 8 px/unit is more than three cells wide. Placement by touch
+ * is refused below it — see the pointerdown gate. A mouse has no such floor;
+ * it is one pixel wide at every zoom. */
+const TOUCH_BUILD_SCALE = 8;
 
 /** The starter district: joining frames THIS, not the whole document, so a
  * world with a 40k-element city two thousand units east still opens on the
@@ -1980,6 +2021,26 @@ fitHome();
 let placing: PartDef | null = null;
 let placeRot = 0; // 0..3, quarter turns; Q rotates
 
+// ---- the armed instruments, which exist only for fingers
+//
+// '1', '2' and '3' probe WHATEVER THE MOUSE IS HOVERING. A finger does not
+// hover: it is down or it is gone, so those three keys have no translation at
+// all — the only honest one is to arm the instrument first and let the next
+// tap say where. The touch palette arms it, `touchDown`/`touchUp` fire it and
+// `disarmTools` drops it; nothing else in the file reads it, so no mouse or
+// pen gesture can ever reach this state. (Declared up here with the other
+// armed-tool state, not down in the touch block, so `disarmTools` can never
+// be reached before it exists.)
+type TouchTool = 'v' | 'i' | 'listen';
+let touchTool: TouchTool | null = null;
+/** The finger carrying an armed instrument. `live` goes false the moment the
+ *  finger disqualifies itself — by travelling (that is a pan, not an aim) or
+ *  by a second finger joining (two fingers are ALWAYS the camera). Firing on
+ *  the way UP rather than on the way down is what makes that possible. */
+let touchShot: { id: number; x: number; y: number; live: boolean } | null = null;
+/** How far a finger may slide and still count as a tap, in CSS px. */
+const TOUCH_TAP_SLOP = 12;
+
 const ROT_DIRS: Point[] = [
   [1, 0],
   [0, 1],
@@ -2066,6 +2127,10 @@ function disarmTools() {
   layerTool = false;
   layerDrag = null;
   repairing = false;
+  // The touch instruments are armed tools like any other, so Esc, a hotkey
+  // and the palette's × all put them down through this one door. Always null
+  // on a desktop session: only the touch palette can ever set it.
+  touchTool = null;
 }
 
 function choosePart(p: PartDef) {
@@ -2798,6 +2863,57 @@ function armPaste() {
 /** Pointer hit-test slack in px (matches elementAt's threshold). */
 const HIT_PX = 14;
 
+// A MOUSE POINTS AT ONE PIXEL; A FINGER COVERS A HUNDRED OF THEM.
+//
+// 14 px is about 3.7 mm — roughly half the 7–9 mm a fingertip actually
+// occupies, so every radius below is a mouse number and a finger misses with
+// all of them. They are widened for touch and ONLY for touch, keyed off the
+// last pointer that was on the glass: a touchscreen laptop keeps mouse
+// numbers until a finger lands, and goes back to them the moment the mouse
+// moves again. Nothing here is a media query.
+/** Body hit slack under a fingertip. ~7 mm, the low end of the range the
+ *  touch-target literature gives, because this radius also decides what
+ *  counts as EMPTY canvas — and empty canvas is where a finger pans. */
+const HIT_PX_TOUCH = 26;
+/** A pin's grab radius grows with zoom (0.4 of a grid cell) so that zooming
+ *  out never turns a screenful of pins into one mush. Touch keeps that shape
+ *  and only changes the two ends of it: a higher ceiling, and a floor, so a
+ *  terminal is never smaller than a finger can ask for. The floor is what
+ *  makes reshaping possible at all below ~30 px/unit. */
+const PIN_PX_TOUCH_MAX = 26;
+const PIN_PX_TOUCH_MIN = 12;
+/** A probe flag is a 9 px pennant — unhittable with a thumb. 18 and not 26,
+ *  because a flag is pinned 14 px right and 18 px up of the terminal it
+ *  belongs to (`probeFlagPx`), i.e. 22.8 px away, and the flag is tested
+ *  BEFORE the pin in the press chain: any radius past that would make a
+ *  probed part's terminal impossible to grab. */
+const PROBE_PX = 9;
+const PROBE_PX_TOUCH = 18;
+
+/** Was the last pointer to touch this page a finger? Written by a capture
+ *  listener so that no shared handler had to change to answer it. */
+let lastTouch = false;
+const onAnyPointer = (ev: PointerEvent) => {
+  lastTouch = ev.pointerType === 'touch';
+  // And has one EVER? Chrome that was already on the screen before touch
+  // existed — the scope dock's strip, the properties editor — is restyled for
+  // fingers off this class, and it is set once, by a real finger, never by
+  // `matchMedia('(pointer: coarse)')`: a touchscreen laptop keeps its mouse
+  // sizing until somebody actually puts a hand on the glass. Same rule the
+  // touch palette and the touch HUD follow by not existing at all.
+  if (lastTouch) document.documentElement.classList.add('hastouch');
+};
+window.addEventListener('pointerdown', onAnyPointer, true);
+window.addEventListener('pointermove', onAnyPointer, true);
+
+/** Body hit slack for whatever is driving right now. */
+const hitPx = () => (lastTouch ? HIT_PX_TOUCH : HIT_PX);
+/** Pin grab radius for whatever is driving right now. */
+const pinPx = () =>
+  lastTouch
+    ? Math.min(PIN_PX_TOUCH_MAX, Math.max(PIN_PX_TOUCH_MIN, cam.scale * 0.4))
+    : Math.min(HIT_PX, cam.scale * 0.4);
+
 /** Elements whose bbox could reach a cursor point: one bucket query, never
  * a document scan. `padPx` is the hit slack, `padGrid` covers the body
  * distance hitTest allows past the pins. */
@@ -2809,10 +2925,11 @@ function nearCursor(x: number, y: number, padPx: number, padGrid = 1): ElementSp
 }
 
 function elementAt(x: number, y: number): ElementSpec | undefined {
+  const slack = hitPx();
   let best: ElementSpec | undefined;
-  let bestD = HIT_PX;
+  let bestD = slack;
   let bestSeq = Infinity;
-  for (const e of nearCursor(x, y, HIT_PX)) {
+  for (const e of nearCursor(x, y, slack)) {
     const d = hitTest(cam, e, x, y);
     const seq = space.seqOf(e.id);
     // Bucket order is not document order: break exact ties the way the old
@@ -2832,7 +2949,11 @@ function elementAt(x: number, y: number): ElementSpec | undefined {
  * part wins, so the pin you see highlighted is the pin you grab. Fixture
  * children are bolted down and never reshape. */
 function pinOwnerAt(x: number, y: number): { e: ElementSpec; k: number } | null {
-  const r = Math.min(HIT_PX, cam.scale * 0.4);
+  const r = pinPx();
+  // The "selected part wins a shared junction" bias has to be at least as
+  // big as the radius it is competing inside, or a touch-widened radius
+  // quietly loses the tie it was written to win.
+  const bias = lastTouch ? r : HIT_PX;
   let best: { e: ElementSpec; k: number } | null = null;
   let bestScore = r;
   for (const e of nearCursor(x, y, r, 0)) {
@@ -2840,7 +2961,7 @@ function pinOwnerAt(x: number, y: number): { e: ElementSpec; k: number } | null 
     for (let k = 0; k < e.pins.length; k++) {
       const [px, py] = toPx(e.pins[k]!);
       const d = Math.hypot(px - x, py - y);
-      const score = selectedIds.has(e.id) ? d - HIT_PX : d; // selected wins ties
+      const score = selectedIds.has(e.id) ? d - bias : d; // selected wins ties
       if (d < r && score < bestScore) {
         bestScore = score;
         best = { e, k };
@@ -2851,7 +2972,7 @@ function pinOwnerAt(x: number, y: number): { e: ElementSpec; k: number } | null 
 }
 
 function pinAt(x: number, y: number): Point | null {
-  const r = Math.min(HIT_PX, cam.scale * 0.4);
+  const r = pinPx();
   let best: Point | null = null;
   let bestD = r;
   for (const e of nearCursor(x, y, r, 0)) {
@@ -2885,9 +3006,10 @@ function probeFlagPx(p: Probe): [number, number] | null {
 }
 
 function probeAt(x: number, y: number): Probe | undefined {
+  const r = lastTouch ? PROBE_PX_TOUCH : PROBE_PX;
   for (const p of probes) {
     const c = probeFlagPx(p);
-    if (c && Math.hypot(x - c[0], y - c[1]) < 9) return p;
+    if (c && Math.hypot(x - c[0], y - c[1]) < r) return p;
   }
   return undefined;
 }
@@ -2976,6 +3098,16 @@ const ctxIsOpen = () => ctxMenu.style.display === 'block';
 let swallowPointer = false;
 /** One entry per open level; index 0 is the root panel. */
 let ctxPanels: HTMLDivElement[] = [];
+/** This menu was raised by a finger. Two things follow from it: the rows are
+ *  drawn at 44 px, and submenus DO NOT open on `pointerenter`.
+ *
+ *  The second one is not a nicety. A touch `pointerenter` arrives with the
+ *  press, and on a narrow screen the submenu flips back over its own parent —
+ *  so the panel lands under the finger that is still down, and the release
+ *  lands on whatever row of it happens to be there. Measured on a 390 px
+ *  phone: tapping "Switches" armed a Switch. On touch a cascade opens on the
+ *  CLICK, after the finger has already gone. */
+let ctxTouch = false;
 
 function closeCtxMenu() {
   ctxMenu.style.display = 'none';
@@ -3013,7 +3145,7 @@ function openCtxPanel(depth: number, items: MenuItem[], ax: number, ay: number, 
         openCtxPanel(depth + 1, it.sub(), r.right - 3, r.top - 4, r.left);
         row.classList.add('open');
       };
-      row.onpointerenter = openChild;
+      if (!ctxTouch) row.onpointerenter = openChild;
       row.onclick = openChild;
     } else {
       row.className = 'mi';
@@ -3053,8 +3185,13 @@ function openCtxPanel(depth: number, items: MenuItem[], ax: number, ay: number, 
   panel.style.top = `${Math.round(Math.max(4, y))}px`;
 }
 
-function openCtxMenu(x: number, y: number, items: MenuItem[]) {
+/** `touch` widens every row to a fingertip (see `#ctxmenu.touch` in
+ *  index.html). Off by default, so a right-click menu is byte-for-byte the
+ *  menu it has always been. */
+function openCtxMenu(x: number, y: number, items: MenuItem[], touch = false) {
   closeCtxMenu();
+  ctxTouch = touch;
+  ctxMenu.classList.toggle('touch', touch);
   openCtxPanel(0, items, x, y);
 }
 
@@ -3169,8 +3306,37 @@ function probeMenu(p: Probe): MenuItem[] {
   return items;
 }
 
-function canvasMenu(x: number, y: number): MenuItem[] {
+function canvasMenu(x: number, y: number, touch = false): MenuItem[] {
   const items: MenuItem[] = [{ label: 'Add part', sub: partsMenu }];
+  if (touch) {
+    // THE WAY BACK, FOR A HAND THAT HAS NO 'H' KEY. Two fingers can carry the
+    // camera to grid 4000,4000 in a few seconds, and from there nothing on
+    // glass returned: the HUD is pointer-events:none, the room browser does
+    // not recentre, and only a page reload rescued the session. These are the
+    // same two calls the keys make. Above them because a lost player is
+    // looking for an exit, not for a part.
+    // Not added for the mouse: 'h' and '⇧H' are already on the keyboard and
+    // the right-click cascade is a measured, byte-compared surface.
+    items.push(
+      { sep: true },
+      { label: 'Home', hint: 'H', run: fitHome },
+      { label: 'Fit everything', hint: '⇧H', run: fitAll },
+      { label: 'Chat…', hint: '⏎', run: chatOpen },
+      {
+        label: 'Controls',
+        hint: '?',
+        run: () => {
+          hintsOpen = true;
+          try {
+            localStorage.setItem('ee.hints', '1');
+          } catch {
+            /* private mode: the toggle still works for this session */
+          }
+        },
+      },
+      { sep: true },
+    );
+  }
   if (clipboard.length > 0) {
     const n = clipboard.length;
     items.push({ label: `Paste${n > 1 ? ` (${n})` : ''}`, run: () => pasteAt(snap(x, y)) });
@@ -3211,20 +3377,88 @@ function roomsMenu(): MenuItem[] {
   ];
 }
 
+/** WHICH OF THE THREE MENUS BELONGS TO THIS POINT. One function, because the
+ *  right button and a finger's press-and-hold must never disagree about what
+ *  is under them: an instrument beats the part it is clipped to, and a part
+ *  beats the empty sheet. */
+function menuItemsAt(x: number, y: number, touch = false): MenuItem[] {
+  const pr = probeAt(x, y);
+  const e = pr ? undefined : elementAt(x, y);
+  return pr ? probeMenu(pr) : e ? partMenu(e, x, y) : canvasMenu(x, y, touch);
+}
+
 // ------------------------------------------------------------------ drags
 let panDrag: { x: number; y: number; ox: number; oy: number } | null = null;
-/** Dragging one pin of one part: `k` is the pin index being carried. */
-let pinDrag: { id: number; k: number; moved: boolean; lastSent: number } | null = null;
+/** Dragging one pin of one part: `k` is the pin index being carried.
+ *  `startPins` is the shape as the drag found it (after any straightening),
+ *  which is what an interrupted gesture has to be put back to. */
+let pinDrag: {
+  id: number;
+  k: number;
+  moved: boolean;
+  lastSent: number;
+  startPins: Point[];
+} | null = null;
 let placeDrag: { a: Point; b: Point } | null = null;
+
+// THE FINGER IS ON TOP OF THE ONE PIXEL THAT MATTERS.
+//
+// Both drags above carry a POINT — the far end of a part being drawn out, or
+// the terminal being reshaped — and on glass that point is under the pad of
+// the finger placing it, which is the one place it cannot be looked at. So on
+// touch the carried point rides up and to the left of the fingertip, the iOS
+// text-caret / Procreate idiom, with a leader line drawn back to the contact
+// so the relationship is stated rather than guessed at.
+//
+// The offset costs nothing in accuracy because both ends are ALREADY grid
+// snapped: a finger only has to land in the right CELL, never on the right
+// pixel. And it is applied on the MOVE, never on the press — a tap still
+// places exactly where it lands, which is what the palette's tap-to-place
+// was measured doing and must keep doing.
+const TOUCH_GHOST_DX = -48;
+const TOUCH_GHOST_DY = -48;
+/** Where the finger currently running a place/pin drag actually is, so the
+ *  leader line can be drawn from it. Null for every mouse gesture. */
+let touchGhost: { fx: number; fy: number } | null = null;
+
+/** The point a drag is AIMING at: the pointer itself for a mouse or a pen,
+ *  the offset ghost for a finger. Also records the contact for the leader. */
+function aimPx(ev: PointerEvent): [number, number] {
+  if (ev.pointerType !== 'touch') {
+    touchGhost = null;
+    return [ev.clientX, ev.clientY];
+  }
+  touchGhost = { fx: ev.clientX, fy: ev.clientY };
+  return [ev.clientX + TOUCH_GHOST_DX, ev.clientY + TOUCH_GHOST_DY];
+}
+
 /** How a click or sweep combines with what is already selected. Ctrl is taken
  *  by map panning, so SUBTRACT is Alt — the CAD convention (shift adds, alt
  *  removes) and the only free modifier. Shift is strictly ADDITIVE: a careful
  *  multi-select must never evaporate because one shift-click landed wrong. */
 type SelectMode = 'replace' | 'add' | 'remove';
-const selectModeOf = (ev: { shiftKey: boolean; altKey: boolean }): SelectMode =>
-  ev.altKey ? 'remove' : ev.shiftKey ? 'add' : 'replace';
-const modifiedSelect = (ev: { shiftKey: boolean; altKey: boolean }) =>
-  ev.shiftKey || ev.altKey;
+/** SHIFT AND ALT, FOR A HAND WITH NEITHER. A finger cannot hold a modifier
+ *  down while it taps, so the touch HUD offers the same two meanings as a
+ *  sticky mode instead.
+ *
+ *  IT IS A MODIFIER FOR FINGERS AND FOR NOTHING ELSE. "No finger has ever
+ *  landed, so it is always null" was not good enough: a touchscreen laptop
+ *  is one machine with both, and one tap on the HUD's mode button used to
+ *  change what the MOUSE did — permanently, because nothing a mouse can do
+ *  clears it. It skipped the pin-drag, the info badge, the machine body and
+ *  the whole startMove branch, so a part could no longer be moved or
+ *  reshaped by mouse and nothing on screen said why. Both readers below now
+ *  ask the EVENT what kind of pointer it is, so a mouse event cannot see the
+ *  flag at all, whatever a finger did a moment ago. */
+type SelectSrc = { shiftKey: boolean; altKey: boolean; pointerType?: string };
+let touchSelectMode: 'add' | 'remove' | null = null;
+/** The sticky mode, but only for the pointer it belongs to. */
+const stickyMode = (ev: SelectSrc) =>
+  ev.pointerType === 'touch' ? touchSelectMode : null;
+const selectModeOf = (ev: SelectSrc): SelectMode =>
+  ev.altKey ? 'remove' : ev.shiftKey ? 'add' : (stickyMode(ev) ?? 'replace');
+const modifiedSelect = (ev: SelectSrc) =>
+  ev.shiftKey || ev.altKey || stickyMode(ev) !== null;
 
 let marquee: { x0: number; y0: number; x1: number; y1: number; mode: SelectMode } | null = null;
 let moveDrag: {
@@ -3438,6 +3672,728 @@ function endMachineDrag() {
   });
 }
 
+/**
+ * TEAR DOWN EVERY IN-FLIGHT CANVAS GESTURE.
+ *
+ * `pointerup` is not the only way a drag ends. A pointer can be taken away —
+ * capture lost, the OS interrupting, a touch cancelled — and until now that
+ * path cleaned up exactly three gestures (the held button, the machine drag,
+ * the pin drag) and silently abandoned the rest: `moveDrag` left its
+ * `history.begin()` open, so the NEXT edit joined an undo entry labelled "move
+ * part", and `marquee`/`panDrag`/`placeDrag`/`scopeDrag`/the panel and
+ * annotation drags were left dangling. That is a desktop bug — an interrupted
+ * mouse drag leaks an unclosed undo transaction — it simply bites touch first,
+ * because touch is where pointers get taken away.
+ *
+ * Two ways to end, because "the pointer vanished" and "the camera is taking
+ * this gesture over" want opposite things:
+ *
+ *   'commit'   — a lost pointer. Whatever the drag had already done locally
+ *                (and half-sent to the server) is stated outright so the two
+ *                agree. This is what `pointercancel` asks for.
+ *   'rollback' — a second finger landed. The document goes back exactly to
+ *                where the first finger found it and nothing reaches the undo
+ *                stack: a pinch that half-places a resistor is worse than no
+ *                pinch at all.
+ *
+ * Gestures that only ever CREATE something on release (the rect drag-outs, a
+ * part placement) are discarded in both modes — release is the only thing
+ * allowed to add to the document.
+ */
+function endCanvasGestures(mode: 'commit' | 'rollback') {
+  // A momentary pushbutton must never be left stuck closed in a shared room.
+  if (buttonHeld) {
+    interact(buttonHeld, { t: 'SetSwitch', closed: false });
+    buttonHeld = null;
+  }
+  // Nothing here has touched the document yet, so both modes just drop it.
+  panDrag = null;
+  marquee = null;
+  placeDrag = null;
+  layerDrag = null;
+  panelDrag = null;
+  labelBoxDrag = null;
+  // The live-rect gestures below have ALREADY edited their rect locally and
+  // sent throttled increments, so both modes state the final rect: the
+  // reconciling op is the only thing that stops client and server drifting.
+  // (A scope or a label box a few pixels out is not the "half-placed
+  // resistor" the rollback mode exists for.)
+  if (scopeDrag || scopeResize) {
+    const s = scopeDrag?.s ?? scopeResize!.s;
+    scopeDrag = null;
+    scopeResize = null;
+    scopeOp(scopeRectOp(s));
+  }
+  if (panelMove || panelResize) {
+    const plid = panelMove?.plid ?? panelResize!.plid;
+    const p = panels.find((q) => q.plid === plid);
+    if (p) panelOp({ t: 'rect', plid: p.plid, x0: p.x0, y0: p.y0, x1: p.x1, y1: p.y1 });
+    panelMove = null;
+    panelResize = null;
+  }
+  if (labelBoxMove || labelBoxResize) {
+    const blid = labelBoxMove?.blid ?? labelBoxResize!.blid;
+    const b = labelBoxes.find((q) => q.blid === blid);
+    if (b) labelBoxOp({ t: 'rect', blid: b.blid, x0: b.x0, y0: b.y0, x1: b.x1, y1: b.y1 });
+    labelBoxMove = null;
+    labelBoxResize = null;
+  }
+  if (netLabelMove) {
+    const l = netLabels.find((q) => q.nlid === netLabelMove!.nlid);
+    if (l) netLabelOp({ t: 'move', nlid: l.nlid, x: l.x, y: l.y });
+    netLabelMove = null;
+  }
+  if (machineDrag) {
+    if (mode === 'rollback') {
+      const d = machineDrag;
+      d.dx = 0;
+      d.dy = 0;
+      placeMachineDrag(d); // package and children back to the snapshot
+      flushMachineDrag(d); // and tell the server, as the inverse increment
+      machineDrag = null;
+      hoist.setHot(false);
+      canvas.style.cursor = 'default';
+      hoist.endLocalDrag();
+    } else {
+      // A lost pointer must not leave the machine half-moved and un-undoable:
+      // commit where it actually got to, as one entry.
+      endMachineDrag();
+    }
+  }
+  if (pinDrag) {
+    const e = elemById(pinDrag.id);
+    if (mode === 'rollback') {
+      if (pinDrag.moved && e) {
+        e.pins = pinDrag.startPins.map((p) => [...p] as Point);
+        space.update(e);
+        editDoc({ t: 'Move', id: e.id, pins: e.pins }); // inside the open group
+      }
+      history.abort();
+    } else {
+      if (pinDrag.moved && e) editDoc({ t: 'Move', id: e.id, pins: e.pins });
+      history.end();
+    }
+    pinDrag = null;
+  }
+  if (moveDrag) {
+    if (mode === 'rollback') {
+      if (moveDrag.moved) {
+        for (const item of moveDrag.items) {
+          const e = elemById(item.id);
+          if (!e) continue;
+          e.pins = item.startPins.map(([x, y]) => [x, y] as Point);
+          space.update(e);
+          editDoc({ t: 'Move', id: e.id, pins: e.pins });
+        }
+      }
+      history.abort();
+    } else {
+      if (moveDrag.moved) {
+        for (const item of moveDrag.items) {
+          const e = elemById(item.id);
+          if (e) editDoc({ t: 'Move', id: e.id, pins: e.pins });
+        }
+      }
+      // A cancelled drag that never moved is not a click: it selects nothing
+      // and flips no switch. Only `pointerup` may mean "click".
+      history.end();
+    }
+    moveDrag = null;
+  }
+}
+
+// ------------------------------------------------------------------ touch
+// THE CAMERA IS ALWAYS TWO FINGERS. Everything below is reached only from an
+// `ev.pointerType === 'touch'` branch at the top of the four canvas pointer
+// handlers; a mouse or a pen never enters any of it.
+//
+// Pan and zoom are ONE transform, not two gestures: a pinch whose centroid
+// drifts is simultaneously a pan, which is how every canvas app on glass
+// behaves, and splitting them makes the world slide out from under the hand.
+/** Every finger currently down on the canvas, in screen pixels. */
+const touchPts = new Map<number, { x: number; y: number }>();
+/** The two fingers currently driving the camera, plus the centroid and span
+ *  they were last seen at. */
+let touchNav: { a: number; b: number; cx: number; cy: number; d: number } | null = null;
+/** The zoom the current pair of fingers is ASKING for, unclamped — see the
+ *  ratchet note in `touchMove`. Meaningless while `touchNav` is null. */
+let touchNavScale = 1;
+/** How far past MIN/MAX_SCALE that ask may run before it too is pinned. Wide
+ *  enough that a per-event span wobble never saturates it, narrow enough that
+ *  a hard over-pinch costs at most a quarter of a turn to come back. */
+const TOUCH_SCALE_SLACK = 1.25;
+/** True from the moment two fingers claim the camera until the LAST of them
+ *  lifts. The finger left over when a pinch ends never got a `pointerdown` of
+ *  its own, so it must not be handed to the one-finger dispatch mid-air. */
+let touchNavTail = false;
+
+// ---------------------------------------------------- one finger, held down
+//
+// A finger has no right button, no modifier keys and no hover. Three gestures
+// give it back the three things that costs it:
+//
+//   PRESS AND HOLD          → the context menu cascade (the right button)
+//   PRESS, HOLD, THEN DRAG  → marquee select, on empty canvas (the FigJam
+//                             convention — a plain drag on empty now pans,
+//                             because panning is what a finger does most)
+//   DOUBLE-TAP a part       → its properties editor (the missing double-click)
+//
+// All three are synthesised here from pointer events on a timer. NOT from the
+// browser: `contextmenu` never fires on iOS Safari and did not fire in any of
+// the three emulated assessments, and `dblclick` is equally untrustworthy on
+// glass. A gesture the platform might not send is not a gesture.
+
+/** How long a finger must sit still to mean "menu". Long enough not to fire
+ *  under a tap, short enough that nobody wonders whether it is working. */
+const TOUCH_HOLD_MS = 450;
+/** How far it may wobble in that time and still count as still. A fingertip
+ *  rolls a few pixels just being lifted. */
+const TOUCH_HOLD_SLOP = 10;
+/** How far it must travel AFTER the menu opened to mean "marquee, not menu".
+ *  Deliberately larger than the wobble slop: dismissing the menu you just
+ *  asked for by breathing on it is worse than a marquee that starts late. */
+const TOUCH_MARQUEE_SLOP = 24;
+/** How far a press may have wandered and still be allowed to become a hold
+ *  once it goes still again. A thumb settles: it lands, slides a few
+ *  millimetres as the pad flattens, and only then stops. Past this it is a
+ *  drag and it means it. */
+const TOUCH_HOLD_SETTLE = 24;
+/** Double-tap: the second tap must land this soon, and this close. */
+const TOUCH_DTAP_MS = 320;
+const TOUCH_DTAP_PX = 34;
+
+/** The single finger currently running a one-finger gesture — the one the
+ *  existing dispatch is also handling. Null while the camera or an armed
+ *  instrument owns the screen. */
+let touch1: {
+  id: number;
+  /** Where and when it landed. */
+  x: number;
+  y: number;
+  t: number;
+  /** Where the hold timer currently running was armed — the landing point,
+   *  or wherever the finger settled after a drift. The menu opens here. */
+  hx: number;
+  hy: number;
+  /** Has it travelled past the wobble slop? */
+  moved: boolean;
+  /** Did the dispatch below decide this press was on empty canvas? (It said
+   *  so by opening a marquee, which is the one thing only empty canvas does.) */
+  onEmpty: boolean;
+  timer: number;
+  /** The hold fired: the menu is up. */
+  held: boolean;
+  /** The dispatch below must not see the rest of this gesture. */
+  spent: boolean;
+} | null = null;
+/** Set when the finger's only job was to dismiss an open menu — that press
+ *  must not then open another one, nor count as half a double-tap. */
+let touchDismissed = false;
+/** Handed from `touchUp` to the trailing `pointerup` listener, which runs
+ *  AFTER the dispatch has had its say: a properties editor opened before the
+ *  dispatch runs would be opened onto a selection that is about to change. */
+let touchTapEnd: { x: number; y: number } | null = null;
+/** The previous clean tap, for the double-tap window. */
+let touchLastTap: { x: number; y: number; t: number } | null = null;
+
+function cancelTouchHold() {
+  if (touch1 && touch1.timer) {
+    clearTimeout(touch1.timer);
+    touch1.timer = 0;
+  }
+}
+
+/** PRESS AND HOLD = RIGHT-CLICK. Whatever the press had started under the
+ *  finger — carrying a pin, moving a part, sweeping a marquee — is put back
+ *  first: asking what something is must never be an edit. */
+function touchHold() {
+  const t = touch1;
+  if (!t) return;
+  t.timer = 0;
+  // A TOUCHSCREEN LAPTOP HAS BOTH HANDS ON IT. If a mouse has moved or
+  // pressed since this finger landed, the gesture in flight belongs to the
+  // mouse, and rolling it back — or popping a menu over it — would be this
+  // timer editing a document it never touched. A resting finger is not a
+  // question when somebody else is talking.
+  if (!lastTouch) return;
+  t.held = true;
+  t.spent = true;
+  endCanvasGestures('rollback');
+  // While a part is armed the finger belongs to the placement, and the chip's
+  // × is the way out; a scope owns its own chrome. Both mirror the guards the
+  // right button already carries.
+  if (placing || pasting) return;
+  if (scopeZoneAt(t.hx, t.hy)) return;
+  // Anchored down-right of the fingertip, exactly as a mouse menu is anchored
+  // down-right of the cursor, so the finger covers a corner and not a row.
+  openCtxMenu(t.hx + 14, t.hy + 12, menuItemsAt(t.hx, t.hy, true), true);
+}
+
+/** Second canvas `pointerdown` listener, registered after the dispatch, so it
+ *  can read what the dispatch DECIDED rather than re-deriving the hit chain.
+ *  That is the whole trick: `marquee` is set only when the press reached the
+ *  bottom of the chain, i.e. hit nothing — which is the one fact this needs. */
+function touchAfterDown(ev: PointerEvent) {
+  cancelTouchHold();
+  touch1 = null;
+  // The camera, an armed instrument, or a menu dismissal already owns it.
+  if (touchPts.size !== 1 || touchNavTail || touchShot || touchDismissed) return;
+  touch1 = {
+    id: ev.pointerId,
+    x: ev.clientX,
+    y: ev.clientY,
+    hx: ev.clientX,
+    hy: ev.clientY,
+    t: performance.now(),
+    moved: false,
+    onEmpty: !!marquee,
+    timer: 0,
+    held: false,
+    spent: false,
+  };
+  // A momentary pushbutton is MEANT to be held. Popping a menu out from under
+  // a finger that is deliberately holding a doorbell closed would make the
+  // part unusable on glass, so a press that closed a Button never becomes a
+  // press-and-hold. (Its menu is on the HUD's ⋯ instead.)
+  if (buttonHeld) return;
+  touch1.timer = window.setTimeout(touchHold, TOUCH_HOLD_MS);
+}
+
+/** Trailing `pointerup` listener: the double-tap, decided after the dispatch
+ *  has finished selecting. */
+function touchAfterUp() {
+  const end = touchTapEnd;
+  touchTapEnd = null;
+  if (!end) return;
+  // LAYING PARTS DOWN IS NOT ASKING TO EDIT ONE. Two taps 18 px and 150 ms
+  // apart with a resistor armed placed two resistors AND threw the properties
+  // editor over the work, because the double-tap synthesiser never asked what
+  // the taps had just done. While a tool is armed the tap means "place", and
+  // it means that every time.
+  if (placing || pasting || touchTool) {
+    touchLastTap = null;
+    return;
+  }
+  const now = performance.now();
+  const prev = touchLastTap;
+  touchLastTap = { x: end.x, y: end.y, t: now };
+  if (!prev) return;
+  if (now - prev.t > TOUCH_DTAP_MS) return;
+  if (Math.hypot(end.x - prev.x, end.y - prev.y) > TOUCH_DTAP_PX) return;
+  touchLastTap = null; // three taps are one double-tap and a spare
+  const e = elementAt(end.x, end.y);
+  if (!e) return;
+  // A Switch and a Button are OPERATED by tapping them — a double-tap on one
+  // is two presses, and stealing the second to open an editor would make a
+  // toggle unreliable. Their editor is on the HUD's ⋯, like everything else
+  // the long press cannot reach.
+  if (e.kind.t === 'Switch' || e.kind.t === 'Button') return;
+  openPropsDialog(e);
+}
+
+/** One armed instrument, aimed at the part under the finger that just lifted.
+ *  A miss leaves the tool armed: a mis-tap on empty canvas should cost one
+ *  more tap, not a trip back to the palette. */
+function fireTouchTool(x: number, y: number) {
+  const t = touchTool;
+  if (!t) return;
+  const e = elementAt(x, y);
+  if (!e || e.kind.t === 'Ground') {
+    toast(t === 'listen' ? 'tap a part to listen to it' : 'tap a part to probe it');
+    return;
+  }
+  if (t === 'v') toggleProbe(e.id, nearestPin(e, x, y), 'v');
+  else if (t === 'i') toggleProbe(e.id, 0, 'i');
+  else toggleListen(e.id, nearestPin(e, x, y));
+  touchTool = null; // single shot, like the key it replaces
+  canvas.style.cursor = 'default';
+}
+
+// ------------------------------------------------- two fingers, tapped once
+//
+// TWO-FINGER TAP = UNDO, the Procreate/Concepts convention. The whole
+// difficulty is telling it from the first quarter-second of a pinch, and a
+// wrong answer here is an edit nobody asked for — so it is measured on all
+// three axes a pinch moves on at once, and a gesture has to be still on ALL
+// of them to count: the fingers must land and leave inside the window, the
+// pair must not slide, and the gap between them must not change. Anything
+// that fails one of those is a pinch, and a pinch never undoes anything.
+const TOUCH_TWOTAP_MS = 250;
+/** ...and how far the pair may move IN TOTAL, summed over every event, before
+ *  it is a nudge of the view and not a tap.
+ *
+ *  It was 12 px measured as displacement from where the fingers landed, which
+ *  is the same thing a two-finger SHOVE of the view four pixels to the left
+ *  looks like — so shoving the canvas a little silently undid the last edit,
+ *  three times in a row in the measurement that found it. The rule now is:
+ *  if the camera moved at all, that was the point of the gesture. Three
+ *  pixels is what a fingertip rolls while lifting, and nothing more. Undo
+ *  costs a tap of the HUD button when a real tap is read as a shove; a shove
+ *  read as an undo costs a piece of the circuit. */
+const TOUCH_TWOTAP_PX = 3;
+let touchTwoTap: { t: number; cx: number; cy: number; d: number; mv: number } | null = null;
+
+/** Centroid and span of two tracked fingers; null if either has gone. */
+function touchSpan(a: number, b: number) {
+  const p = touchPts.get(a);
+  const q = touchPts.get(b);
+  if (!p || !q) return null;
+  return { a, b, cx: (p.x + q.x) / 2, cy: (p.y + q.y) / 2, d: Math.hypot(p.x - q.x, p.y - q.y) };
+}
+
+/** @returns true when touch has claimed this event and the canvas dispatch
+ *  below must not see it. */
+function touchDown(ev: PointerEvent): boolean {
+  touchPts.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+  if (touchShot) touchShot.live = false; // a second finger is never a tap
+  // Read before the dispatch below clears it: a press whose only job was to
+  // dismiss an open menu is not a press-and-hold and not half a double-tap.
+  touchDismissed = swallowPointer;
+  if (touchPts.size < 2 && !touchNavTail) {
+    if (touchTool) {
+      // The instrument owns this finger: no marquee, no part drag, no
+      // selection change underneath it. It fires (or does not) on the lift.
+      touchShot = { id: ev.pointerId, x: ev.clientX, y: ev.clientY, live: true };
+      return true;
+    }
+    return false; // one finger: today's dispatch
+  }
+  try { canvas.setPointerCapture(ev.pointerId); } catch { /* synthetic pointers */ }
+  if (touchPts.size >= 2) {
+    // THE SECOND FINGER CANCELS THE FIRST. Whatever one finger had begun —
+    // carrying a pin, dragging a part, sweeping a marquee, stretching a new
+    // resistor — is put back before the camera takes over.
+    if (!touchNav) {
+      cancelTouchHold();
+      touch1 = null;
+      endCanvasGestures('rollback');
+    }
+    const ids = [...touchPts.keys()];
+    touchNav = touchSpan(ids[ids.length - 2]!, ids[ids.length - 1]!);
+    touchNavTail = true;
+    // Exactly two fingers, freshly down, is the only thing that can still
+    // become a two-finger tap; a third arriving cancels it outright.
+    touchNavScale = cam.scale;
+    touchTwoTap =
+      touchPts.size === 2 && touchNav
+        ? { t: performance.now(), cx: touchNav.cx, cy: touchNav.cy, d: touchNav.d, mv: 0 }
+        : null;
+  }
+  return true;
+}
+
+function touchMove(ev: PointerEvent): boolean {
+  const p = touchPts.get(ev.pointerId);
+  if (p) {
+    p.x = ev.clientX;
+    p.y = ev.clientY;
+  }
+  if (touchShot && touchShot.id === ev.pointerId) {
+    // A travelling finger is a pan attempt, not an aim. The instrument stays
+    // armed for the next tap; this finger is spent either way, so the canvas
+    // dispatch below must not get it and start a drag halfway through.
+    if (Math.hypot(ev.clientX - touchShot.x, ev.clientY - touchShot.y) > TOUCH_TAP_SLOP) {
+      touchShot.live = false;
+    }
+    return true;
+  }
+  const t1 = touch1;
+  if (t1 && t1.id === ev.pointerId) {
+    const far = Math.hypot(ev.clientX - t1.x, ev.clientY - t1.y);
+    if (!t1.moved && far > TOUCH_HOLD_SLOP) {
+      t1.moved = true;
+      cancelTouchHold();
+      if (t1.onEmpty && marquee) {
+        // ONE FINGER ON EMPTY CANVAS PANS. Panning is what a hand does most
+        // on a canvas it cannot see all of, and empty canvas is the only
+        // place with nothing else to mean; marquee moves to press-and-hold.
+        // Converted on the FIRST MOVE, not on the press, so a plain tap on
+        // empty still reaches the marquee's click branch — which is what
+        // clears the selection and what answers a click inside a camera
+        // layer. The pan anchors at the press point, so nothing jumps.
+        marquee = null;
+        panDrag = { x: t1.x, y: t1.y, ox: cam.ox, oy: cam.oy };
+      }
+    } else if (t1.moved && !t1.held && !panDrag && !buttonHeld) {
+      // A THUMB SETTLES BEFORE IT ASKS. The timer used to be cancelled by the
+      // first millimetre of drift and never re-armed, so a press that
+      // wandered 20 px and then sat perfectly still for most of a second got
+      // a MOVED PART instead of the menu — and press-and-hold is the only
+      // route to Edit…, Copy and Probe on glass, so a failed hold both denied
+      // the verb and edited the document. Re-arm from wherever the finger is
+      // now, for as long as the press is still within a thumb's width of
+      // where it landed. Each move pushes it out again, so the menu arrives
+      // 450 ms after the finger actually STOPS, not 450 ms after it started.
+      // (Not while panning the empty sheet: that gesture is already the
+      // camera's, and it edits nothing.)
+      cancelTouchHold();
+      if (far <= TOUCH_HOLD_SETTLE) {
+        t1.hx = ev.clientX;
+        t1.hy = ev.clientY;
+        t1.timer = window.setTimeout(touchHold, TOUCH_HOLD_MS);
+      }
+    }
+    if (t1.held) {
+      // The menu is up and the finger is still down. Drag it far enough and
+      // the menu was a marquee all along (FigJam): the press point is the
+      // corner it was always anchored at.
+      if (t1.spent && t1.onEmpty && far > TOUCH_MARQUEE_SLOP) {
+        closeCtxMenu();
+        marquee = {
+          x0: t1.x,
+          y0: t1.y,
+          x1: ev.clientX,
+          y1: ev.clientY,
+          mode: selectModeOf({ shiftKey: false, altKey: false, pointerType: 'touch' }),
+        };
+        t1.spent = false; // the dispatch below sweeps it from here
+      }
+      if (t1.spent) return true;
+    }
+  }
+  if (!touchNav) return touchNavTail;
+  if (ev.pointerId !== touchNav.a && ev.pointerId !== touchNav.b) return true; // a third finger
+  const n = touchSpan(touchNav.a, touchNav.b);
+  if (!n) return true;
+  if (touchTwoTap) {
+    // Summed over every event, not measured from where the fingers landed:
+    // a shove is a shove whether it goes out and comes back or not.
+    touchTwoTap.mv +=
+      Math.hypot(n.cx - touchNav.cx, n.cy - touchNav.cy) + Math.abs(n.d - touchNav.d);
+    if (touchTwoTap.mv > TOUCH_TWOTAP_PX) touchTwoTap = null; // it moved: a pinch or a pan
+  }
+  const k = touchNav.d > 0 && n.d > 0 ? n.d / touchNav.d : 1;
+  // THE ZOOM THE FINGERS ARE ASKING FOR, WHICH IS NOT ALWAYS THE ONE THEY GET.
+  //
+  // Pointer events deliver one move per finger, so a perfectly parallel
+  // two-finger PAN still shows the span growing and shrinking on alternate
+  // events. Away from a clamp the pair cancels inside a frame. Against one it
+  // could not: the growing half was clamped away and the shrinking half was
+  // not, so a pan at MAX_SCALE ratcheted the zoom down 2% a frame and
+  // overshot the pan by half again as far (measured: 60 px of finger, 91 px
+  // of camera). Track the span ratio in its own unclamped number and clamp
+  // only the camera: the two halves then cancel exactly, because the ratios
+  // telescope. A little slack past each end absorbs an honest over-pinch
+  // without turning it into dead travel on the way back.
+  const want = Math.min(
+    MAX_SCALE * TOUCH_SCALE_SLACK,
+    Math.max(MIN_SCALE / TOUCH_SCALE_SLACK, touchNavScale * k),
+  );
+  const s2 = Math.min(MAX_SCALE, Math.max(MIN_SCALE, want));
+  // Zoom about the centroid the fingers were on (the same anchor arithmetic
+  // the wheel uses), then carry the camera by however far that centroid
+  // travelled.
+  cam.ox = touchNav.cx - (touchNav.cx - cam.ox) * (s2 / cam.scale);
+  cam.oy = touchNav.cy - (touchNav.cy - cam.oy) * (s2 / cam.scale);
+  cam.scale = s2;
+  cam.ox += n.cx - touchNav.cx;
+  cam.oy += n.cy - touchNav.cy;
+  touchNav = n;
+  touchNavScale = want;
+  return true;
+}
+
+/** Shared by `pointerup` and `pointercancel`: a finger leaving is the same
+ *  event to the camera either way. `tap` is false for a CANCELLED finger —
+ *  the camera does not care, but an armed instrument must not fire on a
+ *  gesture the browser tore up. */
+function touchUp(ev: PointerEvent, tap = true): boolean {
+  touchPts.delete(ev.pointerId);
+  let spent = false;
+  if (touchShot && touchShot.id === ev.pointerId) {
+    if (tap && touchShot.live) fireTouchTool(touchShot.x, touchShot.y);
+    touchShot = null;
+    spent = true;
+  }
+  const t1 = touch1;
+  if (t1 && t1.id === ev.pointerId) {
+    cancelTouchHold();
+    touch1 = null;
+    if (t1.held && t1.spent) {
+      // The menu is up. This finger has already said everything it meant.
+      touchLastTap = null;
+      spent = true;
+    } else if (tap && !t1.moved && !t1.held) {
+      // A clean tap. The trailing pointerup listener decides whether it was
+      // the second half of a double-tap, once the dispatch has selected.
+      touchTapEnd = { x: t1.x, y: t1.y };
+    } else {
+      touchLastTap = null; // a drag is never half a double-tap
+    }
+  }
+  if (touchNav && (ev.pointerId === touchNav.a || ev.pointerId === touchNav.b)) {
+    if (touchTwoTap) {
+      // Both fingers still, and the first of them leaving inside the window:
+      // that was a tap, and a two-finger tap is undo.
+      if (tap && performance.now() - touchTwoTap.t <= TOUCH_TWOTAP_MS) {
+        history.undo(elements);
+        // AND SAY SO. The HUD note this writes is a line of a status strip
+        // that is 997 px of text inside 372 px of screen on a phone, with
+        // overflow hidden — i.e. on the device this gesture exists for, the
+        // only report of an edit disappearing was off the right-hand edge.
+        toast(history.note() || 'undo');
+      }
+      touchTwoTap = null;
+    }
+    // Three fingers down and one lifts: the camera re-anchors on the two that
+    // are left rather than jumping.
+    const ids = [...touchPts.keys()];
+    touchNav = ids.length >= 2 ? touchSpan(ids[0]!, ids[1]!) : null;
+    touchNavScale = cam.scale; // a new pair asks from where the camera IS
+  }
+  const owned = touchNavTail;
+  if (touchPts.size === 0) touchNavTail = false;
+  if (owned) {
+    try { canvas.releasePointerCapture(ev.pointerId); } catch { /* synthetic pointers */ }
+  }
+  return owned || spent;
+}
+
+// ------------------------------------------------------------- the palette
+//
+// THE HOTKEY IS THE PALETTE in this game — a part is armed by pressing its
+// letter — so a phone, which has no letters, could look at the world and
+// rearrange it but never add anything to it. This is that keyboard, drawn.
+//
+// It arms through the SAME calls the keys use (`choosePart`, `armRepair`, the
+// net-label tool), so there is one placement path in the client and not two
+// that drift. It is built from `CATALOG` and `CATEGORIES`, so a new part is a
+// new button with no edit anywhere. And it does not exist at all until a real
+// finger has touched the screen: see palette.ts.
+/** THE FIRST THING A PHONE EVER DID WITH THE PALETTE WAS SAY NO.
+ *
+ *  The demo room opens at 5.27 px per grid unit on a 390x844 screen and the
+ *  build floor is 8, so arming a part and tapping produced a refusal every
+ *  single time — a new player's first two actions were "pick a resistor" and
+ *  "you can't". (A tablet arrives at 11.08 and never saw it.)
+ *
+ *  Arming a part is an unambiguous statement of intent, so honour it: take
+ *  the camera to a zoom where a fingertip can name a cell, about the middle
+ *  of the screen so the thing being looked at stays being looked at, and say
+ *  what happened. Above the floor this does nothing at all — and it is
+ *  reached only from the palette, which no mouse session ever builds. */
+const TOUCH_BUILD_TO = 12;
+function zoomToBuild() {
+  if (cam.scale >= TOUCH_BUILD_SCALE) return;
+  const cx = window.innerWidth / 2;
+  const cy = window.innerHeight / 2;
+  const s2 = TOUCH_BUILD_TO;
+  cam.ox = cx - (cx - cam.ox) * (s2 / cam.scale);
+  cam.oy = cy - (cy - cam.oy) * (s2 / cam.scale);
+  cam.scale = s2;
+  toast('zoomed in far enough to build — two fingers move the view');
+}
+
+const palette = createPalette(document.body, {
+  categories: CATEGORIES,
+  parts: CATALOG,
+  choosePart: (p) => {
+    zoomToBuild();
+    choosePart(p);
+  },
+  armTool: (t: ToolId) => {
+    if (t === 'repair') {
+      armRepair();
+      return;
+    }
+    if (t === 'netname') {
+      disarmTools();
+      netLabelTool = true;
+      placing = null;
+      pasting = null;
+      canvas.style.cursor = 'crosshair';
+      toast('tap a point on the net to name it — a name joins nothing');
+      return;
+    }
+    disarmTools(); // arming is exclusive, exactly as it is for the keys
+    placing = null;
+    pasting = null;
+    closeCtxMenu();
+    touchTool = t === 'probe-v' ? 'v' : t === 'probe-i' ? 'i' : 'listen';
+    toast(
+      t === 'listen' ? 'tap a part to listen to that node' : 'tap a part to put a probe on it',
+    );
+  },
+  // The × on the chip. This is Esc's tool layer, and on glass it is the only
+  // way out: there is no Escape key, and the browser's back-swipe leaves the
+  // room instead of the tool.
+  disarm: () => {
+    placing = null;
+    pasting = null;
+    disarmTools();
+    pendingBoxName = null;
+    pendingNetName = null;
+    canvas.style.cursor = 'default';
+  },
+  // Q and X/Y, for a hand that cannot reach them. Armed-only, like the keys:
+  // with nothing being placed the chip is not on screen to be pressed.
+  rotate: () => {
+    if (placing) placeRot = (placeRot + 1) % 4;
+  },
+  flip: (axis: 'x' | 'y') => {
+    if (!placing) return;
+    if (axis === 'x') placeFlipX = !placeFlipX;
+    else placeFlipY = !placeFlipY;
+  },
+});
+
+/** What the armed chip should be showing this frame — the editor's own state,
+ *  read fresh, so a tool dropped by Esc or armed by a hotkey shows up here
+ *  too. Null means nothing is armed and the chip goes away. */
+function armedForPalette(): Armed | null {
+  const base = { orient: false, rot: placeRot, flipX: placeFlipX, flipY: placeFlipY };
+  if (placing) return { ...base, label: placing.name, orient: true, part: placing.name };
+  if (pasting) return { ...base, label: `paste ${pasting.length}` };
+  if (touchTool === 'v') return { ...base, label: 'probe V', tool: 'probe-v' };
+  if (touchTool === 'i') return { ...base, label: 'probe I', tool: 'probe-i' };
+  if (touchTool === 'listen') return { ...base, label: 'listen', tool: 'listen' };
+  if (repairing) return { ...base, label: 'repair', tool: 'repair' };
+  if (netLabelTool) return { ...base, label: 'net name', tool: 'netname' };
+  if (panelTool) return { ...base, label: 'panel region' };
+  if (labelBoxTool) return { ...base, label: 'label box' };
+  if (layerTool) return { ...base, label: 'camera layer' };
+  return null;
+}
+
+// ------------------------------------------------------- the selection HUD
+//
+// The palette gave a finger a way to ARM a part. This is the other half: the
+// verbs that act on what is already on the sheet, all of which live on a key
+// or a modifier and are therefore unreachable on glass — q, x, y, ⌘C, Delete,
+// the arrows, shift/alt, and ⌘Z. Every button here calls the SAME function
+// the key calls, so there is one implementation of "rotate" in the client.
+//
+// Undo and redo are the two that stand alone, with no selection: a player who
+// has just done something wrong must not have to select something first in
+// order to take it back.
+const touchHud = createTouchHud(document.body, {
+  undo: () => history.undo(elements),
+  redo: () => history.redo(elements),
+  rotate: rotateSelection,
+  flip: flipSelection,
+  copy: copySelection,
+  del: () => deleteIds([...selectedIds]),
+  nudge: (dx, dy) => {
+    nudgeSelection(dx, dy);
+    // One tap, one undo entry. A HELD arrow key is what the open group is
+    // for, and a button cannot be held.
+    endNudge();
+  },
+  more: (x, y) => {
+    const id = [...selectedIds][0];
+    const e = id === undefined ? undefined : elemById(id);
+    if (!e) return;
+    // partMenu's x/y choose which pin "probe voltage" clips to. The gesture
+    // came from a button at the bottom of the screen, so the part's own
+    // middle is the only honest answer.
+    const [bx0, by0, bx1, by1] = boundsPx(e);
+    openCtxMenu(x, y, partMenu(e, (bx0 + bx1) / 2, (by0 + by1) / 2), true);
+  },
+  setMode: (m) => {
+    touchSelectMode = m;
+  },
+});
+
 canvas.addEventListener('wheel', (ev) => {
   ev.preventDefault();
   const z = scopeZoneAt(ev.clientX, ev.clientY);
@@ -3460,17 +4416,7 @@ canvas.addEventListener('contextmenu', (ev) => {
   // already started a pan, do not also pop the menu.
   if (panDrag || placing || pasting) return;
   if (scopeZoneAt(ev.clientX, ev.clientY)) return;
-  const pr = probeAt(ev.clientX, ev.clientY);
-  const e = pr ? undefined : elementAt(ev.clientX, ev.clientY);
-  openCtxMenu(
-    ev.clientX,
-    ev.clientY,
-    pr
-      ? probeMenu(pr)
-      : e
-        ? partMenu(e, ev.clientX, ev.clientY)
-        : canvasMenu(ev.clientX, ev.clientY),
-  );
+  openCtxMenu(ev.clientX, ev.clientY, menuItemsAt(ev.clientX, ev.clientY));
 });
 
 // Click-away closes the menu (and that click does nothing else).
@@ -3486,6 +4432,8 @@ window.addEventListener(
 );
 
 canvas.addEventListener('pointerdown', (ev) => {
+  touchGhost = null; // a new gesture aims from scratch; the leader waits for a move
+  if (ev.pointerType === 'touch' && touchDown(ev)) return; // the camera claimed it
   if (ev.button === 2) return; // right button only ever opens the menu
   if (swallowPointer) {
     swallowPointer = false;
@@ -3547,6 +4495,19 @@ canvas.addEventListener('pointerdown', (ev) => {
     // names whichever label just appeared on that point — resolved at commit
     // time, because online the nlid is the server's to allocate.
     pendingNetName = { x: gx, y: gy, deadline: performance.now() + PENDING_NAME_MS };
+    return;
+  }
+  // ZOOMED THIS FAR OUT, A FINGER IS NOT AIMING, IT IS GUESSING.
+  //
+  // Below ~8 px per grid unit the pad of a thumb spans four or five cells and
+  // the symbols have already dropped their detail, so a placement is a coin
+  // toss over which cell it lands in — and a part in the wrong cell is worse
+  // than no part, because it is wired to the wrong things and has to be found
+  // again to be undone. Refuse, say why, and stay armed so the answer is one
+  // pinch and one tap. Selection, panning and the menus are untouched: LOOKING
+  // at a circuit from far away is exactly what far away is for.
+  if (ev.pointerType === 'touch' && (placing || pasting) && cam.scale < TOUCH_BUILD_SCALE) {
+    toastOnce('zoom in to build — pinch out until the parts have detail');
     return;
   }
   if (pasting) {
@@ -3671,7 +4632,13 @@ canvas.addEventListener('pointerdown', (ev) => {
     const own = pinOwnerAt(ev.clientX, ev.clientY);
     if (own && straightenBeforeDrag(own.e)) {
       history.begin([own.e], GESTURE_LABEL[pinGesture(own.e.kind, own.k)]); // pins mutate in place
-      pinDrag = { id: own.e.id, k: own.k, moved: false, lastSent: 0 };
+      pinDrag = {
+        id: own.e.id,
+        k: own.k,
+        moved: false,
+        lastSent: 0,
+        startPins: own.e.pins.map((p) => [...p] as Point),
+      };
       selectedIds = new Set([own.e.id]);
       selectedProbe = null;
       selectedMachine = false;
@@ -3779,6 +4746,7 @@ canvas.addEventListener('dblclick', (ev) => {
 });
 
 canvas.addEventListener('pointermove', (ev) => {
+  if (ev.pointerType === 'touch' && touchMove(ev)) return; // the camera owns it
   mouse = { x: ev.clientX, y: ev.clientY };
   const now = performance.now();
   if (online && now - lastCursorSent > 50) {
@@ -3901,11 +4869,11 @@ canvas.addEventListener('pointermove', (ev) => {
     return;
   }
   if (placeDrag) {
-    placeDrag.b = snap(ev.clientX, ev.clientY);
+    placeDrag.b = snap(...aimPx(ev));
     return;
   }
   if (pinDrag) {
-    const here = snap(ev.clientX, ev.clientY);
+    const here = snap(...aimPx(ev));
     const e = elemById(pinDrag.id);
     if (e) {
       // TWO TERMINALS ARE A PART; THREE ARE A SYMBOL.
@@ -4048,6 +5016,7 @@ canvas.addEventListener('pointermove', (ev) => {
 });
 
 canvas.addEventListener('pointerup', (ev) => {
+  if (ev.pointerType === 'touch' && touchUp(ev)) return; // a camera finger lifting
   try { canvas.releasePointerCapture(ev.pointerId); } catch { /* synthetic pointers */ }
   if (panDrag) {
     panDrag = null;
@@ -4228,9 +5197,24 @@ canvas.addEventListener('pointerup', (ev) => {
   }
 });
 canvas.addEventListener('pointerleave', () => (mouse = null));
-// A cancelled pointer (touch interrupted, capture lost) must not leave a
-// momentary button stuck closed in a shared room.
-canvas.addEventListener('pointercancel', () => {
+// A cancelled pointer must not leave a momentary button stuck closed in a
+// shared room — nor, on touch, an open `history.begin()` for the next edit to
+// fall into.
+//
+// THE TWO HALVES ARE DELIBERATELY NOT THE SAME CODE. A finger's gesture is
+// torn up by the browser routinely (a pinch starting, a system edge swipe),
+// so touch runs the full teardown and states its result. A MOUSE cancel is
+// rare and the old body was all it ever did; routing it through
+// `endCanvasGestures` reached moveDrag, the scope/panel/label-box rect drags
+// and netLabelMove, i.e. it BROADCAST edits on a gesture this build has
+// always treated as a no-op. The desktop path is not a place to fix a
+// desktop bug inside a touch change: below is main's body, unchanged.
+canvas.addEventListener('pointercancel', (ev) => {
+  if (ev.pointerType === 'touch') {
+    if (touchUp(ev, false)) return;
+    endCanvasGestures('commit');
+    return;
+  }
   if (buttonHeld) {
     interact(buttonHeld, { t: 'SetSwitch', closed: false });
     buttonHeld = null;
@@ -4245,6 +5229,20 @@ canvas.addEventListener('pointercancel', () => {
     history.end();
     pinDrag = null;
   }
+});
+
+// THE TWO TRAILING TOUCH LISTENERS. Registered after the dispatch above, so
+// they run after it — which is the point. `touchAfterDown` needs to know what
+// the press LANDED ON, and the cheapest, most faithful answer to that is what
+// the dispatch itself decided (a marquee means it hit nothing); `touchAfterUp`
+// must not open a properties editor onto a selection the dispatch is about to
+// replace. Neither can be folded into the handlers above without restructuring
+// a chain full of early returns, and every line of that chain is a mouse line.
+canvas.addEventListener('pointerdown', (ev) => {
+  if (ev.pointerType === 'touch') touchAfterDown(ev);
+});
+canvas.addEventListener('pointerup', (ev) => {
+  if (ev.pointerType === 'touch') touchAfterUp();
 });
 
 window.addEventListener('keydown', (ev) => {
@@ -5236,6 +6234,46 @@ function frame(now: number) {
     }
   }
 
+  // THE OFFSET GHOST'S LEADER. The carried point is drawn up and left of the
+  // contact (see `aimPx`); without a line back to the finger the part simply
+  // reads as lagging behind the hand. With one, the offset is the point: this
+  // ring is you, that cross is where the end is going.
+  if (touchGhost && (placeDrag || pinDrag)) {
+    const live = placeDrag
+      ? toPx(placeDrag.b)
+      : (() => {
+          const e = elemById(pinDrag!.id);
+          const p = e?.pins[pinDrag!.k];
+          return p ? toPx(p) : null;
+        })();
+    if (live) {
+      const { fx, fy } = touchGhost;
+      ctx.strokeStyle = '#ffb24d99';
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([3, 4]);
+      ctx.beginPath();
+      ctx.moveTo(fx, fy);
+      ctx.lineTo(live[0], live[1]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      // The contact patch, drawn at the size it actually is, so the reason
+      // for the offset is on screen: this is what your finger is covering.
+      ctx.strokeStyle = '#ffb24d55';
+      ctx.beginPath();
+      ctx.arc(fx, fy, HIT_PX_TOUCH, 0, Math.PI * 2);
+      ctx.stroke();
+      // Crosshair on the snapped point itself — the cell, not the pixel.
+      ctx.strokeStyle = '#ffb24d';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(live[0] - 9, live[1]);
+      ctx.lineTo(live[0] + 9, live[1]);
+      ctx.moveTo(live[0], live[1] - 9);
+      ctx.lineTo(live[0], live[1] + 9);
+      ctx.stroke();
+    }
+  }
+
   if (marquee) {
     ctx.strokeStyle = '#5a8cff';
     ctx.fillStyle = '#5a8cff18';
@@ -5265,6 +6303,20 @@ function frame(now: number) {
   panelHost.setCanvasHover(hover?.id ?? null);
 
   dock.update(now, probes, traces, dockScope, netNames());
+
+  // The armed chip. Pulled once a frame rather than pushed from the dozen
+  // places that arm and disarm, so it cannot go stale — and it is a no-op
+  // both while the palette is unmounted (every desktop session) and while
+  // the description has not changed.
+  palette.sync(armedForPalette());
+  // ...and the strip that acts on the selection, from the same one place, for
+  // the same reason. Hidden only under the open parts sheet, which it would
+  // otherwise sit beneath.
+  touchHud.sync({
+    count: selectedIds.size,
+    mode: touchSelectMode,
+    hidden: palette.sheetOpen(),
+  });
 
   // Deliberately NO hover readout: voltages, currents and power are only
   // visible through probes, scopes and panel meters — placing an instrument

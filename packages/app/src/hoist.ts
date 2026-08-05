@@ -64,6 +64,7 @@ import type { MachineFrame, MachineMsg } from './machines/seam';
 import type { ElemLive, ElementSpec } from './circuit';
 import type { Camera, DamageState, DotFlow } from './render';
 import { fmtEng } from './units';
+import { phonePosture } from './touchenv';
 
 export type { MachineMsg } from './machines/seam';
 
@@ -349,7 +350,14 @@ function buildCard(root: HTMLElement, reset: () => void): Card {
   };
   applyTab();
 
-  let open = readLS(OPEN_KEY) !== '0'; // starts expanded; choice is remembered
+  // Starts expanded, and the choice is remembered — EXCEPT on a screen too
+  // narrow to give it away for free. The card is 300x330; on a 390x844 phone
+  // that is a fifth of the world, permanently, over the very schematic the
+  // card is about. In the phone posture (touchenv.ts — a narrow window is
+  // not a phone) it starts as its own title bar, and one
+  // tap on that bar opens it exactly as it always did. A stored choice still
+  // wins: fold it or unfold it on the phone and the phone remembers.
+  let open = (readLS(OPEN_KEY) ?? (phonePosture() ? '0' : '1')) !== '0';
   const apply = () => {
     el.classList.toggle('collapsed', !open);
     caret.textContent = open ? '▾' : '▸';

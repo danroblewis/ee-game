@@ -30,6 +30,12 @@ import {
 import { fmtEng } from './units';
 
 const BAR_PX = 24;
+/** ...and how tall it is once a finger has been seen. The strip is the only
+ * control for the phone's primary instrument and it measured 46x24 — half a
+ * fingertip. It grows exactly once, on the first touch pointer, so a desktop
+ * session (touchscreen laptop included, until somebody actually touches it)
+ * keeps the 24 px strip it has always had. */
+const BAR_PX_TOUCH = 44;
 const MIN_H = 120;
 const MAX_H = 520;
 const DEFAULT_H = 190;
@@ -222,6 +228,7 @@ export function createDock(root: HTMLElement, cv: HTMLCanvasElement, audio: Audi
     return live;
   }
 
+  let barPx = BAR_PX;
   let open = read(OPEN_KEY) === '1'; // collapsed unless explicitly opened before
   let height = clampH(Number(read(HEIGHT_KEY)) || DEFAULT_H);
   let lastSumT = -Infinity;
@@ -240,7 +247,7 @@ export function createDock(root: HTMLElement, cv: HTMLCanvasElement, audio: Audi
   function apply() {
     const showTraces = open && hasProbes;
     root.classList.toggle('collapsed', !showTraces);
-    publishHeight(showTraces ? height : BAR_PX);
+    publishHeight(showTraces ? height : barPx);
     caret.style.display = hasProbes ? '' : 'none';
     caret.textContent = showTraces ? 'scope ▾' : 'scope ▴';
   }
@@ -258,7 +265,7 @@ export function createDock(root: HTMLElement, cv: HTMLCanvasElement, audio: Audi
     if (ev.button !== 0) return;
     ev.preventDefault();
     ev.stopPropagation();
-    drag = { y: ev.clientY, h: open ? height : BAR_PX, moved: false };
+    drag = { y: ev.clientY, h: open ? height : barPx, moved: false };
     bar.setPointerCapture(ev.pointerId);
   });
   bar.addEventListener('pointermove', (ev) => {
@@ -278,6 +285,18 @@ export function createDock(root: HTMLElement, cv: HTMLCanvasElement, audio: Audi
     else setOpen(!open);
   });
   bar.addEventListener('pointercancel', () => (drag = null));
+
+  // The strip is a finger target from the first finger onwards, and not one
+  // second before. (index.html's `html.hastouch` rules restyle the same two
+  // elements; this is the half that has to be a number, because the collapsed
+  // height is published as a CSS variable the rails are laid out against.)
+  const onFirstTouch = (ev: PointerEvent) => {
+    if (ev.pointerType !== 'touch') return;
+    window.removeEventListener('pointerdown', onFirstTouch, true);
+    barPx = BAR_PX_TOUCH;
+    apply();
+  };
+  window.addEventListener('pointerdown', onFirstTouch, true);
 
   /** Probe count plus each channel's latest value in its probe colour. */
   function updateSummary(probes: Probe[], traces: TraceStore, netNames?: NetNames) {

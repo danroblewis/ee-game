@@ -23,6 +23,7 @@
 
 import type { ElementSpec, ElemLive } from './circuit';
 import type { MachineMsg } from './machines/seam';
+import { phonePosture } from './touchenv';
 
 export interface LessonDeps {
   elements(): ElementSpec[];
@@ -446,7 +447,12 @@ export function createLesson(root: HTMLElement, deps: LessonDeps): LessonUI {
 
   // Collapse state is per-course, not per-room: fold it once, it stays folded.
   const OPEN_KEY = 'ee.lesson.open';
-  let open = lsGet(OPEN_KEY) !== '0';
+  // And on a phone it starts folded, for the same reason the hoist's goal
+  // card does: a 300 px card anchored over a 390 px world is not a hint, it
+  // is a lid. The header tap that opens it is already the whole affordance.
+  // (What counts as a phone lives in touchenv.ts: a narrow desktop window
+  // is not one, and it used to be treated as one.)
+  let open = (lsGet(OPEN_KEY) ?? (phonePosture() ? '0' : '1')) !== '0';
   const applyOpen = () => {
     el.classList.toggle('collapsed', !open);
     caret.textContent = open ? '▾' : '▸';

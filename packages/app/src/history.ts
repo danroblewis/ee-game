@@ -179,6 +179,20 @@ export class History {
     if (g) this.commit(g);
   }
 
+  /**
+   * Throw the current gesture away instead of committing it: the caller has
+   * already put the document back where the gesture found it (a second finger
+   * landed and the camera took the gesture over), so there is nothing left for
+   * ⌘Z to undo. Without this the rollback's own compensating Move would land
+   * on the undo stack as an entry that appears to do nothing.
+   *
+   * The compensating edits must be issued BEFORE this call, while the group is
+   * still open, or `record` will commit each one as an entry of its own.
+   */
+  abort(): void {
+    this.group = null;
+  }
+
   /** Record a locally issued op. Call from `editDoc`, before applying it. */
   record(op: DocOp, elements: ElementSpec[]): void {
     if (this.replaying) return;
