@@ -83,6 +83,7 @@ mod slew;
 mod tr808;
 mod vco555;
 mod bass;
+mod ms20;
 #[cfg(test)]
 mod roombench;
 
