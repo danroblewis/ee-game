@@ -276,6 +276,10 @@ const LOGIC: &[Tier] = &[
     Tier::new("DIP-14 74HC", Power, 0.35, 3.0),
     Tier::new("DIP-16 74HC wide", Power, 0.5, 4.0),
 ];
+/// The bucket brigade. Rated like the 555 it sits beside: a DIP-8 analog
+/// chip whose supply and output pins are modelled, so the frame's power is
+/// genuinely its own dissipation and needs no exception.
+const BBD: &[Tier] = &[Tier::new("DIP-8 bucket brigade", Power, 0.35, 3.0)];
 const SUPPLY: &[Tier] = &[Tier::new("battery pack", Current, 2.0, 20.0)];
 
 /// The tier ladder for a kind, lowest rung first. Empty means the kind has
@@ -352,6 +356,7 @@ pub fn tiers(kind: &ElementKind) -> &'static [Tier] {
         // The 555 was always honest: its VCC and GND pins ARE modelled, so
         // the frame's power really is the chip's own dissipation.
         K::Timer555 => TIMER555,
+        K::Bbd { .. } => BBD,
         // The logic family inherits that sentence verbatim, and goes one
         // better: its model is a pure positive-conductance network between
         // modelled supply pins, so `Σ v·i` is not merely its own dissipation
@@ -458,6 +463,7 @@ pub fn kind_name(kind: &ElementKind) -> &'static str {
         K::OpAmp { .. } => "Op-amp",
         K::Ota => "OTA",
         K::Timer555 => "555",
+        K::Bbd { .. } => "BBD",
         K::Potentiometer { .. } => "Potentiometer",
         K::Photocell { .. } => "Photocell",
         K::Motor { .. } => "Motor",

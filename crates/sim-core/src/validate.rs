@@ -762,6 +762,16 @@ fn check_kind(kind: &ElementKind) -> Result<(), &'static str> {
             }
             Ok(())
         }
+        K::Bbd { stages } => {
+            // A one-bucket "delay" is a wire with extra steps, and the upper
+            // bound is what keeps a document from asking for a gigabyte of
+            // buckets. Both ends are the document's problem, not the
+            // solver's, so they are refused here rather than clamped.
+            if !(2..=crate::MAX_BBD_STAGES).contains(&stages) {
+                return Err("a bucket brigade is 2 to 4096 stages");
+            }
+            Ok(())
+        }
         K::Counter { bits, modulus } => {
             if !(2..=4).contains(&bits) {
                 return Err("a counter is 2 to 4 bits wide");

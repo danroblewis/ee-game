@@ -722,6 +722,115 @@ impl ElemFrame {
 /// convergence verdict, no quarantine. That is what makes stepping them in
 /// any order — or on any number of threads — bit-identical to stepping them
 /// in this one.
+/// Clock thresholds for a BBD's CLK pin, in volts above its GND pin.
+///
+/// Absolute rather than supply-relative because the part has no supply pin:
+/// a bucket brigade's clock is an external square wave, and these are the
+/// levels a CMOS driver running on 5 V comfortably clears. The gap is the
+/// hysteresis, so a slow or noisy clock edge still produces exactly one
+/// transition instead of a burst of them.
+const BBD_CLK_HI: f64 = 2.0;
+const BBD_CLK_LO: f64 = 1.0;
+/// Tether on a BBD's IN and CLK pins, in siemens (1 uS = 1 MΩ).
+///
+/// These pins draw essentially nothing — a real bucket brigade's input is a
+/// MOS gate — but "essentially nothing" and "no path at all" are different
+/// things to a matrix: an unconnected input with no route anywhere makes the
+/// row singular. Same tether an op-amp input carries, and small enough that
+/// it never loads what drives it.
+const BBD_G_IN: f64 = 1e-6;
+
+/// A bucket chain: the samples, where the next one lands, and enough to undo
+/// the most recent write.
+#[derive(Clone, Debug)]
+struct DelayLine {
+    /// One entry per bucket. Power-up state is all zeros, which is a real,
+    /// defined state (an uncharged chain), not a sentinel.
+    buf: Vec<f64>,
+    /// Where the NEXT sample is written, which is also where the OLDEST
+    /// sample currently sits — that coincidence is the whole trick, and it
+    /// is why the read costs nothing.
+    w: usize,
+    /// `(index, value)` of the last write, so a rejected step can be undone
+    /// in O(1). Without this the rescue ladder would have to snapshot the
+    /// whole buffer every step, which is the one thing that would make a
+    /// long delay expensive.
+    undo: Option<(usize, f64)>,
+}
+
+#[cfg(test)]
+mod delay_line_tests {
+    use super::DelayLine;
+
+    /// The chain is FIFO and the read costs nothing because `w` is both the
+    /// write slot and the oldest sample.
+    #[test]
+    fn a_chain_is_first_in_first_out() {
+        let mut d = DelayLine::new(3);
+        // A fresh chain is full of its power-up zeros, so the first three
+        // pushes get those back.
+        assert_eq!(d.shift(1.0), 0.0);
+        assert_eq!(d.shift(2.0), 0.0);
+        assert_eq!(d.shift(3.0), 0.0);
+        // ...and then what was put in, in order.
+        assert_eq!(d.shift(4.0), 1.0);
+        assert_eq!(d.shift(5.0), 2.0);
+        assert_eq!(d.shift(6.0), 3.0);
+    }
+
+    /// Rollback restores the exact pre-shift chain, which is what a rejected
+    /// step needs. Without it a rescue would leave a sample in the line and
+    /// the delay would lengthen by one bucket every time the solver
+    /// struggled.
+    #[test]
+    fn rollback_undoes_exactly_one_shift() {
+        let mut d = DelayLine::new(4);
+        for v in [1.0, 2.0, 3.0, 4.0] {
+            d.shift(v);
+        }
+        let before = (d.buf.clone(), d.w);
+        d.shift(99.0);
+        assert_ne!((d.buf.clone(), d.w), before, "the shift must have done something");
+        d.rollback();
+        assert_eq!((d.buf.clone(), d.w), before, "rollback must restore it exactly");
+        // Idempotent: a second rollback is not a second step backwards, so a
+        // rescue that recurses cannot walk the chain backwards.
+        d.rollback();
+        assert_eq!((d.buf, d.w), before);
+    }
+}
+
+impl DelayLine {
+    fn new(stages: usize) -> Self {
+        DelayLine {
+            buf: vec![0.0; stages.max(2)],
+            w: 0,
+            undo: None,
+        }
+    }
+
+    /// Push one sample in, return the one that falls out the far end.
+    fn shift(&mut self, v: f64) -> f64 {
+        let i = self.w;
+        self.undo = Some((i, self.buf[i]));
+        // Read BEFORE the write: `w` holds the oldest sample, and the new one
+        // takes its place.
+        let out = self.buf[i];
+        self.buf[i] = v;
+        self.w = if i + 1 == self.buf.len() { 0 } else { i + 1 };
+        out
+    }
+
+    /// Undo the most recent `shift`. Idempotent: a step that shifted nothing
+    /// has nothing to undo, and undoing twice is not a second rollback.
+    fn rollback(&mut self) {
+        if let Some((i, v)) = self.undo.take() {
+            self.buf[i] = v;
+            self.w = i;
+        }
+    }
+}
+
 pub struct Island {
     /// Elements that take part in the solve occupy `0..active`; the rest
     /// (wires, grounds, broken parts, parts with every pin on ground) are
@@ -774,6 +883,19 @@ pub struct Island {
     /// backward-Euler steps it takes after a switch flip. A waveform edge
     /// arms them exactly the same way, and for exactly the same reason.
     edge_sources: Vec<usize>,
+    /// Bucket chains, keyed by ELEMENT ID rather than by document index.
+    ///
+    /// Deliberately a side table and not a field on `CompiledElem`:
+    ///
+    /// * keying by id means a chain survives `compile()` for free, exactly
+    ///   as `old_state` does. Editing anything else in the room must not
+    ///   empty a delay line that is mid-echo;
+    /// * `CompiledElem` stays small and `Copy`-ish, so the rescue ladder's
+    ///   per-step state snapshot does not clone thousands of samples. A
+    ///   delay only ever writes ONE sample per clock edge, so its rollback
+    ///   is the single overwritten value (see `DelayLine::undo`) rather than
+    ///   a copy of the buffer.
+    delays: BTreeMap<u32, DelayLine>,
     be_steps: u32,
     quarantined: bool,
     /// Count of numeric factorizations since construction (instrumentation
@@ -845,6 +967,11 @@ pub struct Engine {
     /// instrumentation counter keeps meaning "since construction" across
     /// edits (which rebuild the partition from scratch).
     retired_factorizations: u64,
+    /// Bucket chains in transit between `take_doc` (which dismantles the
+    /// islands) and `rebuild` (which re-homes them). Empty at every other
+    /// moment; anything still in here after a rebuild belonged to a part
+    /// that no longer exists, and is dropped with it.
+    orphan_delays: BTreeMap<u32, DelayLine>,
     dt: f64,
     time: f64,
     tuning: Tuning,
@@ -872,6 +999,7 @@ impl Engine {
             order: Vec::new(),
             junctions: Vec::new(),
             retired_factorizations: 0,
+            orphan_delays: BTreeMap::new(),
             dt,
             time: 0.0,
             tuning: Tuning::default(),
@@ -1193,6 +1321,14 @@ impl Engine {
     /// retired into the engine's running total first.
     fn take_doc(&mut self) -> Vec<CompiledElem> {
         let mut islands = core::mem::take(&mut self.islands);
+        // Rescue the bucket chains on the way past. This has to happen HERE
+        // and not in `rebuild`: by the time rebuild runs, the line above has
+        // already emptied `self.islands`, so a harvest there reads nothing
+        // and every edit silently drops every delay line. (Measured: an edit
+        // mid-flight pushed a 25.6 ms delay's arrival from 768 substeps to
+        // 1285 — a full refill — which is exactly what that looks like.)
+        self.orphan_delays
+            .extend(islands.iter_mut().flat_map(|i| core::mem::take(&mut i.delays)));
         self.retired_factorizations += islands.iter().map(|i| i.factorizations).sum::<u64>();
         let mut slots: Vec<Vec<Option<CompiledElem>>> = islands
             .iter_mut()
@@ -1427,6 +1563,12 @@ impl Engine {
     /// Wire closure, node numbering, island partition and per-island unknown
     /// layout. Everything downstream of this is per island.
     fn rebuild(&mut self, mut doc: Vec<CompiledElem>) {
+        // Bucket chains are keyed by id and must OUTLIVE a recompile: wiring
+        // a resistor in somewhere else must not empty a delay line that is
+        // mid-echo. `take_doc` stashed them here on its way past, because it
+        // is the thing that dismantles the islands; whatever is left over
+        // after this belonged to parts that are gone, and is dropped.
+        let mut old_delays = core::mem::take(&mut self.orphan_delays);
         // 1. Junctions: unique endpoints, interned in first-seen order.
         //
         //    The index a point gets is exactly the one a linear scan would
@@ -1784,8 +1926,27 @@ impl Engine {
                     _ => false,
                 })
                 .collect();
+            // Re-home this island's chains. A part whose `stages` CHANGED
+            // gets a fresh chain rather than a reinterpreted one: the old
+            // samples were taken at a different tap position and replaying
+            // them at a new length would be audible nonsense.
+            let delays: BTreeMap<u32, DelayLine> = elems
+                .iter()
+                .filter_map(|e| match e.spec.kind {
+                    ElementKind::Bbd { stages } => {
+                        let want = (stages as usize).max(2);
+                        let dl = old_delays
+                            .remove(&e.spec.id)
+                            .filter(|d| d.buf.len() == want)
+                            .unwrap_or_else(|| DelayLine::new(want));
+                        Some((e.spec.id, dl))
+                    }
+                    _ => None,
+                })
+                .collect();
             islands.push(Island {
                 elems,
+                delays,
                 active,
                 num_nodes,
                 num_branches,
@@ -2439,6 +2600,16 @@ impl Island {
                 for (e, s) in self.elems[..self.active].iter_mut().zip(saved.iter()) {
                     e.state = *s;
                 }
+                // ...and un-shift any bucket chain that moved during the step
+                // being thrown away. Without this a rejected step leaves its
+                // sample in the line permanently and the delay lengthens by
+                // one bucket per rescue — a slow, silent drift that no
+                // voltage assertion would ever notice. O(1) per chain and
+                // idempotent, so the half-steps the ladder takes next record
+                // and undo their own writes independently.
+                for line in self.delays.values_mut() {
+                    line.rollback();
+                }
                 // The rollback restores discrete state (`region` lives in
                 // `ElemState`), so the retained factorization may now
                 // describe a region set that no longer exists. Drop it
@@ -2706,6 +2877,41 @@ impl Island {
                         self.a[(node[0] - 1) * n + bi] += 1.0;
                     }
                     self.b[bi] = v;
+                }
+                ElementKind::Bbd { .. } => {
+                    // Pins [IN, OUT, CLK, GND].
+                    //
+                    // Nothing about the bucket chain appears here. What the
+                    // matrix sees is one ideal voltage source holding the
+                    // sample that fell out of the far end, plus two
+                    // high-impedance inputs — the same shape as the motor,
+                    // and for the same reason: the state lives outside the
+                    // matrix and only ever writes the RHS.
+                    //
+                    // The held sample rides in `v_prev`, which puts it in the
+                    // state digest and in the rescue ladder's snapshot for
+                    // free.
+                    let bi = self.num_nodes + branch.ok_or(())?;
+                    let (vin, vout, vclk, vgnd) = (node[0], node[1], node[2], node[3]);
+                    if need_factor {
+                        // OUT is driven against GND, not against node 0: the
+                        // output current has to come out of the part's own
+                        // ground pin, the way the 555's does, or it appears
+                        // from nowhere and KCL stops meaning anything.
+                        for (pin, sgn) in [(vout, 1.0), (vgnd, -1.0)] {
+                            if pin > 0 {
+                                self.a[bi * n + (pin - 1)] += sgn;
+                                self.a[(pin - 1) * n + bi] += sgn;
+                            }
+                        }
+                        // IN and CLK draw ~nothing, but they may not FLOAT:
+                        // an unconnected input with no path to anywhere is a
+                        // singular row. This is the same 1 MΩ-ish tether an
+                        // op-amp input gets.
+                        self.stamp_g(vin, vgnd, BBD_G_IN);
+                        self.stamp_g(vclk, vgnd, BBD_G_IN);
+                    }
+                    self.b[bi] = state.v_prev;
                 }
                 ElementKind::Motor {
                     ohms,
@@ -3317,6 +3523,12 @@ impl Island {
 
     /// Commit device history and pin currents from the solved unknowns.
     fn accept(&mut self, h: f64, be: bool) {
+        // (element slot, id, freshly sampled input). Collected rather than
+        // applied inline because the chain lives in `self.delays` while the
+        // loop below holds `self.elems` mutably — and because a shift is a
+        // once-per-step event that has no business happening inside a
+        // per-element borrow.
+        let mut bbd_shifts: Vec<(usize, u32, f64)> = Vec::new();
         // The logic family's discrete state moves HERE rather than in
         // `update_guesses`, so it needs the `accept`-time analogue of
         // `discrete_flip`: a chip that changed state has changed the matrix,
@@ -3357,6 +3569,7 @@ impl Island {
             for (k, v) in vs.iter_mut().enumerate() {
                 *v = self.xv(node[k]);
             }
+            let eid = self.elems[ei].spec.id;
             let st = &mut self.elems[ei].state;
             let mut two = |i: f64| {
                 st.pin_i = [0.0; MAX_PINS];
@@ -3416,6 +3629,35 @@ impl Island {
                     // return leg lives in ground and has no pin to report.
                     st.pin_i = [0.0; MAX_PINS];
                     st.pin_i[0] = bi_val.unwrap_or(0.0);
+                }
+                ElementKind::Bbd { .. } => {
+                    // Pins [IN, OUT, CLK, GND]. Runs ONCE PER ACCEPTED STEP,
+                    // which is the whole reason it is here and not in the
+                    // stamp: a shift is a state change, and Newton may visit
+                    // a stamp several times for one step in a room that also
+                    // contains a diode.
+                    let i = bi_val.unwrap_or(0.0);
+                    let vgnd = vs[3];
+                    // Schmitt on the clock, so one slow or noisy edge is one
+                    // transition and not a burst.
+                    let hi = if dbit(st.dstate, D_CLK_PREV) {
+                        vs[2] - vgnd > BBD_CLK_LO
+                    } else {
+                        vs[2] - vgnd > BBD_CLK_HI
+                    };
+                    if hi != dbit(st.dstate, D_CLK_PREV) {
+                        // EVERY transition moves one stage, so a full cycle
+                        // moves two — which is what a real two-phase device
+                        // does, and is what makes the delay the datasheet's
+                        //     t = stages / (2 * f_clock).
+                        bbd_shifts.push((ei, eid, vs[0] - vgnd));
+                        dset(&mut st.dstate, D_CLK_PREV, hi);
+                    }
+                    // Current flows at the OUT pin (sourced from GND); the
+                    // two high-impedance inputs carry ~nothing worth naming.
+                    st.pin_i = [0.0; MAX_PINS];
+                    st.pin_i[1] = i;
+                    st.pin_i[3] = -i;
                 }
                 ElementKind::Motor { .. } => {
                     // The armature current is the branch unknown; it is also
@@ -3651,6 +3893,25 @@ impl Island {
             // is the correct integrator for it anyway.
             self.be_steps = self.be_steps.max(BE_STEPS_AFTER_EVENT);
         }
+
+        // Bucket chains move last, once the loop has released `self.elems`.
+        //
+        // The sample that falls out becomes the OUTPUT the next stamp holds,
+        // and it lands in `v_prev` — which is why the chain itself never has
+        // to be in the state digest for the output to be reproducible, and
+        // why the rescue ladder already snapshots the thing that matters.
+        for (ei, id, sample) in bbd_shifts.drain(..) {
+            let Some(line) = self.delays.get_mut(&id) else {
+                continue;
+            };
+            let out = line.shift(sample);
+            self.elems[ei].state.v_prev = out;
+            // A shifted chain has moved the RHS, so the next substep must
+            // re-solve rather than coast on a retained factorization. The
+            // matrix itself is untouched (this is an RHS-only device, like
+            // the motor), so this does NOT force a refactorization.
+            self.discrete_moved = true;
+        }
     }
 
     /// Deterministic digest of this island's state, for a caller checking
@@ -3679,6 +3940,18 @@ impl Island {
             for p in 0..np {
                 put(e.state.lastv[p]);
                 put(e.state.pin_i[p]);
+            }
+            // The bucket chain. A delay line whose CONTENTS differ is a
+            // different machine even when every terminal voltage currently
+            // agrees: the divergence surfaces seconds later, when those
+            // samples reach the output, which is exactly the kind of drift
+            // the cross-target harness exists to catch. O(stages), and only
+            // ever called by the harness — never in a tick.
+            if let Some(line) = self.delays.get(&e.spec.id) {
+                put(line.w as f64);
+                for v in &line.buf {
+                    put(*v);
+                }
             }
             if matches!(e.spec.kind, ElementKind::Noise { .. }) {
                 put((e.state.noise_n >> 32) as u32 as f64);
@@ -3892,6 +4165,12 @@ impl Engine {
 
     /// Deterministic digest of all continuous + discrete state; the S1
     /// cross-target harness asserts these match bit-for-bit.
+    /// The bucket chain belonging to an element, wherever its island is.
+    /// Linear in island count and used only by the digest.
+    fn delay_of(&self, id: u32) -> Option<&DelayLine> {
+        self.islands.iter().find_map(|i| i.delays.get(&id))
+    }
+
     pub fn state_hash(&self) -> u64 {
         use xxhash_rust::xxh3::Xxh3;
         let mut h = Xxh3::new();
@@ -3936,6 +4215,18 @@ impl Engine {
             // never see it. Conditional for the same reason `broken` is —
             // a world with no noise source hashes exactly as it did before
             // this device existed, so no golden hash moved.
+            // The bucket chain. A delay line whose CONTENTS differ is a
+            // different machine even when every terminal voltage currently
+            // agrees: the divergence surfaces seconds later, when those
+            // samples reach the output, which is exactly the kind of drift
+            // the cross-target harness exists to catch. O(stages), and only
+            // ever called by the harness — never in a tick.
+            if let Some(line) = self.delay_of(e.spec.id) {
+                put(line.w as f64);
+                for v in &line.buf {
+                    put(*v);
+                }
+            }
             if matches!(e.spec.kind, ElementKind::Noise { .. }) {
                 // Two exact halves: every u32 is exactly representable in
                 // f64, so this is a lossless view of the counter through

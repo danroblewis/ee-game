@@ -414,6 +414,63 @@ pub enum ElementKind {
     ShiftReg {
         bits: u8,
     },
+    /// BUCKET BRIGADE DEVICE: an analog delay line. Pins `[IN, OUT, CLK, GND]`.
+    ///
+    /// ## Why this is one element and not `stages` capacitors
+    ///
+    /// A real BBD is a chain of capacitors handing charge along under a
+    /// two-phase clock, and the obvious model — `stages` capacitors and
+    /// `2 * stages` MOSFET switches — is unaffordable at any useful length: a
+    /// 4096-stage MN3005 would be tens of thousands of coupled unknowns
+    /// against an O(n^3) factorization.
+    ///
+    /// It is also the WRONG model. A BBD is a SAMPLED-DATA device: charge
+    /// moves between buckets only at a clock edge, and between edges each
+    /// bucket is isolated from its neighbours. The chain therefore has no
+    /// business in the MNA matrix at all. What the circuit can see is two
+    /// terminals — a high-impedance input that samples, and an output that
+    /// drives — which is exactly the shape `Motor` already has: the state
+    /// evolves outside the matrix and writes the RHS only.
+    ///
+    /// So this costs ONE branch unknown and no Newton iterations, whatever
+    /// `stages` is. The expensive-looking part is one of the cheapest in the
+    /// engine, and none of that is a shortcut: a bucket chain really is a
+    /// shift register of samples, no more behavioural than `Timer555`'s
+    /// internal comparators. Every terminal voltage still comes from the
+    /// solver.
+    ///
+    /// ## Delay
+    ///
+    /// One stage per clock TRANSITION, so a full cycle moves charge two
+    /// half-stages exactly as a two-phase device does, and the delay is the
+    /// datasheet formula:
+    ///
+    /// ```text
+    ///     t_delay = stages / (2 * f_clock)
+    /// ```
+    ///
+    /// The clock is a PIN, not a parameter, which is the whole point: delay
+    /// time is set by whatever the player builds to drive it (a 555 and a
+    /// pot), and modulating that clock is how chorus, flanger and vibrato
+    /// were actually made. Echo needs no feature either — it is a wire from
+    /// OUT back to IN through a resistor.
+    ///
+    /// ## What is NOT modelled, and must be said
+    ///
+    /// * CHARGE TRANSFER INEFFICIENCY. A real bucket loses a little on every
+    ///   hand-off, which over thousands of stages is the BBD's characteristic
+    ///   treble loss and noise. Modelling it per stage is O(stages) per edge
+    ///   and is left out rather than approximated.
+    /// * The sample lands on the substep where the edge is seen, so the delay
+    ///   quantises to `dt`. At 20 us against delays of order 100 ms that is
+    ///   ~0.01 %.
+    /// * ALIASING IS MODELLED, deliberately. Sampling at f_clock folds
+    ///   everything above f_clock/2, which is why every real BBD schematic is
+    ///   wrapped in filters. Getting that wrong should sound wrong.
+    Bbd {
+        /// Bucket count, 2..=MAX_BBD_STAGES.
+        stages: u16,
+    },
     /// Synchronous binary counter. Pins: `[VCC, GND, CLK, RST, Q0..]`,
     /// `bits` in 2..=4, `modulus` in 2..=2^bits.
     ///
@@ -573,6 +630,7 @@ impl ElementKind {
             Gate { .. } => "Gate",
             FlipFlop { .. } => "FlipFlop",
             ShiftReg { .. } => "ShiftReg",
+            Bbd { .. } => "BBD",
             Counter { .. } => "Counter",
             Mux { .. } => "Mux",
         }
@@ -583,6 +641,7 @@ impl ElementKind {
         match self {
             Ground | Rail { .. } => 1,
             Timer555 => 6,
+            Bbd { .. } => 4,
             Ota => 4,
             Npn { .. }
             | Pnp { .. }
@@ -680,6 +739,7 @@ impl ElementKind {
                 | ElementKind::OpAmp { .. }
                 | ElementKind::Timer555
                 | ElementKind::Motor { .. }
+                | ElementKind::Bbd { .. }
         )
     }
 
@@ -739,6 +799,14 @@ impl ElementKind {
 /// 200` past `check_document`); what a tier MEANS is the `damage` crate's
 /// table, which clamps anything it has no row for down to its top row.
 /// Raise this when the tech tree needs more headroom than four rungs.
+/// Longest bucket brigade a document may ask for.
+///
+/// 4096 is the MN3005, the longest BBD anyone actually shipped, and it costs
+/// 32 kB of f64 per placed part — the chain is a plain buffer, not matrix
+/// unknowns, so length is memory rather than solve time. The bound exists so
+/// a hostile or stale document cannot ask for a gigabyte.
+pub const MAX_BBD_STAGES: u16 = 4096;
+
 pub const MAX_TIER: u8 = 3;
 
 /// One placed part.
