@@ -347,6 +347,14 @@
       .prow-grip:hover { color: #8fa2b0; }
       /* The keycap on a control the keyboard can drive. Empty rows collapse
          to nothing, so an unbound control looks exactly as it did. */
+      /* Unbound rows show a faint dot you can click; bound ones a keycap.
+         Both are targets, so binding is discoverable from the control. */
+      .pkb.unbound { opacity: 0.35; }
+      .pkb.learning {
+        border-color: #6cf;
+        color: #6cf;
+        background: #16303c;
+      }
       .pkb:not(:empty) {
         margin-left: 6px;
         padding: 0 4px;

@@ -1050,10 +1050,31 @@ function potWidget(plid: number, id: number, deps: PanelHostDeps): Widget {
 // over a panel that panel owns the keyboard; move away and the ordinary
 // bindings are back. The binding is drawn on the control itself, so it is
 // visible on the thing it acts on rather than hidden in a settings page.
+// Defaults, used only for controls nobody has bound explicitly: a panel is
+// useful the moment it opens, without anyone configuring anything.
 const KB_KEYS = ['q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p'];
 
 /** The panel the cursor is inside, or null. */
 let kbPanel: HTMLElement | null = null;
+
+/** The keycap waiting for a key to be pressed at it, or null. */
+let kbLearning: HTMLElement | null = null;
+
+/** A player's explicit binding for an element, if any. Per-player, like the
+ *  rest of a panel's layout: two people at one board may want different
+ *  keys, and neither should be able to move the other's hands. */
+const kbKeyOf = (id: number): string | null => lsGet(`kb:${id}`);
+const setKbKey = (id: number, key: string | null) => {
+  lsSet(`kb:${id}`, key ?? '');
+};
+
+/** How a key reads on a keycap. Single characters show as themselves; the
+ *  named keys (`Space`, `ArrowLeft`) get something short enough to fit. */
+function kbCap(key: string): string {
+  if (key === ' ') return '␣';
+  if (key.length === 1) return key.toUpperCase();
+  return key.replace(/^Arrow/, '').replace(/^Numpad/, '#').slice(0, 5);
+}
 
 /** Attach to a panel window so it can own the keyboard while hovered. */
 function armKeyboard(win: HTMLElement): void {
@@ -1077,13 +1098,54 @@ type KbControl = HTMLElement & { __kbDown?: () => void; __kbUp?: () => void };
  *  keyboard-capable control gets the Nth key, in document order, so the
  *  mapping is stable and needs no configuration to be useful. */
 export function relabelKeyboard(win: HTMLElement): void {
-  const ctrls = win.querySelectorAll<HTMLElement>('[data-kb]');
+  const ctrls = [...win.querySelectorAll<HTMLElement>('[data-kb]')];
+  // Explicit bindings are claimed FIRST, so a default can never squat on a
+  // key its owner asked for. Whatever is left of q..p then fills in, in
+  // order, skipping anything already spoken for.
+  const taken = new Set<string>();
+  const resolved: (string | null)[] = ctrls.map((c) => {
+    const id = Number(c.dataset.kbId);
+    const k = kbKeyOf(id);
+    if (k) taken.add(k);
+    return k || null;
+  });
+  let next = 0;
+  resolved.forEach((k, i) => {
+    if (k) return;
+    while (next < KB_KEYS.length && taken.has(KB_KEYS[next]!)) next++;
+    if (next < KB_KEYS.length) {
+      resolved[i] = KB_KEYS[next]!;
+      taken.add(KB_KEYS[next]!);
+      next++;
+    }
+  });
   ctrls.forEach((c, i) => {
+    const key = resolved[i] ?? '';
+    // The key lives on the control, so the keydown handler is a lookup and
+    // never has to re-derive the ordering.
+    c.dataset.kbKey = key;
     // `closest` rather than two parentElements: the control's depth inside
     // its row is a widget's business, and hard-coding it silently produced
     // no badges at all.
     const badge = c.closest('.prow')?.querySelector<HTMLElement>('.pkb') ?? null;
-    if (badge) badge.textContent = i < KB_KEYS.length ? KB_KEYS[i]!.toUpperCase() : '';
+    if (!badge || badge === kbLearning) return;
+    badge.textContent = key ? kbCap(key) : '·';
+    badge.classList.toggle('unbound', !key);
+    badge.title = key
+      ? `bound to "${key}" — click to rebind, then press a key (Esc clears)`
+      : 'click, then press a key to bind one';
+    if (!badge.dataset.wired) {
+      badge.dataset.wired = '1';
+      badge.style.cursor = 'pointer';
+      badge.addEventListener('pointerdown', (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (kbLearning) kbLearning.classList.remove('learning');
+        kbLearning = badge;
+        badge.classList.add('learning');
+        badge.textContent = '?';
+      });
+    }
   });
 }
 
@@ -1092,14 +1154,35 @@ export function relabelKeyboard(win: HTMLElement): void {
 if (typeof window !== 'undefined') {
   const hit = (ev: KeyboardEvent): KbControl | null => {
     if (!kbPanel || ev.ctrlKey || ev.metaKey || ev.altKey) return null;
-    const i = KB_KEYS.indexOf(ev.key.toLowerCase());
-    if (i < 0) return null;
-    const ctrls = kbPanel.querySelectorAll<HTMLElement>('[data-kb]');
-    return (ctrls[i] as KbControl) ?? null;
+    const k = ev.key.length === 1 ? ev.key.toLowerCase() : ev.key;
+    for (const c of kbPanel.querySelectorAll<HTMLElement>('[data-kb]')) {
+      if (c.dataset.kbKey && c.dataset.kbKey === k) return c as KbControl;
+    }
+    return null;
+  };
+
+  /** A keycap is waiting: the next key press BINDS instead of acting. */
+  const learn = (ev: KeyboardEvent): boolean => {
+    const badge = kbLearning;
+    if (!badge) return false;
+    ev.preventDefault();
+    ev.stopPropagation();
+    kbLearning = null;
+    badge.classList.remove('learning');
+    const ctrl = badge.closest('.prow')?.querySelector<HTMLElement>('[data-kb]');
+    const id = Number(ctrl?.dataset.kbId);
+    if (!Number.isFinite(id)) return true;
+    // Escape clears the binding rather than setting Escape as the key —
+    // there has to be a way back to nothing, and no one binds Escape.
+    setKbKey(id, ev.key === 'Escape' ? null : ev.key.length === 1 ? ev.key.toLowerCase() : ev.key);
+    const win = badge.closest('.pwin');
+    if (win) relabelKeyboard(win as HTMLElement);
+    return true;
   };
   window.addEventListener(
     'keydown',
     (ev) => {
+      if (learn(ev)) return;
       const c = hit(ev);
       if (!c) return;
       ev.preventDefault();
@@ -1137,6 +1220,7 @@ function switchWidget(id: number, deps: PanelHostDeps): Widget {
   // sprang back when you let go would not be a switch — that is what the
   // Button below is for, and the two parts mean different things.
   btn.dataset.kb = '1';
+  btn.dataset.kbId = String(id);
   (btn as KbControl).__kbDown = toggle;
   ctl.appendChild(btn);
   return {
@@ -1183,6 +1267,7 @@ function buttonWidget(id: number, deps: PanelHostDeps): Widget {
     btn.addEventListener(t, () => set(false));
   }
   btn.dataset.kb = '1';
+  btn.dataset.kbId = String(id);
   (btn as KbControl).__kbDown = () => set(true);
   (btn as KbControl).__kbUp = () => set(false);
   ctl.appendChild(btn);
