@@ -115,6 +115,7 @@ import {
   MAX_NAME,
   FRAME_STRIDE,
   type Wave,
+  logicPins,
   unpackFrame,
   type DocOp,
   type ElementKind,
@@ -2928,16 +2929,23 @@ function nearCursor(x: number, y: number, padPx: number, padGrid = 1): ElementSp
   return space.query(gx - pad, gy - pad, gx + pad, gy + pad, hitScratch);
 }
 
-/** Footprint of a part, in grid units squared: the tie-breaker for a click
- *  that lands on more than one thing.
+/** Is this part drawn as a PACKAGE — a filled box with pins on its edges?
  *
- *  A part wired ACROSS AN IC — a feedback resistor over a chip body, which is
- *  how every real op-amp circuit is drawn — sits inside the chip's outline,
- *  so both report a hit distance of zero and the winner used to be whichever
- *  was in the document first. That is always the chip, because you place the
- *  chip and then wire to it, so the resistor was unclickable. Smallest-wins
- *  fixes it without a z-order to maintain: the small thing lying on the big
- *  thing is the thing you are pointing at. */
+ *  These are the parts you wire ACROSS rather than to, and the ones whose
+ *  bodies swallow everything laid over them. */
+function isChip(kind: ElementKind): boolean {
+  return (
+    logicPins(kind) !== null ||
+    kind.t === 'OpAmp' ||
+    kind.t === 'Ota' ||
+    kind.t === 'Timer555' ||
+    kind.t === 'Bbd' ||
+    kind.t === 'Pt2399'
+  );
+}
+
+/** Footprint of a part, in grid units squared: the tie-breaker between two
+ *  parts of the same class that overlap. */
 function footprint(e: ElementSpec): number {
   let x0 = Infinity;
   let y0 = Infinity;
@@ -2953,29 +2961,46 @@ function footprint(e: ElementSpec): number {
   return (x1 - x0 + 1) * (y1 - y0 + 1);
 }
 
+/** CHIPS ARE ALWAYS BEHIND EVERYTHING ELSE.
+ *
+ *  A chip's body is a filled region, so `hitTest` returns ~0 anywhere inside
+ *  it. That makes a chip win on distance against any part laid over it
+ *  unless the cursor is EXACTLY on that part's line — and parts laid over
+ *  chips are not a corner case, they are how every op-amp feedback network
+ *  is drawn. Ranking by distance, however the ties are broken, therefore
+ *  leaves a resistor across a DIP effectively unclickable.
+ *
+ *  So this is not a tie-break, it is a CLASS ORDER: anything that is not a
+ *  chip is considered first, and the chip is only reached when nothing else
+ *  is under the cursor at all. Clicking bare package body still selects the
+ *  chip, which is the only thing anyone wants from it.
+ *
+ *  Within a class the old rules stand — nearest, then smallest, then
+ *  document order — so every pick that did not involve a chip is unchanged. */
 function elementAt(x: number, y: number): ElementSpec | undefined {
   const slack = hitPx();
-  let best: ElementSpec | undefined;
-  let bestD = slack;
-  let bestArea = Infinity;
-  let bestSeq = Infinity;
-  for (const e of nearCursor(x, y, slack)) {
-    const d = hitTest(cam, e, x, y);
-    const area = footprint(e);
-    const seq = space.seqOf(e.id);
-    // Nearest wins; then SMALLEST wins, so a part lying across a chip is
-    // reachable; then document order, so picking stays stable and identical
-    // to what it was whenever the first two do not decide it.
-    const better =
-      d < bestD || (d === bestD && (area < bestArea || (area === bestArea && seq < bestSeq)));
-    if (better) {
-      bestD = d;
-      bestArea = area;
-      bestSeq = seq;
-      best = e;
+  const pick = (chips: boolean): ElementSpec | undefined => {
+    let best: ElementSpec | undefined;
+    let bestD = slack;
+    let bestArea = Infinity;
+    let bestSeq = Infinity;
+    for (const e of nearCursor(x, y, slack)) {
+      if (isChip(e.kind) !== chips) continue;
+      const d = hitTest(cam, e, x, y);
+      const area = footprint(e);
+      const seq = space.seqOf(e.id);
+      const better =
+        d < bestD || (d === bestD && (area < bestArea || (area === bestArea && seq < bestSeq)));
+      if (better) {
+        bestD = d;
+        bestArea = area;
+        bestSeq = seq;
+        best = e;
+      }
     }
-  }
-  return best;
+    return best;
+  };
+  return pick(false) ?? pick(true);
 }
 
 /** Grid point of the nearest element pin, if the cursor is on one. */
