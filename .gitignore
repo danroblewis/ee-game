@@ -16,5 +16,8 @@ room-save.json
 # dir (EE_ROOMS). A room file committed here would be one player's world frozen
 # into the repo, and would fight every other checkout.
 rooms/
+# ...and the templates a running server saves through POST /api/templates.
+# Same category: live state written by the server, not source.
+templates/
 room-save.json.migrated
 reuse.txt

@@ -10,7 +10,8 @@
     "sfxcheck": "tsc src/sfxcheck.ts --module commonjs --target es2022 --moduleResolution node --strict --skipLibCheck --lib es2022,dom,dom.iterable --outDir node_modules/.sfxcheck && node node_modules/.sfxcheck/sfxcheck.js",
     "historycheck": "tsc src/historycheck.ts --module commonjs --target es2022 --moduleResolution node --strict --skipLibCheck --lib es2022,dom,dom.iterable --outDir node_modules/.historycheck && node node_modules/.historycheck/historycheck.js",
     "unitcheck": "tsc src/unitcheck.ts --module commonjs --target es2022 --moduleResolution node --strict --skipLibCheck --lib es2022,dom,dom.iterable --outDir node_modules/.unitcheck && node node_modules/.unitcheck/unitcheck.js",
-    "wirecheck": "tsc src/wirecheck.ts --module commonjs --target es2022 --moduleResolution node --strict --skipLibCheck --lib es2022,dom,dom.iterable --outDir node_modules/.wirecheck && node node_modules/.wirecheck/wirecheck.js"
+    "wirecheck": "tsc src/wirecheck.ts --module commonjs --target es2022 --moduleResolution node --strict --skipLibCheck --lib es2022,dom,dom.iterable --outDir node_modules/.wirecheck && node node_modules/.wirecheck/wirecheck.js",
+    "gaincheck": "tsc src/gaincheck.ts --module commonjs --target es2022 --moduleResolution node --strict --skipLibCheck --lib es2022,dom,dom.iterable --outDir node_modules/.gaincheck && node node_modules/.gaincheck/gaincheck.js"
   },
   "devDependencies": {
     "typescript": "^5.6.0",

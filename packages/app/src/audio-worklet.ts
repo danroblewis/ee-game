@@ -52,10 +52,32 @@
 // knows why the pitch fell. The slave engages with hysteresis and glides,
 // so a healthy stream is still pitch-perfect and never wobbles.
 
-/** Peak volts that maps to `TARGET_FS` of full scale. */
+/** Peak volts at and above which the output sits at `TARGET_FS`. */
 export const REF_VOLTS = 5;
-/** Full-scale target for a REF_VOLTS-peak signal. */
-export const TARGET_FS = 0.2;
+/**
+ * Ceiling: the output level a REF_VOLTS-or-louder signal is held at.
+ *
+ * Was 0.2, which cost 14 dB for nothing — even a perfect 5 V circuit could
+ * not exceed a fifth of full scale. 0.89 leaves ~1 dB of headroom under the
+ * hard clamp for the limiter's glide to work in, which is all it needs
+ * because the ducking side of that glide is ~2 ms.
+ */
+export const TARGET_FS = 0.89;
+/**
+ * Compression exponent: `out = TARGET_FS * (peak/REF_VOLTS)^AGC_SLOPE`.
+ *
+ * 1.0 would be no compression (and leave quiet rooms inaudible); 0 would be
+ * flat normalisation (and throw away loudness entirely, so a whisper and a
+ * rail would sound identical). 0.4 is a 2.5:1 ratio in dB — it lifts the
+ * measured rooms by ~28 dB while keeping a louder circuit audibly louder.
+ */
+export const AGC_SLOPE = 0.4;
+/**
+ * Gain ceiling, so near-silence is not amplified into hiss. The audio wire
+ * format quantises to 1e-4 V, so 200x puts one quantum of dither at 0.02 of
+ * full scale — audible only when there is genuinely nothing else.
+ */
+export const AGC_MAX_GAIN = 200;
 
 /**
  * Buffer depth the rate matcher holds, and the depth a source primes to
@@ -504,6 +526,16 @@ class SimAudioProcessor extends AudioWorkletProcessor {
     // full-scale aim, cfg.target is the buffer depth the rate matcher holds.
     this.fsTarget = o.target || 0.2;
     this.refV = o.refV || 5;
+    // The compression law. See the auto-gain block in process().
+    this.slope = o.slope || 0.4;
+    this.maxGain = o.maxGain || 200;
+    // A REF_VOLTS sine's RMS: the loudness that maps to the ceiling.
+    this.refRms = this.refV / Math.SQRT2;
+    this.ms = 0;
+    // Loudness follower coefficient, tau ~0.3 s. Slow enough that it reads
+    // the programme rather than the waveform, fast enough to follow a knob.
+    this.msA = 1 - Math.exp(-1 / (0.3 * sampleRate));
+
     const fadeSec = o.fadeSec || 0.006;
     const trimMax = o.trimMax === undefined ? 0.03 : o.trimMax;
     // Shared, immutable tuning handed to every source.
@@ -536,7 +568,10 @@ class SimAudioProcessor extends AudioWorkletProcessor {
     this.mute = false;
     this.masterFade = 1;  // click-free mute/unmute
     this.peak = 0;
-    this.gain = 0;
+    // Start where the OLD law sat: exactly right for a REF_VOLTS circuit, and
+    // quiet enough for anything else that the ramp is heard as a fade-in
+    // rather than a jump. A multiplicative ramp also cannot start at 0.
+    this.gain = this.fsTarget / this.refV;
     this.hpX = 0;
     this.hpY = 0;
     // Telemetry cadence. Never per render quantum: at 48 kHz that would be
@@ -689,6 +724,9 @@ class SimAudioProcessor extends AudioWorkletProcessor {
           this.hpX = 0;
           this.hpY = 0;
           this.peak = 0;
+          this.ms = 0;
+          this.gain = this.fsTarget / this.refV;
+      
           out[k] = 0;
           continue;
         }
@@ -700,19 +738,84 @@ class SimAudioProcessor extends AudioWorkletProcessor {
       const y = sum - this.hpX + this.hpCoef * this.hpY;
       this.hpX = sum;
       this.hpY = y;
-      // Soft normalization on the SUM: REF_VOLTS peak -> TARGET_FS. Louder
-      // signals are pulled down; quieter ones stay quiet (loudness is
-      // information). Two loud speakers duck together instead of clipping.
+      // COMPRESSIVE AUTO-GAIN on the SUM.
+      //
+      // The old law was fsTarget / max(refV, peak), which floored the
+      // denominator at refV and therefore could only ever DUCK. Anything
+      // quieter than 5 V got one fixed tiny gain, so the measured rooms --
+      // 0.20 V for the ladder, 0.28 V for the TR-808 -- played at -42 and
+      // -39 dBFS while the same laptop plays a YouTube sine at 0. That is
+      // roughly 90x too small in amplitude, and no amount of system volume
+      // fixes it because the loss is here, not in the speakers.
+      //
+      // Loudness is still information, which is why this is a power law and
+      // not a flat normaliser: out = ceil * (peak/refV)^slope, capped at
+      // ceil. A louder circuit is still audibly louder; the range is just
+      // compressed into one the ear and a laptop speaker can both use. At
+      // slope 0.4 a 74 dB span of input becomes a 30 dB span of output --
+      // a 2.5:1 ratio, ordinary mastering-compressor territory.
+      //
+      // Above refV the min() pins the output at ceil, so this is still the
+      // same limiter it always was: a 100 V rail lands at ceil, not on the
+      // clipper. Below it, gain is capped at maxGain so a nearly-silent room
+      // does not amplify the wire format's 1e-4 V quantisation into hiss.
+      // TWO FOLLOWERS, because they answer different questions.
+      //
+      // LOUDNESS (mean square) drives the gain. Driving it from the PEAK
+      // instead — which is what the first version of this did — penalises
+      // crest factor twice over: a spiky signal is made quiet because of its
+      // spikes, and adding a second speaker makes the room QUIETER, because
+      // two uncorrelated tones raise the peak by 2x while raising loudness
+      // by only 1.41x. The harness caught exactly that (two quiet sources
+      // measured 0.331 -> 0.309). RMS is also simply the better proxy for
+      // what an ear calls "loud".
+      //
+      // PEAK drives the limiter, which is now the only thing standing
+      // between the AGC and the clipper, and is therefore allowed to
+      // override it downward at any time.
       const mag = y < 0 ? -y : y;
       this.peak = mag > this.peak ? mag : this.peak * 0.99995 + mag * 0.00005;
-      const want = this.fsTarget / Math.max(this.refV, this.peak);
+      this.ms += (y * y - this.ms) * this.msA;
+      const rms = Math.sqrt(this.ms);
+      const agc =
+        rms > 0
+          ? (this.refRms * this.fsTarget * Math.min(1, Math.pow(rms / this.refRms, this.slope))) /
+            (this.refV * rms)
+          : this.maxGain;
+      // The limiter always wins: whatever loudness asks for, the peak may
+      // not exceed the ceiling.
+      const want = Math.min(this.maxGain, agc, this.peak > 0 ? this.fsTarget / this.peak : this.maxGain);
       // Limiter glide: duck fast (~2 ms) so a sudden 100 V rail does not sit
       // on the clipper, recover slowly (~25 ms) so it does not pump.
-      this.gain += (want - this.gain) * (want < this.gain ? 0.01 : 0.0008);
+      // Down fast (~2 ms), up SLOWLY AND MULTIPLICATIVELY.
+      //
+      // The old proportional rise, gain += (want - gain) * k, moves in
+      // proportion to how far away the target is, so with a maxGain of 200
+      // an empty follower slams the gain up by a factor of hundreds within a
+      // few milliseconds. That defeated the source's own 6 ms fade-in
+      // completely (measured: a 0.49 discontinuity at the first sample),
+      // because the peak cap then held the output at the ceiling from sample
+      // one. Rising by a fixed FRACTION of the current gain instead makes
+      // the ramp exponential in dB and independent of the distance — about
+      // +4 dB per 100 ms — so a fade stays a fade and a knob still feels
+      // immediate.
+      if (want < this.gain) this.gain += (want - this.gain) * 0.01;
+      else this.gain = Math.min(want, this.gain * 1.0002);
       // Mute/volume glides too, so toggling it is silent rather than a click.
       this.masterFade += (wantMaster - this.masterFade) * 0.02;
       if (Math.abs(wantMaster - this.masterFade) < 1e-4) this.masterFade = wantMaster;
-      const v = y * this.gain * this.masterFade;
+      // THE LIMITER IS NOT ALLOWED TO BE LATE. The glide is how loudness
+      // moves smoothly, but a glide is by definition behind its target, so
+      // at a source's first sample — or any sudden onset — the gliding gain
+      // can sit far above what the current peak can afford, and the ~2 ms
+      // duck arrives after the damage. The peak follower attacks
+      // instantaneously, so fsTarget/peak is an exact per-sample bound that
+      // is available now; applying it to the OUTPUT rather than to the glide
+      // state makes clipping arithmetically impossible (|y| <= peak, so
+      // |y| * fsTarget/peak <= fsTarget), while leaving the glide free to go
+      // on being smooth underneath.
+      const cap = this.peak > 0 ? this.fsTarget / this.peak : this.maxGain;
+      const v = y * Math.min(this.gain, cap) * this.masterFade;
       out[k] = v > 1 ? 1 : v < -1 ? -1 : v;
     }
     // Reap finished removals after the block, never mid-loop.

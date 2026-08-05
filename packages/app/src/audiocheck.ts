@@ -452,6 +452,22 @@ console.log('\ntwo sources are summed, and the limiter is on the sum');
   const two = mixer();
   // Two quiet, harmonically unrelated sources: the sum must be measurably
   // louder than either alone (i.e. they really are mixed, not switched).
+  //
+  // THE THRESHOLD MOVED, DELIBERATELY, when the output stage gained a real
+  // compressor (AGC_SLOPE). It used to be 1.25, which was the right number
+  // for a law that could only DUCK: below REF_VOLTS the gain was a constant,
+  // so two uncorrelated sources delivered the full sqrt(2) = 1.41x of
+  // summed RMS. A compressor cannot leave that untouched -- by construction
+  // it returns 2^(slope/2), which at slope 0.4 is 1.149 in theory and 1.11
+  // measured (the peak limiter takes the rest). Demanding 1.25 would have
+  // pinned slope at 0.65 or higher and cost ~8 dB of the lift that quiet
+  // rooms exist to get.
+  //
+  // What is being guarded has NOT been weakened: the sum still has to be
+  // strictly, measurably louder, which is what catches a mixer that switches
+  // sources instead of adding them, or one whose AGC fully normalises and
+  // makes the second source free. Full normalisation would land at 1.00 and
+  // still fail this.
   const yTwo = stream(two, [
     { id: 's1', hz: 220, amp: 1 },
     { id: 's2', hz: 313, amp: 1 },
@@ -459,7 +475,7 @@ console.log('\ntwo sources are summed, and the limiter is on the sum');
   const w = 16 * QUANTUM;
   const r1 = rms(yOne.subarray(yOne.length - w));
   const r2 = rms(yTwo.subarray(yTwo.length - w));
-  check('two quiet sources are louder than one', r2 > r1 * 1.25,
+  check('two quiet sources are louder than one', r2 > r1 * 1.08,
     `rms ${r1.toFixed(4)} -> ${r2.toFixed(4)}`);
   // Both tones must be present in the SAME output: that is what "mixed" means.
   const tail = yTwo.subarray(yTwo.length - w);
