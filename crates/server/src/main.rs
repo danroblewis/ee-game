@@ -80,6 +80,8 @@ mod synth_vco;
 mod modules;
 mod moog;
 mod slew;
+#[cfg(test)]
+mod e2e;
 mod tr808;
 mod vco555;
 mod bass;

@@ -2928,18 +2928,49 @@ function nearCursor(x: number, y: number, padPx: number, padGrid = 1): ElementSp
   return space.query(gx - pad, gy - pad, gx + pad, gy + pad, hitScratch);
 }
 
+/** Footprint of a part, in grid units squared: the tie-breaker for a click
+ *  that lands on more than one thing.
+ *
+ *  A part wired ACROSS AN IC — a feedback resistor over a chip body, which is
+ *  how every real op-amp circuit is drawn — sits inside the chip's outline,
+ *  so both report a hit distance of zero and the winner used to be whichever
+ *  was in the document first. That is always the chip, because you place the
+ *  chip and then wire to it, so the resistor was unclickable. Smallest-wins
+ *  fixes it without a z-order to maintain: the small thing lying on the big
+ *  thing is the thing you are pointing at. */
+function footprint(e: ElementSpec): number {
+  let x0 = Infinity;
+  let y0 = Infinity;
+  let x1 = -Infinity;
+  let y1 = -Infinity;
+  for (const [px, py] of e.pins) {
+    x0 = Math.min(x0, px);
+    y0 = Math.min(y0, py);
+    x1 = Math.max(x1, px);
+    y1 = Math.max(y1, py);
+  }
+  // +1 on each side so a zero-height two-pin part still orders sensibly.
+  return (x1 - x0 + 1) * (y1 - y0 + 1);
+}
+
 function elementAt(x: number, y: number): ElementSpec | undefined {
   const slack = hitPx();
   let best: ElementSpec | undefined;
   let bestD = slack;
+  let bestArea = Infinity;
   let bestSeq = Infinity;
   for (const e of nearCursor(x, y, slack)) {
     const d = hitTest(cam, e, x, y);
+    const area = footprint(e);
     const seq = space.seqOf(e.id);
-    // Bucket order is not document order: break exact ties the way the old
-    // document-order scan did (first spec wins) so picking stays stable.
-    if (d < bestD || (d === bestD && seq < bestSeq)) {
+    // Nearest wins; then SMALLEST wins, so a part lying across a chip is
+    // reachable; then document order, so picking stays stable and identical
+    // to what it was whenever the first two do not decide it.
+    const better =
+      d < bestD || (d === bestD && (area < bestArea || (area === bestArea && seq < bestSeq)));
+    if (better) {
       bestD = d;
+      bestArea = area;
       bestSeq = seq;
       best = e;
     }
