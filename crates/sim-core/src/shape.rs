@@ -101,6 +101,10 @@ pub enum Shape {
     /// chips: a player may rotate and mirror it, but not drag its pins into
     /// a shape no package has.
     Bbd,
+    /// `[IN, OUT, VCO, GND, OP1-IN, OP1-OUT, OP2-IN, OP2-OUT]` — the echo
+    /// chip. A wide DIP, because it has to hold a legible block diagram of
+    /// its own innards.
+    Pt2399,
     /// `[in+, in-, out, bias]`.
     Ota,
     /// `[vcc, gnd, trg, thr, out, dis]` — a fixed 4x4 DIP footprint with no
@@ -124,8 +128,7 @@ impl Shape {
             "Ota" => Shape::Ota,
             "Timer555" => Shape::Dip555,
             "Bbd" => Shape::Bbd,
-            // Same package geometry; RT sits where the BBD's CLK does.
-            "Pt2399" => Shape::Bbd,
+            "Pt2399" => Shape::Pt2399,
             _ => Shape::Free,
         }
     }
@@ -148,6 +151,7 @@ impl Shape {
             Shape::Ota => 4,
             Shape::Dip555 => 6,
             Shape::Bbd => 4,
+            Shape::Pt2399 => 8,
         }
     }
 
@@ -162,10 +166,11 @@ impl Shape {
 ///
 /// The ORDER is the netlist's pin order and must never be permuted — pin 0 of
 /// an op-amp is `in+` wherever the symbol ends up pointing.
-fn base(shape: Shape, l: i32) -> [Point; 6] {
+fn base(shape: Shape, l: i32) -> [Point; 8] {
     // Fixed-size array (never allocates); `Shape::pins` says how much of it
-    // is meaningful.
-    let mut p = [(0, 0); 6];
+    // is meaningful. Eight because the echo chip is the widest package here;
+    // the 555's six and everything smaller just leave the tail unused.
+    let mut p = [(0, 0); 8];
     match shape {
         Shape::Single => {}
         Shape::Free => p[1] = (l, 0),
@@ -219,6 +224,19 @@ fn base(shape: Shape, l: i32) -> [Point; 6] {
             p[1] = (5, 0); // out
             p[2] = (0, 3); // clk
             p[3] = (5, 3); // gnd
+        }
+        // A DIP with signal flowing left to right, the delay pin under the
+        // input, and the two op-amps on the lower rows where the block
+        // diagram puts them.
+        Shape::Pt2399 => {
+            p[0] = (0, 0); // in
+            p[1] = (10, 0); // out
+            p[2] = (0, 2); // vco
+            p[3] = (10, 2); // gnd
+            p[4] = (0, 5); // op1-in
+            p[5] = (10, 5); // op1-out
+            p[6] = (0, 7); // op2-in
+            p[7] = (10, 7); // op2-out
         }
     }
     p
@@ -557,6 +575,7 @@ pub fn straighten(shape: Shape, pins: &[Point]) -> Vec<Point> {
         // perpendicular and would tell us nothing about which is which.
         Shape::Dip555 => (pins[0], pins[4], 1, 4),
         Shape::Bbd => (pins[0], pins[1], 2, 3),
+        Shape::Pt2399 => (pins[0], pins[1], 2, 7),
         Shape::Single | Shape::Free => return pins.to_vec(),
     };
     let v = (b.0 - a.0, b.1 - a.1);
@@ -649,6 +668,7 @@ mod tests {
             Shape::Ota => ElementKind::Ota,
             Shape::Dip555 => ElementKind::Timer555,
             Shape::Bbd => ElementKind::Bbd { stages: 1024 },
+            Shape::Pt2399 => ElementKind::Pt2399,
             Shape::Single => ElementKind::Ground,
             Shape::Free => ElementKind::Wire,
         }

@@ -16,7 +16,19 @@ fn rig(rt_ohms: f64, dc: f64) -> Vec<sim_core::ElementSpec> {
         sim_core::ElementSpec {
             id: 1,
             kind: K::Pt2399,
-            pins: vec![(0, 0), (8, 0), (0, 8), (8, 8)],
+            // [IN, OUT, VCO, GND, OP1-IN, OP1-OUT, OP2-IN, OP2-OUT].
+            // The op-amps are left unwired here: these tests are about the
+            // delay, and an unwired op-amp must be harmless.
+            pins: vec![
+                (0, 0),
+                (8, 0),
+                (0, 8),
+                (8, 8),
+                (0, 12),
+                (8, 12),
+                (0, 16),
+                (8, 16),
+            ],
             ..Default::default()
         },
         spec(2, K::VoltageSource { dc, amp: 0.0, hz: 0.0, phase: 0.0, wave: Wave::Sine }, (0, 0), (0, 16)),
@@ -62,19 +74,38 @@ fn a_pt2399_is_a_legal_document() {
     assert_eq!(sim_core::check_document(&rig(20_000.0, 1.0), DT), Ok(()));
 }
 
-/// THE HEADLINE: the resistor sets the delay, and the numbers are the
-/// datasheet's. 5 kΩ should be tens of ms; 50 kΩ should be hundreds.
+/// THE HEADLINE, and it is now checked against the DATASHEET'S OWN TABLE 1
+/// rather than against a law I fitted. Princeton print resistor, clock and
+/// delay for 28 settings; these are five of them spread across the range.
+///
+/// This matters more than it looks. The first version of this part used a
+/// 1/R law, which is the obvious guess and is WRONG: the real table's clock
+/// saturates at 22 MHz as R goes to zero, so there is resistance inside the
+/// pin. Fitting `f = K/(R + R0)` at the two ENDS gives R0 = 2.76 kΩ — and
+/// that constant then predicts the middle of the table, which is the only
+/// evidence that the shape is right and not just bent to fit.
 #[test]
-fn the_resistor_sets_the_delay() {
-    for rt in [5_000.0, 10_000.0, 22_000.0, 50_000.0] {
-        let got = measure(rt);
-        let want = expected(rt);
+fn the_delay_matches_the_datasheet_table() {
+    // (external resistor Ω, printed delay ms) from PT2399 v1.4 Table 1.
+    const TABLE: [(f64, f64); 5] = [
+        (27_600.0, 342.0),
+        (10_500.0, 151.0),
+        (5_400.0, 92.2),
+        (2_400.0, 56.6),
+        (0.5, 31.3),
+    ];
+    let mut worst: f64 = 0.0;
+    for (rt, printed) in TABLE {
+        let got = measure(rt) * 1000.0;
+        let err = (got - printed).abs() / printed * 100.0;
+        println!("{rt:>8.1} Ω: printed {printed:>6.1} ms, model {got:>6.1} ms  ({err:.1} %)");
+        worst = worst.max(err);
         assert!(
-            (got - want).abs() < want * 0.15,
-            "{rt} Ω: measured {got:.4} s, model says {want:.4} s"
+            err < 10.0,
+            "{rt} Ω: datasheet says {printed} ms, model gives {got:.1} ms ({err:.1} % out)"
         );
-        println!("{rt:>7.0} Ω -> {:.1} ms", got * 1000.0);
     }
+    println!("worst error across the table: {worst:.1} %");
 }
 
 /// And the direction is the one the datasheet promises: MORE resistance is
@@ -82,16 +113,19 @@ fn the_resistor_sets_the_delay() {
 /// backwards would still pass a single-point check.
 #[test]
 fn more_resistance_is_more_delay() {
-    let short = measure(5_000.0);
-    let long = measure(50_000.0);
+    // Both ends of the datasheet's own range, rather than two numbers I
+    // picked: R = 0 is its fastest setting and 27.6 kΩ its slowest.
+    let short = measure(0.5);
+    let long = measure(27_600.0);
     assert!(
         long > short * 5.0,
-        "10x the resistance should be ~10x the delay: {short:.4} s -> {long:.4} s"
+        "the slow end should be many times the fast end: {short:.4} s -> {long:.4} s"
     );
-    // ...and the span covers what a real PT2399 covers.
+    // ...and the span covers what a real PT2399 covers: the datasheet's
+    // own range is 31.3 ms at R=0 to 342 ms at 27.6 kΩ.
     assert!(
-        (0.020..0.060).contains(&short) && (0.250..0.450).contains(&long),
-        "range should be roughly the chip's 30-340 ms, got {:.1} ms .. {:.1} ms",
+        (0.028..0.035).contains(&short) && (0.320..0.365).contains(&long),
+        "the span should be the datasheet's 31.3 .. 342 ms, got {:.1} .. {:.1} ms",
         short * 1000.0,
         long * 1000.0
     );
@@ -135,7 +169,12 @@ fn every_plausible_wiring_of_rt_behaves() {
     );
     let mut e2 = Engine::new(DT);
     e2.set_elements(&d);
-    let floor = f64::from(sim_core::PT_STAGES) * DT;
+    // The datasheet's fastest setting, R = 0.5 Ω, is 31.3 ms. Note this is
+    // NOT the engine's substep floor (PT_STAGES * dt = 20.5 ms): with the
+    // real internal resistance in the model, the chip reaches its own
+    // minimum by physics and the clamp never engages anywhere in the legal
+    // range. That is the outcome to protect.
+    let floor = 0.0313;
     let mut got = None;
     for k in 1..100_000u32 {
         e2.advance(1);
@@ -147,6 +186,6 @@ fn every_plausible_wiring_of_rt_behaves() {
     let got = got.expect("RT grounded should give the shortest delay, not silence");
     assert!(
         (got - floor).abs() < floor * 0.2,
-        "RT grounded should clamp to the shortest delay {floor:.4} s, got {got:.4} s"
+        "VCO grounded should give the datasheet's fastest {floor:.4} s, got {got:.4} s"
     );
 }

@@ -826,7 +826,147 @@ export function drawElement(d: DrawCtx, e: ElementSpec) {
       if (e.kind.closed) twoPinDots();
       break;
     }
-    case 'Pt2399':
+    case 'Pt2399': {
+      // THE DATASHEET'S OWN BLOCK DIAGRAM, drawn inside the package.
+      //
+      // The point of this part is that a chip is not a mystery — it is a
+      // handful of ordinary blocks someone else already wired together. A
+      // player who can SEE the two op-amps, the two filters, the modulator,
+      // the RAM and the VCO driving the clock understands why the delay pin
+      // is called VCO and why the op-amps only have one input each. A grey
+      // rectangle with "2399" on it teaches none of that.
+      //
+      // Laid out to match Princeton's figure: analog across the top, the
+      // digital block along the bottom, VCO feeding CLOCK from below.
+      const [Ip, Op_, Vp] = [P[0]!, P[1]!, P[2]!];
+      const ex = norm(sub(Op_, Ip));
+      const ey = norm(sub(Vp, Ip));
+      const w = mag(sub(Op_, Ip)) / s;
+      const h = (mag(sub(P[6]!, Ip)) / s) * (7 / 7);
+      const at = (x: number, y: number): Px => add(add(Ip, ex, x * s), ey, y * s);
+      const lx = (p: Px) => dot(sub(p, Ip), ex) / s;
+      const ly = (p: Px) => dot(sub(p, Ip), ey) / s;
+      const stub = Math.min(0.9, w * 0.14);
+      const [x0, x1, y0, y1] = [stub, w - stub, -0.7, h + 0.7];
+      P.forEach((p, k) => {
+        const left = lx(p) < w * 0.5;
+        stroke(ctx, voltageColor(v(k)), [p, at(left ? x0 : x1, ly(p))]);
+      });
+      ctx.fillStyle = '#181820';
+      ctx.strokeStyle = '#c9c9d4';
+      ctx.beginPath();
+      ctx.moveTo(...at(x0, y0));
+      ctx.lineTo(...at(x1, y0));
+      ctx.lineTo(...at(x1, y1));
+      ctx.lineTo(...at(x0, y1));
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+
+      if (cam.scale > 34) {
+        ctx.save();
+        ctx.globalAlpha = 0.55;
+        ctx.lineWidth = Math.max(1, s * 0.018);
+        ctx.strokeStyle = '#9aa0b4';
+        ctx.fillStyle = '#9aa0b4';
+        const line = (a1: number, b1: number, a2: number, b2: number) =>
+          stroke(ctx, '#9aa0b4', [at(a1, b1), at(a2, b2)]);
+        /** A labelled block, as in the figure. */
+        const box = (cx: number, cy: number, bw: number, bh: number, label: string) => {
+          ctx.beginPath();
+          const [px, py] = at(cx - bw / 2, cy - bh / 2);
+          const [qx, qy] = at(cx + bw / 2, cy + bh / 2);
+          ctx.rect(Math.min(px, qx), Math.min(py, qy), Math.abs(qx - px), Math.abs(qy - py));
+          ctx.stroke();
+          if (cam.scale > 52) {
+            ctx.textAlign = 'center';
+            ctx.font = `${Math.round(s * 0.15)}px ui-monospace`;
+            ctx.fillText(label, ...at(cx, cy + 0.05));
+            ctx.textAlign = 'start';
+          }
+        };
+        /** An op-amp triangle pointing +x, as the figure draws them. */
+        const amp = (cx: number, cy: number, r2: number, label: string, inside = false) => {
+          ctx.beginPath();
+          ctx.moveTo(...at(cx - r2, cy - r2));
+          ctx.lineTo(...at(cx - r2, cy + r2));
+          ctx.lineTo(...at(cx + r2 * 1.3, cy));
+          ctx.closePath();
+          ctx.stroke();
+          if (cam.scale > 52) {
+            ctx.textAlign = 'center';
+            ctx.font = `${Math.round(s * 0.13)}px ui-monospace`;
+            // The op-amps sit two rows apart with a 4.7K drawn above each,
+            // so a name hung BELOW one lands on the next one's resistor.
+            // Naming them inside the triangle is what a real schematic does
+            // anyway.
+            ctx.fillText(label, ...(inside ? at(cx - r2 * 0.1, cy + 0.05) : at(cx, cy + r2 + 0.36)));
+            ctx.textAlign = 'start';
+          }
+        };
+
+        // --- the analog chain across the top: LPF1 -> COMP -> ... -> LPF2
+        amp(1.7, 1.0, 0.42, 'LPF1');
+        amp(3.5, 1.0, 0.42, 'COMP');
+        amp(7.6, 1.0, 0.42, 'LPF2');
+        line(x0 + 0.2, 0.35, 1.28, 0.8);          // IN into LPF1
+        line(2.3, 1.0, 3.08, 1.0);                 // LPF1 -> COMP
+        line(8.15, 1.0, x1 - 0.2, 0.35);           // LPF2 -> OUT
+
+        // --- the digital block along the bottom
+        box(3.0, 3.4, 1.5, 0.8, 'MOD');
+        box(5.0, 3.4, 1.6, 0.8, 'RAM');
+        box(7.0, 3.4, 1.5, 0.8, 'DEM');
+        line(4.1, 1.4, 3.0, 3.0);                  // COMP down into MOD
+        line(3.75, 3.4, 4.2, 3.4);                 // MOD -> RAM
+        line(5.8, 3.4, 6.25, 3.4);                 // RAM -> DEM
+        line(7.0, 3.0, 7.6, 1.45);                 // DEM up into LPF2
+
+        // --- VCO drives the clock, from the pin that sets the delay
+        box(5.0, 5.1, 1.4, 0.72, 'VCO');
+        line(x0 + 0.2, 2.0, 4.3, 5.1);             // the VCO pin
+        line(5.0, 4.74, 5.0, 3.8);                 // VCO -> the RAM's clock
+
+        // --- the two op-amps, each with the 4.7K the figure shows
+        for (const [cy, oi, label] of [
+          [5.6, 4, 'OP1'],
+          [7.0, 6, 'OP2'],
+        ] as Array<[number, number, string]>) {
+          amp(2.2, cy, 0.52, label, true);
+          line(x0 + 0.2, ly(P[oi]!), 1.8, cy);      // its input pin
+          line(2.72, cy, x1 - 0.2, ly(P[oi + 1]!)); // its output pin
+          // The internal 4.7K from IN to OUT, drawn as the figure does.
+          line(1.8, cy - 0.62, 2.9, cy - 0.62);
+          line(1.8, cy - 0.62, 1.8, cy - 0.05);
+          line(2.9, cy - 0.62, 2.9, cy - 0.05);
+          if (cam.scale > 60) {
+            ctx.textAlign = 'center';
+            ctx.font = `${Math.round(s * 0.12)}px ui-monospace`;
+            ctx.fillText('4.7K', ...at(2.35, cy - 0.80));
+            ctx.textAlign = 'start';
+          }
+        }
+        ctx.restore();
+      }
+
+      if (cam.scale > 24) {
+        const labels = pinLabels(e.kind);
+        ctx.fillStyle = '#8a8a98';
+        ctx.font = `${Math.round(s * 0.17)}px ui-monospace`;
+        P.forEach((p, k) => {
+          const left = lx(p) < w * 0.5;
+          ctx.textAlign = left ? 'left' : 'right';
+          const [tx, ty] = at(left ? x0 + 0.12 : x1 - 0.12, ly(p) + 0.06);
+          ctx.fillText(labels[k] ?? '', tx, ty);
+        });
+        ctx.textAlign = 'center';
+        ctx.fillStyle = '#c9c9d4';
+        ctx.font = `${Math.round(s * 0.24)}px ui-monospace`;
+        ctx.fillText('PT2399', ...at(w * 0.5, y0 + 0.42));
+        ctx.textAlign = 'start';
+      }
+      break;
+    }
     case 'Bbd': {
       // A DIP like the 555, but the innards worth hinting at are the BUCKETS:
       // a row of little capacitors handing charge along. That row is the
@@ -894,7 +1034,7 @@ export function drawElement(d: DrawCtx, e: ElementSpec) {
         ctx.textAlign = 'center';
         ctx.fillStyle = '#c9c9d4';
         ctx.font = `${Math.round(s * 0.26)}px ui-monospace`;
-        ctx.fillText(e.kind.t === 'Bbd' ? 'BBD' : '2399', ...at(w * 0.5, y0 + 0.34));
+        ctx.fillText('BBD', ...at(w * 0.5, y0 + 0.34));
         ctx.textAlign = 'start';
       }
       break;

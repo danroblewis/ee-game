@@ -472,7 +472,9 @@ pub enum ElementKind {
         stages: u16,
     },
     /// PT2399-class ECHO CHIP: the same delay line, but it brings its own
-    /// clock. Pins `[IN, OUT, RT, GND]`.
+    /// clock AND its own two op-amps.
+    ///
+    /// Pins `[IN, OUT, VCO, GND, OP1-IN, OP1-OUT, OP2-IN, OP2-OUT]`.
     ///
     /// ## Why this exists next to `Bbd`
     ///
@@ -484,8 +486,8 @@ pub enum ElementKind {
     ///
     /// ## How the resistor sets the delay, honestly
     ///
-    /// RT sits at an internal reference voltage. The player's resistor from
-    /// RT to ground therefore draws `V_RT / R`, and THAT CURRENT — which the
+    /// The VCO pin sits behind an internal reference. The player's resistor
+    /// from it to ground therefore draws a current, and THAT CURRENT — which the
     /// solver computes, not us — sets the internal oscillator. So the delay
     /// really is a consequence of the circuit the player built: swap the
     /// resistor for a pot and the delay sweeps, exactly as it does on the
@@ -512,6 +514,26 @@ pub enum ElementKind {
     ///   range is reachable.
     /// * The real chip's companding and its 1-bit converters — the reason a
     ///   long PT2399 delay degrades so musically — are not modelled.
+    ///
+    /// ## The two op-amps, and why they have no + input
+    ///
+    /// The real chip carries two op-amps, and you are meant to use them: one
+    /// buffers and mixes the input, one sets the wet/dry blend and the
+    /// feedback that makes repeats. They are on the package, so a circuit
+    /// built around this part should use the ones it came with rather than
+    /// bolting external ones on — which is the habit that transfers to a bench.
+    ///
+    /// Each exposes only its INVERTING input and its output, because on the
+    /// real chip the non-inverting inputs are tied internally to the same
+    /// half-supply reference RT sits on. That single fact is why every
+    /// PT2399 circuit ever drawn uses them as INVERTING stages: it is not a
+    /// stylistic choice, it is the only thing the pinout allows. Modelling
+    /// it faithfully means a player who learns the topology here has learned
+    /// the topology, not a convenience.
+    ///
+    /// They are transconductance macromodels — a `gm` stage into an output
+    /// impedance, clamped to the supply — so they cost no branch unknown and
+    /// no Newton iteration, exactly like the delay line they sit beside.
     Pt2399,
     /// Synchronous binary counter. Pins: `[VCC, GND, CLK, RST, Q0..]`,
     /// `bits` in 2..=4, `modulus` in 2..=2^bits.
@@ -685,7 +707,7 @@ impl ElementKind {
             Ground | Rail { .. } => 1,
             Timer555 => 6,
             Bbd { .. } => 4,
-            Pt2399 => 4,
+            Pt2399 => 8,
             Ota => 4,
             Npn { .. }
             | Pnp { .. }
@@ -860,25 +882,46 @@ pub const MAX_BBD_STAGES: u16 = 4096;
 pub const PT_STAGES: u16 = 1024;
 /// The RT pin's internal reference, in volts.
 pub const PT_V_RT: f64 = 2.5;
-/// Internal series resistance behind that reference, in ohms.
+/// Internal series resistance in front of the VCO pin, in ohms.
 ///
-/// NOT cosmetic. As an IDEAL source, RT tied straight to ground was two
-/// contradictory constraints on one node, so the placement gate refused the
-/// edit with `Unsolvable` — and tying a pin to ground is the first thing
-/// anybody tries. With a real internal impedance that wiring is legal and
-/// means what a reader expects: least resistance, most current, fastest
-/// clock, SHORTEST delay.
+/// FROM THE DATASHEET'S OWN TABLE 1, not invented. The table is not a 1/R
+/// law: the clock tops out at 22 MHz as R goes to zero, which can only mean
+/// there is resistance inside the pin. Fitting `f = K / (R + R0)` to the two
+/// ends — 2.0 MHz at 27.6 kΩ and 22 MHz at ~0 — gives R0 = 2.76 kΩ, and that
+/// same constant then predicts the MIDDLE of the table to about 3 %: 150.4 ms
+/// against a printed 151 ms at 10.5 kΩ, 344 against 342 at 27.6 kΩ. A
+/// constant fitted at the ends that lands on the middle is the check that the
+/// SHAPE is right rather than the curve merely being bent to fit.
 ///
-/// 10 Ω is small enough that it costs 0.2 % of the delay at the datasheet's
-/// shortest setting, which is well inside the tolerance of the real part.
-pub const PT_R_RT: f64 = 10.0;
-/// Oscillator frequency per amp drawn from RT.
+/// It also has a happy side effect the first guess at this needed a special
+/// case for: the pin can be tied straight to ground and the chip simply runs
+/// at its fastest, exactly as the real one does at R = 0.5 Ω.
+pub const PT_R_RT: f64 = 2760.0;
+/// Internal op-amp transconductance and output conductance.
 ///
-/// Fitted to the datasheet's two endpoints: 5 kΩ draws 500 µA and must give
-/// ~30 ms (34.1 kHz at 1024 stages), 50 kΩ draws 50 µA and must give ~340 ms
-/// (3.0 kHz). Both land on this one constant, which is the check that the
-/// 1/R law is the right shape and not a curve fit.
-pub const PT_HZ_PER_AMP: f64 = 6.82e7;
+/// Open-loop gain is their ratio, 1e5, which is an ordinary audio op-amp.
+/// A `gm` stage into an output impedance is the standard macromodel and it
+/// stamps entirely into the conductance matrix — no branch unknown, no
+/// Newton iteration — which is what lets a part carry two of them for free.
+pub const PT_OA_GM: f64 = 1e2;
+pub const PT_OA_GOUT: f64 = 1e-3;
+/// How close to its rails an internal op-amp can swing. The chip runs on a
+/// single 5 V supply referred to PT_V_RT, so the output cannot go below the
+/// bottom rail or above the top one, and a feedback loop that asks it to
+/// must CLIP rather than run away.
+pub const PT_OA_LO: f64 = 0.4;
+pub const PT_OA_HI: f64 = 4.6;
+/// Sample-clock frequency per amp drawn from the VCO pin.
+///
+/// Calibrated so `PT_STAGES / f` reproduces Table 1's DELAY column, which is
+/// what a player experiences — the datasheet's own 22 MHz figure is the
+/// chip's system clock, divided internally by about 667 before it reaches
+/// the RAM. Modelling the divided rate directly keeps the shift cadence
+/// inside the engine's substep grid and changes nothing anyone can hear.
+///
+/// Against Table 1: 31.3 ms at 0 Ω (printed 31.3), 150.4 ms at 10.5 kΩ
+/// (printed 151), 344 ms at 27.6 kΩ (printed 342).
+pub const PT_HZ_PER_AMP: f64 = 3.61e7;
 
 pub const MAX_TIER: u8 = 3;
 

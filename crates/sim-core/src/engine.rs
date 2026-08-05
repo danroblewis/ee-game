@@ -561,6 +561,12 @@ const D_DATA: usize = 0;
 const D_SCHMITT: usize = 8;
 const D_CLK_PREV: usize = 16;
 const D_LATCHED: usize = 17;
+/// Base of the PT2399's two internal op-amp clamp states, two bits each
+/// (bits 18..22). They live here rather than in `region` because `region` is
+/// one `i8` and this part has two of them — and because a chip's internal
+/// stage states belong with the other discrete state, where the digest and
+/// the rescue snapshot already carry them.
+const D_PT_OA: usize = 18;
 
 #[inline]
 fn dbit(d: u32, i: usize) -> bool {
@@ -2926,16 +2932,73 @@ impl Island {
                     // instead of the trickle the input tether used to leak,
                     // so an unwired delay pin is honest silence rather than a
                     // six-second delay that reads as a broken part.
-                    let mut inject = |p: usize, q: usize, i: f64| {
+                    // Collected, not applied inline: the stamps below need
+                    // `self` mutably too, and a closure holding it would lock
+                    // them out.
+                    let mut inj: [(usize, usize, f64); 4] = [
+                        (vout, vgnd, state.v_prev * PT_G_OUT),
+                        (vrt, vgnd, crate::PT_V_RT * g_rt),
+                        (0, 0, 0.0),
+                        (0, 0, 0.0),
+                    ];
+
+                    // ------------------------------------- the two op-amps
+                    //
+                    // Each is a transconductance into an output impedance:
+                    //     i_out = gm * (VREF - v(inv))
+                    // with the + input pinned internally at VREF, which is
+                    // the real chip's pinout and the reason these are always
+                    // used as inverting stages. Open-loop gain is gm/gout.
+                    //
+                    // The gm term is a VOLTAGE-CONTROLLED CURRENT SOURCE and
+                    // stamps straight into the conductance matrix, so neither
+                    // op-amp needs a branch unknown. The VREF part of it is a
+                    // constant and rides the RHS.
+                    //
+                    // `region` carries both clamp states, two bits each, in
+                    // the spare half of `dstate`: 0 linear, 1 pinned low,
+                    // 2 pinned high. A pinned op-amp stops being a gm stage
+                    // and becomes a stiff source at the rail, which is what
+                    // makes a runaway feedback loop CLIP instead of diverge.
+                    for (k, (inv, out)) in [(node[4], node[5]), (node[6], node[7])]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        let reg = (state.dstate >> (D_PT_OA + 2 * k)) & 3;
+                        if need_factor {
+                            self.stamp_g(out, vgnd, crate::PT_OA_GOUT);
+                            // A gm stage's input is a pure control terminal
+                            // and draws nothing — but "nothing" and "no path
+                            // at all" are different to a matrix, and an
+                            // op-amp nobody wired would be a singular row.
+                            // Same tether the delay input carries.
+                            self.stamp_g(inv, vgnd, BBD_G_IN);
+                            if reg == 0 {
+                                // -gm * v(inv) into `out`, referred to GND.
+                                let gm = crate::PT_OA_GM;
+                                for (r, sgn) in [(out, 1.0), (vgnd, -1.0)] {
+                                    if r > 0 && inv > 0 {
+                                        self.a[(r - 1) * n + (inv - 1)] += sgn * gm;
+                                    }
+                                }
+                            }
+                        }
+                        let drive = match reg {
+                            1 => crate::PT_OA_LO,
+                            2 => crate::PT_OA_HI,
+                            // Linear: the constant half of gm*(VREF - v_inv).
+                            _ => crate::PT_V_RT * crate::PT_OA_GM / crate::PT_OA_GOUT,
+                        };
+                        inj[2 + k] = (out, vgnd, drive * crate::PT_OA_GOUT);
+                    }
+                    for (p, q, i) in inj {
                         if p > 0 {
                             self.b[p - 1] += i;
                         }
                         if q > 0 {
                             self.b[q - 1] -= i;
                         }
-                    };
-                    inject(vout, vgnd, state.v_prev * PT_G_OUT);
-                    inject(vrt, vgnd, crate::PT_V_RT * g_rt);
+                    }
                 }
                 ElementKind::Bbd { .. } => {
                     // Pins [IN, OUT, CLK, GND].
@@ -3706,11 +3769,46 @@ impl Island {
                         st.vg1 -= 1.0;
                         bbd_shifts.push((ei, eid, vs[0] - vgnd));
                     }
+                    // Each op-amp's clamp state, decided from the solution
+                    // this step actually reached. A stage whose UNCLAMPED
+                    // drive is outside the rails pins to the nearer one, and
+                    // a pinned stage un-pins as soon as the drive comes back
+                    // inside — the ordinary op-amp region test, and the same
+                    // shape the engine's own `OpAmp` uses.
+                    let mut oa_i = [0.0f64; 2];
+                    for (k, (inv, out)) in [(4usize, 5usize), (6, 7)].into_iter().enumerate() {
+                        let want = crate::PT_V_RT
+                            + (crate::PT_V_RT - (vs[inv] - vgnd)) * crate::PT_OA_GM
+                                / crate::PT_OA_GOUT;
+                        let reg = if want < crate::PT_OA_LO {
+                            1
+                        } else if want > crate::PT_OA_HI {
+                            2
+                        } else {
+                            0
+                        };
+                        let sh = D_PT_OA + 2 * k;
+                        st.dstate = (st.dstate & !(3 << sh)) | (reg << sh);
+                        // What the stage delivers into whatever is hanging on
+                        // it. The inverting input itself draws nothing — it is
+                        // a gm stage's control terminal, like a real op-amp's
+                        // input.
+                        let drive = match reg {
+                            1 => crate::PT_OA_LO,
+                            2 => crate::PT_OA_HI,
+                            _ => want,
+                        };
+                        oa_i[k] = (drive - (vs[out] - vgnd)) * crate::PT_OA_GOUT;
+                    }
                     let i_out = (st.v_prev - (vs[1] - vgnd)) * PT_G_OUT;
                     st.pin_i = [0.0; MAX_PINS];
                     st.pin_i[1] = i_out;
                     st.pin_i[2] = i_rt;
-                    st.pin_i[3] = -(i_out + i_rt);
+                    st.pin_i[5] = oa_i[0];
+                    st.pin_i[7] = oa_i[1];
+                    // Everything the chip sources leaves through its own
+                    // ground pin, or KCL stops meaning anything.
+                    st.pin_i[3] = -(i_out + i_rt + oa_i[0] + oa_i[1]);
                 }
                 ElementKind::Bbd { .. } => {
                     // Pins [IN, OUT, CLK, GND]. Runs ONCE PER ACCEPTED STEP,

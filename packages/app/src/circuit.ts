@@ -166,7 +166,9 @@ export function pinLabels(kind: ElementKind): string[] {
     case 'Bbd':
       return ['IN', 'OUT', 'CLK', 'GND'];
     case 'Pt2399':
-      return ['IN', 'OUT', 'RT', 'GND'];
+      // The datasheet's own names, so what a player learns here is what is
+      // printed on the real part.
+      return ['IN', 'OUT', 'VCO', 'GND', 'OP1-IN', 'OP1-OUT', 'OP2-IN', 'OP2-OUT'];
     case 'Potentiometer':
       return ['A', 'W', 'B'];
     case 'Motor':

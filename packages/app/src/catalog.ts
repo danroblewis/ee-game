@@ -418,8 +418,9 @@ export function pinCount(kind: ElementKind): number {
     case 'Timer555':
       return 6;
     case 'Bbd':
-    case 'Pt2399':
       return 4;
+    case 'Pt2399':
+      return 8;
     case 'Ota':
       return 4;
     // The logic family: two supply pins plus its own signals.
