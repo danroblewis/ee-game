@@ -64,6 +64,7 @@ import type { MachineFrame, MachineMsg } from './machines/seam';
 import type { ElemLive, ElementSpec } from './circuit';
 import type { Camera, DamageState, DotFlow } from './render';
 import { fmtEng } from './units';
+import { phonePosture } from './touchenv';
 
 export type { MachineMsg } from './machines/seam';
 
@@ -164,10 +165,6 @@ const sameRect = (a: MachineRect, b: MachineRect) =>
 // -------------------------------------------------------------- goal card
 
 const OPEN_KEY = 'ee.hoist.open';
-/** Viewport width below which screen-anchored chrome starts folded. Matches
- * the `@media (max-width: 500px)` block in index.html — one number, two
- * languages, and they must agree. */
-const NARROW_PX = 500;
 
 // localStorage throws in private/blocked contexts; the card must still work.
 const readLS = (k: string): string | null => {
@@ -356,10 +353,11 @@ function buildCard(root: HTMLElement, reset: () => void): Card {
   // Starts expanded, and the choice is remembered — EXCEPT on a screen too
   // narrow to give it away for free. The card is 300x330; on a 390x844 phone
   // that is a fifth of the world, permanently, over the very schematic the
-  // card is about. Under NARROW_PX it starts as its own title bar, and one
+  // card is about. In the phone posture (touchenv.ts — a narrow window is
+  // not a phone) it starts as its own title bar, and one
   // tap on that bar opens it exactly as it always did. A stored choice still
   // wins: fold it or unfold it on the phone and the phone remembers.
-  let open = (readLS(OPEN_KEY) ?? (window.innerWidth < NARROW_PX ? '0' : '1')) !== '0';
+  let open = (readLS(OPEN_KEY) ?? (phonePosture() ? '0' : '1')) !== '0';
   const apply = () => {
     el.classList.toggle('collapsed', !open);
     caret.textContent = open ? '▾' : '▸';
