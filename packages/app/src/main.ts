@@ -30,6 +30,15 @@
 //   drag from a pin       reshape that part: stretch/shrink/reorient it by
 //                         carrying the pin (wires come from W + drag; pins
 //                         must overlap to connect)
+//   TOUCH: two fingers    the camera, always and in every state — a pinch
+//                         zooms about its own centroid and pans by however far
+//                         that centroid travels, one gesture. A SECOND FINGER
+//                         LANDING CANCELS AND ROLLS BACK whatever the first
+//                         had begun, so a pinch can never half-place a part.
+//                         One finger still means exactly what a mouse press
+//                         means above; there is no keyboard on glass yet, so
+//                         arming a part still needs one (the palette is a
+//                         later stage).
 //   ⌘/Ctrl+C, ⌘/Ctrl+V    copy selection / paste bound to cursor
 //   ⌘/Ctrl+Z, +Shift, ^Y  undo / redo — this player's own edits only
 //   Q                     rotate placement ghost, paste ghost, or selection
@@ -1823,6 +1832,11 @@ function plateView(): [number, number, number] {
 const cam: Camera = { scale: 48, ox: 60, oy: 60 };
 // Exposed for end-to-end tests.
 (window as unknown as { __cam: Camera }).__cam = cam;
+// Likewise the document. A gesture test has to be able to ask what the pins
+// actually ARE: screenshots cannot answer it (the current dots animate, so two
+// frames of an untouched schematic differ), and "it looked right" is not a
+// measurement. A getter, because `elements` is rebound whenever a room loads.
+Object.defineProperty(window, '__els', { get: () => elements });
 const dots = new DotFlow();
 let mouse: { x: number; y: number } | null = null;
 
@@ -3213,8 +3227,16 @@ function roomsMenu(): MenuItem[] {
 
 // ------------------------------------------------------------------ drags
 let panDrag: { x: number; y: number; ox: number; oy: number } | null = null;
-/** Dragging one pin of one part: `k` is the pin index being carried. */
-let pinDrag: { id: number; k: number; moved: boolean; lastSent: number } | null = null;
+/** Dragging one pin of one part: `k` is the pin index being carried.
+ *  `startPins` is the shape as the drag found it (after any straightening),
+ *  which is what an interrupted gesture has to be put back to. */
+let pinDrag: {
+  id: number;
+  k: number;
+  moved: boolean;
+  lastSent: number;
+  startPins: Point[];
+} | null = null;
 let placeDrag: { a: Point; b: Point } | null = null;
 /** How a click or sweep combines with what is already selected. Ctrl is taken
  *  by map panning, so SUBTRACT is Alt — the CAD convention (shift adds, alt
@@ -3438,6 +3460,223 @@ function endMachineDrag() {
   });
 }
 
+/**
+ * TEAR DOWN EVERY IN-FLIGHT CANVAS GESTURE.
+ *
+ * `pointerup` is not the only way a drag ends. A pointer can be taken away —
+ * capture lost, the OS interrupting, a touch cancelled — and until now that
+ * path cleaned up exactly three gestures (the held button, the machine drag,
+ * the pin drag) and silently abandoned the rest: `moveDrag` left its
+ * `history.begin()` open, so the NEXT edit joined an undo entry labelled "move
+ * part", and `marquee`/`panDrag`/`placeDrag`/`scopeDrag`/the panel and
+ * annotation drags were left dangling. That is a desktop bug — an interrupted
+ * mouse drag leaks an unclosed undo transaction — it simply bites touch first,
+ * because touch is where pointers get taken away.
+ *
+ * Two ways to end, because "the pointer vanished" and "the camera is taking
+ * this gesture over" want opposite things:
+ *
+ *   'commit'   — a lost pointer. Whatever the drag had already done locally
+ *                (and half-sent to the server) is stated outright so the two
+ *                agree. This is what `pointercancel` asks for.
+ *   'rollback' — a second finger landed. The document goes back exactly to
+ *                where the first finger found it and nothing reaches the undo
+ *                stack: a pinch that half-places a resistor is worse than no
+ *                pinch at all.
+ *
+ * Gestures that only ever CREATE something on release (the rect drag-outs, a
+ * part placement) are discarded in both modes — release is the only thing
+ * allowed to add to the document.
+ */
+function endCanvasGestures(mode: 'commit' | 'rollback') {
+  // A momentary pushbutton must never be left stuck closed in a shared room.
+  if (buttonHeld) {
+    interact(buttonHeld, { t: 'SetSwitch', closed: false });
+    buttonHeld = null;
+  }
+  // Nothing here has touched the document yet, so both modes just drop it.
+  panDrag = null;
+  marquee = null;
+  placeDrag = null;
+  layerDrag = null;
+  panelDrag = null;
+  labelBoxDrag = null;
+  // The live-rect gestures below have ALREADY edited their rect locally and
+  // sent throttled increments, so both modes state the final rect: the
+  // reconciling op is the only thing that stops client and server drifting.
+  // (A scope or a label box a few pixels out is not the "half-placed
+  // resistor" the rollback mode exists for.)
+  if (scopeDrag || scopeResize) {
+    const s = scopeDrag?.s ?? scopeResize!.s;
+    scopeDrag = null;
+    scopeResize = null;
+    scopeOp(scopeRectOp(s));
+  }
+  if (panelMove || panelResize) {
+    const plid = panelMove?.plid ?? panelResize!.plid;
+    const p = panels.find((q) => q.plid === plid);
+    if (p) panelOp({ t: 'rect', plid: p.plid, x0: p.x0, y0: p.y0, x1: p.x1, y1: p.y1 });
+    panelMove = null;
+    panelResize = null;
+  }
+  if (labelBoxMove || labelBoxResize) {
+    const blid = labelBoxMove?.blid ?? labelBoxResize!.blid;
+    const b = labelBoxes.find((q) => q.blid === blid);
+    if (b) labelBoxOp({ t: 'rect', blid: b.blid, x0: b.x0, y0: b.y0, x1: b.x1, y1: b.y1 });
+    labelBoxMove = null;
+    labelBoxResize = null;
+  }
+  if (netLabelMove) {
+    const l = netLabels.find((q) => q.nlid === netLabelMove!.nlid);
+    if (l) netLabelOp({ t: 'move', nlid: l.nlid, x: l.x, y: l.y });
+    netLabelMove = null;
+  }
+  if (machineDrag) {
+    if (mode === 'rollback') {
+      const d = machineDrag;
+      d.dx = 0;
+      d.dy = 0;
+      placeMachineDrag(d); // package and children back to the snapshot
+      flushMachineDrag(d); // and tell the server, as the inverse increment
+      machineDrag = null;
+      hoist.setHot(false);
+      canvas.style.cursor = 'default';
+      hoist.endLocalDrag();
+    } else {
+      // A lost pointer must not leave the machine half-moved and un-undoable:
+      // commit where it actually got to, as one entry.
+      endMachineDrag();
+    }
+  }
+  if (pinDrag) {
+    const e = elemById(pinDrag.id);
+    if (mode === 'rollback') {
+      if (pinDrag.moved && e) {
+        e.pins = pinDrag.startPins.map((p) => [...p] as Point);
+        space.update(e);
+        editDoc({ t: 'Move', id: e.id, pins: e.pins }); // inside the open group
+      }
+      history.abort();
+    } else {
+      if (pinDrag.moved && e) editDoc({ t: 'Move', id: e.id, pins: e.pins });
+      history.end();
+    }
+    pinDrag = null;
+  }
+  if (moveDrag) {
+    if (mode === 'rollback') {
+      if (moveDrag.moved) {
+        for (const item of moveDrag.items) {
+          const e = elemById(item.id);
+          if (!e) continue;
+          e.pins = item.startPins.map(([x, y]) => [x, y] as Point);
+          space.update(e);
+          editDoc({ t: 'Move', id: e.id, pins: e.pins });
+        }
+      }
+      history.abort();
+    } else {
+      if (moveDrag.moved) {
+        for (const item of moveDrag.items) {
+          const e = elemById(item.id);
+          if (e) editDoc({ t: 'Move', id: e.id, pins: e.pins });
+        }
+      }
+      // A cancelled drag that never moved is not a click: it selects nothing
+      // and flips no switch. Only `pointerup` may mean "click".
+      history.end();
+    }
+    moveDrag = null;
+  }
+}
+
+// ------------------------------------------------------------------ touch
+// THE CAMERA IS ALWAYS TWO FINGERS. Everything below is reached only from an
+// `ev.pointerType === 'touch'` branch at the top of the four canvas pointer
+// handlers; a mouse or a pen never enters any of it.
+//
+// Pan and zoom are ONE transform, not two gestures: a pinch whose centroid
+// drifts is simultaneously a pan, which is how every canvas app on glass
+// behaves, and splitting them makes the world slide out from under the hand.
+/** Every finger currently down on the canvas, in screen pixels. */
+const touchPts = new Map<number, { x: number; y: number }>();
+/** The two fingers currently driving the camera, plus the centroid and span
+ *  they were last seen at. */
+let touchNav: { a: number; b: number; cx: number; cy: number; d: number } | null = null;
+/** True from the moment two fingers claim the camera until the LAST of them
+ *  lifts. The finger left over when a pinch ends never got a `pointerdown` of
+ *  its own, so it must not be handed to the one-finger dispatch mid-air. */
+let touchNavTail = false;
+
+/** Centroid and span of two tracked fingers; null if either has gone. */
+function touchSpan(a: number, b: number) {
+  const p = touchPts.get(a);
+  const q = touchPts.get(b);
+  if (!p || !q) return null;
+  return { a, b, cx: (p.x + q.x) / 2, cy: (p.y + q.y) / 2, d: Math.hypot(p.x - q.x, p.y - q.y) };
+}
+
+/** @returns true when touch has claimed this event and the canvas dispatch
+ *  below must not see it. */
+function touchDown(ev: PointerEvent): boolean {
+  touchPts.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+  if (touchPts.size < 2 && !touchNavTail) return false; // one finger: today's dispatch
+  try { canvas.setPointerCapture(ev.pointerId); } catch { /* synthetic pointers */ }
+  if (touchPts.size >= 2) {
+    // THE SECOND FINGER CANCELS THE FIRST. Whatever one finger had begun —
+    // carrying a pin, dragging a part, sweeping a marquee, stretching a new
+    // resistor — is put back before the camera takes over.
+    if (!touchNav) endCanvasGestures('rollback');
+    const ids = [...touchPts.keys()];
+    touchNav = touchSpan(ids[ids.length - 2]!, ids[ids.length - 1]!);
+    touchNavTail = true;
+  }
+  return true;
+}
+
+function touchMove(ev: PointerEvent): boolean {
+  const p = touchPts.get(ev.pointerId);
+  if (p) {
+    p.x = ev.clientX;
+    p.y = ev.clientY;
+  }
+  if (!touchNav) return touchNavTail;
+  if (ev.pointerId !== touchNav.a && ev.pointerId !== touchNav.b) return true; // a third finger
+  const n = touchSpan(touchNav.a, touchNav.b);
+  if (!n) return true;
+  const k = touchNav.d > 0 && n.d > 0 ? n.d / touchNav.d : 1;
+  const s2 = Math.min(MAX_SCALE, Math.max(MIN_SCALE, cam.scale * k));
+  // Zoom about the centroid the fingers were on (the same anchor arithmetic
+  // the wheel uses), then carry the camera by however far that centroid
+  // travelled. Reading the ratio back off `s2` rather than off `k` is what
+  // keeps a pinch against the MIN/MAX_SCALE clamp from also drifting.
+  cam.ox = touchNav.cx - (touchNav.cx - cam.ox) * (s2 / cam.scale);
+  cam.oy = touchNav.cy - (touchNav.cy - cam.oy) * (s2 / cam.scale);
+  cam.scale = s2;
+  cam.ox += n.cx - touchNav.cx;
+  cam.oy += n.cy - touchNav.cy;
+  touchNav = n;
+  return true;
+}
+
+/** Shared by `pointerup` and `pointercancel`: a finger leaving is the same
+ *  event to the camera either way. */
+function touchUp(ev: PointerEvent): boolean {
+  touchPts.delete(ev.pointerId);
+  if (touchNav && (ev.pointerId === touchNav.a || ev.pointerId === touchNav.b)) {
+    // Three fingers down and one lifts: the camera re-anchors on the two that
+    // are left rather than jumping.
+    const ids = [...touchPts.keys()];
+    touchNav = ids.length >= 2 ? touchSpan(ids[0]!, ids[1]!) : null;
+  }
+  const owned = touchNavTail;
+  if (touchPts.size === 0) touchNavTail = false;
+  if (owned) {
+    try { canvas.releasePointerCapture(ev.pointerId); } catch { /* synthetic pointers */ }
+  }
+  return owned;
+}
+
 canvas.addEventListener('wheel', (ev) => {
   ev.preventDefault();
   const z = scopeZoneAt(ev.clientX, ev.clientY);
@@ -3486,6 +3725,7 @@ window.addEventListener(
 );
 
 canvas.addEventListener('pointerdown', (ev) => {
+  if (ev.pointerType === 'touch' && touchDown(ev)) return; // the camera claimed it
   if (ev.button === 2) return; // right button only ever opens the menu
   if (swallowPointer) {
     swallowPointer = false;
@@ -3671,7 +3911,13 @@ canvas.addEventListener('pointerdown', (ev) => {
     const own = pinOwnerAt(ev.clientX, ev.clientY);
     if (own && straightenBeforeDrag(own.e)) {
       history.begin([own.e], GESTURE_LABEL[pinGesture(own.e.kind, own.k)]); // pins mutate in place
-      pinDrag = { id: own.e.id, k: own.k, moved: false, lastSent: 0 };
+      pinDrag = {
+        id: own.e.id,
+        k: own.k,
+        moved: false,
+        lastSent: 0,
+        startPins: own.e.pins.map((p) => [...p] as Point),
+      };
       selectedIds = new Set([own.e.id]);
       selectedProbe = null;
       selectedMachine = false;
@@ -3779,6 +4025,7 @@ canvas.addEventListener('dblclick', (ev) => {
 });
 
 canvas.addEventListener('pointermove', (ev) => {
+  if (ev.pointerType === 'touch' && touchMove(ev)) return; // the camera owns it
   mouse = { x: ev.clientX, y: ev.clientY };
   const now = performance.now();
   if (online && now - lastCursorSent > 50) {
@@ -4048,6 +4295,7 @@ canvas.addEventListener('pointermove', (ev) => {
 });
 
 canvas.addEventListener('pointerup', (ev) => {
+  if (ev.pointerType === 'touch' && touchUp(ev)) return; // a camera finger lifting
   try { canvas.releasePointerCapture(ev.pointerId); } catch { /* synthetic pointers */ }
   if (panDrag) {
     panDrag = null;
@@ -4229,22 +4477,12 @@ canvas.addEventListener('pointerup', (ev) => {
 });
 canvas.addEventListener('pointerleave', () => (mouse = null));
 // A cancelled pointer (touch interrupted, capture lost) must not leave a
-// momentary button stuck closed in a shared room.
-canvas.addEventListener('pointercancel', () => {
-  if (buttonHeld) {
-    interact(buttonHeld, { t: 'SetSwitch', closed: false });
-    buttonHeld = null;
-  }
-  // A lost pointer must not leave the machine half-moved and un-undoable:
-  // commit where it actually got to, as one entry.
-  endMachineDrag();
-  // Same rule for a half-carried pin: commit where it landed, one entry.
-  if (pinDrag) {
-    const e = elemById(pinDrag.id);
-    if (pinDrag.moved && e) editDoc({ t: 'Move', id: e.id, pins: e.pins });
-    history.end();
-    pinDrag = null;
-  }
+// momentary button stuck closed in a shared room — nor, and this is what it
+// used to do, an open `history.begin()` for the next edit to fall into. Every
+// gesture ends here, through the same teardown `pointerup` reconciles with.
+canvas.addEventListener('pointercancel', (ev) => {
+  if (ev.pointerType === 'touch' && touchUp(ev)) return;
+  endCanvasGestures('commit');
 });
 
 window.addEventListener('keydown', (ev) => {

@@ -2,7 +2,14 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- The world IS the canvas, so the browser's own zoom is a second,
+         competing camera: a stray pinch used to take visualViewport from 1 to
+         5 and every later hit test landed on the wrong grid point. Pin the
+         page scale and let the app own every gesture instead. -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1, user-scalable=no"
+    />
     <title>EE Game — M1 demo</title>
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23101014'/%3E%3Cpath d='M4 20h6l3-9 4 14 3-9h8' fill='none' stroke='%234bff6a' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
     <style>
@@ -12,7 +19,13 @@
          overlay below is positioned off them, so nothing has to know about
          anything else's geometry. */
       :root { --rail-l: 0px; --rail-r: 0px; --dock-h: 24px; }
-      #canvas { display: block; width: 100vw; height: 100vh; cursor: default; }
+      /* touch-action: none is what makes the canvas reachable by finger AT
+         ALL. Without it the browser claimed every touch drag as a scroll it
+         could never perform — one pointermove, then pointercancel — so no
+         wire, no part move, no marquee and no pan existed on a touchscreen.
+         It gates touch only: mouse and pen are not affected by this property,
+         so the desktop path is untouched. */
+      #canvas { display: block; width: 100vw; height: 100vh; cursor: default; touch-action: none; }
       /* The hint block used to be bare text over the world, so it smeared
          across anything it happened to sit in front of. Give it its own
          backdrop: chrome should read as chrome. */
