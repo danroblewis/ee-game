@@ -669,6 +669,53 @@
       #tpal .tpal-b.on { background: #8ee7ff; color: #0d0d13; border-color: #8ee7ff; }
       #tpal .tpal-off { background: #2a1c1c; color: #ffb3b3; border-color: #6a3a3a; font-size: 15px; }
 
+      /* ---- the touch selection HUD (touchhud.ts owns the elements). Like
+         the palette, NONE OF IT EXISTS ON A DESKTOP SESSION — the tree is
+         built on the first pointerdown whose pointerType is 'touch'.
+
+         It floats immediately above the palette bar; `bottom` is written from
+         script because the bar wraps to two rows once the armed chip appears
+         and a fixed offset would cut through it. Centred, wrapping, and
+         pointer-events: none between the buttons so the world behind the gaps
+         stays tappable. */
+      #thud {
+        position: fixed; left: 0; right: 0; bottom: 60px; z-index: 28;
+        display: flex; flex-direction: column; align-items: center; gap: 6px;
+        padding: 0 8px; pointer-events: none;
+        font: 12px/1.4 ui-monospace, monospace; color: #c9c9d4;
+        user-select: none; -webkit-user-select: none;
+      }
+      .thud-grp {
+        display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+        justify-content: center; pointer-events: auto;
+        background: #0d0d12e6; border: 1px solid #23232c; border-radius: 10px;
+        padding: 5px 6px; box-shadow: 0 8px 26px #000a;
+      }
+      /* 44 px is the floor the touch literature settles on; below it a
+         mis-tap edits a shared room. */
+      #thud button {
+        min-height: 44px; min-width: 44px; font: 13px/1 ui-monospace, monospace;
+        cursor: pointer; background: #22222c; color: #c9c9d4;
+        border: 1px solid #3a3a48; border-radius: 6px; padding: 6px 8px;
+        touch-action: manipulation;
+      }
+      #thud button.on { background: #14303a; color: #8ee7ff; border-color: #2f6a7f; }
+      #thud .thud-del { background: #2a1c1c; color: #ffb3b3; border-color: #6a3a3a; }
+      #thud .thud-mode { min-width: 74px; font-size: 11px; }
+      #thud .thud-word { min-width: 56px; }
+      .thud-n { color: #8ee7ff; padding: 0 4px; white-space: nowrap; }
+      /* The arrows sit as one cluster so the four of them read as a d-pad
+         rather than as four more verbs. */
+      .thud-nudge { display: flex; gap: 2px; }
+      #thud .thud-arrow { min-width: 40px; padding: 6px 4px; }
+
+      /* Press-and-hold raises the SAME cascade the right button does, at a
+         size a fingertip can actually pick a row out of. */
+      #ctxmenu.touch .ctxpanel { min-width: 208px; font-size: 14px; padding: 6px; }
+      #ctxmenu.touch .mi { min-height: 44px; padding: 6px 12px; }
+      #ctxmenu.touch .hd { padding: 4px 12px 6px; }
+      #ctxmenu.touch .sep { margin: 6px 2px; }
+
       /* ---- rooms: which room am I in, and how do I get to another one
          (rooms.ts owns the elements; this is only their look).
 

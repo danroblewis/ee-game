@@ -168,6 +168,7 @@ import { createGfx } from './gfx';
 import { createLesson } from './lesson';
 import { connect, MAX_CHAT_LEN, type RoomHello } from './net';
 import { createPalette, type Armed, type ToolId } from './palette';
+import { createTouchHud } from './touchhud';
 // NOT loadBench/saveBench: the intro branch predates scopes becoming room
 // state, and those two were deleted when the per-browser bench went away.
 import { createRooms } from './rooms';
@@ -1841,6 +1842,9 @@ Object.defineProperty(window, '__els', { get: () => elements });
 // And the instruments, for the same reason: a probe placed by an armed touch
 // tool draws a flag on a canvas, and a canvas cannot be asked what it means.
 Object.defineProperty(window, '__probes', { get: () => probes });
+// And the selection, for the HUD's sake: "did the rotate button rotate the
+// thing I picked" is two questions, and this is the first of them.
+Object.defineProperty(window, '__sel', { get: () => [...selectedIds] });
 const dots = new DotFlow();
 let mouse: { x: number; y: number } | null = null;
 
@@ -3018,6 +3022,16 @@ const ctxIsOpen = () => ctxMenu.style.display === 'block';
 let swallowPointer = false;
 /** One entry per open level; index 0 is the root panel. */
 let ctxPanels: HTMLDivElement[] = [];
+/** This menu was raised by a finger. Two things follow from it: the rows are
+ *  drawn at 44 px, and submenus DO NOT open on `pointerenter`.
+ *
+ *  The second one is not a nicety. A touch `pointerenter` arrives with the
+ *  press, and on a narrow screen the submenu flips back over its own parent —
+ *  so the panel lands under the finger that is still down, and the release
+ *  lands on whatever row of it happens to be there. Measured on a 390 px
+ *  phone: tapping "Switches" armed a Switch. On touch a cascade opens on the
+ *  CLICK, after the finger has already gone. */
+let ctxTouch = false;
 
 function closeCtxMenu() {
   ctxMenu.style.display = 'none';
@@ -3055,7 +3069,7 @@ function openCtxPanel(depth: number, items: MenuItem[], ax: number, ay: number, 
         openCtxPanel(depth + 1, it.sub(), r.right - 3, r.top - 4, r.left);
         row.classList.add('open');
       };
-      row.onpointerenter = openChild;
+      if (!ctxTouch) row.onpointerenter = openChild;
       row.onclick = openChild;
     } else {
       row.className = 'mi';
@@ -3095,8 +3109,13 @@ function openCtxPanel(depth: number, items: MenuItem[], ax: number, ay: number, 
   panel.style.top = `${Math.round(Math.max(4, y))}px`;
 }
 
-function openCtxMenu(x: number, y: number, items: MenuItem[]) {
+/** `touch` widens every row to a fingertip (see `#ctxmenu.touch` in
+ *  index.html). Off by default, so a right-click menu is byte-for-byte the
+ *  menu it has always been. */
+function openCtxMenu(x: number, y: number, items: MenuItem[], touch = false) {
   closeCtxMenu();
+  ctxTouch = touch;
+  ctxMenu.classList.toggle('touch', touch);
   openCtxPanel(0, items, x, y);
 }
 
@@ -3253,6 +3272,16 @@ function roomsMenu(): MenuItem[] {
   ];
 }
 
+/** WHICH OF THE THREE MENUS BELONGS TO THIS POINT. One function, because the
+ *  right button and a finger's press-and-hold must never disagree about what
+ *  is under them: an instrument beats the part it is clipped to, and a part
+ *  beats the empty sheet. */
+function menuItemsAt(x: number, y: number): MenuItem[] {
+  const pr = probeAt(x, y);
+  const e = pr ? undefined : elementAt(x, y);
+  return pr ? probeMenu(pr) : e ? partMenu(e, x, y) : canvasMenu(x, y);
+}
+
 // ------------------------------------------------------------------ drags
 let panDrag: { x: number; y: number; ox: number; oy: number } | null = null;
 /** Dragging one pin of one part: `k` is the pin index being carried.
@@ -3271,10 +3300,16 @@ let placeDrag: { a: Point; b: Point } | null = null;
  *  removes) and the only free modifier. Shift is strictly ADDITIVE: a careful
  *  multi-select must never evaporate because one shift-click landed wrong. */
 type SelectMode = 'replace' | 'add' | 'remove';
+/** SHIFT AND ALT, FOR A HAND WITH NEITHER. A finger cannot hold a modifier
+ *  down while it taps, so the touch HUD offers the same two meanings as a
+ *  sticky mode instead. It is null in every session where no finger has ever
+ *  landed — the only thing that can set it is a button that does not exist
+ *  until one does — so the mouse path below reads exactly as it always did. */
+let touchSelectMode: 'add' | 'remove' | null = null;
 const selectModeOf = (ev: { shiftKey: boolean; altKey: boolean }): SelectMode =>
-  ev.altKey ? 'remove' : ev.shiftKey ? 'add' : 'replace';
+  ev.altKey ? 'remove' : ev.shiftKey ? 'add' : (touchSelectMode ?? 'replace');
 const modifiedSelect = (ev: { shiftKey: boolean; altKey: boolean }) =>
-  ev.shiftKey || ev.altKey;
+  ev.shiftKey || ev.altKey || touchSelectMode !== null;
 
 let marquee: { x0: number; y0: number; x1: number; y1: number; mode: SelectMode } | null = null;
 let moveDrag: {
@@ -3636,6 +3671,144 @@ let touchNav: { a: number; b: number; cx: number; cy: number; d: number } | null
  *  its own, so it must not be handed to the one-finger dispatch mid-air. */
 let touchNavTail = false;
 
+// ---------------------------------------------------- one finger, held down
+//
+// A finger has no right button, no modifier keys and no hover. Three gestures
+// give it back the three things that costs it:
+//
+//   PRESS AND HOLD          → the context menu cascade (the right button)
+//   PRESS, HOLD, THEN DRAG  → marquee select, on empty canvas (the FigJam
+//                             convention — a plain drag on empty now pans,
+//                             because panning is what a finger does most)
+//   DOUBLE-TAP a part       → its properties editor (the missing double-click)
+//
+// All three are synthesised here from pointer events on a timer. NOT from the
+// browser: `contextmenu` never fires on iOS Safari and did not fire in any of
+// the three emulated assessments, and `dblclick` is equally untrustworthy on
+// glass. A gesture the platform might not send is not a gesture.
+
+/** How long a finger must sit still to mean "menu". Long enough not to fire
+ *  under a tap, short enough that nobody wonders whether it is working. */
+const TOUCH_HOLD_MS = 450;
+/** How far it may wobble in that time and still count as still. A fingertip
+ *  rolls a few pixels just being lifted. */
+const TOUCH_HOLD_SLOP = 10;
+/** How far it must travel AFTER the menu opened to mean "marquee, not menu".
+ *  Deliberately larger than the wobble slop: dismissing the menu you just
+ *  asked for by breathing on it is worse than a marquee that starts late. */
+const TOUCH_MARQUEE_SLOP = 24;
+/** Double-tap: the second tap must land this soon, and this close. */
+const TOUCH_DTAP_MS = 320;
+const TOUCH_DTAP_PX = 34;
+
+/** The single finger currently running a one-finger gesture — the one the
+ *  existing dispatch is also handling. Null while the camera or an armed
+ *  instrument owns the screen. */
+let touch1: {
+  id: number;
+  /** Where and when it landed. */
+  x: number;
+  y: number;
+  t: number;
+  /** Has it travelled past the wobble slop? */
+  moved: boolean;
+  /** Did the dispatch below decide this press was on empty canvas? (It said
+   *  so by opening a marquee, which is the one thing only empty canvas does.) */
+  onEmpty: boolean;
+  timer: number;
+  /** The hold fired: the menu is up. */
+  held: boolean;
+  /** The dispatch below must not see the rest of this gesture. */
+  spent: boolean;
+} | null = null;
+/** Set when the finger's only job was to dismiss an open menu — that press
+ *  must not then open another one, nor count as half a double-tap. */
+let touchDismissed = false;
+/** Handed from `touchUp` to the trailing `pointerup` listener, which runs
+ *  AFTER the dispatch has had its say: a properties editor opened before the
+ *  dispatch runs would be opened onto a selection that is about to change. */
+let touchTapEnd: { x: number; y: number } | null = null;
+/** The previous clean tap, for the double-tap window. */
+let touchLastTap: { x: number; y: number; t: number } | null = null;
+
+function cancelTouchHold() {
+  if (touch1 && touch1.timer) {
+    clearTimeout(touch1.timer);
+    touch1.timer = 0;
+  }
+}
+
+/** PRESS AND HOLD = RIGHT-CLICK. Whatever the press had started under the
+ *  finger — carrying a pin, moving a part, sweeping a marquee — is put back
+ *  first: asking what something is must never be an edit. */
+function touchHold() {
+  const t = touch1;
+  if (!t) return;
+  t.timer = 0;
+  t.held = true;
+  t.spent = true;
+  endCanvasGestures('rollback');
+  // While a part is armed the finger belongs to the placement, and the chip's
+  // × is the way out; a scope owns its own chrome. Both mirror the guards the
+  // right button already carries.
+  if (placing || pasting) return;
+  if (scopeZoneAt(t.x, t.y)) return;
+  // Anchored down-right of the fingertip, exactly as a mouse menu is anchored
+  // down-right of the cursor, so the finger covers a corner and not a row.
+  openCtxMenu(t.x + 14, t.y + 12, menuItemsAt(t.x, t.y), true);
+}
+
+/** Second canvas `pointerdown` listener, registered after the dispatch, so it
+ *  can read what the dispatch DECIDED rather than re-deriving the hit chain.
+ *  That is the whole trick: `marquee` is set only when the press reached the
+ *  bottom of the chain, i.e. hit nothing — which is the one fact this needs. */
+function touchAfterDown(ev: PointerEvent) {
+  cancelTouchHold();
+  touch1 = null;
+  // The camera, an armed instrument, or a menu dismissal already owns it.
+  if (touchPts.size !== 1 || touchNavTail || touchShot || touchDismissed) return;
+  touch1 = {
+    id: ev.pointerId,
+    x: ev.clientX,
+    y: ev.clientY,
+    t: performance.now(),
+    moved: false,
+    onEmpty: !!marquee,
+    timer: 0,
+    held: false,
+    spent: false,
+  };
+  // A momentary pushbutton is MEANT to be held. Popping a menu out from under
+  // a finger that is deliberately holding a doorbell closed would make the
+  // part unusable on glass, so a press that closed a Button never becomes a
+  // press-and-hold. (Its menu is on the HUD's ⋯ instead.)
+  if (buttonHeld) return;
+  touch1.timer = window.setTimeout(touchHold, TOUCH_HOLD_MS);
+}
+
+/** Trailing `pointerup` listener: the double-tap, decided after the dispatch
+ *  has finished selecting. */
+function touchAfterUp() {
+  const end = touchTapEnd;
+  touchTapEnd = null;
+  if (!end) return;
+  const now = performance.now();
+  const prev = touchLastTap;
+  touchLastTap = { x: end.x, y: end.y, t: now };
+  if (!prev) return;
+  if (now - prev.t > TOUCH_DTAP_MS) return;
+  if (Math.hypot(end.x - prev.x, end.y - prev.y) > TOUCH_DTAP_PX) return;
+  touchLastTap = null; // three taps are one double-tap and a spare
+  const e = elementAt(end.x, end.y);
+  if (!e) return;
+  // A Switch and a Button are OPERATED by tapping them — a double-tap on one
+  // is two presses, and stealing the second to open an editor would make a
+  // toggle unreliable. Their editor is on the HUD's ⋯, like everything else
+  // the long press cannot reach.
+  if (e.kind.t === 'Switch' || e.kind.t === 'Button') return;
+  openPropsDialog(e);
+}
+
 /** One armed instrument, aimed at the part under the finger that just lifted.
  *  A miss leaves the tool armed: a mis-tap on empty canvas should cost one
  *  more tap, not a trip back to the palette. */
@@ -3654,6 +3827,19 @@ function fireTouchTool(x: number, y: number) {
   canvas.style.cursor = 'default';
 }
 
+// ------------------------------------------------- two fingers, tapped once
+//
+// TWO-FINGER TAP = UNDO, the Procreate/Concepts convention. The whole
+// difficulty is telling it from the first quarter-second of a pinch, and a
+// wrong answer here is an edit nobody asked for — so it is measured on all
+// three axes a pinch moves on at once, and a gesture has to be still on ALL
+// of them to count: the fingers must land and leave inside the window, the
+// pair must not slide, and the gap between them must not change. Anything
+// that fails one of those is a pinch, and a pinch never undoes anything.
+const TOUCH_TWOTAP_MS = 250;
+const TOUCH_TWOTAP_PX = 12;
+let touchTwoTap: { t: number; cx: number; cy: number; d: number } | null = null;
+
 /** Centroid and span of two tracked fingers; null if either has gone. */
 function touchSpan(a: number, b: number) {
   const p = touchPts.get(a);
@@ -3667,6 +3853,9 @@ function touchSpan(a: number, b: number) {
 function touchDown(ev: PointerEvent): boolean {
   touchPts.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
   if (touchShot) touchShot.live = false; // a second finger is never a tap
+  // Read before the dispatch below clears it: a press whose only job was to
+  // dismiss an open menu is not a press-and-hold and not half a double-tap.
+  touchDismissed = swallowPointer;
   if (touchPts.size < 2 && !touchNavTail) {
     if (touchTool) {
       // The instrument owns this finger: no marquee, no part drag, no
@@ -3681,10 +3870,20 @@ function touchDown(ev: PointerEvent): boolean {
     // THE SECOND FINGER CANCELS THE FIRST. Whatever one finger had begun —
     // carrying a pin, dragging a part, sweeping a marquee, stretching a new
     // resistor — is put back before the camera takes over.
-    if (!touchNav) endCanvasGestures('rollback');
+    if (!touchNav) {
+      cancelTouchHold();
+      touch1 = null;
+      endCanvasGestures('rollback');
+    }
     const ids = [...touchPts.keys()];
     touchNav = touchSpan(ids[ids.length - 2]!, ids[ids.length - 1]!);
     touchNavTail = true;
+    // Exactly two fingers, freshly down, is the only thing that can still
+    // become a two-finger tap; a third arriving cancels it outright.
+    touchTwoTap =
+      touchPts.size === 2 && touchNav
+        ? { t: performance.now(), cx: touchNav.cx, cy: touchNav.cy, d: touchNav.d }
+        : null;
   }
   return true;
 }
@@ -3704,10 +3903,53 @@ function touchMove(ev: PointerEvent): boolean {
     }
     return true;
   }
+  const t1 = touch1;
+  if (t1 && t1.id === ev.pointerId) {
+    const far = Math.hypot(ev.clientX - t1.x, ev.clientY - t1.y);
+    if (!t1.moved && far > TOUCH_HOLD_SLOP) {
+      t1.moved = true;
+      cancelTouchHold();
+      if (t1.onEmpty && marquee) {
+        // ONE FINGER ON EMPTY CANVAS PANS. Panning is what a hand does most
+        // on a canvas it cannot see all of, and empty canvas is the only
+        // place with nothing else to mean; marquee moves to press-and-hold.
+        // Converted on the FIRST MOVE, not on the press, so a plain tap on
+        // empty still reaches the marquee's click branch — which is what
+        // clears the selection and what answers a click inside a camera
+        // layer. The pan anchors at the press point, so nothing jumps.
+        marquee = null;
+        panDrag = { x: t1.x, y: t1.y, ox: cam.ox, oy: cam.oy };
+      }
+    }
+    if (t1.held) {
+      // The menu is up and the finger is still down. Drag it far enough and
+      // the menu was a marquee all along (FigJam): the press point is the
+      // corner it was always anchored at.
+      if (t1.spent && t1.onEmpty && far > TOUCH_MARQUEE_SLOP) {
+        closeCtxMenu();
+        marquee = {
+          x0: t1.x,
+          y0: t1.y,
+          x1: ev.clientX,
+          y1: ev.clientY,
+          mode: selectModeOf({ shiftKey: false, altKey: false }),
+        };
+        t1.spent = false; // the dispatch below sweeps it from here
+      }
+      if (t1.spent) return true;
+    }
+  }
   if (!touchNav) return touchNavTail;
   if (ev.pointerId !== touchNav.a && ev.pointerId !== touchNav.b) return true; // a third finger
   const n = touchSpan(touchNav.a, touchNav.b);
   if (!n) return true;
+  if (
+    touchTwoTap &&
+    (Math.hypot(n.cx - touchTwoTap.cx, n.cy - touchTwoTap.cy) > TOUCH_TWOTAP_PX ||
+      Math.abs(n.d - touchTwoTap.d) > TOUCH_TWOTAP_PX)
+  ) {
+    touchTwoTap = null; // it slid or it spread: this is a pinch
+  }
   const k = touchNav.d > 0 && n.d > 0 ? n.d / touchNav.d : 1;
   const s2 = Math.min(MAX_SCALE, Math.max(MIN_SCALE, cam.scale * k));
   // Zoom about the centroid the fingers were on (the same anchor arithmetic
@@ -3735,7 +3977,31 @@ function touchUp(ev: PointerEvent, tap = true): boolean {
     touchShot = null;
     spent = true;
   }
+  const t1 = touch1;
+  if (t1 && t1.id === ev.pointerId) {
+    cancelTouchHold();
+    touch1 = null;
+    if (t1.held && t1.spent) {
+      // The menu is up. This finger has already said everything it meant.
+      touchLastTap = null;
+      spent = true;
+    } else if (tap && !t1.moved && !t1.held) {
+      // A clean tap. The trailing pointerup listener decides whether it was
+      // the second half of a double-tap, once the dispatch has selected.
+      touchTapEnd = { x: t1.x, y: t1.y };
+    } else {
+      touchLastTap = null; // a drag is never half a double-tap
+    }
+  }
   if (touchNav && (ev.pointerId === touchNav.a || ev.pointerId === touchNav.b)) {
+    if (touchTwoTap) {
+      // Both fingers still, and the first of them leaving inside the window:
+      // that was a tap, and a two-finger tap is undo.
+      if (tap && performance.now() - touchTwoTap.t <= TOUCH_TWOTAP_MS) {
+        history.undo(elements);
+      }
+      touchTwoTap = null;
+    }
     // Three fingers down and one lifts: the camera re-anchors on the two that
     // are left rather than jumping.
     const ids = [...touchPts.keys()];
@@ -3828,6 +4094,45 @@ function armedForPalette(): Armed | null {
   return null;
 }
 
+// ------------------------------------------------------- the selection HUD
+//
+// The palette gave a finger a way to ARM a part. This is the other half: the
+// verbs that act on what is already on the sheet, all of which live on a key
+// or a modifier and are therefore unreachable on glass — q, x, y, ⌘C, Delete,
+// the arrows, shift/alt, and ⌘Z. Every button here calls the SAME function
+// the key calls, so there is one implementation of "rotate" in the client.
+//
+// Undo and redo are the two that stand alone, with no selection: a player who
+// has just done something wrong must not have to select something first in
+// order to take it back.
+const touchHud = createTouchHud(document.body, {
+  undo: () => history.undo(elements),
+  redo: () => history.redo(elements),
+  rotate: rotateSelection,
+  flip: flipSelection,
+  copy: copySelection,
+  del: () => deleteIds([...selectedIds]),
+  nudge: (dx, dy) => {
+    nudgeSelection(dx, dy);
+    // One tap, one undo entry. A HELD arrow key is what the open group is
+    // for, and a button cannot be held.
+    endNudge();
+  },
+  more: (x, y) => {
+    const id = [...selectedIds][0];
+    const e = id === undefined ? undefined : elemById(id);
+    if (!e) return;
+    // partMenu's x/y choose which pin "probe voltage" clips to. The gesture
+    // came from a button at the bottom of the screen, so the part's own
+    // middle is the only honest answer.
+    const [bx0, by0, bx1, by1] = boundsPx(e);
+    openCtxMenu(x, y, partMenu(e, (bx0 + bx1) / 2, (by0 + by1) / 2), true);
+  },
+  setMode: (m) => {
+    touchSelectMode = m;
+  },
+});
+
 canvas.addEventListener('wheel', (ev) => {
   ev.preventDefault();
   const z = scopeZoneAt(ev.clientX, ev.clientY);
@@ -3850,17 +4155,7 @@ canvas.addEventListener('contextmenu', (ev) => {
   // already started a pan, do not also pop the menu.
   if (panDrag || placing || pasting) return;
   if (scopeZoneAt(ev.clientX, ev.clientY)) return;
-  const pr = probeAt(ev.clientX, ev.clientY);
-  const e = pr ? undefined : elementAt(ev.clientX, ev.clientY);
-  openCtxMenu(
-    ev.clientX,
-    ev.clientY,
-    pr
-      ? probeMenu(pr)
-      : e
-        ? partMenu(e, ev.clientX, ev.clientY)
-        : canvasMenu(ev.clientX, ev.clientY),
-  );
+  openCtxMenu(ev.clientX, ev.clientY, menuItemsAt(ev.clientX, ev.clientY));
 });
 
 // Click-away closes the menu (and that click does nothing else).
@@ -4634,6 +4929,20 @@ canvas.addEventListener('pointerleave', () => (mouse = null));
 canvas.addEventListener('pointercancel', (ev) => {
   if (ev.pointerType === 'touch' && touchUp(ev, false)) return;
   endCanvasGestures('commit');
+});
+
+// THE TWO TRAILING TOUCH LISTENERS. Registered after the dispatch above, so
+// they run after it — which is the point. `touchAfterDown` needs to know what
+// the press LANDED ON, and the cheapest, most faithful answer to that is what
+// the dispatch itself decided (a marquee means it hit nothing); `touchAfterUp`
+// must not open a properties editor onto a selection the dispatch is about to
+// replace. Neither can be folded into the handlers above without restructuring
+// a chain full of early returns, and every line of that chain is a mouse line.
+canvas.addEventListener('pointerdown', (ev) => {
+  if (ev.pointerType === 'touch') touchAfterDown(ev);
+});
+canvas.addEventListener('pointerup', (ev) => {
+  if (ev.pointerType === 'touch') touchAfterUp();
 });
 
 window.addEventListener('keydown', (ev) => {
@@ -5660,6 +5969,14 @@ function frame(now: number) {
   // both while the palette is unmounted (every desktop session) and while
   // the description has not changed.
   palette.sync(armedForPalette());
+  // ...and the strip that acts on the selection, from the same one place, for
+  // the same reason. Hidden only under the open parts sheet, which it would
+  // otherwise sit beneath.
+  touchHud.sync({
+    count: selectedIds.size,
+    mode: touchSelectMode,
+    hidden: palette.sheetOpen(),
+  });
 
   // Deliberately NO hover readout: voltages, currents and power are only
   // visible through probes, scopes and panel meters — placing an instrument
