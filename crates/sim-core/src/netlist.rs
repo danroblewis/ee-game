@@ -903,12 +903,30 @@ pub const PT_R_RT: f64 = 2760.0;
 /// A `gm` stage into an output impedance is the standard macromodel and it
 /// stamps entirely into the conductance matrix — no branch unknown, no
 /// Newton iteration — which is what lets a part carry two of them for free.
-pub const PT_OA_GM: f64 = 1e2;
-pub const PT_OA_GOUT: f64 = 1e-3;
-/// How close to its rails an internal op-amp can swing. The chip runs on a
-/// single 5 V supply referred to PT_V_RT, so the output cannot go below the
-/// bottom rail or above the top one, and a feedback loop that asks it to
-/// must CLIP rather than run away.
+pub const PT_OA_GM: f64 = 5e3;
+/// 2 Ω of open-loop output impedance. Low for a macromodel, and chosen on
+/// purpose: in this game a speaker is 8 Ω, so a stage that cannot drive one
+/// is a stage nobody can hear. At 1 kΩ — the first value here — the chip's
+/// own op-amp delivered 0.4 % of its signal into a speaker, which reads as a
+/// broken part rather than a loaded one. A closed-loop op-amp's output
+/// impedance is its open-loop value divided by the loop gain anyway, so the
+/// honest figure for a stage in feedback is far below even this.
+pub const PT_OA_GOUT: f64 = 0.5;
+/// The rails an internal op-amp would clip at, on the chip's single 5 V
+/// supply referred to PT_V_RT.
+///
+/// NOT ENFORCED YET, and that is a real gap rather than an oversight worth
+/// hiding. Clipping is a discrete nonlinearity, so the region has to be
+/// iterated to consistency inside Newton like `OpAmp`'s is — and at a gain
+/// of 1e4 the inverting input only has to move half a millivolt to traverse
+/// the whole rail range, so a first attempt at that region test CHATTERED
+/// and quarantined the room after four rescues. A linear stage that always
+/// converges beats a clipping one that can take a player's circuit down, so
+/// these are documentation until the region test is done properly.
+///
+/// What it costs: an overdriven internal op-amp keeps amplifying instead of
+/// clipping, so an echo with a feedback gain above unity grows without bound
+/// rather than settling into distortion the way the real chip does.
 pub const PT_OA_LO: f64 = 0.4;
 pub const PT_OA_HI: f64 = 4.6;
 /// Sample-clock frequency per amp drawn from the VCO pin.

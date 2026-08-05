@@ -2964,7 +2964,6 @@ impl Island {
                         .into_iter()
                         .enumerate()
                     {
-                        let reg = (state.dstate >> (D_PT_OA + 2 * k)) & 3;
                         if need_factor {
                             self.stamp_g(out, vgnd, crate::PT_OA_GOUT);
                             // A gm stage's input is a pure control terminal
@@ -2973,21 +2972,24 @@ impl Island {
                             // op-amp nobody wired would be a singular row.
                             // Same tether the delay input carries.
                             self.stamp_g(inv, vgnd, BBD_G_IN);
-                            if reg == 0 {
-                                // -gm * v(inv) into `out`, referred to GND.
-                                let gm = crate::PT_OA_GM;
-                                for (r, sgn) in [(out, 1.0), (vgnd, -1.0)] {
-                                    if r > 0 && inv > 0 {
-                                        self.a[(r - 1) * n + (inv - 1)] += sgn * gm;
-                                    }
+                            // -gm * v(inv) into `out`, referred to GND.
+                            let gm = crate::PT_OA_GM;
+                            for (r, sgn) in [(out, 1.0), (vgnd, -1.0)] {
+                                if r > 0 && inv > 0 {
+                                    self.a[(r - 1) * n + (inv - 1)] += sgn * gm;
                                 }
                             }
                         }
-                        let drive = match reg {
-                            1 => crate::PT_OA_LO,
-                            2 => crate::PT_OA_HI,
-                            // Linear: the constant half of gm*(VREF - v_inv).
-                            _ => crate::PT_V_RT * crate::PT_OA_GM / crate::PT_OA_GOUT,
+                        let drive = {
+                            // The output is
+                            //     v_out = VREF + A * (VREF - v_inv)
+                            // and BOTH constant terms have to be here. The
+                            // first version dropped the leading VREF, which
+                            // put the stage's rest point at 0 V instead of at
+                            // the half-supply everything else is referred to —
+                            // so a unity-gain buffer delivered 0.046 V for a
+                            // 1 V input and looked like a loading problem.
+                            crate::PT_V_RT * (1.0 + crate::PT_OA_GM / crate::PT_OA_GOUT)
                         };
                         inj[2 + k] = (out, vgnd, drive * crate::PT_OA_GOUT);
                     }
@@ -3769,36 +3771,19 @@ impl Island {
                         st.vg1 -= 1.0;
                         bbd_shifts.push((ei, eid, vs[0] - vgnd));
                     }
-                    // Each op-amp's clamp state, decided from the solution
-                    // this step actually reached. A stage whose UNCLAMPED
-                    // drive is outside the rails pins to the nearer one, and
-                    // a pinned stage un-pins as soon as the drive comes back
-                    // inside — the ordinary op-amp region test, and the same
-                    // shape the engine's own `OpAmp` uses.
+                    // The clamp regions are NOT decided here — see
+                    // `update_guesses`. Deciding them after the solve made
+                    // them one step stale, and with a gain of 1e4 that is not
+                    // a small error: the stage flip-flopped between its rails
+                    // every step and delivered the same railed output whatever
+                    // went in. All that is left here is reporting current.
+                    // What each stage delivers into whatever hangs on it.
                     let mut oa_i = [0.0f64; 2];
                     for (k, (inv, out)) in [(4usize, 5usize), (6, 7)].into_iter().enumerate() {
                         let want = crate::PT_V_RT
                             + (crate::PT_V_RT - (vs[inv] - vgnd)) * crate::PT_OA_GM
                                 / crate::PT_OA_GOUT;
-                        let reg = if want < crate::PT_OA_LO {
-                            1
-                        } else if want > crate::PT_OA_HI {
-                            2
-                        } else {
-                            0
-                        };
-                        let sh = D_PT_OA + 2 * k;
-                        st.dstate = (st.dstate & !(3 << sh)) | (reg << sh);
-                        // What the stage delivers into whatever is hanging on
-                        // it. The inverting input itself draws nothing — it is
-                        // a gm stage's control terminal, like a real op-amp's
-                        // input.
-                        let drive = match reg {
-                            1 => crate::PT_OA_LO,
-                            2 => crate::PT_OA_HI,
-                            _ => want,
-                        };
-                        oa_i[k] = (drive - (vs[out] - vgnd)) * crate::PT_OA_GOUT;
+                        oa_i[k] = (want - (vs[out] - vgnd)) * crate::PT_OA_GOUT;
                     }
                     let i_out = (st.v_prev - (vs[1] - vgnd)) * PT_G_OUT;
                     st.pin_i = [0.0; MAX_PINS];
