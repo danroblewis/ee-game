@@ -22,10 +22,23 @@
 //! three, so this is not extra solving work per step — it is a bigger
 //! matrix, every step, forever.
 //!
-//! THE FIX, when someone takes it: prune degree-1 nodes before building.
-//! It has to be iterative (pruning one can expose another) and it changes
-//! the matrix, so it moves golden state hashes and needs the determinism
-//! harness re-baselined deliberately rather than in passing.
+//! FIXED, by merging rather than pruning. A loose end of a pure conductance
+//! is at EXACTLY the far end's potential — zero current through a resistor
+//! is zero volts across it — so it can share that node's unknown instead of
+//! getting one of its own. After:
+//!
+//!     none                  4.3 ms    2 nodes
+//!     10 connected          9.2 ms    2 nodes
+//!     10 dangling           8.0 ms    2 nodes   <- was 16.7 ms and 12 nodes
+//!
+//! A loose end now costs exactly what a connected one costs: its stamping,
+//! and nothing else.
+//!
+//! ONLY PURE CONDUCTANCES, which is the whole safety argument. Zero current
+//! means zero drop for a resistor and does not for anything else: a
+//! capacitor holds its charge, an inductor its history, and an ideal source
+//! with a loose end would become `0 = dc` — a singular row — the moment its
+//! terminals were made one. Those keep their unknown.
 use sim_core::{ElementKind as K, Engine, Wave};
 use sim_golden::*;
 use std::time::Instant;
@@ -60,7 +73,7 @@ fn room_connected(n: usize) -> Vec<sim_core::ElementSpec> {
 }
 
 #[test]
-fn ten_connected_resistors_are_free_and_ten_loose_ones_are_not() {
+fn a_loose_end_costs_no_more_than_a_connected_one() {
     let bench = |d: Vec<sim_core::ElementSpec>| {
         let mut eng = Engine::new(DT);
         eng.set_elements(&d);
@@ -75,6 +88,10 @@ fn ten_connected_resistors_are_free_and_ten_loose_ones_are_not() {
     println!("  none        : {base:6.1} ms   {nb} nodes");
     println!("  10 connected: {conn:6.1} ms   {nc} nodes");
     println!("  10 dangling : {dang:6.1} ms   {nd} nodes");
+    // THE GUARD: loose ends must add no unknowns. Without the merge this is
+    // 12 against 2, and the room pays for it on every step forever.
+    assert_eq!(nd, nb, "loose ends must not add nodes");
+    assert_eq!(nc, nb, "connected resistors never did");
 }
 
 #[test]

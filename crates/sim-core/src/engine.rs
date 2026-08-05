@@ -1631,6 +1631,39 @@ impl Engine {
             );
         }
 
+        // 1b. LOOSE ENDS COST AN UNKNOWN, so give them away.
+        //
+        //     A resistor with one end connected to nothing carries no current
+        //     — KCL at a point nothing else touches leaves no other option —
+        //     and a pure conductance with no current through it has NO
+        //     VOLTAGE ACROSS IT. Its free end is therefore at exactly the far
+        //     end's potential, always, and giving it a row of its own asks
+        //     the solver to rediscover that on every substep forever.
+        //
+        //     Measured before this: ten dangling resistors took a room from
+        //     4.3 ms to 16.7 ms per 50k steps and its node count from 2 to
+        //     12, while ten resistors connected at BOTH ends — same stamping,
+        //     no new nodes — cost less than half as much. Newton iterations
+        //     and factorization counts were identical across all three, so
+        //     it was never solve work: it was matrix size, on every step, for
+        //     the life of the room.
+        //
+        //     ONLY PURE CONDUCTANCES, and that restriction is the whole
+        //     safety argument. Zero current means zero drop for a resistor,
+        //     and does NOT for anything else: a capacitor holds its charge,
+        //     an inductor its history, and an ideal SOURCE with a loose end
+        //     would become `0 = dc` — a singular row — the moment its two
+        //     terminals were made one. Those keep their unknown.
+        let mut degree: Vec<u32> = vec![0; points.len()];
+        for (e, je) in doc.iter().zip(ends.iter()) {
+            if e.broken {
+                continue;
+            }
+            for &j in je {
+                degree[j] += 1;
+            }
+        }
+
         // 2. Union-find: wires merge their endpoints; grounds pin to a
         //    virtual ground root.
         let ground_root = points.len();
@@ -1643,6 +1676,25 @@ impl Engine {
             // breakable and a "broken" wire silently keeps shorting.
             if e.broken {
                 continue;
+            }
+            // A loose end of a pure conductance joins the node it hangs
+            // off: same potential, one unknown instead of two.
+            if matches!(
+                e.spec.kind,
+                ElementKind::Resistor { .. }
+                    | ElementKind::Lamp { .. }
+                    | ElementKind::Speaker { .. }
+                    | ElementKind::Photocell { .. }
+            ) && je.len() == 2
+            {
+                for (a, b) in [(0usize, 1usize), (1, 0)] {
+                    if degree[je[a]] == 1 {
+                        let (ra, rb) = (find(&mut parent, je[a]), find(&mut parent, je[b]));
+                        if ra != rb {
+                            parent[ra] = rb;
+                        }
+                    }
+                }
             }
             match e.spec.kind {
                 ElementKind::Wire => {
