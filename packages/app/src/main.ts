@@ -1550,16 +1550,96 @@ function labelBoxOp(op: LabelBoxOp) {
 /** Net labels, same rule. Offline there is no `netmap` broadcast (nothing is
  * deriving one), so every label reads detached until a server answers —
  * which is honest: this client genuinely does not know which net it is on. */
-function netLabelOp(op: NetLabelOp) {
-  if (online) {
-    net.sendNetLabel(op);
-    return;
+/** Send a net-label op, and REMEMBER HOW TO TAKE IT BACK.
+ *
+ *  Net labels used to bypass the undo stack entirely, so a label a player
+ *  placed by accident could be deleted (hover its plate, Delete) but never
+ *  undone — and nothing about the way it appears suggests it is any less a
+ *  thing than the parts around it.
+ *
+ *  The inverse is issued as another op through this same function rather
+ *  than by restoring a snapshot, because that is the only form that works
+ *  ONLINE as well: the server owns the list, and the client's copy is
+ *  whatever it last broadcast. `History.pushAction` already exists for
+ *  exactly this kind of non-DocOp gesture — the machine drag uses it — so
+ *  this needs no new undo machinery at all.
+ *
+ *  Identifying the label to undo is by POSITION, not by nlid, for the same
+ *  reason: when a player adds one online, the id is the server's to mint and
+ *  has not arrived yet. The anchor is a grid point and only one label may
+ *  sit on it, so position identifies it exactly. */
+function netLabelOp(op: NetLabelOp, record = true): void {
+  // Snapshot what the op is about to destroy, BEFORE it happens.
+  const prev =
+    op.t === 'remove' || op.t === 'move' || op.t === 'rename'
+      ? netLabels.find((l) => l.nlid === op.nlid)
+      : undefined;
+  const at = (x: number, y: number) => netLabels.find((l) => l.x === x && l.y === y);
+
+  send(op);
+  if (!record) return;
+
+  if (op.t === 'add') {
+    const { x, y } = op;
+    history.pushAction({
+      label: 'add net label',
+      undo: () => {
+        const l = at(x, y);
+        if (l) netLabelOp({ t: 'remove', nlid: l.nlid }, false);
+      },
+      redo: () => netLabelOp({ t: 'add', x, y, name: op.name }, false),
+    });
+  } else if (prev) {
+    const was = { ...prev };
+    if (op.t === 'remove') {
+      history.pushAction({
+        label: 'delete net label',
+        undo: () => netLabelOp({ t: 'add', x: was.x, y: was.y, name: was.name }, false),
+        redo: () => {
+          const l = at(was.x, was.y);
+          if (l) netLabelOp({ t: 'remove', nlid: l.nlid }, false);
+        },
+      });
+    } else if (op.t === 'move') {
+      const to = { x: op.x, y: op.y };
+      history.pushAction({
+        label: 'move net label',
+        undo: () => {
+          const l = at(to.x, to.y);
+          if (l) netLabelOp({ t: 'move', nlid: l.nlid, x: was.x, y: was.y }, false);
+        },
+        redo: () => {
+          const l = at(was.x, was.y);
+          if (l) netLabelOp({ t: 'move', nlid: l.nlid, x: to.x, y: to.y }, false);
+        },
+      });
+    } else if (op.t === 'rename') {
+      const to = op.name;
+      history.pushAction({
+        label: 'rename net label',
+        undo: () => {
+          const l = at(was.x, was.y);
+          if (l) netLabelOp({ t: 'rename', nlid: l.nlid, name: was.name }, false);
+        },
+        redo: () => {
+          const l = at(was.x, was.y);
+          if (l) netLabelOp({ t: 'rename', nlid: l.nlid, name: to }, false);
+        },
+      });
+    }
   }
-  netLabels = applyNetLabelOp(netLabels, op, () => {
-    for (const l of netLabels) localNlidCounter = Math.max(localNlidCounter, l.nlid + 1);
-    return localNlidCounter++;
-  });
-  resolvePendingNames();
+
+  function send(o: NetLabelOp): void {
+    if (online) {
+      net.sendNetLabel(o);
+      return;
+    }
+    netLabels = applyNetLabelOp(netLabels, o, () => {
+      for (const l of netLabels) localNlidCounter = Math.max(localNlidCounter, l.nlid + 1);
+      return localNlidCounter++;
+    });
+    resolvePendingNames();
+  }
 }
 
 // ------------------------------------------------------- external inputs
@@ -1855,6 +1935,8 @@ const cam: Camera = { scale: 48, ox: 60, oy: 60 };
 // frames of an untouched schematic differ), and "it looked right" is not a
 // measurement. A getter, because `elements` is rebound whenever a room loads.
 Object.defineProperty(window, '__els', { get: () => elements });
+// End-to-end tests need to see annotations too, not just parts.
+Object.defineProperty(window, '__nl', { get: () => netLabels });
 // And the instruments, for the same reason: a probe placed by an armed touch
 // tool draws a flag on a canvas, and a canvas cannot be asked what it means.
 Object.defineProperty(window, '__probes', { get: () => probes });

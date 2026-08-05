@@ -493,6 +493,21 @@ export function netLabelAt(
     const [X, Y, W, H] = netLabelRect(cam, l);
     if (x >= X && x <= X + W && y >= Y && y <= Y + H) return l;
   }
+  // ...and the ANCHOR itself, not only the plate.
+  //
+  // The plate is drawn offset from the grid point it names, so a player who
+  // puts the cursor on the label — on the dot, where they clicked to make it
+  // — was missing it entirely, and Delete did nothing. Measured: hovering the
+  // exact anchor and pressing Delete left the label in place. A thing you can
+  // make and cannot unmake is a trap, and "hover a few pixels up and to the
+  // right of where you clicked" is not a discoverable escape from it.
+  const r = Math.max(10, cam.scale * 0.35);
+  for (let k = labels.length - 1; k >= 0; k--) {
+    const l = labels[k]!;
+    const px = cam.ox + l.x * cam.scale;
+    const py = cam.oy + l.y * cam.scale;
+    if (Math.hypot(px - x, py - y) <= r) return l;
+  }
   return null;
 }
 
