@@ -826,6 +826,7 @@ export function drawElement(d: DrawCtx, e: ElementSpec) {
       if (e.kind.closed) twoPinDots();
       break;
     }
+    case 'Pt2399':
     case 'Bbd': {
       // A DIP like the 555, but the innards worth hinting at are the BUCKETS:
       // a row of little capacitors handing charge along. That row is the
@@ -893,7 +894,7 @@ export function drawElement(d: DrawCtx, e: ElementSpec) {
         ctx.textAlign = 'center';
         ctx.fillStyle = '#c9c9d4';
         ctx.font = `${Math.round(s * 0.26)}px ui-monospace`;
-        ctx.fillText('BBD', ...at(w * 0.5, y0 + 0.34));
+        ctx.fillText(e.kind.t === 'Bbd' ? 'BBD' : '2399', ...at(w * 0.5, y0 + 0.34));
         ctx.textAlign = 'start';
       }
       break;

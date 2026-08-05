@@ -297,6 +297,7 @@ const PART_HOTKEYS: Record<string, string> = {
   // The bucket brigade. E for echo, which is what a player is reaching for
   // when they want one — the part's own name is the last thing they'd guess.
   E: 'Bucket Brigade (BBD)',
+  P: 'Echo Chip (PT2399)',
 };
 
 // Read `?stdvalues=` BEFORE anything can rewrite the query string. `rooms.ts`

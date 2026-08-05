@@ -17,7 +17,7 @@ pub use netlist::{
     Wave,
     photocell_ohms, DocOp, ElementKind, ElementSpec, GateOp, InteractOp, LogicPins, ParamWrite,
     Point,
-    DEFAULT_OPAMP_ISC, MAX_BBD_STAGES, MAX_PINS, MAX_TIER,
+    DEFAULT_OPAMP_ISC, MAX_BBD_STAGES, MAX_PINS, MAX_TIER, PT_HZ_PER_AMP, PT_STAGES, PT_V_RT,
 };
 pub use shape::{is_rigid, Handle, Placement, Shape};
 pub use validate::{check_document, check_edit, check_shapes, rigid_hint, Reject, SmallIds};

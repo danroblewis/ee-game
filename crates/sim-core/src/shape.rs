@@ -124,6 +124,8 @@ impl Shape {
             "Ota" => Shape::Ota,
             "Timer555" => Shape::Dip555,
             "Bbd" => Shape::Bbd,
+            // Same package geometry; RT sits where the BBD's CLK does.
+            "Pt2399" => Shape::Bbd,
             _ => Shape::Free,
         }
     }

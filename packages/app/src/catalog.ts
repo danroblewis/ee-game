@@ -276,6 +276,15 @@ export const CATALOG: PartDef[] = [
     // chain fits in 8 kB.
     make: () => ({ t: 'Bbd', stages: 1024 }),
   },
+  {
+    name: 'Echo Chip (PT2399)',
+    keys: 'delay echo pt2399 reverb slapback digital',
+    cat: 'Chips',
+    key: '⇧P',
+    // No stages field: a real chip's RAM is fixed and only its clock moves.
+    // The delay is whatever resistor you hang on RT.
+    make: () => ({ t: 'Pt2399' }),
+  },
 
   // ------------------------------------------------------- the logic family
   //
@@ -409,6 +418,7 @@ export function pinCount(kind: ElementKind): number {
     case 'Timer555':
       return 6;
     case 'Bbd':
+    case 'Pt2399':
       return 4;
     case 'Ota':
       return 4;

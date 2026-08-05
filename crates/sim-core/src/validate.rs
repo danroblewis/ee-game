@@ -762,6 +762,9 @@ fn check_kind(kind: &ElementKind) -> Result<(), &'static str> {
             }
             Ok(())
         }
+        // Nothing to range-check: the delay is set by the resistor the
+        // player wires to RT, which is that resistor's problem, not a field.
+        K::Pt2399 => Ok(()),
         K::Bbd { stages } => {
             // A one-bucket "delay" is a wire with extra steps, and the upper
             // bound is what keeps a document from asking for a gigabyte of

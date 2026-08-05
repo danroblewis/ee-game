@@ -739,6 +739,13 @@ const BBD_CLK_LO: f64 = 1.0;
 /// row singular. Same tether an op-amp input carries, and small enough that
 /// it never loads what drives it.
 const BBD_G_IN: f64 = 1e-6;
+/// PT2399 output source impedance, as a conductance (1 mS = 1 kΩ).
+///
+/// A real buffered chip output is not ideal, and here that is load-bearing
+/// rather than pedantry: giving the output a source impedance frees this
+/// part's single branch unknown for the RT reference, where the current
+/// being measured is the input to everything else.
+const PT_G_OUT: f64 = 1e-3;
 
 /// A bucket chain: the samples, where the next one lands, and enough to undo
 /// the most recent write.
@@ -1932,8 +1939,17 @@ impl Engine {
             // them at a new length would be audible nonsense.
             let delays: BTreeMap<u32, DelayLine> = elems
                 .iter()
-                .filter_map(|e| match e.spec.kind {
-                    ElementKind::Bbd { stages } => {
+                .filter_map(|e| {
+                    // Both delay parts draw from the same chain. Only where
+                    // the clock comes from differs: the BBD takes it from a
+                    // pin, the PT2399 makes its own — and the PT's depth is
+                    // fixed, because a real chip's RAM is.
+                    let stages = match e.spec.kind {
+                        ElementKind::Bbd { stages } => stages,
+                        ElementKind::Pt2399 => crate::PT_STAGES,
+                        _ => return None,
+                    };
+                    {
                         let want = (stages as usize).max(2);
                         let dl = old_delays
                             .remove(&e.spec.id)
@@ -1941,7 +1957,6 @@ impl Engine {
                             .unwrap_or_else(|| DelayLine::new(want));
                         Some((e.spec.id, dl))
                     }
-                    _ => None,
                 })
                 .collect();
             islands.push(Island {
@@ -2878,6 +2893,44 @@ impl Island {
                     }
                     self.b[bi] = v;
                 }
+                ElementKind::Pt2399 => {
+                    // Pins [IN, OUT, RT, GND].
+                    //
+                    // The BRANCH is spent on the RT reference, not on the
+                    // output. That is deliberate: the current the player's
+                    // resistor draws from RT is the input to the entire
+                    // mechanism, and reading it out of a Norton equivalent
+                    // would make it a small difference between two large
+                    // numbers. As an ideal source it IS the branch unknown,
+                    // exactly.
+                    //
+                    // The output pays for that by having a real source
+                    // impedance instead of being ideal — which a buffered
+                    // chip output has anyway, so the model gets more honest
+                    // rather than less.
+                    let bi = self.num_nodes + branch.ok_or(())?;
+                    let (vin, vout, vrt, vgnd) = (node[0], node[1], node[2], node[3]);
+                    if need_factor {
+                        for (pin, sgn) in [(vrt, 1.0), (vgnd, -1.0)] {
+                            if pin > 0 {
+                                self.a[bi * n + (pin - 1)] += sgn;
+                                self.a[(pin - 1) * n + bi] += sgn;
+                            }
+                        }
+                        self.stamp_g(vin, vgnd, BBD_G_IN);
+                        self.stamp_g(vout, vgnd, PT_G_OUT);
+                    }
+                    self.b[bi] = crate::PT_V_RT;
+                    // Norton half of the output: a Thevenin source of the
+                    // held sample behind PT_R_OUT.
+                    let inj = state.v_prev * PT_G_OUT;
+                    if vout > 0 {
+                        self.b[vout - 1] += inj;
+                    }
+                    if vgnd > 0 {
+                        self.b[vgnd - 1] -= inj;
+                    }
+                }
                 ElementKind::Bbd { .. } => {
                     // Pins [IN, OUT, CLK, GND].
                     //
@@ -3629,6 +3682,28 @@ impl Island {
                     // return leg lives in ground and has no pin to report.
                     st.pin_i = [0.0; MAX_PINS];
                     st.pin_i[0] = bi_val.unwrap_or(0.0);
+                }
+                ElementKind::Pt2399 => {
+                    // The branch unknown IS the RT current, which is the
+                    // whole reason the branch was spent there.
+                    let i_rt = bi_val.unwrap_or(0.0).abs();
+                    let vgnd = vs[3];
+                    // The chip's own oscillator: a phase accumulator, so
+                    // nothing has to be wired to a clock pin. Clamped at one
+                    // shift per substep — the engine cannot move a sample
+                    // faster than it steps, and pretending otherwise would
+                    // silently shorten the delay instead of refusing it.
+                    let f = (crate::PT_HZ_PER_AMP * i_rt).clamp(0.0, 1.0 / h);
+                    st.vg1 += f * h;
+                    if st.vg1 >= 1.0 {
+                        st.vg1 -= 1.0;
+                        bbd_shifts.push((ei, eid, vs[0] - vgnd));
+                    }
+                    let i_out = (st.v_prev - (vs[1] - vgnd)) * PT_G_OUT;
+                    st.pin_i = [0.0; MAX_PINS];
+                    st.pin_i[1] = i_out;
+                    st.pin_i[2] = i_rt;
+                    st.pin_i[3] = -(i_out + i_rt);
                 }
                 ElementKind::Bbd { .. } => {
                     // Pins [IN, OUT, CLK, GND]. Runs ONCE PER ACCEPTED STEP,

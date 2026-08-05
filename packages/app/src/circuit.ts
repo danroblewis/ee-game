@@ -81,6 +81,7 @@ export type ElementKind =
   | { t: 'Ota' }
   | { t: 'Timer555' }
   | { t: 'Bbd'; stages: number }
+  | { t: 'Pt2399' }
   | { t: 'Potentiometer'; ohms: number; wiper: number }
   /** Light-dependent resistor. `r_dark`/`r_lit` are the CALIBRATION and are
    *  document state; `light` is the READING and is not — the server never
@@ -164,6 +165,8 @@ export function pinLabels(kind: ElementKind): string[] {
       return ['VCC', 'GND', 'TRG', 'THR', 'OUT', 'DIS'];
     case 'Bbd':
       return ['IN', 'OUT', 'CLK', 'GND'];
+    case 'Pt2399':
+      return ['IN', 'OUT', 'RT', 'GND'];
     case 'Potentiometer':
       return ['A', 'W', 'B'];
     case 'Motor':

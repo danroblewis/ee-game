@@ -357,6 +357,7 @@ pub fn tiers(kind: &ElementKind) -> &'static [Tier] {
         // the frame's power really is the chip's own dissipation.
         K::Timer555 => TIMER555,
         K::Bbd { .. } => BBD,
+        K::Pt2399 => BBD,
         // The logic family inherits that sentence verbatim, and goes one
         // better: its model is a pure positive-conductance network between
         // modelled supply pins, so `Σ v·i` is not merely its own dissipation
@@ -464,6 +465,7 @@ pub fn kind_name(kind: &ElementKind) -> &'static str {
         K::Ota => "OTA",
         K::Timer555 => "555",
         K::Bbd { .. } => "BBD",
+        K::Pt2399 => "PT2399",
         K::Potentiometer { .. } => "Potentiometer",
         K::Photocell { .. } => "Photocell",
         K::Motor { .. } => "Motor",

@@ -471,6 +471,48 @@ pub enum ElementKind {
         /// Bucket count, 2..=MAX_BBD_STAGES.
         stages: u16,
     },
+    /// PT2399-class ECHO CHIP: the same delay line, but it brings its own
+    /// clock. Pins `[IN, OUT, RT, GND]`.
+    ///
+    /// ## Why this exists next to `Bbd`
+    ///
+    /// A bucket brigade needs a clock, which means a 555 and a pot before it
+    /// does anything. That is the right answer for a player who wants to
+    /// modulate the delay — it is how a flanger is built — and the wrong one
+    /// for a player who just wants an echo. The real PT2399 answers exactly
+    /// that: one resistor on pin 6 and you have a delay.
+    ///
+    /// ## How the resistor sets the delay, honestly
+    ///
+    /// RT sits at an internal reference voltage. The player's resistor from
+    /// RT to ground therefore draws `V_RT / R`, and THAT CURRENT — which the
+    /// solver computes, not us — sets the internal oscillator. So the delay
+    /// really is a consequence of the circuit the player built: swap the
+    /// resistor for a pot and the delay sweeps, exactly as it does on the
+    /// bench. Nothing reads a resistance; nothing could, and it would be a
+    /// lie if it did.
+    ///
+    /// ```text
+    ///     f_clock = PT_HZ_PER_AMP * i_RT,     delay = PT_STAGES / f_clock
+    /// ```
+    ///
+    /// with the constant fitted so the datasheet's own range falls out: about
+    /// 30 ms at 5 kΩ, about 340 ms at 50 kΩ.
+    ///
+    /// ## Deviations, stated
+    ///
+    /// * The output has a real source impedance rather than being ideal, so
+    ///   it costs no branch unknown — the single branch this part owns is
+    ///   spent on the RT reference, because that current is the input to the
+    ///   whole mechanism and reading it through a Norton equivalent would be
+    ///   a small difference of two large numbers.
+    /// * The clock cannot exceed one shift per substep, which caps the
+    ///   shortest delay at `PT_STAGES * dt`. At the room's 20 µs that is
+    ///   20 ms, just under the chip's own 30 ms minimum, so the whole useful
+    ///   range is reachable.
+    /// * The real chip's companding and its 1-bit converters — the reason a
+    ///   long PT2399 delay degrades so musically — are not modelled.
+    Pt2399,
     /// Synchronous binary counter. Pins: `[VCC, GND, CLK, RST, Q0..]`,
     /// `bits` in 2..=4, `modulus` in 2..=2^bits.
     ///
@@ -631,6 +673,7 @@ impl ElementKind {
             FlipFlop { .. } => "FlipFlop",
             ShiftReg { .. } => "ShiftReg",
             Bbd { .. } => "BBD",
+            Pt2399 => "PT2399",
             Counter { .. } => "Counter",
             Mux { .. } => "Mux",
         }
@@ -642,6 +685,7 @@ impl ElementKind {
             Ground | Rail { .. } => 1,
             Timer555 => 6,
             Bbd { .. } => 4,
+            Pt2399 => 4,
             Ota => 4,
             Npn { .. }
             | Pnp { .. }
@@ -740,6 +784,7 @@ impl ElementKind {
                 | ElementKind::Timer555
                 | ElementKind::Motor { .. }
                 | ElementKind::Bbd { .. }
+                | ElementKind::Pt2399
         )
     }
 
@@ -806,6 +851,23 @@ impl ElementKind {
 /// unknowns, so length is memory rather than solve time. The bound exists so
 /// a hostile or stale document cannot ask for a gigabyte.
 pub const MAX_BBD_STAGES: u16 = 4096;
+
+/// The PT2399's internal delay-line depth, in samples.
+///
+/// Fixed, because the real chip's RAM is: only its clock varies. 1024 puts
+/// the datasheet's 30 ms at 34 kHz and its 340 ms at 3 kHz, both of which
+/// the engine's 50 kHz substep grid can clock without ever needing two
+/// shifts in one substep.
+pub const PT_STAGES: u16 = 1024;
+/// The RT pin's internal reference, in volts.
+pub const PT_V_RT: f64 = 2.5;
+/// Oscillator frequency per amp drawn from RT.
+///
+/// Fitted to the datasheet's two endpoints: 5 kΩ draws 500 µA and must give
+/// ~30 ms (34.1 kHz at 1024 stages), 50 kΩ draws 50 µA and must give ~340 ms
+/// (3.0 kHz). Both land on this one constant, which is the check that the
+/// 1/R law is the right shape and not a curve fit.
+pub const PT_HZ_PER_AMP: f64 = 6.82e7;
 
 pub const MAX_TIER: u8 = 3;
 
