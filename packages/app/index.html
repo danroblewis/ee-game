@@ -370,8 +370,15 @@
       }
       .prow-label { flex: 0 0 82px; color: #8ea3b1; font-size: 11px; letter-spacing: 0.04em; }
       .prow-ctl { flex: 1 1 110px; display: flex; align-items: center; gap: 6px; min-width: 0; }
+      /* FIXED WIDTH, not `auto`. These hold live solver output, so the text
+         changes several times a second, and a content-sized column changes
+         width along with it — measured swinging 76 -> 86.4 px, which slides
+         the right-aligned number sideways underneath whatever control it
+         belongs to. 88px is the widest reading measured, so pinning it there
+         costs no clipping and the number stops wandering. `tabular-nums` is
+         the same rule one level down: digits must not resize each other. */
       .prow-val {
-        flex: 0 0 auto; min-width: 76px; text-align: right; color: #cfe3ee;
+        flex: 0 0 88px; text-align: right; color: #cfe3ee;
         font-variant-numeric: tabular-nums;
       }
       .pslider { flex: 1 1 auto; min-width: 60px; accent-color: #4ad4ff; }

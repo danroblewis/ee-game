@@ -944,6 +944,15 @@ function rowLabel(spec: ElementSpec | undefined, fallback: string, extra?: strin
 /** Potentiometer: a real slider, or a knob you drag — per-widget choice. */
 function potWidget(plid: number, id: number, deps: PanelHostDeps): Widget {
   const { el, lab, ctl, val, setLabel } = makeRow(`pot:${id}`, `POT #${id}`);
+  // A POT SHOWS NO NUMBERS. The percentage only repeated what the slider's
+  // position and the knob's angle were already showing, and the wiper voltage
+  // is live solver output — it changed several times a second, and the width
+  // of the text changed with it. Measured across one full drag the readout
+  // swung 76 -> 86.4 px wide on its own wrapped line directly under the
+  // slider, and being right-aligned, the number slid back and forth there the
+  // whole time. The slider itself never resized; it just never sat still
+  // next to something that did, while you were trying to aim at it.
+  val.remove();
   let spec: ElementSpec | undefined;
   const push = sender(deps, () => spec);
 
@@ -1030,9 +1039,6 @@ function potWidget(plid: number, id: number, deps: PanelHostDeps): Widget {
         slider.value = String(k.wiper);
         needle.style.transform = `rotate(${-135 + k.wiper * 270}deg)`;
       }
-      const l = ctx.live.get(id);
-      // The wiper pin voltage is solver output, not a UI guess.
-      val.textContent = `${(k.wiper * 100).toFixed(0)}% ${l ? fmtEng(l.v[1] ?? 0, 'V') : ''}`;
     },
   };
 }
