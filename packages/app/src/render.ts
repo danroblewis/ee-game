@@ -573,7 +573,7 @@ export function drawElement(d: DrawCtx, e: ElementSpec) {
       const text = (e.name ?? '').trim();
       // The flag is sized to the NAME, so a long one is readable and a short
       // one does not float in whitespace.
-      const w = Math.max(1.1, text.length * 0.34 + 0.5);
+      const w = labelFlagWidth(e);
       ctx.strokeStyle = col;
       ctx.beginPath();
       ctx.moveTo(A[0], A[1]);
@@ -1997,21 +1997,59 @@ export function drawElementsLod(
 /** Distance in px from (x, y) to the element (nearest pin-chain segment;
  * 3-pin parts also count their body around the centroid, packages their
  * whole pin bounding box). */
+/** How wide a label's flag is, in grid units — sized to its name. */
+export function labelFlagWidth(e: ElementSpec): number {
+  return Math.max(1.1, (e.name ?? '').trim().length * 0.34 + 0.5);
+}
+
+/** THE VISIBLE EXTENT of a one-pin symbol, in grid units.
+ *
+ *  `reach` is how far the body runs from the pin along `oneAxis`, `halfW`
+ *  how far it spreads either side, and `sign` which way `oneAxis` points.
+ *
+ *  It exists so the DRAWING and the HIT TEST agree. They did not: the hit
+ *  test measured distance to a bare LINE along the axis, while a rail draws
+ *  a 0.28-radius ring, a ground draws crossbars a quarter-unit wide, and a
+ *  label draws a flag as wide as its name. Everything but the thin spine was
+ *  unclickable, which on a label — whose spine is most of a unit from the
+ *  flag you are aiming at — meant only the pin worked. */
+export function oneBody(
+  e: ElementSpec,
+): { reach: number; halfW: number; sign: number } | null {
+  switch (e.kind.t) {
+    // Stem to 0.25, then crossbars out to 0.69, widest 0.5 across.
+    case 'Ground':
+      return { reach: 0.72, halfW: 0.28, sign: 1 };
+    // Stem to 0.55, then a ring of radius 0.28 centred there.
+    case 'Rail':
+      return { reach: 0.86, halfW: 0.30, sign: -1 };
+    // Stem to 0.55, then the pennant, 0.42 either side.
+    case 'Label':
+      return { reach: 0.55 + labelFlagWidth(e), halfW: 0.45, sign: 1 };
+    default:
+      return null;
+  }
+}
+
 export function hitTest(cam: Camera, e: ElementSpec, x: number, y: number): number {
   const P = e.pins.map((p) => px(cam, p));
   if (P.length === 1) {
     const [ax, ay] = P[0]!;
     // One-pin parts draw a body away from the pin, in whichever direction
-    // their rotation points: the whole stem-to-symbol span is the clickable
-    // body, or the part could only ever be grabbed by its connection point.
-    const len = e.kind.t === 'Rail' ? 0.85 : e.kind.t === 'Ground' ? 0.72 : 0;
-    if (len === 0) return Math.hypot(x - ax, y - ay);
-    const [ux, uy] = oneAxis(e, e.kind.t === 'Rail' ? -1 : 1);
-    const dx = ux * cam.scale * len;
-    const dy = uy * cam.scale * len;
-    const l2 = dx * dx + dy * dy;
-    const t = Math.max(0, Math.min(1, ((x - ax) * dx + (y - ay) * dy) / l2));
-    return Math.hypot(x - (ax + t * dx), y - (ay + t * dy));
+    // their rotation points. The clickable region is that WHOLE BODY — a
+    // rectangle, not a line — so anywhere on the symbol you can see is
+    // somewhere you can grab. A part reachable only by its connection point
+    // is a part you fight with.
+    const body = oneBody(e);
+    if (!body) return Math.hypot(x - ax, y - ay);
+    const [ux, uy] = oneAxis(e, body.sign);
+    // Into the symbol's own frame: `along` runs down the axis, `across` is
+    // the perpendicular. Distance to the rectangle is zero INSIDE it.
+    const along = (x - ax) * ux + (y - ay) * uy;
+    const across = Math.abs((x - ax) * -uy + (y - ay) * ux);
+    const da = Math.max(0, along < 0 ? -along : along - body.reach * cam.scale);
+    const dc = Math.max(0, across - body.halfW * cam.scale);
+    return Math.hypot(da, dc);
   }
   let best = Infinity;
   const segs: [Px, Px][] = [];
