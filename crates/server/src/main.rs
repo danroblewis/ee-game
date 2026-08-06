@@ -82,6 +82,8 @@ mod moog;
 mod slew;
 #[cfg(test)]
 mod e2e;
+#[cfg(test)]
+mod muxrail;
 mod tr808;
 mod vco555;
 mod bass;
