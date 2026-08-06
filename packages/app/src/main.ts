@@ -3652,18 +3652,25 @@ function probeMenu(p: Probe): MenuItem[] {
 }
 
 function canvasMenu(x: number, y: number, touch = false): MenuItem[] {
-  const items: MenuItem[] = [{ label: 'Add part', sub: partsMenu }];
+  // THE PARTS ARE THE MENU. Right-clicking bare grid is overwhelmingly a
+  // request for a part, and burying the categories under an "Add part" entry
+  // cost a hover-and-wait on the way to every single one of the forty-seven
+  // — a whole level of cascade that existed only to name what the menu was
+  // already for. The categories now ARE the top of the menu and everything
+  // else follows, which is the order of how often it is wanted.
+  const items: MenuItem[] = [];
   if (touch) {
     // THE WAY BACK, FOR A HAND THAT HAS NO 'H' KEY. Two fingers can carry the
     // camera to grid 4000,4000 in a few seconds, and from there nothing on
     // glass returned: the HUD is pointer-events:none, the room browser does
     // not recentre, and only a page reload rescued the session. These are the
-    // same two calls the keys make. Above them because a lost player is
-    // looking for an exit, not for a part.
+    // same two calls the keys make. ABOVE THE PARTS, because a lost player is
+    // looking for an exit, not for a part — and now that the categories sit
+    // at the top of this menu rather than behind one entry, an exit placed
+    // under them would be eight rows down a phone screen.
     // Not added for the mouse: 'h' and '⇧H' are already on the keyboard and
     // the right-click cascade is a measured, byte-compared surface.
     items.push(
-      { sep: true },
       { label: 'Home', hint: 'H', run: fitHome },
       { label: 'Fit everything', hint: '⇧H', run: fitAll },
       { label: 'Chat…', hint: '⏎', run: chatOpen },
@@ -3682,6 +3689,7 @@ function canvasMenu(x: number, y: number, touch = false): MenuItem[] {
       { sep: true },
     );
   }
+  items.push(...partsMenu());
   if (clipboard.length > 0) {
     const n = clipboard.length;
     items.push({ label: `Paste${n > 1 ? ` (${n})` : ''}`, run: () => pasteAt(snap(x, y)) });
