@@ -1739,6 +1739,27 @@ function labelBoxOp(op: LabelBoxOp, record = true): void {
  *  reason: when a player adds one online, the id is the server's to mint and
  *  has not arrived yet. The anchor is a grid point and only one label may
  *  sit on it, so position identifies it exactly. */
+/** The bonds this room's names imply, for the offline sim.
+ *
+ *  Same grouping rule as the server's — trimmed, case-insensitive, blanks
+ *  ignored — because a client that disagreed about what is connected would
+ *  show a different circuit than the room it is about to join. */
+function pushNetBonds(): void {
+  const by = new Map<string, Array<[number, number]>>();
+  for (const l of netLabels) {
+    const k = l.name.trim().toLowerCase();
+    if (!k) continue;
+    const g = by.get(k) ?? [];
+    g.push([l.x, l.y]);
+    by.set(k, g);
+  }
+  const bonds: Array<[[number, number], [number, number]]> = [];
+  for (const pts of by.values()) {
+    for (let i = 1; i < pts.length; i++) bonds.push([pts[i - 1]!, pts[i]!]);
+  }
+  localSim.setBonds(bonds);
+}
+
 function netLabelOp(op: NetLabelOp, record = true): void {
   // Snapshot what the op is about to destroy, BEFORE it happens.
   const prev =
@@ -1809,6 +1830,10 @@ function netLabelOp(op: NetLabelOp, record = true): void {
       for (const l of netLabels) localNlidCounter = Math.max(localNlidCounter, l.nlid + 1);
       return localNlidCounter++;
     });
+    // A name is a connection: the offline netlist has to be rebuilt, exactly
+    // as it would be for a wire.
+    pushNetBonds();
+    localSim.setElements(elements);
     resolvePendingNames();
   }
 }

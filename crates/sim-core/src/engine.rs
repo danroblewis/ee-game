@@ -993,6 +993,16 @@ pub struct Engine {
     /// moment; anything still in here after a rebuild belonged to a part
     /// that no longer exists, and is dropped with it.
     orphan_delays: BTreeMap<u32, DelayLine>,
+    /// Extra joins between grid points that are NOT wires.
+    ///
+    /// A named net label is the only source of these today: two labels
+    /// carrying the same name make their anchors one node, exactly as they
+    /// do on paper and in every schematic tool. They are kept OUT of the
+    /// document on purpose — a synthetic wire would show up in snapshots,
+    /// saves, `frame()` and undo, and a player would be able to select and
+    /// delete a connection they never drew. A bond is a fact about the
+    /// netlist, not a part.
+    bonds: Vec<(Point, Point)>,
     dt: f64,
     time: f64,
     tuning: Tuning,
@@ -1021,6 +1031,7 @@ impl Engine {
             junctions: Vec::new(),
             retired_factorizations: 0,
             orphan_delays: BTreeMap::new(),
+            bonds: Vec::new(),
             dt,
             time: 0.0,
             tuning: Tuning::default(),
@@ -1369,6 +1380,21 @@ impl Engine {
     /// Replace the document and recompile. Continuous state (cap voltage,
     /// inductor current) and the broken flag survive for elements whose id
     /// persists: moving a dead resistor does not repair it.
+    /// Declare the named-net bonds. Recompiles: this changes which points
+    /// are the same node, which is as fundamental as adding a wire.
+    ///
+    /// Idempotent and cheap when nothing moved — an unchanged list rebuilds
+    /// an identical netlist — but the caller should still avoid calling it
+    /// every tick for the same reason it does not call `set_elements` every
+    /// tick.
+    pub fn set_bonds(&mut self, bonds: &[(Point, Point)]) {
+        if self.bonds == bonds {
+            return;
+        }
+        self.bonds = bonds.to_vec();
+        self.compile();
+    }
+
     pub fn set_elements(&mut self, specs: &[ElementSpec]) {
         // Keyed by id, not scanned for it: `set_elements` is called on every
         // edit and on every block the placement gate trials, and the scan this
@@ -1663,11 +1689,45 @@ impl Engine {
                 degree[j] += 1;
             }
         }
+        // A POINT A NET LABEL NAMES IS NOT A LOOSE END, and forgetting that
+        // makes the two features destroy each other. A resistor whose top is
+        // connected only by a name still has element-degree 1, so the merge
+        // above folds it into its own far end — and the far end here is
+        // ground, so the whole named net silently became ground. Measured:
+        // every point in the room collapsed to node 0.
+        //
+        // A bond is a connection. It counts.
+        for (a, b) in &self.bonds {
+            if let Some(&i) = index_of.get(a) {
+                degree[i] += 1;
+            }
+            if let Some(&i) = index_of.get(b) {
+                degree[i] += 1;
+            }
+        }
 
         // 2. Union-find: wires merge their endpoints; grounds pin to a
         //    virtual ground root.
         let ground_root = points.len();
         let mut parent: Vec<usize> = (0..=points.len()).collect();
+        // NAMED-NET BONDS, applied exactly where a wire would be and before
+        // any element gets a say. Two labels carrying the same name make
+        // their anchors one node — which is what a net name means on paper
+        // and in every schematic tool.
+        //
+        // A bond whose point is not in this document is silently ignored: a
+        // label can outlive the part it named, and that is a dangling label
+        // rather than a broken netlist.
+        let bonds = core::mem::take(&mut self.bonds);
+        for (a, b) in &bonds {
+            if let (Some(&ia), Some(&ib)) = (index_of.get(a), index_of.get(b)) {
+                let (ra, rb) = (find(&mut parent, ia), find(&mut parent, ib));
+                if ra != rb {
+                    parent[ra] = rb;
+                }
+            }
+        }
+        self.bonds = bonds;
         for (e, je) in doc.iter().zip(ends.iter()) {
             // A broken part is an OPEN circuit — it must not merge nodes any
             // more than it stamps. `damage::rating` returns None for Wire and

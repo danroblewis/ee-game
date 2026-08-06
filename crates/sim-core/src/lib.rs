@@ -20,7 +20,10 @@ pub use netlist::{
     DEFAULT_OPAMP_ISC, MAX_BBD_STAGES, MAX_PINS, MAX_TIER, PT_HZ_PER_AMP, PT_OA_GM, PT_OA_GOUT, PT_OA_HI, PT_OA_LO, PT_OA_VLIN, PT_R_RT, PT_STAGES, PT_V_RT,
 };
 pub use shape::{is_rigid, Handle, Placement, Shape};
-pub use validate::{check_document, check_edit, check_shapes, rigid_hint, Reject, SmallIds};
+pub use validate::{
+    check_document, check_document_bonded, check_edit, check_shapes, net_bonds, rigid_hint, Reject,
+    SmallIds,
+};
 
 #[cfg(test)]
 mod tests {

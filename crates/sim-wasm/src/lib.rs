@@ -32,6 +32,19 @@ impl Sim {
     }
 
     /// Replace the document. `specs` is the JSON array of ElementSpec.
+    /// Declare the named-net bonds — `[[ [x,y], [x,y] ], ...]`.
+    ///
+    /// The offline sim needs these for the same reason the server does: a
+    /// name is a connection, and a client that ignored them would show a
+    /// different circuit than the room it is about to join.
+    #[wasm_bindgen(js_name = setBonds)]
+    pub fn set_bonds(&mut self, bonds: JsValue) -> Result<(), JsValue> {
+        let b: Vec<(sim_core::Point, sim_core::Point)> =
+            serde_wasm_bindgen::from_value(bonds).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        self.engine.set_bonds(&b);
+        Ok(())
+    }
+
     #[wasm_bindgen(js_name = setElements)]
     pub fn set_elements(&mut self, specs: JsValue) -> Result<(), JsValue> {
         let specs: Vec<ElementSpec> =

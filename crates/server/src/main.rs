@@ -84,6 +84,8 @@ mod slew;
 mod e2e;
 #[cfg(test)]
 mod muxrail;
+#[cfg(test)]
+mod netbond_test;
 mod tr808;
 mod vco555;
 mod bass;
@@ -2083,6 +2085,7 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
     {
         let elems = room.elements.lock().unwrap().clone();
         sources = source_ids(&elems);
+        eng.set_bonds(&room_bonds(&room));
         eng.set_elements(&elems);
         // Restored damage: the ratings are re-derived from the document (they
         // are never persisted) and every part that was dead when the server
@@ -2094,7 +2097,7 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
         // A restored document predating the placement gate (or hand-edited
         // on disk) can be unsolvable; it cannot be refused — it IS the room —
         // so say why the room is about to freeze instead of freezing mutely.
-        if let Err(r) = check_room_doc(&elems) {
+        if let Err(r) = check_room_doc_bonded(&elems, &room) {
             tracing::warn!(
                 "restored document fails placement validation ({}): \
                  the room may quarantine until the offending part is removed",
@@ -2248,7 +2251,7 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
                         apply_interact_to(&mut next, id, op);
                         (next, wiper_of(&elems, id))
                     };
-                    if let Err(r) = check_room_doc(&candidate) {
+                    if let Err(r) = check_room_doc_bonded(&candidate, &room) {
                         let _ = room.events.send(reject_msg(who, "interact", &r));
                         continue;
                     }
@@ -2311,7 +2314,7 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
                     // so refusing the repair keeps the room alive.
                     if let Err(r) = {
                         let elems = room.elements.lock().unwrap();
-                        check_room_doc(&elems)
+                        check_room_doc_bonded(&elems, &room)
                     } {
                         let _ = room.events.send(reject_msg(who, "repair", &r));
                         continue;
@@ -2473,9 +2476,18 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
                     }
                 }
                 Cmd::NetLabel { op } => {
-                    let mut labels = room.net_labels.lock().unwrap();
-                    if apply_net_label_op(&mut labels, &room.next_nlid, &op) {
+                    let changed = {
+                        let mut labels = room.net_labels.lock().unwrap();
+                        apply_net_label_op(&mut labels, &room.next_nlid, &op)
+                    };
+                    if changed {
                         room.dirty.store(true, Ordering::Relaxed);
+                        // A NAME IS A CONNECTION, so this is a netlist edit
+                        // and the engine has to be told. Naming two points
+                        // the same thing joins them exactly as a wire would,
+                        // and un-naming one parts them again.
+                        eng.set_bonds(&room_bonds(&room));
+                        let labels = room.net_labels.lock().unwrap();
                         let _ = room
                             .events
                             .send(json!({"t": "netlabels", "list": *labels}).to_string());
@@ -2718,7 +2730,7 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
                     .map(|children| (next, next_rect, children))
             };
             if let Some((next, next_rect, children)) = moved {
-                if let Err(r) = check_room_doc(&next) {
+                if let Err(r) = check_room_doc_bonded(&next, &room) {
                     let _ = room.events.send(reject_msg(pending_mover, "machinemove", &r));
                 } else {
                     *room.elements.lock().unwrap() = next;
@@ -3158,6 +3170,26 @@ fn sample_probes(eng: &Engine, probes: &[Probe], bufs: &mut [Vec<f32>]) {
 /// placement, only refused.
 fn check_room_doc(elems: &[ElementSpec]) -> Result<(), sim_core::Reject> {
     sim_core::check_document(elems, DT)
+}
+
+/// The bonds a room's net labels imply. See `sim_core::net_bonds`.
+fn room_bonds(room: &Room) -> Vec<(sim_core::Point, sim_core::Point)> {
+    let labels = room.net_labels.lock().unwrap();
+    sim_core::net_bonds(
+        &labels
+            .iter()
+            .map(|l| (l.name.clone(), (l.x, l.y)))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// The gate, told what the room's names have joined.
+///
+/// A candidate judged WITHOUT the bonds is a different circuit from the one
+/// the engine will run — it would refuse edits that are fine, and accept
+/// edits that are not, both for reasons a player could never see.
+fn check_room_doc_bonded(elems: &[ElementSpec], room: &Room) -> Result<(), sim_core::Reject> {
+    sim_core::check_document_bonded(elems, DT, &room_bonds(room))
 }
 
 /// The gate for a DOCUMENT EDIT: everything `check_room_doc` judges, plus the
