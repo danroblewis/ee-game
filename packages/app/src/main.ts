@@ -455,6 +455,17 @@ let selectedMachine = false;
  * copying a 5 W resistor has to give you a 5 W resistor. */
 type ClipItem = { kind: ElementKind; pins: Point[]; tier?: number; rot?: number };
 let clipboard: ClipItem[] = [];
+/** The net label the player has selected, if any.
+ *
+ *  Annotations are not `ElementSpec`s, so they cannot live in `selectedIds`
+ *  — that set is element ids and a net label's nlid is a different namespace
+ *  entirely. One slot rather than a set: net labels are placed one at a
+ *  time and the marquee has never reached them. */
+let selectedNl: number | null = null;
+/** Copying a net label loads THIS instead of the part clipboard, and clears
+ *  it. The two are mutually exclusive on purpose: one paste key, one thing
+ *  to paste, and no rule to remember about which wins. */
+let clipNetLabel: string | null = null;
 let pasting: ClipItem[] | null = null;
 
 /** In-place oscilloscopes: world-anchored SHARED instruments (the shape lives
@@ -469,15 +480,69 @@ let sidCounter = 1;
 /** Scopes are room state: online the server owns the list (its broadcast is
  * the truth), offline we apply the same rules locally. Exactly the deal
  * `panelOp` and `layerOp` strike, and the one scopes never had. */
-function scopeOp(op: ScopeOp) {
-  if (online) {
-    net.sendScope(op);
-    return;
+function scopeOp(op: ScopeOp, record = true): void {
+  const was =
+    'sid' in op ? floatScopes.find((s) => s.sid === op.sid) : undefined;
+  const snap = was ? JSON.parse(JSON.stringify(was)) : undefined;
+  const at = (x: number, y: number) => floatScopes.find((s) => s.x === x && s.y === y);
+  const send = (o: ScopeOp) => {
+    if (online) {
+      net.sendScope(o);
+      return;
+    }
+    floatScopes = applyScopeOp(floatScopes, o, () => {
+      for (const s of floatScopes) sidCounter = Math.max(sidCounter, s.sid + 1);
+      return sidCounter++;
+    });
+  };
+  // Same route as the other three annotations: an inverse OP (so it works
+  // online, where the server owns the list) keyed by POSITION (so it works
+  // before the server has minted an id).
+  if (record) {
+    if (op.t === 'add') {
+      const { x, y, w, h, set, pids } = op;
+      history.pushAction({
+        label: 'add scope',
+        undo: () => {
+          const s2 = at(x, y);
+          if (s2) scopeOp({ t: 'remove', sid: s2.sid }, false);
+        },
+        redo: () => scopeOp({ t: 'add', x, y, w, h, set, pids }, false),
+      });
+    } else if (snap) {
+      const w = snap;
+      if (op.t === 'remove') {
+        history.pushAction({
+          label: 'close scope',
+          undo: () =>
+            scopeOp(
+              { t: 'add', x: w.x, y: w.y, w: w.w, h: w.h, set: wireScopeSet(w), pids: w.pids ?? null },
+              false,
+            ),
+          redo: () => {
+            const s2 = at(w.x, w.y);
+            if (s2) scopeOp({ t: 'remove', sid: s2.sid }, false);
+          },
+        });
+      } else if (op.t === 'rect') {
+        const to = { x: op.x, y: op.y, w: op.w, h: op.h };
+        history.pushAction({
+          label: 'move scope',
+          undo: () => {
+            const s2 = at(to.x, to.y);
+            if (s2) scopeOp({ t: 'rect', sid: s2.sid, x: w.x, y: w.y, w: w.w, h: w.h }, false);
+          },
+          redo: () => {
+            const s2 = at(w.x, w.y);
+            if (s2) scopeOp({ t: 'rect', sid: s2.sid, ...to }, false);
+          },
+        });
+      }
+      // `set` is not recorded: a timebase nudge is a view preference, not an
+      // edit, and filling the undo stack with them would bury the edits.
+    }
   }
-  floatScopes = applyScopeOp(floatScopes, op, () => {
-    for (const s of floatScopes) sidCounter = Math.max(sidCounter, s.sid + 1);
-    return sidCounter++;
-  });
+  send(op);
 }
 
 // Retuning: the throttle and the echo hold.
@@ -2044,6 +2109,7 @@ Object.defineProperty(window, '__els', { get: () => elements });
 // End-to-end tests need to see annotations too, not just parts.
 Object.defineProperty(window, '__nl', { get: () => netLabels });
 Object.defineProperty(window, '__lb', { get: () => labelBoxes });
+Object.defineProperty(window, '__sc', { get: () => floatScopes });
 // And the instruments, for the same reason: a probe placed by an armed touch
 // tool draws a flag on a canvas, and a canvas cannot be asked what it means.
 Object.defineProperty(window, '__probes', { get: () => probes });
@@ -2988,6 +3054,7 @@ const deleteElements = (sel: ElementSpec[]) => deleteIds(sel.map((e) => e.id));
 
 function copyElements(sel: ElementSpec[]) {
   if (sel.length === 0) return;
+  clipNetLabel = null;
   const [cx, cy] = centroidOf(sel);
   clipboard = sel.map((e) => ({
     kind: JSON.parse(JSON.stringify(e.kind)) as ElementKind,
@@ -3004,9 +3071,22 @@ function copyElements(sel: ElementSpec[]) {
   }));
 }
 
-const copySelection = () => copyElements(elements.filter((e) => selectedIds.has(e.id)));
+const copySelection = () => {
+  // A selected net label copies ITS NAME, and takes the clipboard: one paste
+  // key, one thing loaded, nothing to remember about which wins.
+  if (selectedNl !== null) {
+    const l = netLabels.find((n) => n.nlid === selectedNl);
+    if (l) {
+      clipNetLabel = l.name;
+      clipboard = [];
+      return;
+    }
+  }
+  copyElements(elements.filter((e) => selectedIds.has(e.id)));
+};
 
 function selectAll() {
+  selectedNl = null;
   selectedIds = new Set(elements.map((e) => e.id));
   selectedProbe = null;
   selectedMachine = false;
@@ -3047,6 +3127,15 @@ function pasteAt(at: Point) {
 
 /** Arm the cursor-bound paste ghost (⌘/Ctrl+V). */
 function armPaste() {
+  // A copied net label pastes STRAIGHT DOWN at the cursor. There is no ghost
+  // to drag around: a net label names the grid point it stands on, so the
+  // only question a paste has is "which point", and the cursor has answered
+  // it already.
+  if (clipNetLabel !== null && mouse) {
+    const [gx, gy] = toGrid(mouse.x, mouse.y);
+    netLabelOp({ t: 'add', x: gx, y: gy, name: clipNetLabel });
+    return;
+  }
   if (clipboard.length === 0) return;
   pasting = clipboard.map((c) => ({ ...c }));
   placing = null;
@@ -4861,6 +4950,10 @@ canvas.addEventListener('pointerdown', (ev) => {
       if (ev.shiftKey) {
         netLabelOp({ t: 'remove', nlid: l.nlid });
       } else {
+        // Selecting it is what makes Delete and Copy mean something without
+        // the cursor having to stay on top of it.
+        selectedNl = l.nlid;
+        selectedIds.clear();
         const [gx, gy] = toGrid(ev.clientX, ev.clientY);
         netLabelMove = {
           nlid: l.nlid,
@@ -5689,7 +5782,17 @@ window.addEventListener('keydown', (ev) => {
     if (mouse) {
       const nl = netLabelAt(cam, netLabels, mouse.x, mouse.y);
       if (nl) {
+        if (selectedNl === nl.nlid) selectedNl = null;
         netLabelOp({ t: 'remove', nlid: nl.nlid });
+        return;
+      }
+      // ...and one that is SELECTED but not under the cursor. Requiring the
+      // pointer to stay on top of a thing to delete it is the reason this
+      // felt impossible: you click it, move the mouse a little, and the key
+      // does nothing.
+      if (selectedNl !== null && netLabels.some((l) => l.nlid === selectedNl)) {
+        netLabelOp({ t: 'remove', nlid: selectedNl });
+        selectedNl = null;
         return;
       }
       const lb = labelBoxHotAt(cam, labelBoxes, mouse.x, mouse.y);
@@ -6413,7 +6516,12 @@ function frame(now: number) {
     cam,
     netLabels,
     netMap,
-    netLabelMove?.nlid ?? (mouse ? (netLabelAt(cam, netLabels, mouse.x, mouse.y)?.nlid ?? null) : null),
+    // Dragging beats hovering beats selected: the highlight always shows the
+    // one an action would land on, and a selected label stays lit after the
+    // cursor moves away so "selected" is a state you can see.
+    netLabelMove?.nlid ??
+      (mouse ? (netLabelAt(cam, netLabels, mouse.x, mouse.y)?.nlid ?? null) : null) ??
+      selectedNl,
   );
 
   // Ghost previews for in-progress edits.
