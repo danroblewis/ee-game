@@ -132,6 +132,18 @@ export const CATALOG: PartDef[] = [
     make: () => ({ t: 'CurrentSource', amps: 0.01 }),
   },
   {
+    name: 'Label',
+    keys: 'label net name wire together join connect vcc gnd bus',
+    cat: 'Sources',
+    key: '⇧W',
+    // A LABEL IS A PART, like the ground and the rail beside it. Every label
+    // sharing a name is one node — which is what a label means in KiCad and
+    // on paper, and the reason a supply dragged across a sheet on wires is a
+    // mess a name replaces. Its name is the part's own name, so renaming it
+    // is the same gesture as renaming anything else.
+    make: () => ({ t: 'Label' }),
+  },
+  {
     name: 'V Rail',
     keys: 'rail vcc vdd supply single pin',
     cat: 'Sources',
@@ -414,6 +426,7 @@ export function pinCount(kind: ElementKind): number {
   switch (kind.t) {
     case 'Ground':
     case 'Rail':
+    case 'Label':
       return 1;
     case 'Timer555':
       return 6;

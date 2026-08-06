@@ -60,6 +60,7 @@ export const isLogic = (kind: ElementKind): boolean => logicPins(kind) !== null;
 export type ElementKind =
   | { t: 'Wire' }
   | { t: 'Ground' }
+  | { t: 'Label' }
   | { t: 'Resistor'; ohms: number }
   | { t: 'Lamp'; ohms: number; rated_watts: number }
   | { t: 'Speaker'; ohms: number }

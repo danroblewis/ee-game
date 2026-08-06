@@ -559,6 +559,55 @@ export function drawElement(d: DrawCtx, e: ElementSpec) {
       twoPinDots();
       break;
     }
+    case 'Label': {
+      // A flag on a stalk standing on its grid point — which is what a net
+      // name looks like on paper. `rot` turns it, exactly as it turns the
+      // ground below: a one-pin symbol has no pin geometry to orient it, so
+      // the document carries the quarter-turn.
+      const [ux, uy] = oneAxis(e, 1);
+      const at = (along: number, across: number): Px => [
+        A[0] + s * (ux * along - uy * across),
+        A[1] + s * (uy * along + ux * across),
+      ];
+      const col = voltageColor(v(0));
+      const text = (e.name ?? '').trim();
+      // The flag is sized to the NAME, so a long one is readable and a short
+      // one does not float in whitespace.
+      const w = Math.max(1.1, text.length * 0.34 + 0.5);
+      ctx.strokeStyle = col;
+      ctx.beginPath();
+      ctx.moveTo(A[0], A[1]);
+      ctx.lineTo(...at(0.55, 0));
+      ctx.stroke();
+      // A pennant: square at the stalk, pointed at the far end, so the
+      // symbol reads as a tag rather than as another chip body.
+      ctx.beginPath();
+      ctx.moveTo(...at(0.55, -0.42));
+      ctx.lineTo(...at(0.55 + w - 0.32, -0.42));
+      ctx.lineTo(...at(0.55 + w, 0));
+      ctx.lineTo(...at(0.55 + w - 0.32, 0.42));
+      ctx.lineTo(...at(0.55, 0.42));
+      ctx.closePath();
+      ctx.fillStyle = '#181820';
+      ctx.fill();
+      ctx.stroke();
+      if (cam.scale > 16 && text) {
+        ctx.save();
+        // Keep the text upright whatever the flag's quarter-turn is —
+        // a name read upside down is not a name anybody uses.
+        const [tx, ty] = at(0.55 + (w - 0.32) / 2, 0);
+        ctx.translate(tx, ty);
+        ctx.fillStyle = col;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.font = `${Math.round(s * 0.3)}px ui-monospace`;
+        ctx.fillText(text, 0, 0);
+        ctx.restore();
+        ctx.textAlign = 'start';
+        ctx.textBaseline = 'alphabetic';
+      }
+      break;
+    }
     case 'Ground': {
       // The body hangs off the single pin along `oneAxis`, which is where
       // the part's `rot` finally lands: a one-pin symbol has no pin geometry

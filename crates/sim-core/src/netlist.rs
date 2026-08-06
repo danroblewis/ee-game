@@ -158,6 +158,25 @@ pub enum ElementKind {
     Wire,
     /// Pins its single endpoint to node 0.
     Ground,
+    /// A LABEL: one pin, and every label sharing a NAME is one node.
+    ///
+    /// The same species as `Wire`. A wire stamps nothing and merges the two
+    /// points it is drawn between; a label stamps nothing and merges every
+    /// point that carries its name, however far apart they are and however
+    /// many there are. That is what a label means in KiCad, on paper, and in
+    /// every schematic tool — and it is the whole reason to have one: a
+    /// supply dragged across a sheet on wires is the mess a name replaces.
+    ///
+    /// THE NAME LIVES IN `ElementSpec::name`, not in here, because
+    /// `ElementKind` is `Copy` and a `String` would end that. The name is
+    /// therefore the ONE case where `name` is electrically significant — see
+    /// the note on that field, which says so.
+    ///
+    /// It is a PART, not an annotation, and that is the entire design. Every
+    /// capability — selection, deletion, copy and paste, dragging with a
+    /// group, rotation, undo, the placement gate, saving — comes from being
+    /// in the document, and none of it is written twice.
+    Label,
     Resistor {
         ohms: f64,
     },
@@ -712,6 +731,7 @@ impl ElementKind {
             Gate { .. } => "Gate",
             FlipFlop { .. } => "FlipFlop",
             ShiftReg { .. } => "ShiftReg",
+            Label => "Label",
             Bbd { .. } => "BBD",
             Pt2399 => "PT2399",
             Counter { .. } => "Counter",
@@ -722,7 +742,7 @@ impl ElementKind {
     pub fn pin_count(&self) -> usize {
         use ElementKind::*;
         match self {
-            Ground | Rail { .. } => 1,
+            Ground | Rail { .. } | Label => 1,
             Timer555 => 6,
             Bbd { .. } => 4,
             Pt2399 => 12,
@@ -1010,12 +1030,22 @@ pub struct ElementSpec {
     pub rot: u8,
     /// What a player calls this part: "TEMPO", "CUTOFF", "BEAT 1".
     ///
-    /// A LABEL, and nothing else. It never reaches a stamp, never changes a
-    /// node count and never moves a state hash, exactly like `tier` — two
-    /// parts differing only in their names are the same circuit. It exists
-    /// because a control panel listing "SW #431" tells a player nothing, and
-    /// the only way to name a control used to be to wrap it in its own panel
-    /// region just to borrow the region's name.
+    /// For every kind EXCEPT `Label`, this is decoration: it never reaches a
+    /// stamp, never changes a node count and never moves a state hash,
+    /// exactly like `tier` — two switches differing only in their names are
+    /// the same circuit. It exists because a control panel listing "SW #431"
+    /// tells a player nothing.
+    ///
+    /// ON A `Label` IT IS ELECTRICAL. Two labels carrying one name are one
+    /// node, so a rename there rewires the room, changes the node count and
+    /// moves the state hash. That is not an exception grudgingly admitted —
+    /// it is what a label IS, and it is the same thing a wire does with its
+    /// two endpoints. The name still never reaches a STAMP: like a wire, a
+    /// label contributes no matrix entry of its own and only decides which
+    /// points are the same unknown.
+    ///
+    /// The name lives here rather than in `ElementKind` for one blunt
+    /// reason: `ElementKind` is `Copy`, and a `String` would end that.
     ///
     /// Shared document state, not client-local: two players looking at one
     /// room must read the same labels on the same knobs.

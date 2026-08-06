@@ -294,6 +294,9 @@ pub fn tiers(kind: &ElementKind) -> &'static [Tier] {
         // table. (Contrast Wire, which is a real conductor and does have
         // one.)
         K::Ground => NO_TIERS,
+        // A label states which points are one node. Like Ground it has no
+        // conductor, no package and no dissipation — nothing here to rate.
+        K::Label => NO_TIERS,
         // Wire IS a conductor and it gets a rating, because "you cannot run
         // a motor through signal wire" is exactly the class of lesson this
         // model exists to teach, and because M6's world wire runs (gauge
@@ -444,6 +447,7 @@ pub fn kind_name(kind: &ElementKind) -> &'static str {
     match kind {
         K::Wire => "Wire",
         K::Ground => "Ground",
+        K::Label => "Label",
         K::Resistor { .. } => "Resistor",
         K::Lamp { .. } => "Lamp",
         K::Speaker { .. } => "Speaker",

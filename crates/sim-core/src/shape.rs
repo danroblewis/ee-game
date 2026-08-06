@@ -121,7 +121,7 @@ impl Shape {
     /// shape rule that has never heard of a part must not refuse it.
     pub fn for_tag(tag: &str) -> Shape {
         match tag {
-            "Ground" | "Rail" => Shape::Single,
+            "Ground" | "Rail" | "Label" => Shape::Single,
             "OpAmp" => Shape::OpAmp,
             "Npn" | "Pnp" | "Nmos" | "Pmos" => Shape::Transistor,
             "Potentiometer" => Shape::Pot,

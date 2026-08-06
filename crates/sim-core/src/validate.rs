@@ -765,6 +765,9 @@ fn check_kind(kind: &ElementKind) -> Result<(), &'static str> {
         // Nothing to range-check: the delay is set by the resistor the
         // player wires to RT, which is that resistor's problem, not a field.
         K::Pt2399 => Ok(()),
+        // Nothing to range-check: a label's only property is its name, and
+        // `MAX_NAME` already bounds that for every part.
+        K::Label => Ok(()),
         K::Bbd { stages } => {
             // A one-bucket "delay" is a wire with extra steps, and the upper
             // bound is what keeps a document from asking for a gigabyte of
@@ -1321,54 +1324,7 @@ fn pin_at_peak(specs: &mut [ElementSpec], sign: f64) {
 ///   keeps continuous state by id. A document that only fails from an
 ///   initial transient it has already lived through is refused — the safe
 ///   direction, and the only one available to a pure function.
-/// Group named-net anchors into the BONDS the netlist should carry.
-///
-/// One place, so the gate, the server's engine and the client's offline
-/// engine can never disagree about what is connected — a disagreement there
-/// is a refusal a player cannot explain, or worse, a room that solves
-/// differently on two screens.
-///
-/// Names are compared trimmed and case-insensitively, because "+5V" and
-/// "+5v" are the same net to everyone except a string comparison. A blank
-/// name bonds nothing: an unnamed label is a label somebody has not finished
-/// typing, not an instruction to short two points together.
-///
-/// Each group is CHAINED (a-b, b-c, ...) rather than fully connected: n-1
-/// bonds instead of n²/2, and union-find makes them the same node either way.
-pub fn net_bonds(labels: &[(String, Point)]) -> Vec<(Point, Point)> {
-    let mut by_name: std::collections::BTreeMap<String, Vec<Point>> = Default::default();
-    for (name, p) in labels {
-        let key = name.trim().to_ascii_lowercase();
-        if key.is_empty() {
-            continue;
-        }
-        by_name.entry(key).or_default().push(*p);
-    }
-    let mut out = Vec::new();
-    for (_, pts) in by_name {
-        for w in pts.windows(2) {
-            if w[0] != w[1] {
-                out.push((w[0], w[1]));
-            }
-        }
-    }
-    out
-}
-
 pub fn check_document(specs: &[ElementSpec], dt: f64) -> Result<(), Reject> {
-    check_document_bonded(specs, dt, &[])
-}
-
-/// The gate, told which points a named net has joined.
-///
-/// The plain `check_document` is this with no bonds, so every existing
-/// caller keeps its exact meaning — and a caller that HAS bonds must use
-/// this one, or it will judge a different circuit than the engine runs.
-pub fn check_document_bonded(
-    specs: &[ElementSpec],
-    dt: f64,
-    bonds: &[(Point, Point)],
-) -> Result<(), Reject> {
     for s in specs {
         if s.pins.len() != s.kind.pin_count() {
             return Err(Reject::BadValue {
@@ -1430,10 +1386,6 @@ pub fn check_document_bonded(
     // exactly the kind of event a sleeping island would never reach.
     let mut eng = Engine::new(dt);
     eng.set_tuning(sim_tuning_off());
-    // Bonds BEFORE elements: `set_bonds` recompiles, and compiling an empty
-    // document is free, so this order costs one no-op instead of one full
-    // extra compile of the whole room.
-    eng.set_bonds(bonds);
     eng.set_elements(specs);
     diagnose(&eng)?;
     if !eng.probe_solvable() {

@@ -85,7 +85,7 @@ mod e2e;
 #[cfg(test)]
 mod muxrail;
 #[cfg(test)]
-mod netbond_test;
+mod floattest;
 mod tr808;
 mod vco555;
 mod bass;
@@ -1870,11 +1870,35 @@ impl SaveFile {
     /// A save/template file as a room setup. This is where a LEGACY file (no
     /// `machine` key) gets its hoist back: absent means "the single-room
     /// server wrote this, and that server always had a hoist".
-    fn into_setup(self) -> RoomSetup {
+    fn into_setup(mut self) -> RoomSetup {
         let machine = self.machine.unwrap_or(MachineSpec::Hoist {
             rect: sane_rect(self.hoist_rect),
             state: self.hoist,
         });
+        // MIGRATION: net labels used to be room furniture, stored beside the
+        // panels and the label boxes, with their own ids and their own ops
+        // and their own everything. They are PARTS now — one pin, and every
+        // label sharing a name is one node — so an old save's `netlabels`
+        // become `Label` elements here and the field falls out of use.
+        //
+        // Done at load rather than by a script, because a save on disk may be
+        // months old and a player should not have to know that anything
+        // changed. Ids are minted above the document's high-water mark so a
+        // migrated label can never collide with a part.
+        if !self.netlabels.is_empty() {
+            let mut next = self.elements.iter().map(|e| e.id).max().unwrap_or(0) + 1;
+            for l in std::mem::take(&mut self.netlabels) {
+                self.elements.push(ElementSpec {
+                    id: next,
+                    kind: ElementKind::Label,
+                    pins: vec![(l.x, l.y)],
+                    name: l.name,
+                    ..Default::default()
+                });
+                next += 1;
+            }
+            tracing::info!("migrated old net labels into Label parts");
+        }
         RoomSetup {
             ext: self.ext,
             elements: self.elements,
@@ -2085,7 +2109,6 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
     {
         let elems = room.elements.lock().unwrap().clone();
         sources = source_ids(&elems);
-        eng.set_bonds(&room_bonds(&room));
         eng.set_elements(&elems);
         // Restored damage: the ratings are re-derived from the document (they
         // are never persisted) and every part that was dead when the server
@@ -2097,7 +2120,7 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
         // A restored document predating the placement gate (or hand-edited
         // on disk) can be unsolvable; it cannot be refused — it IS the room —
         // so say why the room is about to freeze instead of freezing mutely.
-        if let Err(r) = check_room_doc_bonded(&elems, &room) {
+        if let Err(r) = check_room_doc(&elems) {
             tracing::warn!(
                 "restored document fails placement validation ({}): \
                  the room may quarantine until the offending part is removed",
@@ -2251,7 +2274,7 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
                         apply_interact_to(&mut next, id, op);
                         (next, wiper_of(&elems, id))
                     };
-                    if let Err(r) = check_room_doc_bonded(&candidate, &room) {
+                    if let Err(r) = check_room_doc(&candidate) {
                         let _ = room.events.send(reject_msg(who, "interact", &r));
                         continue;
                     }
@@ -2314,7 +2337,7 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
                     // so refusing the repair keeps the room alive.
                     if let Err(r) = {
                         let elems = room.elements.lock().unwrap();
-                        check_room_doc_bonded(&elems, &room)
+                        check_room_doc(&elems)
                     } {
                         let _ = room.events.send(reject_msg(who, "repair", &r));
                         continue;
@@ -2486,8 +2509,7 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
                         // and the engine has to be told. Naming two points
                         // the same thing joins them exactly as a wire would,
                         // and un-naming one parts them again.
-                        eng.set_bonds(&room_bonds(&room));
-                        let labels = room.net_labels.lock().unwrap();
+                                        let labels = room.net_labels.lock().unwrap();
                         let _ = room
                             .events
                             .send(json!({"t": "netlabels", "list": *labels}).to_string());
@@ -2730,7 +2752,7 @@ async fn sim_task(handle: Arc<RoomHandle>, parked: Parked) {
                     .map(|children| (next, next_rect, children))
             };
             if let Some((next, next_rect, children)) = moved {
-                if let Err(r) = check_room_doc_bonded(&next, &room) {
+                if let Err(r) = check_room_doc(&next) {
                     let _ = room.events.send(reject_msg(pending_mover, "machinemove", &r));
                 } else {
                     *room.elements.lock().unwrap() = next;
@@ -3170,26 +3192,6 @@ fn sample_probes(eng: &Engine, probes: &[Probe], bufs: &mut [Vec<f32>]) {
 /// placement, only refused.
 fn check_room_doc(elems: &[ElementSpec]) -> Result<(), sim_core::Reject> {
     sim_core::check_document(elems, DT)
-}
-
-/// The bonds a room's net labels imply. See `sim_core::net_bonds`.
-fn room_bonds(room: &Room) -> Vec<(sim_core::Point, sim_core::Point)> {
-    let labels = room.net_labels.lock().unwrap();
-    sim_core::net_bonds(
-        &labels
-            .iter()
-            .map(|l| (l.name.clone(), (l.x, l.y)))
-            .collect::<Vec<_>>(),
-    )
-}
-
-/// The gate, told what the room's names have joined.
-///
-/// A candidate judged WITHOUT the bonds is a different circuit from the one
-/// the engine will run — it would refuse edits that are fine, and accept
-/// edits that are not, both for reasons a player could never see.
-fn check_room_doc_bonded(elems: &[ElementSpec], room: &Room) -> Result<(), sim_core::Reject> {
-    sim_core::check_document_bonded(elems, DT, &room_bonds(room))
 }
 
 /// The gate for a DOCUMENT EDIT: everything `check_room_doc` judges, plus the

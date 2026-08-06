@@ -637,7 +637,11 @@ async fn joining_resumes_a_parked_room_and_parking_preserves_everything() {
     assert_eq!(h.room.panels.lock().unwrap().len(), 1);
     let reloaded = Registry::open(&rd, &td);
     let back = reloaded.get(&h.meta().id).unwrap();
-    assert_eq!(back.room.elements.lock().unwrap().len(), 8);
+    // NINE, not eight: the old net label came back as a `Label` PART. Net
+    // labels used to be room furniture with their own id space and their own
+    // ops; they are elements now, and `into_setup` migrates an old save on
+    // load so nobody has to know that changed.
+    assert_eq!(back.room.elements.lock().unwrap().len(), 9);
     assert_eq!(back.room.probes.lock().unwrap().len(), 2);
     assert_eq!(back.room.panels.lock().unwrap()[0].name, "DRIVE");
     // The words survive the round trip through the file, in both primitives.
@@ -645,13 +649,23 @@ async fn joining_resumes_a_parked_room_and_parking_preserves_everything() {
     assert_eq!(boxes.len(), 1);
     assert_eq!(boxes[0].name, "POWER STAGE");
     assert_eq!((boxes[0].x0, boxes[0].y1), (2.0, 9.0));
-    let nets = back.room.net_labels.lock().unwrap().clone();
-    assert_eq!(nets.len(), 1);
-    assert_eq!(nets[0].name, "5V RAIL");
-    assert_eq!((nets[0].x, nets[0].y), (3, 4), "the anchor is a grid point");
-    // A restored room must not hand the next label an id somebody already has.
+    // The furniture list is EMPTY, and the label is in the document instead —
+    // with its name and its anchor intact.
+    assert!(
+        back.room.net_labels.lock().unwrap().is_empty(),
+        "the old net-label list must be migrated away, not kept alongside"
+    );
+    let els = back.room.elements.lock().unwrap().clone();
+    let lab = els
+        .iter()
+        .find(|e| matches!(e.kind, sim_core::ElementKind::Label))
+        .expect("the net label became a Label part");
+    assert_eq!(lab.name, "5V RAIL");
+    assert_eq!(lab.pins, vec![(3, 4)], "the anchor is a grid point");
+    // Its id must not collide with a part that already existed.
+    assert!(els.iter().filter(|e| e.id == lab.id).count() == 1);
+    // A restored room must not hand the next box an id somebody already has.
     assert!(back.room.next_blid.load(Ordering::Relaxed) > boxes[0].blid);
-    assert!(back.room.next_nlid.load(Ordering::Relaxed) > nets[0].nlid);
     assert!(back.has_machine);
 
     // And it resumes again.

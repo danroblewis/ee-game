@@ -297,6 +297,7 @@ const PART_HOTKEYS: Record<string, string> = {
   U: 'Multiplexer',
   // The bucket brigade. E for echo, which is what a player is reaching for
   // when they want one — the part's own name is the last thing they'd guess.
+  W: 'Label',
   E: 'Bucket Brigade (BBD)',
   P: 'Echo Chip (PT2399)',
 };
@@ -1739,27 +1740,6 @@ function labelBoxOp(op: LabelBoxOp, record = true): void {
  *  reason: when a player adds one online, the id is the server's to mint and
  *  has not arrived yet. The anchor is a grid point and only one label may
  *  sit on it, so position identifies it exactly. */
-/** The bonds this room's names imply, for the offline sim.
- *
- *  Same grouping rule as the server's — trimmed, case-insensitive, blanks
- *  ignored — because a client that disagreed about what is connected would
- *  show a different circuit than the room it is about to join. */
-function pushNetBonds(): void {
-  const by = new Map<string, Array<[number, number]>>();
-  for (const l of netLabels) {
-    const k = l.name.trim().toLowerCase();
-    if (!k) continue;
-    const g = by.get(k) ?? [];
-    g.push([l.x, l.y]);
-    by.set(k, g);
-  }
-  const bonds: Array<[[number, number], [number, number]]> = [];
-  for (const pts of by.values()) {
-    for (let i = 1; i < pts.length; i++) bonds.push([pts[i - 1]!, pts[i]!]);
-  }
-  localSim.setBonds(bonds);
-}
-
 function netLabelOp(op: NetLabelOp, record = true): void {
   // Snapshot what the op is about to destroy, BEFORE it happens.
   const prev =
@@ -1830,10 +1810,6 @@ function netLabelOp(op: NetLabelOp, record = true): void {
       for (const l of netLabels) localNlidCounter = Math.max(localNlidCounter, l.nlid + 1);
       return localNlidCounter++;
     });
-    // A name is a connection: the offline netlist has to be rebuilt, exactly
-    // as it would be for a wire.
-    pushNetBonds();
-    localSim.setElements(elements);
     resolvePendingNames();
   }
 }
@@ -3709,7 +3685,6 @@ function canvasMenu(x: number, y: number, touch = false): MenuItem[] {
     { label: 'Oscilloscope here', hint: 'O', run: () => addFloatScope(snap(x, y)) },
     { label: 'Control panel here', hint: 'J', run: () => (panelTool = true) },
     { label: 'Label box here', hint: '⇧J', run: () => (labelBoxTool = true) },
-    { label: 'Name this net', hint: '⇧W', run: () => (netLabelTool = true) },
     {
       label: 'Camera layer here',
       hint: '⇧Y',
@@ -5768,20 +5743,6 @@ window.addEventListener('keydown', (ev) => {
     pasting = null;
     canvas.style.cursor = 'crosshair';
     toast('drag out a label box, then type what it is');
-    return;
-  }
-  if (ev.key === 'W') {
-    // ⇧W: NAME A NET. Next to W (the wire) because a net is what wires make.
-    // The click lands the name on a grid POINT — see `NetLabel` in
-    // crates/server/src/main.rs for why the anchor is a point, what happens
-    // when the thing under it is deleted, and why two nets may share a name
-    // without being joined by it.
-    disarmTools();
-    netLabelTool = true;
-    placing = null;
-    pasting = null;
-    canvas.style.cursor = 'crosshair';
-    toast('click a point on the net to name it — a name joins nothing');
     return;
   }
   if (ev.key === 'Delete' || ev.key === 'Backspace') {
