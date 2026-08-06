@@ -217,6 +217,43 @@ impl Room {
             .collect()
     }
 
+    /// The switch (or button) with a terminal ON a given grid point.
+    ///
+    /// A test that says "the SER switch" wants to name it the way the sheet
+    /// does — by where it is — not by an id that shifts the moment somebody
+    /// inserts a resistor earlier in the room. Returns None rather than
+    /// panicking, so a test can assert its absence too.
+    pub fn switch_at(&self, at: (i32, i32)) -> Option<u32> {
+        self.elements
+            .iter()
+            .find(|e| {
+                matches!(e.kind, K::Switch { .. } | K::Button { .. }) && e.pins.contains(&at)
+            })
+            .map(|e| e.id)
+    }
+
+    /// Delete every WIRE with a terminal on a point — "what if this had never
+    /// been connected?".
+    ///
+    /// This is how a room proves that one of its wires is load-bearing.
+    /// Grounding the pin instead would test something else entirely: a pin a
+    /// room deliberately ties to the supply is SHORTED by a ground symbol,
+    /// and the placement gate refuses that before the solver ever sees it —
+    /// correctly, and uselessly for the question being asked. Only wires are
+    /// removed, so the part on the other end stays in the room.
+    pub fn cut(&mut self, at: (i32, i32)) -> &mut Self {
+        let before = self.elements.len();
+        self.elements
+            .retain(|e| !(matches!(e.kind, K::Wire) && e.pins.contains(&at)));
+        assert!(
+            self.elements.len() < before,
+            "{}: no wire to cut at {at:?}",
+            self.what
+        );
+        self.eng.set_elements(&self.elements);
+        self
+    }
+
     pub fn pots(&self) -> Vec<u32> {
         self.elements
             .iter()

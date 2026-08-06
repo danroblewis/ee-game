@@ -425,6 +425,12 @@ pub static BUILTINS: &[Builtin] = &[
         build: hoist_setup,
     },
     Builtin {
+        id: "logic",
+        name: "The Logic Bench",
+        blurb: "One of every digital chip, clocked and lit. The shift register's input is SER, and every /RST is tied high.",
+        build: crate::logicshow::logic_setup,
+    },
+    Builtin {
         id: "showcase",
         name: "Showcase",
         blurb: "Four wired vignettes to poke at. No machine, no goal.",

@@ -55,6 +55,7 @@
 //! the hoist and never gets ids 900-999 injected into it.
 
 mod lessons;
+mod logicshow;
 mod lobby;
 mod registry;
 mod templates;
