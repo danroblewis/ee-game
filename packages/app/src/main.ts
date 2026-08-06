@@ -3099,6 +3099,50 @@ function selectAll() {
   selectedMachine = false;
 }
 
+/** Every wire in the run that `seed` belongs to — a flood fill from wire to
+ *  wire through shared endpoints.
+ *
+ *  WIRES ONLY, deliberately. The point of the gesture is "this tangle, all
+ *  of it, move it or bin it", and a fill that also swallowed the parts would
+ *  walk straight out of the tangle and take half the room with it: one
+ *  resistor bridged into the run and its far end drags in the next run, and
+ *  the next. Stopping at the parts makes the result the thing you can see —
+ *  the routing — and leaves what the routing connects where it is.
+ *
+ *  A junction still spans: two wires meeting on a part's pin share that
+ *  POINT, so the fill crosses it without the part joining the selection.
+ *  That is the same rule the netlist uses, which is why the highlighted set
+ *  matches what a player would call "connected". */
+function connectedWires(seed: ElementSpec): number[] {
+  if (seed.kind.t !== 'Wire') return [seed.id];
+  // Point -> wires touching it, built once per gesture. A run is walked by
+  // its endpoints, so this index is the whole algorithm.
+  const at = new Map<string, ElementSpec[]>();
+  const key = (p: Point) => `${p[0]},${p[1]}`;
+  for (const e of elements) {
+    if (e.kind.t !== 'Wire') continue;
+    for (const p of e.pins) {
+      const k = key(p);
+      const list = at.get(k);
+      if (list) list.push(e);
+      else at.set(k, [e]);
+    }
+  }
+  const seen = new Set<number>([seed.id]);
+  const queue: ElementSpec[] = [seed];
+  while (queue.length > 0) {
+    const e = queue.pop()!;
+    for (const p of e.pins) {
+      for (const n of at.get(key(p)) ?? []) {
+        if (seen.has(n.id)) continue;
+        seen.add(n.id);
+        queue.push(n);
+      }
+    }
+  }
+  return [...seen];
+}
+
 function commitPaste(at: Point) {
   if (!pasting) return;
   const ids: number[] = [];
@@ -3583,6 +3627,22 @@ function partMenu(e: ElementSpec, x: number, y: number): MenuItem[] {
     { label: `Rotate${many}`, hint: 'Q', run: () => rotateElements(groupOf(e)) },
     { label: `Delete${many}`, hint: 'Del', run: () => deleteElements(groupOf(e)) },
   );
+  if (e.kind.t === 'Wire') {
+    // Only worth offering when it would actually gather something up: on a
+    // lone wire this is just "select", which the click already did.
+    const run = connectedWires(e);
+    if (run.length > 1) {
+      items.push({
+        label: `Select the whole run (${run.length} wires)`,
+        run: () => {
+          selectedIds = new Set(run);
+          selectedProbe = null;
+          selectedMachine = false;
+          selectedNl = null;
+        },
+      });
+    }
+  }
   if (e.kind.t !== 'Ground') {
     items.push(
       { sep: true },
