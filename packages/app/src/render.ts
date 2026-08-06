@@ -1123,46 +1123,137 @@ export function drawElement(d: DrawCtx, e: ElementSpec) {
       ctx.fill();
       ctx.stroke();
       if (cam.scale > 40) {
-        // Faint hint of the innards: the 2/3–1/3 divider tap points and
-        // the two comparators the latch listens to.
+        // THE ACTUAL INSIDE OF A 555. What was here before was a line with
+        // three dots on it and two triangles — the divider's TAP POINTS
+        // without the divider, and the comparators without the latch they
+        // drive or the transistor that latch discharges the cap through. All
+        // five blocks are drawn now, because the reason to open a chip up is
+        // to see the mechanism, and the mechanism is: two comparators watch
+        // one resistor chain, a flip-flop remembers which of them spoke
+        // last, and its output both leaves on OUT and shorts DIS to ground.
+        //
+        // Everything is placed off `x0/x1/y0/y1` rather than as constants,
+        // so it stays put if the footprint is ever re-cut.
         ctx.save();
-        ctx.globalAlpha = 0.3;
-        ctx.lineWidth = Math.max(1, s * 0.02);
+        ctx.globalAlpha = 0.42;
+        ctx.lineWidth = Math.max(1, s * 0.018);
         ctx.strokeStyle = '#c9c9d4';
         ctx.fillStyle = '#c9c9d4';
-        const dvx = x0 + (x1 - x0) * 0.78;
-        stroke(ctx, '#c9c9d4', [at(dvx, y0 + 0.35), at(dvx, y1 - 0.35)]);
-        for (const f of [0.25, 0.5, 0.75]) {
-          const c = at(dvx, y0 + 0.35 + (y1 - y0 - 0.7) * f);
+        const line = (...p: Px[]) => stroke(ctx, '#c9c9d4', p);
+        const ix0 = x0 + 0.14;
+        const ix1 = x1 - 0.14;
+        const iw = ix1 - ix0;
+        // Four columns: the divider, the comparators, the latch, and the
+        // output/discharge stage hard against the right edge.
+        // The interior is barely two units wide and BOTH walls carry pin
+        // labels, so the diagram lives in the middle and the labels shrink
+        // out of its way (see the label block below). Four columns do not
+        // fit; the discharge transistor shares the last one with the latch
+        // by sitting at a different HEIGHT instead.
+        const divx = ix0 + iw * 0.34;
+        const cmpx = ix0 + iw * 0.60;
+        const ffx = ix0 + iw * 0.86;
+
+        // ---- the three 5 k resistors, VCC to GND -------------------------
+        // Equal boxes with the taps in the gaps between them, so 2/3 and 1/3
+        // are WHERE THEY COME FROM rather than dots on a bare line.
+        const rw = 0.17;
+        const top = 0.32;
+        const bot = h - 0.32;
+        const seg = (bot - top - 0.4) / 3;
+        const rBox = (i: number) => {
+          const ya = top + i * (seg + 0.2);
           ctx.beginPath();
-          ctx.arc(c[0], c[1], Math.max(1.5, s * 0.05), 0, Math.PI * 2);
-          ctx.fill();
-        }
-        const cmpx = x0 + (x1 - x0) * 0.26;
-        for (const cy of [h * 0.3, h * 0.7]) {
+          ctx.rect(...at(divx - rw, ya), rw * 2 * s, seg * s);
+          ctx.stroke();
+          return [ya, ya + seg] as const;
+        };
+        const [r1a] = rBox(0);
+        const [r2a, r2b] = rBox(1);
+        const [, r3b] = rBox(2);
+        const t23 = r1a + seg + 0.1; // between R1 and R2 — two thirds of VCC
+        const t13 = r2b + 0.1; // between R2 and R3 — one third
+        line(at(x0, 0), at(divx, 0), at(divx, r1a));
+        line(at(divx, r3b), at(divx, h), at(x0, h));
+        line(at(divx, r1a + seg), at(divx, r2a));
+        line(at(divx, r2b), at(divx, r2b + 0.2));
+
+        // ---- the two comparators ----------------------------------------
+        // Each sits at the height of the pin it watches — the trigger at
+        // TRG, the threshold at THR — so the pin runs straight in and only
+        // the divider taps have to travel.
+        const tri = (cy: number) => {
           ctx.beginPath();
-          ctx.moveTo(...at(cmpx - 0.18, cy - 0.34));
-          ctx.lineTo(...at(cmpx - 0.18, cy + 0.34));
-          ctx.lineTo(...at(cmpx + 0.5, cy));
+          ctx.moveTo(...at(cmpx - 0.26, cy - 0.38));
+          ctx.lineTo(...at(cmpx - 0.26, cy + 0.38));
+          ctx.lineTo(...at(cmpx + 0.34, cy));
           ctx.closePath();
           ctx.stroke();
-        }
+        };
+        const yTrg = ly(P[2]!);
+        const yThr = ly(P[3]!);
+        tri(yTrg);
+        tri(yThr);
+        line(at(x0, yTrg), at(cmpx - 0.26, yTrg - 0.16));
+        line(at(x0, yThr), at(cmpx - 0.26, yThr + 0.16));
+        // The taps, on their own lanes so the two runs do not share a line.
+        line(at(divx, t23), at(divx + 0.22, t23), at(divx + 0.22, yThr - 0.16), at(cmpx - 0.26, yThr - 0.16));
+        line(at(divx, t13), at(divx + 0.40, t13), at(divx + 0.40, yTrg + 0.16), at(cmpx - 0.26, yTrg + 0.16));
+
+        // ---- the flip-flop ----------------------------------------------
+        // The thing the old drawing was most missing: a 555 is not two
+        // comparators, it is two comparators WITH A MEMORY between them.
+        const ffy0 = Math.min(yTrg, yThr) + 0.55;
+        const ffy1 = Math.max(yTrg, yThr) - 0.55;
+        const ffw = 0.2;
+        ctx.beginPath();
+        ctx.rect(...at(ffx - ffw, ffy0), ffw * 2 * s, (ffy1 - ffy0) * s);
+        ctx.stroke();
+        line(at(cmpx + 0.34, yTrg), at(ffx - ffw, ffy0 + 0.16));
+        line(at(cmpx + 0.34, yThr), at(ffx - ffw, ffy1 - 0.16));
+
+        // ---- discharge transistor, and the output ------------------------
+        // Q drives both: the DIS pin gets shorted to GND through the
+        // transistor while the output is low, which is the whole reason a
+        // 555 can time a capacitor it also discharges.
+        const yDis = ly(P[5]!);
+        const yOut = ly(P[4]!);
+        // The transistor sits at DIS's own height, at the far wall, so it
+        // never has to share a column with the latch.
+        const bar = ix1 - 0.16;
+        const dirDis = Math.sign(ffy0 - yDis) || 1; // which way the DIS pin lies
+        line(at(ffx, ffy0 - 0.02), at(ffx, yDis), at(bar - 0.14, yDis)); // base
+        line(at(bar, yDis - 0.26), at(bar, yDis + 0.26)); // the gate bar
+        line(at(bar - 0.14, yDis), at(bar, yDis));
+        line(at(bar + 0.02, yDis - 0.2 * dirDis), at(x1, yDis)); // through to DIS
+        // Emitter down the wall to the ground rail the divider already ends on.
+        line(at(bar + 0.02, yDis + 0.2 * dirDis), at(bar + 0.16, yDis + 0.42 * dirDis));
+        line(at(bar + 0.16, yDis + 0.42 * dirDis), at(bar + 0.16, h), at(divx, h));
+        // The output leaves the latch for the OUT pin.
+        line(at(ffx, ffy1 + 0.02), at(ffx, yOut), at(x1, yOut));
         ctx.restore();
       }
       if (cam.scale > 24) {
+        // ONCE THE INNARDS ARE SHOWING, the labels and the legend get out of
+        // their way: the package is two units wide inside and the block
+        // diagram needs the middle of it. Smaller type hard against each
+        // wall, and the part number moves up under the lid instead of
+        // sitting across the comparators.
+        const inner = cam.scale > 40;
         const labels = pinLabels(e.kind);
         ctx.fillStyle = '#8a8a98';
-        ctx.font = `${Math.round(s * 0.2)}px ui-monospace`;
+        ctx.font = `${Math.round(s * (inner ? 0.14 : 0.2))}px ui-monospace`;
+        const pad = inner ? 0.07 : 0.16;
         P.forEach((p, k) => {
           const left = lx(p) < w * 0.5;
           ctx.textAlign = left ? 'left' : 'right';
-          const [tx, ty] = at(left ? x0 + 0.16 : x1 - 0.16, ly(p) + 0.08);
+          const [tx, ty] = at(left ? x0 + pad : x1 - pad, ly(p) + (inner ? 0.05 : 0.08));
           ctx.fillText(labels[k] ?? '', tx, ty);
         });
         ctx.textAlign = 'center';
         ctx.fillStyle = '#c9c9d4';
-        ctx.font = `${Math.round(s * 0.34)}px ui-monospace`;
-        ctx.fillText('555', ...at(w * 0.5, h * 0.5 + 0.12));
+        ctx.font = `${Math.round(s * (inner ? 0.2 : 0.34))}px ui-monospace`;
+        ctx.fillText('555', ...at(w * 0.5, inner ? y0 + 0.34 : h * 0.5 + 0.12));
         ctx.textAlign = 'start';
       }
       const io = iPin(4);
