@@ -3004,9 +3004,11 @@ impl Island {
                     // Collected, not applied inline: the stamps below need
                     // `self` mutably too, and a closure holding it would lock
                     // them out.
-                    let mut inj: [(usize, usize, f64); 4] = [
+                    let mut inj: [(usize, usize, f64); 6] = [
                         (vout, vgnd, state.v_prev * PT_G_OUT),
                         (vrt, vgnd, crate::PT_V_RT * g_rt),
+                        (0, 0, 0.0),
+                        (0, 0, 0.0),
                         (0, 0, 0.0),
                         (0, 0, 0.0),
                     ];
@@ -3029,9 +3031,14 @@ impl Island {
                     // 2 pinned high. A pinned op-amp stops being a gm stage
                     // and becomes a stiff source at the rail, which is what
                     // makes a runaway feedback loop CLIP instead of diverge.
-                    for (k, (inv, out)) in [(node[4], node[5]), (node[6], node[7])]
-                        .into_iter()
-                        .enumerate()
+                    for (k, (inv, out)) in [
+                        (node[4], node[5]),   // OP1
+                        (node[6], node[7]),   // OP2
+                        (node[8], node[9]),   // LPF1
+                        (node[10], node[11]), // LPF2
+                    ]
+                    .into_iter()
+                    .enumerate()
                     {
                         // 0 linear, 1 pinned low, 2 pinned high. Decided from
                         // the INPUT in `update_guesses` — see there for why
@@ -3607,7 +3614,7 @@ impl Island {
                     // cannot settle at this gain, and the first version of
                     // this chattered until the solver quarantined the room.
                     let vgnd = self.xv(node[3]);
-                    for (k, inv) in [4usize, 6].into_iter().enumerate() {
+                    for (k, inv) in [4usize, 6, 8, 10].into_iter().enumerate() {
                         let d = crate::PT_V_RT - (self.xv(node[inv]) - vgnd);
                         let reg = (self.elems[ei].state.dstate >> (D_PT_OA + 2 * k)) & 3;
                         // HYSTERESIS, and it is not a nicety. The linear
@@ -3931,8 +3938,10 @@ impl Island {
                     // every step and delivered the same railed output whatever
                     // went in. All that is left here is reporting current.
                     // What each stage delivers into whatever hangs on it.
-                    let mut oa_i = [0.0f64; 2];
-                    for (k, (inv, out)) in [(4usize, 5usize), (6, 7)].into_iter().enumerate() {
+                    let mut oa_i = [0.0f64; 4];
+                    for (k, (inv, out)) in
+                        [(4usize, 5usize), (6, 7), (8, 9), (10, 11)].into_iter().enumerate()
+                    {
                         let want = crate::PT_V_RT
                             + (crate::PT_V_RT - (vs[inv] - vgnd)) * crate::PT_OA_GM
                                 / crate::PT_OA_GOUT;
@@ -3944,9 +3953,11 @@ impl Island {
                     st.pin_i[2] = i_rt;
                     st.pin_i[5] = oa_i[0];
                     st.pin_i[7] = oa_i[1];
+                    st.pin_i[9] = oa_i[2];
+                    st.pin_i[11] = oa_i[3];
                     // Everything the chip sources leaves through its own
                     // ground pin, or KCL stops meaning anything.
-                    st.pin_i[3] = -(i_out + i_rt + oa_i[0] + oa_i[1]);
+                    st.pin_i[3] = -(i_out + i_rt + oa_i.iter().sum::<f64>());
                 }
                 ElementKind::Bbd { .. } => {
                     // Pins [IN, OUT, CLK, GND]. Runs ONCE PER ACCEPTED STEP,

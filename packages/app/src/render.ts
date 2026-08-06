@@ -842,7 +842,7 @@ export function drawElement(d: DrawCtx, e: ElementSpec) {
       const ex = norm(sub(Op_, Ip));
       const ey = norm(sub(Vp, Ip));
       const w = mag(sub(Op_, Ip)) / s;
-      const h = (mag(sub(P[6]!, Ip)) / s) * (7 / 7);
+      const h = mag(sub(P[10]!, Ip)) / s;
       const at = (x: number, y: number): Px => add(add(Ip, ex, x * s), ey, y * s);
       const lx = (p: Px) => dot(sub(p, Ip), ex) / s;
       const ly = (p: Px) => dot(sub(p, Ip), ey) / s;
@@ -931,11 +931,16 @@ export function drawElement(d: DrawCtx, e: ElementSpec) {
         for (const [cy, oi, label] of [
           [5.6, 4, 'OP1'],
           [7.0, 6, 'OP2'],
+          [9.0, 8, 'LPF1'],
+          [11.0, 10, 'LPF2'],
         ] as Array<[number, number, string]>) {
           amp(2.2, cy, 0.52, label, true);
           line(x0 + 0.2, ly(P[oi]!), 1.8, cy);      // its input pin
           line(2.72, cy, x1 - 0.2, ly(P[oi + 1]!)); // its output pin
-          // The internal 4.7K from IN to OUT, drawn as the figure does.
+          // The internal 4.7K from IN to OUT, drawn as the figure does —
+          // and only on OP1/OP2, because the filters do not have one: their
+          // feedback is whatever the builder solders across the pins.
+          if (oi >= 8) continue;
           line(1.8, cy - 0.62, 2.9, cy - 0.62);
           line(1.8, cy - 0.62, 1.8, cy - 0.05);
           line(2.9, cy - 0.62, 2.9, cy - 0.05);

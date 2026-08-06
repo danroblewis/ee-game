@@ -151,7 +151,7 @@ impl Shape {
             Shape::Ota => 4,
             Shape::Dip555 => 6,
             Shape::Bbd => 4,
-            Shape::Pt2399 => 8,
+            Shape::Pt2399 => 12,
         }
     }
 
@@ -166,11 +166,11 @@ impl Shape {
 ///
 /// The ORDER is the netlist's pin order and must never be permuted — pin 0 of
 /// an op-amp is `in+` wherever the symbol ends up pointing.
-fn base(shape: Shape, l: i32) -> [Point; 8] {
+fn base(shape: Shape, l: i32) -> [Point; 12] {
     // Fixed-size array (never allocates); `Shape::pins` says how much of it
     // is meaningful. Eight because the echo chip is the widest package here;
     // the 555's six and everything smaller just leave the tail unused.
-    let mut p = [(0, 0); 8];
+    let mut p = [(0, 0); 12];
     match shape {
         Shape::Single => {}
         Shape::Free => p[1] = (l, 0),
@@ -228,6 +228,9 @@ fn base(shape: Shape, l: i32) -> [Point; 8] {
         // A DIP with signal flowing left to right, the delay pin under the
         // input, and the two op-amps on the lower rows where the block
         // diagram puts them.
+        // Six rows: the delay's own pins at the top, then the four op-amp
+        // stages the chip carries, each with its input on the left and its
+        // output on the right.
         Shape::Pt2399 => {
             p[0] = (0, 0); // in
             p[1] = (10, 0); // out
@@ -237,6 +240,10 @@ fn base(shape: Shape, l: i32) -> [Point; 8] {
             p[5] = (10, 5); // op1-out
             p[6] = (0, 7); // op2-in
             p[7] = (10, 7); // op2-out
+            p[8] = (0, 9); // lpf1-in
+            p[9] = (10, 9); // lpf1-out
+            p[10] = (0, 11); // lpf2-in
+            p[11] = (10, 11); // lpf2-out
         }
     }
     p
@@ -575,7 +582,7 @@ pub fn straighten(shape: Shape, pins: &[Point]) -> Vec<Point> {
         // perpendicular and would tell us nothing about which is which.
         Shape::Dip555 => (pins[0], pins[4], 1, 4),
         Shape::Bbd => (pins[0], pins[1], 2, 3),
-        Shape::Pt2399 => (pins[0], pins[1], 2, 7),
+        Shape::Pt2399 => (pins[0], pins[1], 2, 11),
         Shape::Single | Shape::Free => return pins.to_vec(),
     };
     let v = (b.0 - a.0, b.1 - a.1);

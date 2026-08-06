@@ -40,7 +40,7 @@ const fn logic_width(n: u8, lo: u8, hi: u8) -> usize {
 /// `pin_count()` rather than this constant, so no golden digest moves, and
 /// `FRAME_STRIDE` is derived from it in one place that both transports
 /// call.
-pub const MAX_PINS: usize = 10;
+pub const MAX_PINS: usize = 12;
 
 /// Short-circuit output current a legacy (field-less) `OpAmp` deserialises
 /// to: a 741/LM358-class jellybean. See `ElementKind::OpAmp`.
@@ -474,7 +474,8 @@ pub enum ElementKind {
     /// PT2399-class ECHO CHIP: the same delay line, but it brings its own
     /// clock AND its own two op-amps.
     ///
-    /// Pins `[IN, OUT, VCO, GND, OP1-IN, OP1-OUT, OP2-IN, OP2-OUT]`.
+    /// Pins `[IN, OUT, VCO, GND, OP1-IN, OP1-OUT, OP2-IN, OP2-OUT,
+    ///          LPF1-IN, LPF1-OUT, LPF2-IN, LPF2-OUT]`.
     ///
     /// ## Why this exists next to `Bbd`
     ///
@@ -534,6 +535,23 @@ pub enum ElementKind {
     /// They are transconductance macromodels — a `gm` stage into an output
     /// impedance, clamped to the supply — so they cost no branch unknown and
     /// no Newton iteration, exactly like the delay line they sit beside.
+    ///
+    /// ## The two filters, and why they are op-amps too
+    ///
+    /// LPF1 and LPF2 are the anti-alias filter in front of the converter and
+    /// the reconstruction filter behind it — and on the real chip they are
+    /// not fixed filters at all. They are op-amp stages with their corners
+    /// set by CAPACITORS THE BUILDER SOLDERS ON, which is why the datasheet's
+    /// application circuit is covered in 3900 pF and 0.082 uF parts around
+    /// pins 13-16. So they are modelled as what they are: two more stages of
+    /// exactly the kind above, with the filter left to the player.
+    ///
+    /// That matters more here than on real hardware. This is the first part
+    /// in the game where ALIASING IS REAL — sample above half the VCO clock
+    /// and it folds — so the filters are not decoration, they are the
+    /// difference between a delay and a mess. Giving the player the same
+    /// pins the chip has means the fix for that is the same fix a bench
+    /// would use.
     Pt2399,
     /// Synchronous binary counter. Pins: `[VCC, GND, CLK, RST, Q0..]`,
     /// `bits` in 2..=4, `modulus` in 2..=2^bits.
@@ -707,7 +725,7 @@ impl ElementKind {
             Ground | Rail { .. } => 1,
             Timer555 => 6,
             Bbd { .. } => 4,
-            Pt2399 => 8,
+            Pt2399 => 12,
             Ota => 4,
             Npn { .. }
             | Pnp { .. }

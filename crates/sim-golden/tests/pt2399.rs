@@ -19,15 +19,14 @@ fn rig(rt_ohms: f64, dc: f64) -> Vec<sim_core::ElementSpec> {
             // [IN, OUT, VCO, GND, OP1-IN, OP1-OUT, OP2-IN, OP2-OUT].
             // The op-amps are left unwired here: these tests are about the
             // delay, and an unwired op-amp must be harmless.
+            // [IN, OUT, VCO, GND, OP1-IN/OUT, OP2-IN/OUT, LPF1-IN/OUT,
+            //  LPF2-IN/OUT]. The op-amps and filters are left unwired here:
+            //  these tests are about the delay, and an unwired stage must be
+            //  harmless.
             pins: vec![
-                (0, 0),
-                (8, 0),
-                (0, 8),
-                (8, 8),
-                (0, 12),
-                (8, 12),
-                (0, 16),
-                (8, 16),
+                (0, 0), (8, 0), (0, 8), (8, 8),
+                (0, 12), (8, 12), (0, 16), (8, 16),
+                (0, 20), (8, 20), (0, 24), (8, 24),
             ],
             ..Default::default()
         },
@@ -219,7 +218,8 @@ fn too_much_feedback_clips_instead_of_running_away() {
         sim_core::ElementSpec {
             id: 1,
             kind: K::Pt2399,
-            pins: vec![(0,0),(10,0),(0,2),(10,2),(0,5),(10,5),(0,7),(10,7)],
+            pins: vec![(0,0),(10,0),(0,2),(10,2),(0,5),(10,5),(0,7),(10,7),
+                       (0,9),(10,9),(0,11),(10,11)],
             ..Default::default()
         },
         spec(2, r(10_000.0), (0, 2), (0, 24)),
@@ -262,4 +262,79 @@ fn too_much_feedback_clips_instead_of_running_away() {
     );
     println!("overdriven echo peaked at {worst:.2} V (rails are {} .. {})",
         sim_core::PT_OA_LO, sim_core::PT_OA_HI);
+}
+
+/// THE FILTERS ARE REAL FILTERS, built the way the datasheet builds them.
+///
+/// LPF1 and LPF2 are not fixed corners inside the chip — they are op-amp
+/// stages whose response comes from CAPACITORS THE BUILDER ADDS, which is
+/// why the application circuit is covered in 3900 pF and 0.082 uF parts
+/// around pins 13-16. This wires one as a first-order low pass (R in, R||C
+/// feedback) and measures the rolloff, because "we exposed some pins" is not
+/// the same claim as "a filter can be built on them".
+///
+/// It matters more here than anywhere else in the game: this is the first
+/// part where ALIASING IS REAL, so these pins are the difference between a
+/// delay and a mess.
+#[test]
+fn a_filter_built_on_lpf1_actually_filters() {
+    // Inverting stage: 10k in, 10k feedback with 1.6 nF across it.
+    // f_c = 1/(2*pi*R*C) = 9.9 kHz.
+    let rig = |hz: f64| -> f64 {
+        let d = vec![
+            sim_core::ElementSpec {
+                id: 1,
+                kind: K::Pt2399,
+                pins: vec![(0,0),(10,0),(0,2),(10,2),(0,5),(10,5),(0,7),(10,7),
+                           (0,9),(10,9),(0,11),(10,11)],
+                ..Default::default()
+            },
+            spec(2, r(10_000.0), (0, 2), (0, 30)),
+            gnd(3, (0, 30)),
+            gnd(4, (10, 2)),
+            // Signal into LPF1-IN through 10k, biased at the chip's rest.
+            spec(5, K::VoltageSource { dc: sim_core::PT_V_RT, amp: 0.5, hz, phase: 0.0, wave: Wave::Sine }, (30, 9), (30, 30)),
+            gnd(6, (30, 30)),
+            spec(7, r(10_000.0), (30, 9), (0, 9)),
+            spec(8, r(10_000.0), (0, 9), (10, 9)),          // feedback R
+            spec(9, K::Capacitor { farads: 1.6e-9 }, (0, 9), (10, 9)), // feedback C
+            spec(10, r(100_000.0), (10, 9), (10, 30)),
+            gnd(11, (10, 30)),
+        ];
+        let mut eng = Engine::new(DT);
+        eng.set_elements(&d);
+        eng.advance((0.02 / DT) as u32);
+        let (mut hi, mut lo) = (f64::MIN, f64::MAX);
+        for _ in 0..((5.0 / hz / DT) as u32).max(2_000) {
+            eng.advance(1);
+            let v = eng.voltage_at((10, 9)).unwrap();
+            hi = hi.max(v);
+            lo = lo.min(v);
+        }
+        assert!(!eng.is_quarantined(), "{hz} Hz quarantined");
+        hi - lo
+    };
+    // Well below the corner the stage is unity-inverting: 1.0 V p-p in,
+    // ~1.0 V p-p out. An octave and two octaves above it, a first-order
+    // pole gives -6 dB and -12 dB.
+    // EVERY PROBE STAYS UNDER THE SIMULATOR'S OWN NYQUIST. At dt = 20 us the
+    // engine samples at 50 kHz, so 25 kHz is the ceiling — and a first
+    // attempt at this probed 40 kHz, which aliased down to 10 kHz and came
+    // back showing LESS attenuation than 20 kHz. The filter was fine; the
+    // measurement was above the sample rate. Corner here is 9.9 kHz.
+    let pass = rig(500.0);
+    let mid = rig(5_000.0);
+    let stop = rig(20_000.0);
+    println!("  500 Hz {pass:.4} V   5 kHz {mid:.4} V   20 kHz {stop:.4} V");
+    println!(
+        "  -> {:.1} dB at 5 kHz, {:.1} dB at 20 kHz",
+        20.0 * (mid / pass).log10(),
+        20.0 * (stop / pass).log10()
+    );
+    assert!(pass > 0.8, "the passband should come through, got {pass:.4} V p-p");
+    assert!(mid < pass, "5 kHz should already be down: {mid:.4} vs {pass:.4}");
+    assert!(
+        stop < mid * 0.7,
+        "20 kHz should be well down on 5 kHz: {stop:.4} vs {mid:.4}"
+    );
 }

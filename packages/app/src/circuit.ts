@@ -168,7 +168,11 @@ export function pinLabels(kind: ElementKind): string[] {
     case 'Pt2399':
       // The datasheet's own names, so what a player learns here is what is
       // printed on the real part.
-      return ['IN', 'OUT', 'VCO', 'GND', 'OP1-IN', 'OP1-OUT', 'OP2-IN', 'OP2-OUT'];
+      return [
+        'IN', 'OUT', 'VCO', 'GND',
+        'OP1-IN', 'OP1-OUT', 'OP2-IN', 'OP2-OUT',
+        'LPF1-IN', 'LPF1-OUT', 'LPF2-IN', 'LPF2-OUT',
+      ];
     case 'Potentiometer':
       return ['A', 'W', 'B'];
     case 'Motor':
@@ -239,7 +243,7 @@ export interface ElemLive {
 /** `[id, npins, v0..vN, i0..iN, power]` — the TS mirror of
  *  `sim_core::FRAME_STRIDE` and `sim_core::MAX_PINS`. 10 is set by the
  *  widest logic parts (4-bit shift register, 4:1 mux, both 9 pins). */
-export const MAX_PINS = 10;
+export const MAX_PINS = 12;
 
 /** Longest part name the server accepts. Mirrors `sim_core::MAX_NAME`; the
  *  gate refuses anything longer, so the input caps at the same number rather

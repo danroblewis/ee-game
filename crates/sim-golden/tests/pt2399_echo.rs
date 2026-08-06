@@ -23,7 +23,8 @@ const DT: f64 = 20e-6;
 fn the_echo_recipe() {
     let mk = |dc: f64| vec![
         sim_core::ElementSpec { id: 1, kind: K::Pt2399,
-            pins: vec![(0,0),(10,0),(0,2),(10,2),(0,5),(10,5),(0,7),(10,7)],
+            pins: vec![(0,0),(10,0),(0,2),(10,2),(0,5),(10,5),(0,7),(10,7),
+                       (0,9),(10,9),(0,11),(10,11)],
             ..Default::default() },
         spec(2, r(10_000.0), (0,2),(0,24)), gnd(3,(0,24)),      // delay time
         gnd(4,(10,2)),                                           // chip ground
