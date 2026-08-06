@@ -650,7 +650,13 @@ function applyDoc(op: DocOp) {
     const e = elemById(op.id);
     if (e) {
       e.pins = op.pins;
-      if (op.rot !== undefined) e.rot = op.rot & 3;
+      // `!= null`, not `!== undefined`: a Move that carries no rotation means
+      // "leave the symbol alone", and it can say so as an absent field (our
+      // own local ops) or as an explicit null (any server that serialises
+      // `Option::None`). Reading `null & 3` gives 0, so the strict check
+      // turned a null into a rotation back to upright — see the matching note
+      // on `DocOp::Move` in netlist.rs. Both spellings must mean the same.
+      if (op.rot != null) e.rot = op.rot & 3;
       space.update(e);
     }
   } else if (op.t === 'SetKind') {
@@ -3719,9 +3725,24 @@ function roomsMenu(): MenuItem[] {
  *  right button and a finger's press-and-hold must never disagree about what
  *  is under them: an instrument beats the part it is clipped to, and a part
  *  beats the empty sheet. */
+/** The menu for a point, and — on empty canvas — the end of the selection.
+ *
+ *  ASKING THE MAP FOR A MENU IS A WAY OF SAYING "not that, this". Landing on
+ *  bare grid with parts still lit left you reading a menu about the canvas
+ *  while the screen insisted several parts were the subject, and the next key
+ *  you pressed went to them; clearing the selection first makes the right-
+ *  click mean what it looks like it means. Landing ON something is the
+ *  opposite gesture — that is a menu ABOUT that part — so the selection is
+ *  left exactly as it is there, and a right-click inside a multi-part
+ *  selection still acts on the whole group. */
 function menuItemsAt(x: number, y: number, touch = false): MenuItem[] {
   const pr = probeAt(x, y);
   const e = pr ? undefined : elementAt(x, y);
+  if (!pr && !e && (selectedIds.size > 0 || selectedProbe !== null || selectedMachine)) {
+    selectedIds = new Set();
+    selectedProbe = null;
+    selectedMachine = false;
+  }
   return pr ? probeMenu(pr) : e ? partMenu(e, x, y) : canvasMenu(x, y, touch);
 }
 
@@ -5810,6 +5831,15 @@ window.addEventListener('keydown', (ev) => {
   if (ev.key === 'q' || ev.key === 'Q') {
     if (placing) {
       placeRot = (placeRot + 1) % 4;
+      // AND the part you just put down, if it is still what is selected.
+      // Placing leaves the tool armed (Falstad-style) and the new part
+      // selected, so the two readings of Q — "turn the ghost" and "turn the
+      // thing I just placed" — are both live at once, and answering only the
+      // first made a one-pin part impossible to straighten after the fact:
+      // you pressed Q, the ghost turned where you were not looking, and the
+      // ground symbol on the sheet sat there. Turning both keeps them
+      // agreeing, which is also what the screen implies is happening.
+      rotateSelection();
     } else if (pasting) {
       // Rotate the paste ghost 90° clockwise about its centroid (origin).
       pasting = pasting.map((c) => ({
@@ -6523,9 +6553,24 @@ function frame(now: number) {
     drawElement({ ctx, cam, dots, dtSec: 0 }, { id: 0, kind, pins: placePins(kind, placeDrag.a, b) });
   } else if (placing && mouse) {
     const kind = placing.make();
-    if (pinCount(kind) > 3) {
+    // WHAT GETS A GHOST is decided by how the part is placed, not by how many
+    // pins it has. A part you STAMP DOWN with one click — a chip, and equally
+    // a ground or a rail — never gets drawn during a drag, so without a ghost
+    // there is no moment before the click when you can see it at all; you
+    // find out what you placed, and which way round, afterwards. A part you
+    // DRAW OUT between two points (resistor, wire, source) shows itself the
+    // whole time you are dragging it, and an extra ghost idling under the
+    // cursor beforehand only says something the drag is about to say better.
+    const n = pinCount(kind);
+    if (n > 3 || n === 1) {
       const a = snap(mouse.x, mouse.y);
-      drawElement({ ctx, cam, dots, dtSec: 0 }, { id: 0, kind, pins: placePins(kind, a, placeEnd(a)) });
+      // `rot` matters only for the one-pin case, where the pins cannot carry
+      // the turn — but passing it always is what makes Q visible before the
+      // click, which is the whole reason the ghost is here.
+      drawElement(
+        { ctx, cam, dots, dtSec: 0 },
+        { id: 0, kind, pins: placePins(kind, a, placeEnd(a)), rot: placeRot },
+      );
     }
   }
   if (pasting && mouse) {

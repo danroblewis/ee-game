@@ -5724,6 +5724,35 @@ mod tests {
         ));
         assert_eq!(rot_of(1), 3, "a plain move must not reset the orientation");
 
+        // AND IT MUST NOT RESET IT ON THE WAY OUT EITHER. Applying the op
+        // correctly is only half of it: this same op is re-serialised and
+        // broadcast to every client, and a `None` that goes out as
+        // `"rot": null` is a rotation instruction to anyone who tests the
+        // field for presence rather than for null. That is exactly what
+        // happened — drag a rotated ground symbol and the echo of your own
+        // drag stood it back up — so the wire format is asserted here, not
+        // just the in-memory effect.
+        let wire = serde_json::to_string(&DocOp::Move {
+            id: 1,
+            pins: vec![(2, 2)],
+            rot: None,
+        })
+        .unwrap();
+        assert!(
+            !wire.contains("rot"),
+            "a Move carrying no rotation must not mention `rot` at all, got {wire}"
+        );
+        let turned = serde_json::to_string(&DocOp::Move {
+            id: 1,
+            pins: vec![(2, 2)],
+            rot: Some(3),
+        })
+        .unwrap();
+        assert!(
+            turned.contains("\"rot\":3"),
+            "a Move that DOES carry a rotation must still send it, got {turned}"
+        );
+
         // Out of range: the whole op is dropped, like a wrong pin count.
         assert!(!apply_doc_op(
             &room,

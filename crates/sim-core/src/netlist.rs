@@ -1146,10 +1146,21 @@ pub enum DocOp {
     /// of the turn. One op, one undo entry, either way. `None` means "leave
     /// the symbol as it is", which is also what an old client's Move
     /// deserialises to.
+    ///
+    /// `skip_serializing_if` IS LOad-BEARING, not tidiness. Without it a
+    /// `None` goes out on the wire as `"rot": null`, and a JSON client
+    /// asking `op.rot !== undefined` — the obvious way to spell "was a
+    /// rotation supplied?" — gets `true` for null and then reads `null & 3`,
+    /// which is 0. That turned every drag echo into a silent straighten:
+    /// rotate a ground symbol, drag it, and the server's own broadcast of
+    /// your drag stood it back up. The field must be ABSENT to mean absent.
     Move {
         id: u32,
         pins: Vec<Point>,
-        #[cfg_attr(feature = "serde", serde(default))]
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
         rot: Option<u8>,
     },
     /// Reconfigure a part's parameters (the properties-panel path). The
