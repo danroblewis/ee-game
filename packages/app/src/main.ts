@@ -164,6 +164,7 @@ import {
   type NetMap,
 } from './annotate';
 import { History, isTypingTarget } from './history';
+import { parseParts, serializeParts } from './clipfmt';
 import { createHoist, type MachineRect } from './hoist';
 import { createGfx } from './gfx';
 import { createLesson } from './lesson';
@@ -455,6 +456,8 @@ let selectedMachine = false;
  * two per-instance document properties (rating tier, symbol rotation) —
  * copying a 5 W resistor has to give you a 5 W resistor. */
 type ClipItem = { kind: ElementKind; pins: Point[]; tier?: number; rot?: number };
+/** Also written to the SYSTEM clipboard as text, so a selection can cross
+ *  between two windows — see `clipfmt.ts`. */
 let clipboard: ClipItem[] = [];
 /** The net label the player has selected, if any.
  *
@@ -3076,6 +3079,16 @@ function copyElements(sel: ElementSpec[]) {
     tier: e.tier ?? 0,
     rot: e.rot ?? 0,
   }));
+  // ...AND ONTO THE SYSTEM CLIPBOARD, which is the half that crosses windows.
+  // Fire and forget: `writeText` rejects when the document is not focused or
+  // the permission is refused, and a copy that only worked inside this tab is
+  // still the copy that has always worked. Never let it reach the key
+  // handler.
+  try {
+    void navigator.clipboard?.writeText(serializeParts(clipboard))?.catch(() => {});
+  } catch {
+    /* no clipboard API (old browser, insecure origin): in-memory copy stands */
+  }
 }
 
 const copySelection = () => {
@@ -3175,6 +3188,30 @@ function pasteAt(at: Point) {
   placing = null;
   commitPaste(at);
 }
+
+// THE OTHER HALF OF CROSSING WINDOWS. `navigator.clipboard.readText()` needs
+// a permission that Safari will not grant and Chrome prompts for; the `paste`
+// EVENT needs none, because the user pressing the key is the authorisation.
+// So the key handler below arms from memory (instant, and right whenever the
+// copy happened in this tab) and this listener corrects it a tick later if
+// the system clipboard turns out to hold a circuit from somewhere else.
+//
+// Anything that is not ours is ignored rather than refused: the clipboard
+// usually holds a sentence, and pasting one should leave the in-memory ghost
+// exactly as the key handler left it.
+window.addEventListener('paste', (ev) => {
+  if (isTypingTarget(ev)) return; // the chat box owns its own paste
+  const text = ev.clipboardData?.getData('text/plain');
+  if (!text) return;
+  const parts = parseParts(text);
+  if (!parts) return;
+  ev.preventDefault();
+  clipNetLabel = null;
+  clipboard = parts.map((c) => ({ ...c }));
+  pasting = clipboard.map((c) => ({ ...c }));
+  placing = null;
+  canvas.style.cursor = 'crosshair';
+});
 
 /** Arm the cursor-bound paste ghost (⌘/Ctrl+V). */
 function armPaste() {
@@ -5695,8 +5732,15 @@ window.addEventListener('keydown', (ev) => {
       copySelection();
       ev.preventDefault();
     } else if (ev.key === 'v') {
+      // NO `preventDefault` HERE, and that is the whole of cross-window
+      // paste. Cancelling the key cancels the browser's `paste` event with
+      // it, and that event is the only way to read the system clipboard
+      // without a permission Safari will not grant. So: arm from memory now
+      // (right whenever the copy happened in this tab, and instant), and let
+      // the paste listener overwrite it a tick later if the clipboard turns
+      // out to hold a circuit from another window. The listener calls
+      // `preventDefault` itself once it knows the text is ours.
       armPaste();
-      ev.preventDefault();
     } else if (!isTypingTarget(ev) && (ev.key === 'z' || ev.key === 'Z' || ev.key === 'y')) {
       // ⌘/Ctrl+Z undo, ⌘/Ctrl+Shift+Z or Ctrl+Y redo — MY edits only.
       if (ev.key === 'y' || ev.shiftKey) history.redo(elements);

@@ -94,7 +94,10 @@ export function labelFor(ops: DocOp[]): string {
 
 /** True when a keystroke belongs to a text field (property dialog, panel
  * window, palette search) — undo keys must stay out of the way there. */
-export function isTypingTarget(ev: KeyboardEvent): boolean {
+/** Takes anything with a `target` — a KeyboardEvent, a ClipboardEvent —
+ *  because the question ("is a text field the subject of this?") is the same
+ *  one whatever the event is, and only `target` is ever read. */
+export function isTypingTarget(ev: { target: EventTarget | null }): boolean {
   for (const n of [ev.target, document.activeElement]) {
     if (!(n instanceof HTMLElement)) continue;
     if (n.isContentEditable) return true;
